@@ -1,0 +1,144 @@
+# CLAUDE.md: working on net-gateway
+
+Guide for agents (and people) changing this repo. User-facing docs are in
+[README.md](README.md); how it fits together is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); why it looks this way (and what
+was tried and rejected) is in [docs/DECISIONS.md](docs/DECISIONS.md).
+
+## What this is
+
+A Claude Code plugin (`plugins/net-gateway/`) published through a local
+directory marketplace (`.claude-plugin/marketplace.json`, name `local-tools`).
+Users install it **straight from their checkout** (`pixi run install`), so any
+edit here is live in their next Claude Code session. Be careful, and run the
+tests before you stop. The only requirements are Claude Code and pixi; keep it
+that way, and keep it working on macOS and Linux (desktop and headless).
+
+## Layout
+
+```
+.claude-plugin/marketplace.json   marketplace "local-tools" -> ./plugins/net-gateway
+settings.rules.json               permission rules the plugin expects (template; install.py merges it)
+settings.snippet.json             deny-only backstop for if the plugin is disabled
+docs/                             ARCHITECTURE, DECISIONS, history/
+plugins/net-gateway/
+  .claude-plugin/plugin.json      name, version
+  .mcp.json                       MCP server "gw" (stdio, via pixi)
+  hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse(Bash)
+  hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
+  commands/{help,secret,sudo,net-log}.md   slash commands
+  install.py                      `pixi run install`: register plugin + merge settings.rules.json
+  config/policy.json              tunables (domains, tiers, size limits)
+  pixi.toml / pixi.lock           Python 3.12 + age, all platforms
+  run.py                          single entry: server | hook-* | log | check | scrub | vault
+  src/netgw/
+    policy.py      config, allowlists, redaction/scrubbing, audit log, Bash blocklist
+    actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
+    mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
+    hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
+    commands.py    /net-gateway:secret and /net-gateway:sudo handling, transcript scrubber
+    vault.py       age-encrypted JSON vault (~/.config/net-gateway), sudo switches
+    web_form.py    one-time 127.0.0.1 browser form for entering values
+    cli.py         `run.py log` (the /net-log viewer), `check`, and `vault` (terminal
+                   fallback for /secret and /sudo when no browser can open)
+  tests/run_tests.py              single offline test script (no pytest)
+```
+
+## Commands
+
+```bash
+cd plugins/net-gateway
+pixi run test                    # must stay green; prints "N passed, 0 failed"
+claude plugin validate .         # plugin manifest
+claude plugin validate ../..     # marketplace manifest
+pixi run --frozen python run.py check 'some bash command'   # would the hook redirect it?
+pixi run --frozen python run.py log 40                      # audit log viewer
+pixi run install --dry-run       # what the installer would add to settings.json
+```
+
+The tests are hermetic. They set `NETGW_HOME`, `NETGW_CONFIG` and
+`NETGW_AUDIT_LOG` to temp paths, use a fake `sudo`/`ssh` on `PATH`, a fake
+browser (`NETGW_BROWSER`), and local HTTP servers on 127.0.0.1. They never
+touch the real vault, log or network. Add a check for every behavior change,
+and when it's a security property, confirm the new check **fails** without
+your change (mutation-check it).
+
+## Invariants: don't break these
+
+1. **No secret value ever reaches Claude**: not in tool results, errors,
+   hook output, logs or the transcript. Values come from the vault inside the
+   server process, are injected into the request or stdin, and are scrubbed
+   from responses (`_hide`) and logs (`policy.redact`/`scrub`).
+2. **Secrets go only to their allowed hosts.** Redirects drop credentials when
+   they cross hosts or downgrade to http (`_GatewayRedirect`). There are no
+   `keychain:`/`env:` refs; the vault is the only source.
+3. **Claude can't grant itself anything.** Vault changes and sudo switches
+   happen only in the UserPromptSubmit hook (user-typed prompts). The slash
+   commands are `disable-model-invocation: true`. No MCP tool may add a
+   secret, allow a host, or enable sudo.
+4. **Approvals come from Claude Code's permission prompt**, i.e. `ask` rules in
+   settings.json (`port_check`, `run_privileged_confirm`). Never rely on MCP
+   elicitation forms: the desktop app auto-cancels them without showing them
+   (see DECISIONS). Never add a model-settable "approved" parameter.
+5. **Root commands**: argv lists only (no shell strings); the password goes
+   only to `sudo -v` and the command gets stdin from /dev/null; `sudo -k`
+   afterwards; commands the Bash blocklist matches are refused here too;
+   `run_privileged` runs only where sudo is enabled (persistently, or for this
+   session via `CLAUDE_CODE_SESSION_ID`).
+6. **The prompt hook fails closed.** If it can't run, a /secret or /sudo
+   prompt is blocked, never passed through (`prompt.sh`).
+7. **Stdlib only** in `src/`. The only external binaries are `age`/`age-keygen`
+   (from pixi), the system `sudo`/`ssh`, and the browser.
+
+## Gotchas when working here
+
+- **The plugin is active in your own session.** Its PreToolUse hook blocks any
+  Bash command whose text matches the blocklist: `curl`, `wget`, `nmap`,
+  `security find…`, `age -d`, `secret get`, the vault path, and so on. That
+  includes heredocs, commit messages, `grep` patterns and scripts written
+  inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
+  use `git commit -F file`. Check with `run.py check '…'`.
+- **You can't read the vault** (`Read(~/.config/net-gateway/**)` is denied) and
+  must not try. Use the `secret_list` tool for names.
+- **Tool and hook changes need a new session** to be picked up (the MCP server
+  and hooks load at session start). Test headless with `claude -p`, or ask the
+  user to open a new session.
+- **Headless `claude -p` auto-cancels anything interactive**, and so does the
+  desktop app for MCP elicitation. Use fakes (`NETGW_BROWSER`, `NETGW_HOME`)
+  for end-to-end checks.
+- The `Edit(...config/**)` deny rule only stops the Edit tool. Bash can still
+  change `policy.json`, so the rules are a guardrail, not a boundary (see
+  ARCHITECTURE, threat model). Don't widen `allow_domains` or tiers without the
+  user asking.
+- The audit log is shared by all sessions on the machine; entries from other
+  sessions are normal.
+
+## Status (2026-10-15, v0.3.0)
+
+Verified live (macOS, desktop app): Bash redirect; vault add/up/allow/del/list
+through the browser form with no popup; secret use to allowed hosts and refusal
+elsewhere; sudo on a remote Linux host with approve, decline, session enable and
+disable; the safety-net block with transcript scrub; the vault read denial; the
+/net-log view.
+
+Linux: the test suite covers headless detection (no `DISPLAY` means no
+browser and the terminal fallback) and the installer's path handling, and the
+pixi lock includes linux-64 and linux-aarch64. Not yet run end-to-end on a
+Linux desktop.
+
+Not yet verified live: the session-start "sudo enabled" warning; per-session
+isolation in two real sessions (covered by tests); `pixi run install` on a fresh
+machine; Windows (sudo can't work there; the rest should).
+
+Known limitations / ideas:
+- Logs and the quarantine folder live inside the plugin folder (gitignored).
+  Could move to `CLAUDE_PLUGIN_DATA`.
+- The Bash blocklist is regex-based: false positives (e.g. `git commit -m
+  "...curl..."`) and easy bypasses (`c''url`, base64, `nc`). It steers a
+  cooperative model; it isn't a sandbox.
+- Plain `sudo` in Bash isn't redirected. It can't prompt for a password
+  from Claude's Bash, so it only works for NOPASSWD rules; password-based root
+  goes through run_privileged.
+- The `/net-gateway:` prefix is required (plugin commands can't register a
+  bare name). The hook also accepts bare `/secret` and `/sudo`, but the app
+  shows "isn't a command" above the input for those.

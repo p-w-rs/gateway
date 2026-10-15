@@ -1,0 +1,9 @@
+{
+  "name": "net-gateway",
+  "version": "0.3.0",
+  "description": "Routes network, credential, and certificate work through one audited path: WebFetch and MCP tools instead of curl, wget, nmap, certutil, cmdkey, the macOS security keychain tool, and PowerShell web cmdlets.",
+  "author": {
+    "name": "p-w-rs"
+  },
+  "keywords": ["security", "network", "governance", "hooks", "mcp"]
+}

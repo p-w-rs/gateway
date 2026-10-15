@@ -1,0 +1,16 @@
+{
+  "name": "local-tools",
+  "owner": {
+    "name": "p-w-rs"
+  },
+  "metadata": {
+    "description": "Local marketplace for internal Claude Code plugins."
+  },
+  "plugins": [
+    {
+      "name": "net-gateway",
+      "source": "./plugins/net-gateway",
+      "description": "Audited single path for network, credential, and certificate work."
+    }
+  ]
+}

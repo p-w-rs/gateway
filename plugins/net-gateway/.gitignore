@@ -1,0 +1,5 @@
+.pixi/
+logs/
+quarantine/
+__pycache__/
+*.pyc

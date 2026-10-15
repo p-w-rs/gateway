@@ -1,0 +1,20 @@
+{
+  "_comment": "Optional backstop if the plugin is ever disabled: merge into your user settings.json. Prefix rules only; the plugin's PreToolUse hook catches full paths, aliases and inline python/node calls. The Read/Edit denies protect the gateway's vault and your personal age store.",
+  "permissions": {
+    "deny": [
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(security:*)",
+      "Bash(nmap:*)",
+      "Bash(masscan:*)",
+      "Bash(certutil:*)",
+      "Bash(cmdkey:*)",
+      "Bash(age:*)",
+      "Bash(secret:*)",
+      "Read(~/.config/age/**)",
+      "Read(~/.config/secrets/**)",
+      "Read(~/.config/net-gateway/**)",
+      "Edit(~/.config/net-gateway/**)"
+    ]
+  }
+}
