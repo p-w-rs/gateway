@@ -188,8 +188,13 @@ def http_request(method: str, url: str, headers: dict | None = None,
 
     policy.audit("http_request", {"method": method, "url": url, "host": host,
                                   "status": result.get("status"),
-                                  "ok": result.get("ok")})
+                                  "ok": result.get("ok"), **_error(result)})
     return result
+
+
+def _error(result: dict[str, Any]) -> dict[str, Any]:
+    """A short error for the audit log when an action failed (secrets already hidden)."""
+    return {} if result.get("ok") else {"error": str(result.get("reason", ""))[:200]}
 
 
 def download(url: str, approve: Approver = None) -> dict[str, Any]:
@@ -228,7 +233,8 @@ def download(url: str, approve: Approver = None) -> dict[str, Any]:
     except Exception as e:
         dest.unlink(missing_ok=True)
         result = {"ok": False, "reason": str(e)}
-    policy.audit("download", {"url": url, "host": host, "ok": result.get("ok")})
+    policy.audit("download", {"url": url, "host": host, "ok": result.get("ok"),
+                              **_error(result)})
     return result
 
 
@@ -495,7 +501,8 @@ def cert_inspect(host: str, port: int = 443) -> dict[str, Any]:
             result["verify_error"] = verify_error
     except Exception as e:
         result = {"ok": False, "reason": str(e)}
-    policy.audit("cert_inspect", {"host": host, "port": port, "ok": result.get("ok")})
+    policy.audit("cert_inspect", {"host": host, "port": port, "ok": result.get("ok"),
+                                  **_error(result)})
     return result
 
 

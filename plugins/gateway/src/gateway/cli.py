@@ -36,6 +36,14 @@ def cmd_log(argv: list[str]) -> int:
             elif event == "refused":
                 where = d.get("host") or d.get("action") or ""
                 extra = (d.get("reason") or "")[:80]
+            elif event in ("http_request", "download", "cert_inspect"):
+                where = d.get("url") or d.get("host") or ""
+                if d.get("ok") is False:
+                    extra = "failed: " + (d.get("error") or "no reason recorded")[:80]
+                elif d.get("status") is not None:
+                    extra = str(d["status"])
+                else:
+                    extra = "ok" if d.get("ok") else ""
             else:
                 where = (d.get("url") or d.get("host") or d.get("target")
                          or d.get("path") or d.get("tool") or d.get("ref") or "")

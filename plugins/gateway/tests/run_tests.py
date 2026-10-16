@@ -6,6 +6,7 @@ or:
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,10 @@ class Echo(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/to/"):          # /to/<url> -> 302 <url>
             self.send_response(302)
             self.send_header("Location", self.path[len("/to/"):])
+            self.end_headers()
+            return
+        if self.path.startswith("/missing"):
+            self.send_response(404)
             self.end_headers()
             return
         out = json.dumps({k.lower(): v for k, v in self.headers.items()}).encode()
@@ -260,6 +265,25 @@ for leak in LEAKS:
     check(f"audit hides {leak[:10]}", leak not in log)
 check("audit never holds env secret", SECRET not in log)
 check("audit keeps host info", "api.x.com" in log and "127.0.0.1" in log)
+_s = socket.socket()
+_s.bind(("127.0.0.1", 0))
+CLOSED = _s.getsockname()[1]
+_s.close()
+actions.http_request("GET", A + "/okay")
+actions.http_request("GET", A + "/missing?api_key=LEAKKEY98")
+actions.http_request("GET", f"http://127.0.0.1:{CLOSED}/down")
+from gateway import cli  # noqa: E402
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    cli.cmd_log(["3"])
+_rows = _out.getvalue().splitlines()
+check("/gate:log shows a request's status", len(_rows) == 3 and _rows[0].endswith("/okay  [200]"))
+check("/gate:log marks an HTTP error as failed",
+      "/missing" in _rows[1] and "[failed: HTTP Error 404" in _rows[1])
+check("/gate:log marks a connection error as failed",
+      "/down" in _rows[2] and "[failed: " in _rows[2])
+check("audit error text never holds the query secret",
+      "LEAKKEY98" not in Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text())
 check("scrub leaves plain text", policy.scrub("git status --short", policy.load_config())
       == "git status --short")
 
