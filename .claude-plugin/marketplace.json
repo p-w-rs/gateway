@@ -1,5 +1,5 @@
 {
-  "name": "local-tools",
+  "name": "gateway",
   "owner": {
     "name": "p-w-rs"
   },
@@ -8,8 +8,8 @@
   },
   "plugins": [
     {
-      "name": "net-gateway",
-      "source": "./plugins/net-gateway",
+      "name": "gate",
+      "source": "./plugins/gateway",
       "description": "Audited single path for network, credential, and certificate work."
     }
   ]

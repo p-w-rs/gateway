@@ -13,8 +13,8 @@
       "Bash(secret:*)",
       "Read(~/.config/age/**)",
       "Read(~/.config/secrets/**)",
-      "Read(~/.config/net-gateway/**)",
-      "Edit(~/.config/net-gateway/**)"
+      "Read(~/.config/gateway/**)",
+      "Edit(~/.config/gateway/**)"
     ]
   }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Install net-gateway for the current user (run via `pixi run install`).
+"""Install gateway for the current user (run via `pixi run install`).
 
-1. Registers this repo as the local plugin marketplace "local-tools" and
-   installs net-gateway from it (`claude plugin ...`).
+1. Registers this repo as the local plugin marketplace "gateway" and
+   installs gateway from it (`claude plugin ...`).
 2. Merges the plugin's permission rules (settings.rules.json at the repo
    root) into your user settings.json, after showing what changes and asking.
    A backup is written first. Re-running is safe: rules already there are
@@ -80,14 +80,14 @@ def install_plugin() -> bool:
               "https://code.claude.com", file=sys.stderr)
         return False
     listed = _claude("plugin", "marketplace", "list").stdout
-    if "local-tools" not in listed:
+    if "gateway" not in listed:
         r = _claude("plugin", "marketplace", "add", str(REPO_ROOT))
         print(r.stdout.strip() or r.stderr.strip())
         if r.returncode != 0:
             return False
     else:
-        print("✓ marketplace local-tools already registered")
-    r = _claude("plugin", "install", "net-gateway@local-tools")
+        print("✓ marketplace gateway already registered")
+    r = _claude("plugin", "install", "gate@gateway")
     print(r.stdout.strip() or r.stderr.strip())
     return r.returncode == 0 or "already" in (r.stdout + r.stderr).lower()
 
@@ -129,7 +129,7 @@ def main(argv: list[str]) -> int:
         os.replace(tmp, path)
         print("✓ settings updated")
 
-    print("\nDone. Restart Claude Code (or /reload-plugins), then try /net-gateway:help")
+    print("\nDone. Restart Claude Code (or /reload-plugins), then try /gate:help")
     return 0
 
 

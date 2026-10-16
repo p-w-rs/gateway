@@ -1,4 +1,4 @@
-# net-gateway
+# gateway
 
 A Claude Code plugin that gives Claude **one audited path** for network,
 credential and root work, instead of letting it run `curl`, `wget`, `nmap`,
@@ -29,17 +29,17 @@ host), and log everything.
 ## Managing secrets and sudo (you, in the chat)
 
 ```
-/net-gateway:secret add HF_TOKEN Hugging Face Hub token   → a browser page asks for the value
-/net-gateway:secret allow HF_TOKEN huggingface.co         → where it may be sent
-/net-gateway:secret up HF_TOKEN [new description]         → new value (browser page)
-/net-gateway:secret desc | disallow | del | list | help
+/gate:secret add HF_TOKEN Hugging Face Hub token   → a browser page asks for the value
+/gate:secret allow HF_TOKEN huggingface.co         → where it may be sent
+/gate:secret up HF_TOKEN [new description]         → new value (browser page)
+/gate:secret desc | disallow | del | list | help
 
-/net-gateway:sudo add $USER localhost                    → a browser page asks for the password
-/net-gateway:sudo add admin myserver                   (an ssh alias, host name or IP)
-/net-gateway:sudo enable myserver                       → root runs WITHOUT asking, this session only
-/net-gateway:sudo enable myserver always                → ...in every session
-/net-gateway:sudo disable myserver                      → back to asking (all sessions)
-/net-gateway:sudo up | del | list | help
+/gate:sudo add $USER localhost                    → a browser page asks for the password
+/gate:sudo add admin myserver                   (an ssh alias, host name or IP)
+/gate:sudo enable myserver                       → root runs WITHOUT asking, this session only
+/gate:sudo enable myserver always                → ...in every session
+/gate:sudo disable myserver                      → back to asking (all sessions)
+/gate:sudo up | del | list | help
 ```
 
 - **Values never go in the chat.** A one-time page opens in your browser on
@@ -73,13 +73,13 @@ code is Python standard library. Put the clone somewhere permanent, because
 Claude Code loads the plugin from it.
 
 ```bash
-git clone https://github.com/p-w-rs/net-gateway.git ~/net-gateway
-cd ~/net-gateway/plugins/net-gateway
+git clone https://github.com/p-w-rs/gateway.git ~/gateway
+cd ~/gateway/plugins/gateway
 pixi run install
 ```
 
 `pixi run install`:
-- registers the repo as the local marketplace `local-tools` and installs the
+- registers the repo as the local marketplace `gateway` and installs the
   plugin;
 - shows the permission rules from [settings.rules.json](settings.rules.json) it
   will add to your user `settings.json` (in `$CLAUDE_CONFIG_DIR` or
@@ -87,7 +87,7 @@ pixi run install
 
 The `ask` rules are what make Claude Code prompt for `port_check` and for root
 commands when sudo is disabled, so keep them. Options: `--dry-run`, `--yes`,
-`--skip-plugin`. Then restart Claude Code and run **`/net-gateway:help`**.
+`--skip-plugin`. Then restart Claude Code and run **`/gate:help`**.
 
 Updating later: `git pull` in the clone, then start a new Claude Code session.
 
@@ -99,8 +99,8 @@ Updating later: `git pull` in the clone, then start a new Claude Code session.
   tells you the exact terminal command, which asks at a hidden prompt:
 
   ```bash
-  pixi run --manifest-path ~/net-gateway/plugins/net-gateway/pixi.toml vault secret add NAME description
-  pixi run --manifest-path ~/net-gateway/plugins/net-gateway/pixi.toml vault sudo add USER HOST
+  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault secret add NAME description
+  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault sudo add USER HOST
   ```
 
   Sudo enable from the terminal needs `always`, because a terminal has no
@@ -111,20 +111,20 @@ Updating later: `git pull` in the clone, then start a new Claude Code session.
 
 ## Configure
 
-`plugins/net-gateway/config/policy.json`: allowed domains, port-check scope,
+`plugins/gateway/config/policy.json`: allowed domains, port-check scope,
 approval tiers, response and download size limits. Credentials and their hosts
-are **not** configured here; use `/net-gateway:secret`.
+are **not** configured here; use `/gate:secret`.
 
 ## Review what happened
 
-`/net-gateway:net-log` summarizes the audit log (`plugins/net-gateway/logs/`):
+`/gate:log` summarizes the audit log (`plugins/gateway/logs/`):
 hosts contacted, credentials used (by name), root commands and how each was
 approved, vault changes, refusals. It never shows values.
 
 ## Develop / test
 
 ```bash
-cd plugins/net-gateway
+cd plugins/gateway
 pixi run test          # ~240 checks, offline, uses throwaway vaults and fakes
 claude plugin validate .
 ```

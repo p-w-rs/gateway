@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single entry point for every net-gateway mode.
+"""Single entry point for every gateway mode.
 
 Putting src/ on sys.path here means the package imports work the same whether
 Claude Code launches the MCP server, a hook, or the CLI. Invoked as:
@@ -20,22 +20,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 def main() -> int:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "server":
-        from netgw import mcp_server
+        from gateway import mcp_server
         mcp_server.main()
         return 0
     if mode == "hook-route":
-        from netgw import hooks
+        from gateway import hooks
         return hooks.route_main()
     if mode == "hook-session":
-        from netgw import hooks
+        from gateway import hooks
         return hooks.session_main()
     if mode == "hook-prompt":
-        from netgw import hooks
+        from gateway import hooks
         return hooks.prompt_main()
     if mode == "scrub":
-        from netgw import commands
+        from gateway import commands
         return commands.scrub_main(sys.argv[2:])
-    from netgw import cli
+    from gateway import cli
     return cli.main(sys.argv[1:])
 
 

@@ -1,7 +1,7 @@
 """The gateway's own encrypted vault: secrets and sudo passwords.
 
-Separate from any personal secret store. Lives in $NETGW_HOME (default
-${XDG_CONFIG_HOME:-~/.config}/net-gateway):
+Separate from any personal secret store. Lives in $GATEWAY_HOME (default
+${XDG_CONFIG_HOME:-~/.config}/gateway):
 
     key.txt     age identity, generated on first write (mode 600)
     store.age   the vault, age-encrypted JSON (mode 600)
@@ -36,11 +36,11 @@ LOCAL_ALIASES = {"localhost", "local", "127.0.0.1", "::1", "this"}
 
 
 def home() -> Path:
-    override = os.environ.get("NETGW_HOME")
+    override = os.environ.get("GATEWAY_HOME")
     if override:
         return Path(override)
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "net-gateway"
+    return Path(base) / "gateway"
 
 
 def key_path() -> Path:

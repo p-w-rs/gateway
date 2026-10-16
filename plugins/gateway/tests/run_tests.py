@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-contained tests for net-gateway. Pure stdlib; run with:
+"""Self-contained tests for gateway. Pure stdlib; run with:
     pixi run test
 or:
     python tests/run_tests.py
@@ -19,13 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 # Never write test activity into the real audit log.
-TMP = Path(tempfile.mkdtemp(prefix="netgw-test-"))
-os.environ["NETGW_AUDIT_LOG"] = str(TMP / "audit.jsonl")
+TMP = Path(tempfile.mkdtemp(prefix="gateway-test-"))
+os.environ["GATEWAY_AUDIT_LOG"] = str(TMP / "audit.jsonl")
 # ...nor touch the real vault, nor ever open a real pop-up on screen.
-os.environ["NETGW_HOME"] = str(TMP / "vault")
-os.environ["NETGW_DIALOG"] = "none"
+os.environ["GATEWAY_HOME"] = str(TMP / "vault")
+os.environ["GATEWAY_DIALOG"] = "none"
 
-from netgw import actions, policy  # noqa: E402
+from gateway import actions, policy  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -150,7 +150,7 @@ A = f"http://127.0.0.1:{PA}"          # host "127.0.0.1"
 B = f"http://localhost:{PA}"          # same server, different host name
 
 SECRET = "s3cr3t-VALUE-0123456789"
-os.environ["NETGW_TEST_SECRET"] = SECRET  # env refs must NOT reach this any more
+os.environ["GATEWAY_TEST_SECRET"] = SECRET  # env refs must NOT reach this any more
 
 
 def use_config(extra):
@@ -158,7 +158,7 @@ def use_config(extra):
     base = json.loads((ROOT / "config" / "policy.json").read_text())
     base.update(extra)
     p.write_text(json.dumps(base))
-    os.environ["NETGW_CONFIG"] = str(p)
+    os.environ["GATEWAY_CONFIG"] = str(p)
 
 
 def echoed(r):
@@ -169,7 +169,7 @@ def echoed(r):
 
 
 use_config({})
-from netgw import vault  # noqa: E402
+from gateway import vault  # noqa: E402
 with vault.locked():
     _d = vault.load()
     _d["secrets"]["TEST_SECRET"] = {"value": SECRET, "description": "test",
@@ -180,7 +180,7 @@ with vault.locked():
 
 print("secret binding:")
 n = len(HITS)
-r = actions.http_request("GET", A + "/x", auth_ref="env:NETGW_TEST_SECRET")
+r = actions.http_request("GET", A + "/x", auth_ref="env:GATEWAY_TEST_SECRET")
 check("env: refs no longer work", r.get("ok") is False and SECRET not in json.dumps(r))
 check("env: ref: no request made", len(HITS) == n)
 r = actions.http_request("GET", A + "/x", auth_ref="keychain:anything")
@@ -240,7 +240,7 @@ check("download over max_download_bytes: refused and partial file deleted",
 use_config({})
 
 print("audit value scrubbing:")
-from netgw import hooks  # noqa: E402
+from gateway import hooks  # noqa: E402
 import contextlib  # noqa: E402
 import io  # noqa: E402
 LEAKS = ["ghp_LEAKME0123456789", "QQQSECRETQQQ", "LEAKKEY99", "hunter2pass",
@@ -255,7 +255,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 sys.stdin = old_stdin
 actions.http_request("GET", A + "/x?api_key=LEAKKEY99")
 actions.http_request("GET", f"http://alice:hunter2pass@127.0.0.1:{PA}/y")
-log = Path(os.environ["NETGW_AUDIT_LOG"]).read_text()
+log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
 for leak in LEAKS:
     check(f"audit hides {leak[:10]}", leak not in log)
 check("audit never holds env secret", SECRET not in log)
@@ -265,9 +265,9 @@ check("scrub leaves plain text", policy.scrub("git status --short", policy.load_
 
 # --- Vault + /secret and /sudo chat commands (throwaway vault in TMP) --------
 print("vault commands:")
-from netgw import commands, vault  # noqa: E402
+from gateway import commands, vault  # noqa: E402
 
-os.environ["NETGW_HOME"] = str(TMP / "vault")
+os.environ["GATEWAY_HOME"] = str(TMP / "vault")
 SID = "test-session-1"
 TRANSCRIPT = TMP / "transcript.jsonl"
 TRANSCRIPT.write_text("")
@@ -296,9 +296,9 @@ FAKE_BROWSER_SH = TMP / "fake_browser.sh"
 FAKE_BROWSER_SH.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_BROWSER}" "$1"\n')
 FAKE_BROWSER_SH.chmod(0o755)
 URL_FILE, PAGE_FILE, PLAN_FILE = TMP / "form.url", TMP / "form.html", TMP / "form.plan"
-os.environ.update(NETGW_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FILE),
+os.environ.update(GATEWAY_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FILE),
                   FAKE_PAGE_FILE=str(PAGE_FILE), FAKE_FORM_FILE=str(PLAN_FILE),
-                  NETGW_FORM_TIMEOUT="10")
+                  GATEWAY_FORM_TIMEOUT="10")
 
 
 def form_plan(plan):
@@ -320,17 +320,17 @@ def say(prompt, sid=SID):
 
 def passed(out):
     return out is not None and "decision" not in out and \
-        "<net-gateway-result>" in out["hookSpecificOutput"]["additionalContext"]
+        "<gateway-result>" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def add_secret(name, value, desc):
     form_plan({"action": "save", "value": value})
-    return say(f"/net-gateway:secret add {name} {desc}")
+    return say(f"/gate:secret add {name} {desc}")
 
 
 def add_sudo(user, host, pw):
     form_plan({"action": "save", "value": pw})
-    return say(f"/net-gateway:sudo add {user} {host}")
+    return say(f"/gate:sudo add {user} {host}")
 
 
 out = add_secret("HF_TOKEN", "hf_abc123456789", "Hugging Face token for the Hub API")
@@ -351,45 +351,45 @@ check("add refuses an existing name (passed through as an error, no form)",
       passed(out) and "already exists" in out["reason"] and not URL_FILE.exists()
       and vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
 check("bad name refused", "not a valid name" in add_secret("9BAD", "v12345", "x")["reason"])
-check("add needs a description", "Add a description" in say("/net-gateway:secret add NODESC")["reason"]
+check("add needs a description", "Add a description" in say("/gate:secret add NODESC")["reason"]
       and not vault.secret("NODESC"))
 form_plan({"action": "cancel"})
-out = say("/net-gateway:secret add CANCELLED something")
+out = say("/gate:secret add CANCELLED something")
 check("form cancelled: nothing stored", "Cancelled" in out["reason"] and not vault.secret("CANCELLED"))
-out = say("/net-gateway:secret list")
+out = say("/gate:secret list")
 check("/secret list shows name, description, hosts",
       "HF_TOKEN: Hugging Face token for the Hub API [hosts: none yet]" in out["reason"])
-out = say("/net-gateway:secret allow HF_TOKEN huggingface.co")
+out = say("/gate:secret allow HF_TOKEN huggingface.co")
 check("/secret allow", passed(out) and vault.secret("HF_TOKEN")["hosts"] == ["huggingface.co"])
-check("allow refuses '*'", "not a host" in say("/net-gateway:secret allow HF_TOKEN *")["reason"])
+check("allow refuses '*'", "not a host" in say("/gate:secret allow HF_TOKEN *")["reason"])
 form_plan({"action": "save", "value": "hf_new_987654321"})
-say("/net-gateway:secret up HF_TOKEN")
+say("/gate:secret up HF_TOKEN")
 check("/secret up: new value from form, description and hosts kept",
       vault.secret("HF_TOKEN")["value"] == "hf_new_987654321"
       and vault.secret("HF_TOKEN")["description"].startswith("Hugging Face token")
       and vault.secret("HF_TOKEN")["hosts"] == ["huggingface.co"])
 form_plan({"action": "save", "value": ""})
-say("/net-gateway:secret up HF_TOKEN Hub token, renamed")
+say("/gate:secret up HF_TOKEN Hub token, renamed")
 check("/secret up: empty value keeps it, changes description",
       vault.secret("HF_TOKEN")["value"] == "hf_new_987654321"
       and vault.secret("HF_TOKEN")["description"] == "Hub token, renamed")
-say("/net-gateway:secret desc HF_TOKEN Hub token: write access to my models")
+say("/gate:secret desc HF_TOKEN Hub token: write access to my models")
 check("/secret desc", vault.secret("HF_TOKEN")["description"] == "Hub token: write access to my models")
-say("/net-gateway:secret disallow HF_TOKEN huggingface.co")
+say("/gate:secret disallow HF_TOKEN huggingface.co")
 check("/secret disallow", vault.secret("HF_TOKEN")["hosts"] == [])
 add_secret("TMP_X", "tmp_value_123", "temp")
-say("/net-gateway:secret del TMP_X")
+say("/gate:secret del TMP_X")
 check("/secret del", vault.secret("TMP_X") is None)
-check("unknown subcommand gives help", "Unknown command" in say("/net-gateway:secret frob")["reason"])
+check("unknown subcommand gives help", "Unknown command" in say("/gate:secret frob")["reason"])
 
 print("typed values are blocked, never passed through:")
-out = say("/net-gateway:secret add LEAK hf_abcdefghij123456 my token")
+out = say("/gate:secret add LEAK hf_abcdefghij123456 my token")
 check("token-like word: blocked, not stored", out["decision"] == "block"
       and out["hookSpecificOutput"]["suppressOriginalPrompt"] is True and not vault.secret("LEAK"))
 check("block message never repeats it", "hf_abcdefghij123456" not in out["reason"])
-out = say("/net-gateway:secret allow HF_TOKEN ghp_abcdefghijklmnop1234")
+out = say("/gate:secret allow HF_TOKEN ghp_abcdefghijklmnop1234")
 check("token-like word anywhere: blocked", out["decision"] == "block")
-_log = Path(os.environ["NETGW_AUDIT_LOG"]).read_text()
+_log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
 check("blocked attempt is logged with name and reason",
       '"secret add"' in _log and '"LEAK"' in _log and "looked like a typed value" in _log)
 check("blocked attempt's value is not logged",
@@ -398,7 +398,7 @@ check("log names the secret command and target",
       '"command": "secret allow", "target": "HF_TOKEN -> huggingface.co", "outcome": "ok"' in _log)
 check("ordinary description words are fine",
       passed(add_secret("DOCS_TOKEN", "docs_value_1", "Readme token for docs site")))
-out = say(f"/net-gateway:sudo add {ME} localhost {SUDO_PW}")
+out = say(f"/gate:sudo add {ME} localhost {SUDO_PW}")
 check("password after /sudo add USER HOST: blocked, not stored",
       out["decision"] == "block" and not vault.sudo_entries("localhost")
       and SUDO_PW not in out["reason"])
@@ -414,37 +414,37 @@ out = add_sudo("someoneelse", "localhost", SUDO_PW)
 check("/sudo localhost must be the current user", "asks for the password of" in out["reason"])
 add_sudo("admin", "myserver", SUDO_PW)
 add_sudo("admin", "10.0.0.5", "not-the-password")
-out = say("/net-gateway:sudo list")
+out = say("/gate:sudo list")
 check("/sudo list shows user@host and state, never passwords",
       out["reason"].count("@") == 3 and SUDO_PW not in out["reason"]
       and "disabled" in out["reason"])
 check("/sudo host can't look like an ssh option",
       "not a host" in add_sudo("admin", "-oProxyCommand=x", "pw123456")["reason"])
 form_plan({"action": "cancel"})
-out = say("/net-gateway:sudo add admin box1")
+out = say("/gate:sudo add admin box1")
 check("/sudo add cancelled: nothing stored", "Cancelled" in out["reason"]
       and not vault.sudo_entries("box1"))
 
 print("sudo enable for one session vs always:")
 check("disabled by default", not vault.sudo_enabled("myserver", SID))
-out = say("/net-gateway:sudo enable myserver")
+out = say("/gate:sudo enable myserver")
 check("enable HOST: this session only", passed(out) and "THIS session only" in out["reason"]
       and vault.sudo_enabled("myserver", SID)
       and not vault.sudo_enabled("myserver", "another-session")
       and not vault.sudo_enabled("myserver"))
 check("/sudo list shows session state", "ENABLED for this session"
-      in say("/net-gateway:sudo list")["reason"])
+      in say("/gate:sudo list")["reason"])
 check("other sessions still see it disabled", "admin@myserver  [disabled"
-      in say("/net-gateway:sudo list", sid="another-session")["reason"])
-out = say("/net-gateway:sudo enable myserver always")
+      in say("/gate:sudo list", sid="another-session")["reason"])
+out = say("/gate:sudo enable myserver always")
 check("enable HOST always: every session", "EVERY session" in out["reason"]
       and vault.sudo_enabled("myserver", "another-session") and vault.sudo_enabled("myserver"))
-say("/net-gateway:sudo disable myserver")
+say("/gate:sudo disable myserver")
 check("disable clears both", not vault.sudo_enabled("myserver", SID)
       and not vault.sudo_enabled("myserver"))
 check("can't enable without a stored password",
-      "No sudo password stored" in say("/net-gateway:sudo enable nowhere.example")["reason"])
-check("enable usage checked", "Usage" in say("/net-gateway:sudo enable myserver forever")["reason"])
+      "No sudo password stored" in say("/gate:sudo enable nowhere.example")["reason"])
+check("enable usage checked", "Usage" in say("/gate:sudo enable myserver forever")["reason"])
 
 print("transcript scrubbing (only for blocked typed values):")
 line_cmd = json.dumps({"type": "queue-operation",
@@ -462,9 +462,9 @@ check("scrub keeps file size (safe while appending)", TRANSCRIPT.stat().st_size 
 check("scrub keeps every line valid JSON", all(json.loads(x) for x in t.splitlines()))
 check("scrub leaves non-command lines alone", t.splitlines()[2] == line_other.strip())
 TRANSCRIPT.write_text("")
-say("/net-gateway:secret add LATE hf_latevalue123456789 written after the hook returns")
+say("/gate:secret add LATE hf_latevalue123456789 written after the hook returns")
 with TRANSCRIPT.open("a") as f:
-    f.write(json.dumps({"content": "/net-gateway:secret add LATE hf_latevalue123456789 x"}) + "\n")
+    f.write(json.dumps({"content": "/gate:secret add LATE hf_latevalue123456789 x"}) + "\n")
 deadline = time.time() + 8
 while time.time() < deadline and "hf_latevalue123456789" in TRANSCRIPT.read_text():
     time.sleep(0.2)
@@ -486,10 +486,10 @@ def run_sh(prompt, root=ROOT):
 t0 = time.time()
 check("wrapper: normal prompt passes untouched", run_sh("hello there") == "")
 check("wrapper: normal prompt is fast (no Python)", time.time() - t0 < 0.5)
-out = json.loads(run_sh("/net-gateway:secret desc HF_TOKEN via the wrapper"))
+out = json.loads(run_sh("/gate:secret desc HF_TOKEN via the wrapper"))
 check("wrapper: command handled and passed through", "decision" not in out
       and vault.secret("HF_TOKEN")["description"] == "via the wrapper")
-out = json.loads(run_sh("/net-gateway:secret list", root=TMP / "no-such-plugin"))
+out = json.loads(run_sh("/gate:secret list", root=TMP / "no-such-plugin"))
 check("wrapper: gateway failure blocks (fail closed)", out["decision"] == "block")
 
 print("vault-backed tools:")
@@ -497,7 +497,7 @@ use_config({})
 add_secret("API_KEY", "key_abcdef123456", "Test API on 127.0.0.1")
 r = actions.http_request("GET", A + "/x", auth_ref="API_KEY")
 check("not-yet-allowed secret refused with /secret allow hint",
-      r.get("refused") is True and "/net-gateway:secret allow API_KEY 127.0.0.1" in r["reason"])
+      r.get("refused") is True and "/gate:secret allow API_KEY 127.0.0.1" in r["reason"])
 say("/secret allow API_KEY 127.0.0.1")
 r = actions.http_request("GET", A + "/x", auth_ref="API_KEY")
 check("allowed secret sent as Bearer", echoed(r).get("authorization") == "***REDACTED***"
@@ -517,7 +517,7 @@ check("secret_list shows vault catalog",
       r["secrets"]["API_KEY"]["hosts"] == ["127.0.0.1"] and "admin@myserver" in r["sudo"])
 check("secret_list has no values",
       not any(v in json.dumps(r) for v in ("key_abcdef123456", "hf_new_987654321", SUDO_PW)))
-for c_ in ("cat ~/.config/net-gateway/key.txt", "age -d -i k s", "age --decrypt s",
+for c_ in ("cat ~/.config/gateway/key.txt", "age -d -i k s", "age --decrypt s",
            "secret get HF_TOKEN", "cat ~/.config/age/keys.txt"):
     check(f"redirect: {c_[:40]}", policy.match_blocked(c_) is not None)
 for c_ in ("secret list", "age-keygen -y k", "echo page -d", "sudo -n true"):
@@ -581,7 +581,7 @@ def confirmed(*a, **k):
 
 r = confirmed("elsewhere", touch)
 check("host without stored password refused with /sudo add hint",
-      r.get("refused") is True and "/net-gateway:sudo add USER elsewhere" in r["reason"])
+      r.get("refused") is True and "/gate:sudo add USER elsewhere" in r["reason"])
 r = confirmed("-oProxyCommand=x", touch)
 check("option-like host refused", r.get("refused") is True)
 r = confirmed("localhost", "rm -rf /")
@@ -635,21 +635,21 @@ check("several users: must pick one", r.get("refused") is True and "user=" in r[
 r = confirmed("myserver", ["true"], user="other")
 check("user= picks the entry", r.get("ok") is True
       and Path(os.environ["FAKE_SSH_LOG"]).read_text() == "other@myserver\n")
-log = Path(os.environ["NETGW_AUDIT_LOG"]).read_text()
+log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
 check("audit logs run_privileged", '"run_privileged"' in log and "admin@myserver" in log)
 check("confirmed root runs are logged as approved, not 'without asking'",
       "approved in Claude Code's prompt" in log and "ran_without_asking" not in log)
-from netgw import cli  # noqa: E402
+from gateway import cli  # noqa: E402
 import contextlib as _cl  # noqa: E402
 _buf = io.StringIO() if "io" in globals() else __import__("io").StringIO()
 with _cl.redirect_stdout(_buf):
     cli.cmd_log(["400"])
 _view = _buf.getvalue()
-check("/net-log shows root runs with approval and exit code",
+check("/gate:log shows root runs with approval and exit code",
       "admin@myserver: printf" in _view and "[approved in Claude Code's prompt, exit 0]" in _view)
-check("/net-log shows vault commands with target and outcome",
+check("/gate:log shows vault commands with target and outcome",
       "secret add HF_TOKEN  [ok]" in _view and "blocked: looked like a typed value" in _view)
-check("/net-log never shows vault values",
+check("/gate:log never shows vault values",
       not any(v in _view for v in (SUDO_PW, "hf_abc123456789", "hf_new_987654321")))
 print("sudo enable/disable:")
 say("/sudo del other myserver")
@@ -658,7 +658,7 @@ check("disabled by default", not vault.sudo_enabled("localhost")
 r = actions.run_privileged("localhost", ["echo", "x"])
 check("disabled: refused with confirm and enable hints", r.get("refused") is True
       and "run_privileged_confirm" in r["reason"]
-      and "/net-gateway:sudo enable localhost" in r["reason"])
+      and "/gate:sudo enable localhost" in r["reason"])
 out = say("/sudo enable localhost always")
 check("/sudo enable localhost always", vault.sudo_enabled("localhost")
       and "WITHOUT asking" in out["reason"])
@@ -725,7 +725,7 @@ r = actions.http_request("GET", A + "/x", auth_ref="NEWHOST_KEY", approve=approv
 check("new host: refused, not sent, no gateway prompt",
       r.get("refused") is True and len(HITS) == n and not ASKED)
 check("new host: hint gives the exact /secret allow command",
-      "/net-gateway:secret allow NEWHOST_KEY 127.0.0.1" in r["reason"])
+      "/gate:secret allow NEWHOST_KEY 127.0.0.1" in r["reason"])
 check("refusal never shows the value", "nh_value_123456" not in json.dumps(r))
 say("/secret allow NEWHOST_KEY 127.0.0.1")
 check("/secret allow adds the host", True
@@ -792,7 +792,7 @@ class Client:
 
 # Client without elicitation support: "ask" actions must not run.
 c = Client({})
-check("initialize", c.init["result"]["serverInfo"]["name"] == "net-gateway")
+check("initialize", c.init["result"]["serverInfo"]["name"] == "gateway")
 tools = c.rpc("tools/list", {})["result"]["tools"]
 names = {t["name"] for t in tools}
 check("tools listed", {"http_request", "port_check", "secret_list", "run_privileged",
@@ -853,7 +853,7 @@ check("disabled again over MCP: refused", el is None and body.get("refused") is 
 add_secret("MCP_KEY", "mcp_value_123456", "test")
 body, el = c.call("http_request", {"url": A + "/x", "auth_ref": "MCP_KEY"})
 check("secret to new host over MCP: refused with hint, no gateway form",
-      el is None and body.get("refused") is True and "/net-gateway:secret allow" in body["reason"])
+      el is None and body.get("refused") is True and "/gate:secret allow" in body["reason"])
 say("/secret allow MCP_KEY 127.0.0.1")
 check("/secret allow, then MCP sees the host",
       el is None and vault.secret("MCP_KEY")["hosts"] == ["127.0.0.1"])
@@ -861,7 +861,7 @@ body, el = c.call("http_request", {"url": A + "/x", "auth_ref": "MCP_KEY"})
 check("allowed secret host over MCP: sent", el is None and body.get("ok") is True)
 
 print("browser form (web_form):")
-from netgw import web_form  # noqa: E402
+from gateway import web_form  # noqa: E402
 import http.client  # noqa: E402
 import re as _re  # noqa: E402
 import urllib.request as _ur  # noqa: E402
@@ -888,7 +888,7 @@ FAKE_BROWSER_SH.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_BROWSER}"
 FAKE_BROWSER_SH.chmod(0o755)
 URL_FILE, PAGE_FILE = TMP / "form.url", TMP / "form.html"
 PLAN_FILE = TMP / "form.plan"
-os.environ.update(NETGW_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FILE),
+os.environ.update(GATEWAY_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FILE),
                   FAKE_PAGE_FILE=str(PAGE_FILE), FAKE_FORM_FILE=str(PLAN_FILE))
 
 
@@ -901,7 +901,7 @@ def form_plan(plan):
 
 # Security of the form server itself: probe it while it waits.
 form_plan(None)
-os.environ["NETGW_FORM_TIMEOUT"] = "8"
+os.environ["GATEWAY_FORM_TIMEOUT"] = "8"
 box = {}
 th = threading.Thread(target=lambda: box.update(
     v=web_form.ask("Store the secret <X>", [("Description", "<b>desc</b>")], "Value")))
@@ -953,27 +953,27 @@ except OSError:
     check("one-time: server gone after submit", True)
 
 form_plan(None)
-os.environ["NETGW_FORM_TIMEOUT"] = "1"
+os.environ["GATEWAY_FORM_TIMEOUT"] = "1"
 t0 = time.time()
 check("not submitted: times out with None", web_form.ask("t", [], "v") is None
       and time.time() - t0 < 5)
-os.environ["NETGW_FORM_TIMEOUT"] = "10"
+os.environ["GATEWAY_FORM_TIMEOUT"] = "10"
 form_plan({"action": "cancel"})
 check("Cancel button: None", web_form.ask("t", [], "v") is None)
-os.environ["NETGW_BROWSER"] = "none"
+os.environ["GATEWAY_BROWSER"] = "none"
 try:
     web_form.ask("t", [], "v")
     check("no browser: raises Unavailable", False)
 except web_form.Unavailable:
     check("no browser: raises Unavailable", True)
-os.environ["NETGW_BROWSER"] = str(FAKE_BROWSER_SH)
+os.environ["GATEWAY_BROWSER"] = str(FAKE_BROWSER_SH)
 
 print("tool list and settings:")
 names = {t["name"] for t in c.rpc("tools/list", {})["result"]["tools"]}
 check("no vault_* tools any more", not any(n.startswith("vault_") for n in names))
 c.close()
 _proposed = json.loads((ROOT.parents[1] / "settings.rules.json").read_text())["permissions"]
-_gw = "mcp__plugin_net-gateway_gw__"
+_gw = "mcp__plugin_gate_gw__"
 check("rules template: run_privileged_confirm and port_check on 'ask', not 'allow'",
       all(_gw + t in _proposed["ask"] and _gw + t not in _proposed["allow"]
           for t in ("run_privileged_confirm", "port_check")))
@@ -984,9 +984,9 @@ check("rules template: no vault_* rules, no personal paths",
 print("installer (merge logic, no real settings touched):")
 sys.path.insert(0, str(ROOT))
 import install  # noqa: E402
-rules = install.load_rules(Path.home() / "x" / "plugins" / "net-gateway")
+rules = install.load_rules(Path.home() / "x" / "plugins" / "gateway")
 check("installer: {PLUGIN_DIR} under home becomes ~/...",
-      "Edit(~/x/plugins/net-gateway/config/**)" in rules["deny"])
+      "Edit(~/x/plugins/gateway/config/**)" in rules["deny"])
 check("installer: path outside home becomes //abs",
       install.rule_path(Path("/opt/ng")) == "//opt/ng")
 before = {"theme": "dark",
@@ -1004,7 +1004,7 @@ check("installer: idempotent", again == after and changes2 == [])
 check("installer: input not mutated", before["permissions"]["allow"] == ["Bash(ls:*)", _gw + "port_check"])
 
 print("linux / headless value entry:")
-_saved_env = {k: os.environ.get(k) for k in ("NETGW_BROWSER", "DISPLAY", "WAYLAND_DISPLAY",
+_saved_env = {k: os.environ.get(k) for k in ("GATEWAY_BROWSER", "DISPLAY", "WAYLAND_DISPLAY",
                                              "SSH_CONNECTION")}
 for k in _saved_env:
     os.environ.pop(k, None)
@@ -1030,16 +1030,16 @@ finally:
         else:
             os.environ[k] = v
 
-os.environ["NETGW_BROWSER"] = "none"
-out = say("/net-gateway:secret add HEADLESS_K a key added over ssh")
+os.environ["GATEWAY_BROWSER"] = "none"
+out = say("/gate:secret add HEADLESS_K a key added over ssh")
 check("no browser: passes through an error with the exact terminal command",
       passed(out) and "pixi run --manifest-path" in out["reason"]
       and "vault secret add HEADLESS_K a key added over ssh" in out["reason"]
       and not vault.secret("HEADLESS_K"))
-os.environ["NETGW_BROWSER"] = str(FAKE_BROWSER_SH)
+os.environ["GATEWAY_BROWSER"] = str(FAKE_BROWSER_SH)
 
 # The terminal fallback reuses the same command code with a hidden prompt.
-from netgw import commands as _cmds  # noqa: E402
+from gateway import commands as _cmds  # noqa: E402
 _cmds.VALUE_PROVIDER = lambda title, details, label, optional: "term_value_123456"
 try:
     msg = _cmds.run_secret("add TERM_K added from a terminal")
@@ -1060,7 +1060,7 @@ p = subprocess.run([sys.executable, str(ROOT / "run.py"), "vault", "secret", "ad
                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
 check("terminal fallback refuses without a real terminal (never reads a piped value)",
       p.returncode == 2 and "interactive terminal" in p.stderr)
-check("/net-gateway:help command exists, mentions the fallback",
+check("/gate:help command exists, mentions the fallback",
       "vault secret add" in (ROOT / "commands" / "help.md").read_text())
 
 print(f"\n{PASS} passed, {FAIL} failed")

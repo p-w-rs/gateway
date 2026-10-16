@@ -1,4 +1,4 @@
-# CLAUDE.md: working on net-gateway
+# CLAUDE.md: working on gateway
 
 Guide for agents (and people) changing this repo. User-facing docs are in
 [README.md](README.md); how it fits together is in
@@ -7,8 +7,8 @@ was tried and rejected) is in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## What this is
 
-A Claude Code plugin (`plugins/net-gateway/`) published through a local
-directory marketplace (`.claude-plugin/marketplace.json`, name `local-tools`).
+A Claude Code plugin (`plugins/gateway/`) published through a local
+directory marketplace (`.claude-plugin/marketplace.json`, name `gateway`).
 Users install it **straight from their checkout** (`pixi run install`), so any
 edit here is live in their next Claude Code session. Be careful, and run the
 tests before you stop. The only requirements are Claude Code and pixi; keep it
@@ -17,29 +17,29 @@ that way, and keep it working on macOS and Linux (desktop and headless).
 ## Layout
 
 ```
-.claude-plugin/marketplace.json   marketplace "local-tools" -> ./plugins/net-gateway
+.claude-plugin/marketplace.json   marketplace "gateway" -> ./plugins/gateway
 settings.rules.json               permission rules the plugin expects (template; install.py merges it)
 settings.snippet.json             deny-only backstop for if the plugin is disabled
 docs/                             ARCHITECTURE, DECISIONS, history/
-plugins/net-gateway/
+plugins/gateway/
   .claude-plugin/plugin.json      name, version
   .mcp.json                       MCP server "gw" (stdio, via pixi)
   hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse(Bash)
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
-  commands/{help,secret,sudo,net-log}.md   slash commands
+  commands/{help,secret,sudo,log}.md   slash commands
   install.py                      `pixi run install`: register plugin + merge settings.rules.json
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
   run.py                          single entry: server | hook-* | log | check | scrub | vault
-  src/netgw/
+  src/gateway/
     policy.py      config, allowlists, redaction/scrubbing, audit log, Bash blocklist
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
-    commands.py    /net-gateway:secret and /net-gateway:sudo handling, transcript scrubber
-    vault.py       age-encrypted JSON vault (~/.config/net-gateway), sudo switches
+    commands.py    /gate:secret and /gate:sudo handling, transcript scrubber
+    vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches
     web_form.py    one-time 127.0.0.1 browser form for entering values
-    cli.py         `run.py log` (the /net-log viewer), `check`, and `vault` (terminal
+    cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
                    fallback for /secret and /sudo when no browser can open)
   tests/run_tests.py              single offline test script (no pytest)
 ```
@@ -47,7 +47,7 @@ plugins/net-gateway/
 ## Commands
 
 ```bash
-cd plugins/net-gateway
+cd plugins/gateway
 pixi run test                    # must stay green; prints "N passed, 0 failed"
 claude plugin validate .         # plugin manifest
 claude plugin validate ../..     # marketplace manifest
@@ -56,9 +56,9 @@ pixi run --frozen python run.py log 40                      # audit log viewer
 pixi run install --dry-run       # what the installer would add to settings.json
 ```
 
-The tests are hermetic. They set `NETGW_HOME`, `NETGW_CONFIG` and
-`NETGW_AUDIT_LOG` to temp paths, use a fake `sudo`/`ssh` on `PATH`, a fake
-browser (`NETGW_BROWSER`), and local HTTP servers on 127.0.0.1. They never
+The tests are hermetic. They set `GATEWAY_HOME`, `GATEWAY_CONFIG` and
+`GATEWAY_AUDIT_LOG` to temp paths, use a fake `sudo`/`ssh` on `PATH`, a fake
+browser (`GATEWAY_BROWSER`), and local HTTP servers on 127.0.0.1. They never
 touch the real vault, log or network. Add a check for every behavior change,
 and when it's a security property, confirm the new check **fails** without
 your change (mutation-check it).
@@ -98,13 +98,13 @@ your change (mutation-check it).
   includes heredocs, commit messages, `grep` patterns and scripts written
   inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
   use `git commit -F file`. Check with `run.py check '…'`.
-- **You can't read the vault** (`Read(~/.config/net-gateway/**)` is denied) and
+- **You can't read the vault** (`Read(~/.config/gateway/**)` is denied) and
   must not try. Use the `secret_list` tool for names.
 - **Tool and hook changes need a new session** to be picked up (the MCP server
   and hooks load at session start). Test headless with `claude -p`, or ask the
   user to open a new session.
 - **Headless `claude -p` auto-cancels anything interactive**, and so does the
-  desktop app for MCP elicitation. Use fakes (`NETGW_BROWSER`, `NETGW_HOME`)
+  desktop app for MCP elicitation. Use fakes (`GATEWAY_BROWSER`, `GATEWAY_HOME`)
   for end-to-end checks.
 - The `Edit(...config/**)` deny rule only stops the Edit tool. Bash can still
   change `policy.json`, so the rules are a guardrail, not a boundary (see
@@ -119,7 +119,7 @@ Verified live (macOS, desktop app): Bash redirect; vault add/up/allow/del/list
 through the browser form with no popup; secret use to allowed hosts and refusal
 elsewhere; sudo on a remote Linux host with approve, decline, session enable and
 disable; the safety-net block with transcript scrub; the vault read denial; the
-/net-log view.
+/gate:log view.
 
 Linux: the test suite covers headless detection (no `DISPLAY` means no
 browser and the terminal fallback) and the installer's path handling, and the
@@ -139,6 +139,6 @@ Known limitations / ideas:
 - Plain `sudo` in Bash isn't redirected. It can't prompt for a password
   from Claude's Bash, so it only works for NOPASSWD rules; password-based root
   goes through run_privileged.
-- The `/net-gateway:` prefix is required (plugin commands can't register a
+- The `/gate:` prefix is required (plugin commands can't register a
   bare name). The hook also accepts bare `/secret` and `/sudo`, but the app
   shows "isn't a command" above the input for those.

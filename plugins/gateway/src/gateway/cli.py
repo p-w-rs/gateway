@@ -1,4 +1,4 @@
-"""netgw CLI — a thin human/script entry point to the same policy core.
+"""gateway CLI — a thin human/script entry point to the same policy core.
 
 Subcommands (run as `pixi run --manifest-path …/pixi.toml <task>` or
 `python run.py <subcommand>` inside the pixi env):
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_vault(argv: list[str]) -> int:
-    """Terminal fallback for /net-gateway:secret and /net-gateway:sudo, for
+    """Terminal fallback for /gate:secret and /gate:sudo, for
     machines with no browser (ssh, headless Linux). Same commands; values are
     read at a hidden prompt. Session-only sudo enable isn't possible here (no
     Claude session), so use `sudo enable HOST always`."""

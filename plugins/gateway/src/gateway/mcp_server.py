@@ -1,4 +1,4 @@
-"""Minimal MCP stdio server for net-gateway — pure standard library.
+"""Minimal MCP stdio server for gateway — pure standard library.
 
 Implements just enough of the Model Context Protocol to expose tools over
 stdio JSON-RPC: initialize, tools/list, tools/call — plus a server-to-client
@@ -194,7 +194,7 @@ class Server:
         schema: dict[str, Any] = {"type": "object", "properties": properties or {}}
         if required:
             schema["required"] = required
-        eid = f"netgw-elicit-{next(self._ids)}"
+        eid = f"gateway-elicit-{next(self._ids)}"
         self.send({"jsonrpc": "2.0", "id": eid, "method": "elicitation/create",
                    "params": {"message": message, "requestedSchema": schema}})
         while True:
@@ -241,7 +241,7 @@ class Server:
                 "protocolVersion": asked if asked in SUPPORTED_VERSIONS
                 else PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "net-gateway", "version": __version__},
+                "serverInfo": {"name": "gateway", "version": __version__},
             })
         elif method == "notifications/initialized":
             pass  # no response to notifications

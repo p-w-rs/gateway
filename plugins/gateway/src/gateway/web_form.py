@@ -10,7 +10,7 @@ Guards: loopback only; unguessable one-time path; the Host header must be the
 loopback address (blocks DNS rebinding); a POST must carry the page's own
 nonce; the server stops after one submission, a cancel, or the timeout.
 
-NETGW_BROWSER, if set, is a program run as `PROGRAM URL` instead of the
+GATEWAY_BROWSER, if set, is a program run as `PROGRAM URL` instead of the
 system browser (the tests use it to fill the form).
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>net-gateway</title>
+<title>gateway</title>
 <style>
  :root {{ color-scheme: light dark; --bg:#f6f6f4; --card:#fff; --fg:#1d1d1b; --muted:#6b6b66;
          --line:#d9d9d4; --accent:#2f5d50; }}
@@ -55,7 +55,7 @@ PAGE = """<!doctype html>
 </style></head>
 <body><main><div class="card">
 <h1>{title}</h1>
-<p>Claude can't see what you type here. It goes straight to the net-gateway vault.</p>
+<p>Claude can't see what you type here. It goes straight to the gateway vault.</p>
 <dl>{details}</dl>
 <form method="post" autocomplete="off">
 <input type="hidden" name="nonce" value="{nonce}">
@@ -69,7 +69,7 @@ PAGE = """<!doctype html>
 """
 
 DONE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>net-gateway</title><style>:root{{color-scheme:light dark}}
+<title>gateway</title><style>:root{{color-scheme:light dark}}
 body{{font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 max-width:440px;margin:20vh auto;padding:0 16px}}</style></head>
 <body><p>{msg}</p><p>You can close this tab.</p></body></html>"""
@@ -85,7 +85,7 @@ def ask(title: str, details: list[tuple[str, str]], label: str,
     left empty), or None if cancelled or timed out. Raises Unavailable if no
     browser could be opened."""
     if timeout is None:
-        timeout = float(os.environ.get("NETGW_FORM_TIMEOUT") or TIMEOUT)
+        timeout = float(os.environ.get("GATEWAY_FORM_TIMEOUT") or TIMEOUT)
     path = "/" + secrets.token_urlsafe(16)
     nonce = secrets.token_urlsafe(16)
     state: dict[str, Any] = {"value": None}
@@ -140,7 +140,7 @@ def ask(title: str, details: list[tuple[str, str]], label: str,
                     self._send(400, DONE.format(msg="No value entered; nothing was saved."))
                 else:
                     state["value"] = value
-                    self._send(200, DONE.format(msg="Saved to the net-gateway vault."))
+                    self._send(200, DONE.format(msg="Saved to the gateway vault."))
             done.set()
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -158,7 +158,7 @@ def ask(title: str, details: list[tuple[str, str]], label: str,
 
 
 def _open(url: str) -> bool:
-    prog = os.environ.get("NETGW_BROWSER")
+    prog = os.environ.get("GATEWAY_BROWSER")
     if prog:
         if prog.lower() == "none":
             return False
@@ -178,8 +178,8 @@ def gui_available() -> bool:
     server), Python's webbrowser may fall back to a console browser such as
     lynx, which would hang the hook, so the caller falls back to the terminal
     instead."""
-    if os.environ.get("NETGW_BROWSER"):
-        return os.environ["NETGW_BROWSER"].lower() != "none"
+    if os.environ.get("GATEWAY_BROWSER"):
+        return os.environ["GATEWAY_BROWSER"].lower() != "none"
     if sys.platform == "darwin":
         return not os.environ.get("SSH_CONNECTION")
     if sys.platform == "win32":

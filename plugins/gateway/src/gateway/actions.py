@@ -55,7 +55,7 @@ def _gate(action: str, host: str = "", what: str = "",
         return None
     if pre_approved:  # the caller records how it was approved
         return None
-    answer = approve(f"net-gateway wants to run {what or action}. {d.reason} Allow?") \
+    answer = approve(f"gateway wants to run {what or action}. {d.reason} Allow?") \
         if approve else None
     if answer in (True, "always"):
         policy.audit("user_approved", {"action": action, "host": host})
@@ -260,7 +260,7 @@ def port_check(target: str, ports: list[int] | None = None,
 
 
 def _allowed_hosts(ref: str, cfg: dict[str, Any] | None = None) -> list[str]:
-    """Hosts a vault secret may be sent to (set with /net-gateway:secret allow)."""
+    """Hosts a vault secret may be sent to (set with /gate:secret allow)."""
     s = vault.secret(ref)
     return [h for h in (s or {}).get("hosts", []) if h and h != "*"]
 
@@ -278,7 +278,7 @@ def _ask_new_host(ref: str, host: str, method: str, url: str, bound: list[str],
 
 def _how_to_allow(ref: str, host: str) -> str:
     return (f"If the task needs it, ask the user to run: "
-            f"/net-gateway:secret allow {ref} {host} - then retry.")
+            f"/gate:secret allow {ref} {host} - then retry.")
 
 
 def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None) -> str:
@@ -286,7 +286,7 @@ def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None) -> str:
     s = vault.secret(ref) if vault.NAME_RE.fullmatch(ref or "") else None
     if not s:
         raise RuntimeError(f"no secret named {ref}; ask the user to run: "
-                           f"/net-gateway:secret add {ref} <description>")
+                           f"/gate:secret add {ref} <description>")
     return s["value"]
 
 
@@ -303,7 +303,7 @@ def secret_list(approve: Approver = None) -> dict[str, Any]:
     return {"ok": True, "secrets": cat["secrets"], "sudo": cat["sudo"],
             "note": "Names only, never values. Use a secret's NAME as auth_ref on "
                     "http_request, only for its hosts. Missing one? Ask the user to "
-                    "run /net-gateway:secret add NAME <description> (a browser form "
+                    "run /gate:secret add NAME <description> (a browser form "
                     "asks them for the value)."}
 
 
@@ -371,7 +371,7 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
         who = f"{user}@{host}" if user else host
         return _refuse("run_privileged", host, (
             f"No sudo password is stored for {who}, so nothing can run as root "
-            f"there. Ask the user to run: /net-gateway:sudo add USER {host} "
+            f"there. Ask the user to run: /gate:sudo add USER {host} "
             "(a browser form asks them for the password)."))
     if len(entries) > 1:
         return _refuse("run_privileged", host, (
@@ -402,7 +402,7 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
             f"sudo is disabled on {host}, so each root command needs the user's "
             "approval: call run_privileged_confirm with the same arguments (Claude "
             "Code asks the user). If the user wants root without asking there, "
-            f"they can run /net-gateway:sudo enable {host}.")}
+            f"they can run /gate:sudo enable {host}.")}
     gate = _gate("run_privileged", host, f"AS ROOT on {target}: {cmdline}", approve,
                  pre_approved=True)  # a 'refuse' tier in policy.json still wins
     if gate is not None:

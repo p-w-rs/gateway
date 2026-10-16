@@ -1,9 +1,9 @@
-# Self-contained runtime for the net-gateway plugin.
+# Self-contained runtime for the gateway plugin.
 # Recipients need only Claude Code + pixi; pixi provides the Python and the
 # `age` binary below, so no system install is required. All gateway code is
 # pure standard library; age decrypts `age:` secret references.
 [workspace]
-name = "net-gateway"
+name = "gateway"
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64", "win-64"]
 

@@ -1,13 +1,13 @@
 # Architecture
 
-net-gateway has three moving parts inside Claude Code (hooks, an MCP server,
+gateway has three moving parts inside Claude Code (hooks, an MCP server,
 slash commands) and one store outside it (the vault). They all share
-`src/netgw/` through a single entry point, `run.py`, run with pixi's
+`src/gateway/` through a single entry point, `run.py`, run with pixi's
 Python.
 
 ```
                  ┌───────────────────────── Claude Code session ─────────────────────────┐
- user prompt ──▶ │ UserPromptSubmit hook ── /net-gateway:secret|sudo ──▶ commands.py ─┐   │
+ user prompt ──▶ │ UserPromptSubmit hook ── /gate:secret|sudo ──▶ commands.py ─┐   │
                  │   (prompt.sh pre-filter)                                          │   │
                  │                              browser form (web_form.py) ◀─────────┤   │
                  │                                                                   ▼   │
@@ -27,7 +27,7 @@ Python.
 | Event | Runs | Does |
 |---|---|---|
 | SessionStart | `run.py hook-session` | Injects the network policy plus a **catalog**: secret names, descriptions, allowed hosts, sudo targets and their state for *this* session. Never values. If sudo is enabled for the session, it also shows the user a `systemMessage` warning. |
-| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes ordinary prompts through without starting Python. For `/net-gateway:secret` or `/net-gateway:sudo` (or bare `/secret`, `/sudo`) it calls `commands.handle`. |
+| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes ordinary prompts through without starting Python. For `/gate:secret` or `/gate:sudo` (or bare `/secret`, `/sudo`) it calls `commands.handle`. |
 | PreToolUse(Bash) | `run.py hook-route` | `policy.match_blocked(command)`; on a hit, it returns `permissionDecision: deny` with the gateway equivalent. It fails open on its own errors. |
 
 ### The slash commands and the prompt hook
@@ -35,7 +35,7 @@ Python.
 `commands.handle(payload)` returns hook JSON:
 
 - **Normal case: pass through.** It runs the command (add, up, allow, enable,
-  …), then returns `additionalContext` holding a `<net-gateway-result>`
+  …), then returns `additionalContext` holding a `<gateway-result>`
   block. The prompt still reaches Claude, expanded from
   `commands/secret.md`/`sudo.md`, whose body tells Claude to relay the result
   in a line and call no tools. There's no "blocked by hook" popup, and the
@@ -97,7 +97,7 @@ sh. The password is scrubbed from stdout and stderr.
 
 ## Vault (`vault.py`)
 
-`$NETGW_HOME` (default `${XDG_CONFIG_HOME:-~/.config}/net-gateway`):
+`$GATEWAY_HOME` (default `${XDG_CONFIG_HOME:-~/.config}/gateway`):
 
 ```
 key.txt     age X25519 identity, generated on first write, mode 600
@@ -133,8 +133,8 @@ names must match `HOST_RE`, so a leading `-` (an ssh option) is impossible.
 
 ## Install (`install.py`, `pixi run install`)
 
-1. `claude plugin marketplace add <repo>` (skipped if `local-tools` is
-   already registered), then `claude plugin install net-gateway@local-tools`.
+1. `claude plugin marketplace add <repo>` (skipped if `gateway` is
+   already registered), then `claude plugin install gate@gateway`.
 2. Reads `settings.rules.json`, replaces `{PLUGIN_DIR}` with a rule path (`~/…`
    under home, `//abs/…` otherwise; a single `/` would be relative to the
    settings file), and merges into `$CLAUDE_CONFIG_DIR/settings.json` or

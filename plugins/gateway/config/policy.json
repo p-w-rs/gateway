@@ -1,5 +1,5 @@
 {
-  "_comment": "Tune the gateway here; values override the built-in defaults in src/netgw/policy.py. Reload Claude Code after editing.",
+  "_comment": "Tune the gateway here; values override the built-in defaults in src/gateway/policy.py. Reload Claude Code after editing.",
   "_approvals_comment": "auto = run, refuse = never run, ask = needs approval. Real approvals come from Claude Code's permission prompt ('ask' rules in settings.json, e.g. port_check, run_privileged_confirm), so tools gated there are 'auto' here to avoid a second prompt. An 'ask' tier here uses an MCP form, which the desktop app auto-cancels, so in practice it means refuse. run_privileged is decided by the per-host sudo switch; 'refuse' turns it off entirely.",
   "allow_domains": [
     "*"
@@ -20,7 +20,7 @@
     "file_hash": "auto",
     "run_privileged": "ask"
   },
-  "_vault_comment": "Secrets and sudo passwords live in the gateway's own vault, managed with /net-gateway:secret and /net-gateway:sudo.",
+  "_vault_comment": "Secrets and sudo passwords live in the gateway's own vault, managed with /gate:secret and /gate:sudo.",
   "max_response_bytes": 5000000,
   "download_dir": "quarantine",
   "max_download_bytes": 500000000

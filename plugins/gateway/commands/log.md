@@ -1,8 +1,8 @@
 ---
-description: Show this machine's net-gateway audit log (recent network/credential/cert activity)
+description: Show this machine's gateway audit log (recent network/credential/cert activity)
 ---
 
-Run the net-gateway audit log viewer and summarize the results for the user.
+Run the gateway audit log viewer and summarize the results for the user.
 
 Use the Bash tool to run:
 

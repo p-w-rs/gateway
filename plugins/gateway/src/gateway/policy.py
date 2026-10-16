@@ -1,6 +1,6 @@
-"""Shared policy core for the net-gateway plugin.
+"""Shared policy core for the gateway plugin.
 
-Used by the MCP server, the PreToolUse hook, and the netgw CLI so that every
+Used by the MCP server, the PreToolUse hook, and the gateway CLI so that every
 route into the network / credential / certificate surface applies the same
 allowlists, approval tiers, redaction, and audit logging.
 
@@ -35,19 +35,19 @@ def plugin_root() -> Path:
     env = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
     if env and "${" not in env and Path(env).is_absolute() and Path(env).is_dir():
         return Path(env)
-    # src/netgw/policy.py -> plugin root is two parents up from src/
+    # src/gateway/policy.py -> plugin root is two parents up from src/
     return Path(__file__).resolve().parents[2]
 
 
 def config_path() -> Path:
-    override = os.environ.get("NETGW_CONFIG")
+    override = os.environ.get("GATEWAY_CONFIG")
     if override:
         return Path(override)
     return plugin_root() / "config" / "policy.json"
 
 
 def audit_log_path() -> Path:
-    override = os.environ.get("NETGW_AUDIT_LOG")
+    override = os.environ.get("GATEWAY_AUDIT_LOG")
     if override:
         return Path(override)
     return plugin_root() / "logs" / "audit.jsonl"
@@ -121,7 +121,7 @@ def load_config() -> dict[str, Any]:
                 else:
                     cfg[k] = v
         except Exception as e:
-            sys.stderr.write(f"net-gateway: ignoring unreadable {p}: {e}\n")
+            sys.stderr.write(f"gateway: ignoring unreadable {p}: {e}\n")
     return cfg
 
 
@@ -282,8 +282,8 @@ _BLOCKED = [
     (r"(?i)\bnode\b.*-e.*\bfetch\s*\(", "node inline fetch", "the http_request tool"),
     # Secret stores: values must stay inside the gateway. The gateway's own
     # vault, and the user's personal `secret` store, which is not Claude's.
-    (r"net-gateway/(key\.txt|store\.age)|\.config/net-gateway\b",
-     "net-gateway vault file", "secret_list for names; values are never shown"),
+    (r"gateway/(key\.txt|store\.age)|\.config/gateway\b",
+     "gateway vault file", "secret_list for names; values are never shown"),
     (r"\bage\b[^|;&]*\s(-d|--decrypt)\b", "age --decrypt",
      "the secret's NAME as auth_ref on http_request (secret_list shows names)"),
     (r"\bsecret\s+(get|run|edit|reload)\b", "the user's personal secret store",
@@ -300,8 +300,8 @@ def match_blocked(command: str) -> tuple[str, str] | None:
     for rx, name, route in _BLOCKED_COMPILED:
         if rx.search(command):
             return name, route
-    # The vault's actual folder, wherever NETGW_HOME / XDG_CONFIG_HOME put it.
+    # The vault's actual folder, wherever GATEWAY_HOME / XDG_CONFIG_HOME put it.
     from . import vault
     if str(vault.home()) in command:
-        return "net-gateway vault file", "secret_list for names; values are never shown"
+        return "gateway vault file", "secret_list for names; values are never shown"
     return None

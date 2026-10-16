@@ -43,7 +43,7 @@ Each of these was tried in order:
 - **Tried:** `vault_*` MCP tools Claude could call ("add my token" → tool →
   form). That needed in-app forms (which fail) or permission prompts per
   change, and it made Claude the actor for security changes.
-- **Chosen:** only user-typed `/net-gateway:secret` and `/net-gateway:sudo`
+- **Chosen:** only user-typed `/gate:secret` and `/gate:sudo`
   change the vault. Claude can read the catalog and tells the user which
   command to run.
 
@@ -56,7 +56,7 @@ Each of these was tried in order:
   - It mixed the user's personal shell secrets with what Claude may use.
   - `env:` could read any variable.
   - `secret_list` exposed every keychain item name.
-- **Chosen:** a separate age key and store at `~/.config/net-gateway`, with
+- **Chosen:** a separate age key and store at `~/.config/gateway`, with
   per-secret allowed hosts. The personal store is blocked from Claude
   (`Bash(secret:*)`, `Read(~/.config/secrets/**)`, …).
 

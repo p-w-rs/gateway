@@ -1,4 +1,4 @@
-"""The /net-gateway:secret and /net-gateway:sudo chat commands.
+"""The /gate:secret and /gate:sudo chat commands.
 
 A UserPromptSubmit hook handles them. Values (secrets, sudo passwords) are
 never typed in the chat: the hook opens a one-time browser form with a masked
@@ -12,19 +12,19 @@ The one exception: if the text looks like it contains a value anyway (a
 blocked so Claude never sees it, and the typed words are scrubbed from the
 transcript and prompt history.
 
-    /net-gateway:secret add NAME description...     (browser form asks the value)
-    /net-gateway:secret up NAME [new description]   (browser form; empty = keep)
-    /net-gateway:secret desc NAME description...
-    /net-gateway:secret allow NAME HOST [HOST...]
-    /net-gateway:secret disallow NAME HOST [HOST...]
-    /net-gateway:secret del NAME
-    /net-gateway:secret list
-    /net-gateway:sudo add USER HOST                  (browser form asks the password)
-    /net-gateway:sudo up USER HOST
-    /net-gateway:sudo del USER HOST
-    /net-gateway:sudo enable HOST [always]           this session only, or all sessions
-    /net-gateway:sudo disable HOST
-    /net-gateway:sudo list
+    /gate:secret add NAME description...     (browser form asks the value)
+    /gate:secret up NAME [new description]   (browser form; empty = keep)
+    /gate:secret desc NAME description...
+    /gate:secret allow NAME HOST [HOST...]
+    /gate:secret disallow NAME HOST [HOST...]
+    /gate:secret del NAME
+    /gate:secret list
+    /gate:sudo add USER HOST                  (browser form asks the password)
+    /gate:sudo up USER HOST
+    /gate:sudo del USER HOST
+    /gate:sudo enable HOST [always]           this session only, or all sessions
+    /gate:sudo disable HOST
+    /gate:sudo list
 """
 from __future__ import annotations
 
@@ -40,26 +40,26 @@ from typing import Any
 
 from . import policy, vault, web_form
 
-PREFIX = re.compile(r"^\s*/(?:net-gateway:)?(secret|sudo)(?=\s|$)(.*)$", re.S)
+PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo)(?=\s|$)(.*)$", re.S)
 
 SECRET_HELP = (
-    "/net-gateway:secret add NAME description     store a secret (a browser form asks the value)\n"
-    "/net-gateway:secret up NAME [description]    new value (browser form) and/or description\n"
-    "/net-gateway:secret desc NAME description    change only the description\n"
-    "/net-gateway:secret allow NAME HOST...       let it be sent to these hosts\n"
-    "/net-gateway:secret disallow NAME HOST...    stop sending it to these hosts\n"
-    "/net-gateway:secret del NAME                 delete it\n"
-    "/net-gateway:secret list                     names, descriptions, hosts"
+    "/gate:secret add NAME description     store a secret (a browser form asks the value)\n"
+    "/gate:secret up NAME [description]    new value (browser form) and/or description\n"
+    "/gate:secret desc NAME description    change only the description\n"
+    "/gate:secret allow NAME HOST...       let it be sent to these hosts\n"
+    "/gate:secret disallow NAME HOST...    stop sending it to these hosts\n"
+    "/gate:secret del NAME                 delete it\n"
+    "/gate:secret list                     names, descriptions, hosts"
 )
 SUDO_HELP = (
-    "/net-gateway:sudo add USER HOST       store a sudo password (a browser form asks it);\n"
+    "/gate:sudo add USER HOST       store a sudo password (a browser form asks it);\n"
     "                                      HOST: localhost, an ssh alias, a name or an IP\n"
-    "/net-gateway:sudo up USER HOST        replace it\n"
-    "/net-gateway:sudo del USER HOST       delete it\n"
-    "/net-gateway:sudo enable HOST         root commands run WITHOUT asking, this session only\n"
-    "/net-gateway:sudo enable HOST always  ...in every session\n"
-    "/net-gateway:sudo disable HOST        every root command asks again (the default)\n"
-    "/net-gateway:sudo list                stored USER@HOST entries and where sudo is enabled"
+    "/gate:sudo up USER HOST        replace it\n"
+    "/gate:sudo del USER HOST       delete it\n"
+    "/gate:sudo enable HOST         root commands run WITHOUT asking, this session only\n"
+    "/gate:sudo enable HOST always  ...in every session\n"
+    "/gate:sudo disable HOST        every root command asks again (the default)\n"
+    "/gate:sudo list                stored USER@HOST entries and where sudo is enabled"
 )
 
 
@@ -115,7 +115,7 @@ def _guard_text(words: list[str]) -> None:
         raise LooksLikeValue(
             "That looks like it contains a secret value, so it was not sent to "
             "Claude and nothing was saved. Values go in the browser form: type only "
-            "/net-gateway:secret add NAME description. (Your typed text has been "
+            "/gate:secret add NAME description. (Your typed text has been "
             "scrubbed from the transcript.)", hits)
 
 
@@ -178,12 +178,12 @@ def run_secret(rest: str) -> str:
         if sub == "add":
             if existing:
                 raise CommandError(f"{name} already exists; use "
-                                   f"/net-gateway:secret up {name}.")
+                                   f"/gate:secret up {name}.")
             if not desc:
                 raise CommandError("Add a description so Claude knows what it is for: "
-                                   f"/net-gateway:secret add {name} what it is and what for")
+                                   f"/gate:secret add {name} what it is and what for")
         elif not existing:
-            raise CommandError(f"No secret named {name}; use /net-gateway:secret add.")
+            raise CommandError(f"No secret named {name}; use /gate:secret add.")
         value = _form(f"{'Store' if sub == 'add' else 'Update'} the secret {name}",
                       [("Description", desc or (existing or {}).get("description", "")),
                        ("Sent only to", ", ".join((existing or {}).get("hosts", []))
@@ -207,7 +207,7 @@ def run_secret(rest: str) -> str:
             s = data["secrets"][name]
         msg = f"{'Stored' if sub == 'add' else 'Updated'} {_describe(name, s)}."
         if not s["hosts"]:
-            msg += (f" It can't be sent anywhere yet: /net-gateway:secret allow {name} HOST")
+            msg += (f" It can't be sent anywhere yet: /gate:secret allow {name} HOST")
         return msg
 
     with vault.locked():
@@ -224,7 +224,7 @@ def run_secret(rest: str) -> str:
         if sub in ("allow", "disallow"):
             parts = tail.split()
             if not parts:
-                raise CommandError(f"Usage: /net-gateway:secret {sub} NAME HOST [HOST...]")
+                raise CommandError(f"Usage: /gate:secret {sub} NAME HOST [HOST...]")
             name = _name(parts[0])
             if name not in secrets:
                 raise CommandError(f"No secret named {name}.")
@@ -284,18 +284,18 @@ def run_sudo(rest: str, session_id: str) -> str:
             # Anything after HOST would be a password typed into the chat.
             raise LooksLikeValue(
                 "Nothing was saved, and this was not sent to Claude: type only "
-                "/net-gateway:sudo add USER HOST and enter the password in the "
+                "/gate:sudo add USER HOST and enter the password in the "
                 "browser form. (Your typed text has been scrubbed from the "
                 "transcript.)", [" ".join(words[2:])] + words[2:])
         if len(words) != 2:
-            raise CommandError(f"Usage: /net-gateway:sudo {sub} USER HOST")
+            raise CommandError(f"Usage: /gate:sudo {sub} USER HOST")
         user, host = _sudo_target(*words)
         key = f"{user}@{host}"
         exists = key in vault.load()["sudo"]
         if sub == "add" and exists:
-            raise CommandError(f"{key} already has a password; use /net-gateway:sudo up.")
+            raise CommandError(f"{key} already has a password; use /gate:sudo up.")
         if sub != "add" and not exists:
-            raise CommandError(f"No sudo password for {key}; use /net-gateway:sudo add.")
+            raise CommandError(f"No sudo password for {key}; use /gate:sudo add.")
         pw = _form(f"{'Store a' if sub == 'add' else 'Update the'} sudo password",
                    [("User", user),
                     ("Host", "this machine" if host == "localhost" else host),
@@ -314,7 +314,7 @@ def run_sudo(rest: str, session_id: str) -> str:
     _guard_text(words)
     if sub in ("del", "delete", "rm"):
         if len(words) != 2:
-            raise CommandError("Usage: /net-gateway:sudo del USER HOST")
+            raise CommandError("Usage: /gate:sudo del USER HOST")
         host = vault.norm_host(words[1])
         key = f"{words[0]}@{host}"
         with vault.locked():
@@ -327,7 +327,7 @@ def run_sudo(rest: str, session_id: str) -> str:
         return f"Deleted the sudo password for {key}."
     if sub in ("enable", "disable"):
         if not words or len(words) > 2 or (len(words) == 2 and words[1].lower() != "always"):
-            raise CommandError(f"Usage: /net-gateway:sudo {sub} HOST"
+            raise CommandError(f"Usage: /gate:sudo {sub} HOST"
                                + (" [always]" if sub == "enable" else ""))
         host = vault.norm_host(words[0])
         if not vault.HOST_RE.fullmatch(host):
@@ -338,7 +338,7 @@ def run_sudo(rest: str, session_id: str) -> str:
             if sub == "enable":
                 if not any(e.get("host") == host for e in data["sudo"].values()):
                     raise CommandError(f"No sudo password stored for {host}; use "
-                                       f"/net-gateway:sudo add USER {host} first.")
+                                       f"/gate:sudo add USER {host} first.")
                 if always:
                     if host not in data["sudo_enabled"]:
                         data["sudo_enabled"].append(host)
@@ -353,7 +353,7 @@ def run_sudo(rest: str, session_id: str) -> str:
         if sub == "enable":
             scope = "in EVERY session" if always else "for THIS session only"
             return (f"sudo ENABLED on {host} {scope}: root commands there now run "
-                    f"WITHOUT asking. Turn off with /net-gateway:sudo disable {host}.")
+                    f"WITHOUT asking. Turn off with /gate:sudo disable {host}.")
         return f"sudo disabled on {host} (all sessions): every root command there asks."
     raise CommandError(f"Unknown command '{sub}'.\n{SUDO_HELP}")
 
@@ -375,9 +375,9 @@ def passthrough(result: str) -> dict[str, Any]:
     """Let the prompt reach Claude with the result attached."""
     return {"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
-        "additionalContext": ("<net-gateway-result>\nThe net-gateway already handled "
+        "additionalContext": ("<gateway-result>\nThe gateway already handled "
                               "the user's command. Result:\n" + result
-                              + "\n</net-gateway-result>")}}
+                              + "\n</gateway-result>")}}
 
 
 def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -395,14 +395,14 @@ def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
     except LooksLikeValue as e:
         _spawn_scrubber(payload.get("transcript_path", ""), e.typed)
         policy.audit(f"vault_{kind}", _log_detail(kind, rest, "blocked: looked like a typed value"))
-        return block(f"net-gateway: {e}")
+        return block(f"gateway: {e}")
     except CommandError as e:
         result, outcome = f"Error: {e}", "error"
     except Exception as e:  # report, but never let a typed value through
         _spawn_scrubber(payload.get("transcript_path", ""),
                         [w for w in rest.split()[1:] if len(w) >= 4])
         policy.audit(f"vault_{kind}", _log_detail(kind, rest, f"failed: {type(e).__name__}"))
-        return block(f"net-gateway: could not process the command "
+        return block(f"gateway: could not process the command "
                      f"({type(e).__name__}: {e}); nothing was saved.")
     policy.audit(f"vault_{kind}", _log_detail(kind, rest, outcome))
     return passthrough(result)
@@ -458,7 +458,7 @@ def _needles(value: str) -> list[bytes]:
     return sorted((n for n in out if n), key=len, reverse=True)
 
 
-MARKERS = (b"/secret", b"/sudo", b"net-gateway:secret", b"net-gateway:sudo")
+MARKERS = (b"/secret", b"/sudo", b"gate:secret", b"gate:sudo")
 
 
 def scrub_file(path: Path, values: list[str]) -> int:

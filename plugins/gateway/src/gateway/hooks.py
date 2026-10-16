@@ -5,7 +5,7 @@ session_main -> SessionStart: inject the network policy and the vault catalog
                 (names, descriptions, hosts; never values) so Claude uses the
                 gateway on the first try.
 prompt_main  -> UserPromptSubmit (via hooks/prompt.sh): handle
-                /net-gateway:secret and /net-gateway:sudo, then let the prompt
+                /gate:secret and /gate:sudo, then let the prompt
                 through with the result (or block it if it may hold a value).
 """
 from __future__ import annotations
@@ -20,30 +20,30 @@ SESSION_NOTE = (
     "certutil, cmdkey, the macOS `security` keychain tool, or PowerShell "
     "Invoke-WebRequest / Invoke-RestMethod directly. Instead:\n"
     "- Read a web page: built-in WebFetch tool.\n"
-    "- Call an API (any method/headers/body): net-gateway http_request tool.\n"
-    "- Download a file: net-gateway download tool (saves to quarantine).\n"
-    "- Check host/port reachability: net-gateway port_check tool.\n"
-    "- Credentials live in the net-gateway vault; values never reach you. Pass "
+    "- Call an API (any method/headers/body): gateway http_request tool.\n"
+    "- Download a file: gateway download tool (saves to quarantine).\n"
+    "- Check host/port reachability: gateway port_check tool.\n"
+    "- Credentials live in the gateway vault; values never reach you. Pass "
     "the secret's NAME as auth_ref to http_request. Allowed hosts go through "
     "silently; any other host is refused. Never try to read the vault files.\n"
     "- Commands needing root (the sudo password, stored in the vault, is "
     "injected for you): where sudo is ENABLED (see below), use run_privileged "
     "(no prompt; use it only for what the task needs); elsewhere use "
     "run_privileged_confirm (Claude Code asks the user for each call).\n"
-    "- TLS certs / file hashes: net-gateway cert_inspect / file_hash.\n"
+    "- TLS certs / file hashes: gateway cert_inspect / file_hash.\n"
     "- The user manages the vault with slash commands; you can't run them. When "
     "something is missing or not allowed, tell the user the exact command:\n"
-    "  /net-gateway:secret add NAME <description>   (a browser form asks the value)\n"
-    "  /net-gateway:secret allow NAME HOST\n"
-    "  /net-gateway:sudo add USER HOST               (a browser form asks the password)\n"
-    "  /net-gateway:sudo enable HOST [always]        (this session, or every session)\n"
-    "  /net-gateway:sudo disable HOST\n"
-    "  (/net-gateway:secret help and /net-gateway:sudo help list the rest.)\n"
-    "When a <net-gateway-result> block is attached to the user's message, the "
+    "  /gate:secret add NAME <description>   (a browser form asks the value)\n"
+    "  /gate:secret allow NAME HOST\n"
+    "  /gate:sudo add USER HOST               (a browser form asks the password)\n"
+    "  /gate:sudo enable HOST [always]        (this session, or every session)\n"
+    "  /gate:sudo disable HOST\n"
+    "  (/gate:secret help and /gate:sudo help list the rest.)\n"
+    "When a <gateway-result> block is attached to the user's message, the "
     "gateway already handled their command: just relay the result in a line.\n"
     "NEVER ask the user to paste a secret or password into the chat; if they do "
     "anyway, don't repeat it and tell them to replace it.\n"
-    "Every gateway call is logged; run /net-log to review this session."
+    "Every gateway call is logged; run /gate:log to review this session."
 )
 
 
@@ -66,9 +66,9 @@ def route_main() -> int:
     name, route = hit
     policy.audit("hook_redirect", {"tool": name, "command": command[:500]})
     reason = (
-        f"'{name}' is routed through the net-gateway instead of running "
+        f"'{name}' is routed through the gateway instead of running "
         f"directly. Use {route}. Credentials stay hidden and every call is "
-        f"logged (see /net-log)."
+        f"logged (see /gate:log)."
     )
     print(json.dumps({
         "hookSpecificOutput": {
@@ -85,13 +85,13 @@ def _catalog_note(session_id: str = "") -> str:
         data = vault.load()
         cat = vault.catalog(data)
     except Exception as e:
-        return f"\n(The net-gateway vault could not be read: {e})"
+        return f"\n(The gateway vault could not be read: {e})"
     lines = []
     if cat["secrets"]:
-        lines.append("Secrets in the net-gateway vault (use the NAME as auth_ref):")
+        lines.append("Secrets in the gateway vault (use the NAME as auth_ref):")
         for n, s in cat["secrets"].items():
             hosts = (", ".join(s["hosts"])
-                     or f"none yet: ask the user to run /net-gateway:secret allow {n} HOST")
+                     or f"none yet: ask the user to run /gate:secret allow {n} HOST")
             lines.append(f"- {n}: {s['description'] or '(no description)'} [hosts: {hosts}]")
     if cat["sudo"]:
         lines.append("Stored sudo passwords:")
@@ -111,8 +111,8 @@ def _enabled_warning(session_id: str = "") -> str | None:
                     if vault.sudo_enabled(e["host"], session_id, data)})
     if not hosts:
         return None
-    return ("net-gateway: sudo is ENABLED (root commands run without asking) on: "
-            + ", ".join(hosts) + ". Turn off with /net-gateway:sudo disable HOST.")
+    return ("gateway: sudo is ENABLED (root commands run without asking) on: "
+            + ", ".join(hosts) + ". Turn off with /gate:sudo disable HOST.")
 
 
 def session_main() -> int:
@@ -141,7 +141,7 @@ def prompt_main() -> int:
         out = commands.handle(payload)
     except Exception as e:  # noqa: BLE001
         out = commands.block(
-            f"net-gateway: could not process the command ({type(e).__name__}); "
+            f"gateway: could not process the command ({type(e).__name__}); "
             "nothing was saved and it was not sent to Claude.")
     if out is not None:
         print(json.dumps(out))
