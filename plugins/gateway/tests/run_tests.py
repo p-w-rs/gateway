@@ -2252,7 +2252,8 @@ import base64 as _b64e  # noqa: E402
 import hashlib as _hl  # noqa: E402
 from gateway import dbops, entra  # noqa: E402
 
-ENTRA = {"challenge": "", "rt": "", "n": 0, "token_hits": 0, "device_polls": 0, "scopes": []}
+ENTRA = {"challenge": "", "rt": "", "n": 0, "token_hits": 0, "device_polls": 0, "scopes": [],
+         "valid": set()}
 
 
 def _jwt(claims):
@@ -2305,11 +2306,13 @@ class FakeEntra(http.server.BaseHTTPRequestHandler):
                 self._json(400, {"error": "authorization_pending"})
                 return
         elif g == "refresh_token":
-            if f.get("refresh_token") != ENTRA["rt"]:
+            if f.get("refresh_token") not in ENTRA["valid"]:
                 self._json(400, {"error": "invalid_grant", "error_description": "stale refresh token"})
                 return
+            ENTRA["valid"].discard(f["refresh_token"])  # rotated: the old one is spent
         ENTRA["n"] += 1
         ENTRA["rt"] = f"rt-{ENTRA['n']}"
+        ENTRA["valid"].add(ENTRA["rt"])
         self._json(200, {"access_token": f"at-{ENTRA['n']}-{_hl.sha1(f.get('scope', '').encode()).hexdigest()[:6]}",
                          "refresh_token": ENTRA["rt"], "expires_in": 3600,
                          "id_token": _jwt({"preferred_username": "jpowers@asirobots.com",
@@ -2529,6 +2532,84 @@ else:
 check("MCP lists mlcat tools", {"mlcat", "mlcat_workspace", "mlcat_workspace_confirm"}
       <= {t["name"] for t in mcp_server.TOOLS})
 _csrv.shutdown()
+
+print("registries:")
+from gateway import regops  # noqa: E402
+
+ACR_SEEN = []
+
+
+class FakeACR(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        f = {k: v[0] for k, v in urllib.parse.parse_qs(
+            self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()).items()}
+        ACR_SEEN.append(f)
+        b = json.dumps({"refresh_token": "acr-refresh-0123456789abcdef"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+
+_asrv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeACR)
+threading.Thread(target=_asrv.serve_forever, daemon=True).start()
+AHOST = f"127.0.0.1:{_asrv.server_address[1]}"
+FAKE_CRANE = RT / "fake-crane"
+FAKE_CRANE.write_text(f'''#!/bin/sh
+echo "args: $*"
+"{sys.executable}" - <<'PY'
+import base64, json, os
+cfg = json.load(open(os.path.join(os.environ["DOCKER_CONFIG"], "config.json")))
+for host, v in cfg["auths"].items():
+    user, _, pw = base64.b64decode(v["auth"]).decode().partition(":")
+    print("registry=" + host, "user=" + user, "pw-len=" + str(len(pw)))
+print("home-is-temp=" + str("gw-run-" in os.environ.get("HOME", "")))
+PY
+''')
+FAKE_CRANE.chmod(0o755)
+os.environ["GATEWAY_BIN_CRANE"] = str(FAKE_CRANE)
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:pkgs"] = {"kind": "github", "host": "github.com", "login": "octo-pkgs",
+                                     "owners": [], "hosts": ["github.com", "api.github.com"],
+                                     "secrets": {"token": "gho_pkgsTOKEN0123456789abcdef"}, "prompts": {}}
+    _d["accounts"]["registry:ghcr"] = {"kind": "registry", "host": "ghcr.io", "via": "github:pkgs",
+                                       "owners": ["acme"], "hosts": ["ghcr.io"], "secrets": {}, "prompts": {}}
+    _d["accounts"]["registry:acr"] = {"kind": "registry", "host": AHOST, "via": "azure:work",
+                                      "owners": [], "hosts": ["127.0.0.1"], "secrets": {}, "prompts": {}}
+    _d["accounts"]["registry:hub"] = {"kind": "registry", "host": "docker.io", "login": "me",
+                                      "owners": [], "hosts": ["docker.io"],
+                                      "secrets": {"token": "dckr_pat_HUBtoken0123456789"}, "prompts": {}}
+    vault.save(_d)
+try:
+    r = regops.registry_tool(["ls", "ghcr.io/acme/app"], "registry:ghcr")
+    check("registry ghcr.io via a GitHub account: its login and token, temp DOCKER_CONFIG",
+          r["ok"] and "registry=ghcr.io user=octo-pkgs pw-len=29" in r["stdout"]
+          and "home-is-temp=True" in r["stdout"] and "gho_pkgs" not in json.dumps(r))
+    check("registry: owners scope the images", regops.registry_tool(
+        ["ls", "ghcr.io/other/app"], "registry:ghcr").get("refused") is True)
+    r = regops.registry_tool(["manifest", f"{AHOST}/team/img:1"], "registry:acr")
+    check("registry ACR via an azure account: ARM token exchanged for an ACR token",
+          r["ok"] and "user=00000000-0000-0000-0000-000000000000" in r["stdout"]
+          and ACR_SEEN and ACR_SEEN[-1]["grant_type"] == "access_token"
+          and ACR_SEEN[-1]["access_token"].startswith("at-") and "acr-refresh" not in json.dumps(r))
+    r = regops.registry_tool(["push", "img.tar", "docker.io/me/img:1"], "registry:hub")
+    check("registry with its own token (write=auto)", r["ok"] and "user=me" in r["stdout"]
+          and r["class"] == "write" and "dckr_pat" not in json.dumps(r))
+    r = regops.registry_tool(["delete", "docker.io/me/img:1"], "registry:hub")
+    check("registry: deletes ask (registry_confirm)", r.get("use") == "registry_confirm")
+    check("registry: crane auth refused",
+          regops.registry_tool(["auth", "token", "ghcr.io"], "registry:ghcr").get("refused") is True)
+    for args, want in ((["ls", "x"], "read"), (["pull", "x", "f.tar"], "read"), (["copy", "a", "b"], "write"),
+                       (["delete", "x"], "delete"), (["tag", "x", "v2"], "write")):
+        check(f"classify crane {' '.join(args)}", regops.classify(args) == want)
+finally:
+    os.environ.pop("GATEWAY_BIN_CRANE")
+check("MCP lists registry (+confirm)", {"registry", "registry_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
+_asrv.shutdown()
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

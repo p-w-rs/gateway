@@ -422,6 +422,8 @@ FIELD_INFO = {
     "user": ("User", "the login user on that host"),
     "port": ("Port (optional)", "empty = 22"),
     "jump": ("Jump host (optional)", "another ssh account to go through, e.g. ssh:bastion"),
+    "via": ("Sign in through (optional)", "github:NAME for ghcr.io, azure:NAME for an Azure "
+                                          "Container Registry; empty = use the token below"),
 }
 
 
@@ -495,7 +497,8 @@ def _clean_setting(kind: str, f: str, v: str) -> str:
           "tenant": lambda x: vault.GUID_RE.fullmatch(x) or vault.HOST_RE.fullmatch(x.lower()),
           "client_id": vault.GUID_RE.fullmatch,
           "port": lambda x: x.isdigit() and 0 < int(x) < 65536,
-          "jump": lambda x: vault.parse_account_ref(x) and x.startswith("ssh:")}[f]
+          "jump": lambda x: vault.parse_account_ref(x) and x.startswith("ssh:"),
+          "via": lambda x: vault.parse_account_ref(x) and x.split(":")[0] in ("github", "azure")}[f]
     if not ok(v):
         raise CommandError(f"'{v}' is not a valid {FIELD_INFO[f][0].lower()}.")
     return v.lower() if f in ("host",) else v

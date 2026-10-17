@@ -263,7 +263,7 @@ KINDS: dict[str, dict[str, Any]] = {
     "ssh": {"label": "SSH host", "host": "",
             "fields": ("host", "user", "port", "jump"), "secrets": ("ssh_key",), "owners": False},
     "registry": {"label": "Container registry", "host": "",
-                 "fields": ("host", "login"), "secrets": ("token",), "owners": True},
+                 "fields": ("host", "login", "via"), "secrets": ("token",), "owners": True},
 }
 SECRET_FIELDS = ("token", "ssh_key", "refresh_token")  # refresh_token: an SSO sign-in
 

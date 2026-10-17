@@ -20,7 +20,8 @@
       "mcp__plugin_gate_gw__ssh_copy",
       "mcp__plugin_gate_gw__databricks",
       "mcp__plugin_gate_gw__mlcat",
-      "mcp__plugin_gate_gw__mlcat_workspace"
+      "mcp__plugin_gate_gw__mlcat_workspace",
+      "mcp__plugin_gate_gw__registry"
     ],
     "ask": [
       "mcp__plugin_gate_gw__port_check",
@@ -32,7 +33,8 @@
       "mcp__plugin_gate_gw__ssh_exec_confirm",
       "mcp__plugin_gate_gw__ssh_copy_confirm",
       "mcp__plugin_gate_gw__databricks_confirm",
-      "mcp__plugin_gate_gw__mlcat_workspace_confirm"
+      "mcp__plugin_gate_gw__mlcat_workspace_confirm",
+      "mcp__plugin_gate_gw__registry_confirm"
     ],
     "deny": [
       "Bash(curl:*)",

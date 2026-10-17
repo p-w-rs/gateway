@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, mlcat, pijulops, policy, sshops, vault
+from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, mlcat, pijulops, policy, regops, sshops, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -122,6 +122,17 @@ _MLW_SCHEMA: dict[str, Any] = {
         "timeout": {"type": "integer", "default": 3600},
     },
     "required": ["action", "cwd"],
+}
+
+_REG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "crane arguments, e.g. [\"ls\", \"ghcr.io/org/image\"]"},
+        "account": {"type": "string", "description": "registry:NAME"},
+        "timeout": {"type": "integer", "default": 1800},
+    },
+    "required": ["args", "account"],
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -413,6 +424,21 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _MLW_SCHEMA,
     },
     {
+        "name": "registry",
+        "description": ("Container images as a gateway registry account, no Docker needed (use "
+                        "INSTEAD OF docker/podman login/push/pull, skopeo, oras or crane in "
+                        "Bash): crane commands such as ls, manifest, digest, pull IMAGE "
+                        "FILE.tar, push FILE.tar IMAGE, copy SRC DST, tag, delete. ghcr.io can "
+                        "sign in through a GitHub account, ACR through an azure account. If the "
+                        "policy asks first, call registry_confirm."),
+        "inputSchema": _REG_SCHEMA,
+    },
+    {
+        "name": "registry_confirm",
+        "description": "Same as registry, after Claude Code asks the user.",
+        "inputSchema": _REG_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -616,6 +642,10 @@ def dispatch(name: str, args: dict[str, Any],
                                      args.get("data_dir", "data"), args.get("account"),
                                      confirmed=name == "mlcat_workspace_confirm",
                                      timeout=min(int(args.get("timeout", 3600)), 14400))
+    if name in ("registry", "registry_confirm"):
+        return regops.registry_tool(args.get("args"), args.get("account", ""),
+                                    confirmed=name == "registry_confirm",
+                                    timeout=min(int(args.get("timeout", 1800)), 7200))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",
