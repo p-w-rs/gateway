@@ -36,6 +36,9 @@ plugins/gateway/
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
     runner.py      run a CLI as an account: env allowlist, private ssh-agent, one-call
                    credential helper, hardened git config, scrubbed output
+    gitops.py      the git / git_confirm / git_identity tools (account by remote URL)
+    ghops.py       the gh / gh_confirm tools (the plugin's own gh)
+    logins.py      /gate:account login (GitHub via gh's web flow)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
     commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
@@ -133,6 +136,11 @@ the `git` tool comes next. It's tested against a local git-http-backend
 behind Basic auth, a user-level sshd, and a hostile repo config (hooks,
 fsmonitor, sshCommand, askpass, credential helper, proxy, pack programs).
 8 properties are mutation-checked.
+
+Phase 3 adds the `git` (all of git), `git_confirm`, `git_identity`, `gh`,
+`gh_confirm` and `account_list` tools, and `/gate:account login` for GitHub.
+423 tests pass, and 10 more properties are mutation-checked. Tool changes need
+`pixi run install` (new permission rules) and a new session.
 
 ### v0.3.0 (2026-10-15)
 

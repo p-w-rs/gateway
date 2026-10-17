@@ -78,6 +78,12 @@ environment, and that's how per-session sudo works.
 | secret_list / secret_use | allow | names, descriptions, hosts, sudo targets; never values |
 | run_privileged | allow | only where sudo is **enabled** (always, or for this session); otherwise refused with a pointer to the next tool |
 | run_privileged_confirm | **ask** | the same command, for disabled hosts; Claude Code's prompt shows the host and argv |
+| account_list | allow | the accounts catalog (never values) |
+| git | allow | any git command (`gitops.py`): local ones without credentials; remote ones as the account for the remote's host+owner, under its prompt policy |
+| git_confirm | **ask** | the same, for calls the policy says to ask about (deletes, force-with-lease by default) |
+| git_identity | allow | the repo's own user.name/user.email (and gateway.account) from an account |
+| gh | allow | the plugin's own gh as an account (`ghops.py`): GH_TOKEN or GH_ENTERPRISE_TOKEN, GH_HOST, a temp GH_CONFIG_DIR |
+| gh_confirm | **ask** | the same, when the policy asks |
 
 `_gate` applies the `policy.json` tiers. An `ask` tier there would use MCP
 elicitation (`Server.approve`/`form`), but the desktop app auto-cancels those,
@@ -186,6 +192,43 @@ calls it yet, the `git` MCP tool comes next). Per call:
 - **Output** is capped at 1 MB per stream, and the account's values (and
   each line of a key) plus `policy.scrub` patterns are replaced. The process
   group is killed on timeout, and each call is audited as `run`.
+
+## git and gh as an account (`gitops.py`, `ghops.py`)
+
+- **Which remote:** the URL git will really use (`remote get-url [--push]`,
+  or `ls-remote --get-url`, so insteadOf/pushurl apply). Several push URLs
+  and `fetch --all` are refused, so each URL uses its own account. A
+  password in a URL is refused.
+- **Which account:** kinds github/hf/ssh whose `hosts` cover the host.
+  - One that lists the owner wins over one with no owners (a catch-all).
+  - Two candidates at the same level are ambiguous: pass `account=`.
+  - A named account outside its owners is refused, with the
+    `/gate:account allow` command to fix it.
+  - No match: the command runs without credentials (public repos).
+- **Class and policy:**
+  - Classes: `read` (fetch, pull, clone, ls-remote, lfs fetch) and `write`
+    (push, lfs push).
+  - `delete`: `--delete`, `:ref`, `--mirror`, `--prune`,
+    `--force-with-lease`, `gh … delete|archive|rename|transfer`,
+    `gh api -X DELETE`.
+  - Plain `--force` / `+ref` is always refused.
+  - The policy's answer: `auto` runs; `ask` refuses with `use: git_confirm`
+    (or `gh_confirm`), whose settings rule is `ask`; `refuse` refuses both.
+- **Guards:**
+  - Nothing may point into the vault (cwd or any path argument).
+  - `git config` can't set credential/ssh/hook/url/http/include/alias/filter
+    keys.
+  - Plain http only to loopback.
+  - gh refuses `auth`, extensions, alias, config, browse/`--web`,
+    `--hostname`, repo clone/sync, pr checkout, and repo create/fork with clone/push/remote options. `gh api` only
+    to the account's hosts.
+- **`/gate:account login github:NAME`** (`logins.py`):
+  - The hook runs the plugin's gh `auth login --web --insecure-storage` in
+    a 0700 temp `GH_CONFIG_DIR` and shows gh's one-time code on a local
+    page (`web_form.Notice`, with Cancel) or in the terminal.
+  - When gh exits it reads `oauth_token` from that dir into the vault and
+    removes the dir.
+  - Scopes: gh's defaults plus workflow, read:packages and write:packages.
 
 ## Policy and logging (`policy.py`)
 

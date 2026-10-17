@@ -108,3 +108,22 @@ git). The parts that shape the code:
   (asirobots), gh's own OAuth web flow works, verified 2026-10-17. The
   gateway will run its own pixi `gh` in a temp config dir and move the token
   into the vault, rather than copy gh's client id into our code.
+
+## git, gh and GitHub sign-in (v0.4, phase 3)
+
+- **One `git` tool for all of git.** The user asked for literally every git
+  command to go through the gateway. Local commands carry no credentials;
+  the cost is one MCP call per command.
+- **Accounts are picked by the remote's real URL**, not by what Claude says,
+  and a named account must fit the remote's scope. So Claude can't send the
+  work token to a personal repo by asking.
+- **gh's own web login, run by the hook.** asirobots allows only SSO, and
+  gh's OAuth app works there (verified 2026-10-17). gh can only save a
+  token in the keychain or a file, so it saves to a file in a 0700 temp dir
+  for the few seconds before the hook moves the token into the vault: the
+  one place a token touches disk, by gh's design.
+- **GHES vs github.com:** any GitHub host other than github.com and
+  `*.ghe.com` gets `GH_ENTERPRISE_TOKEN`, as gh expects.
+- **Not yet:** pinned host keys per account (ssh accepts new keys per call
+  and reports them), commit signing, submodules with credentials, and the
+  Bash redirect (phase 9).

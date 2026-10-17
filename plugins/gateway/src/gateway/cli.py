@@ -160,8 +160,13 @@ def cmd_vault(argv: list[str]) -> int:
                 return None
         return got
 
+    def show_code(code, url):
+        print(f"Open {url} (on any device), enter the code {code}, approve, and finish any "
+              "SSO step. Waiting...")
+
     commands.VALUE_PROVIDER = prompt
     commands.FIELDS_PROVIDER = fields
+    commands.LOGIN_SHOW = show_code
     kind, rest = argv[0], " ".join(argv[1:])
     try:
         if kind == "secret":

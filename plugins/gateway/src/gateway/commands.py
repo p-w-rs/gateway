@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import policy, vault, web_form
+from . import logins, policy, vault, web_form
 
 PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo|account)(?=\s|$)(.*)$", re.S)
 
@@ -79,7 +79,7 @@ ACCOUNT_HELP = (
     "/gate:account pubkey KIND:NAME             show its public SSH key (to paste on the site)\n"
     "/gate:account import KIND:NAME SECRET      use a /gate:secret value as its token\n"
     "/gate:account forget KIND:NAME token|ssh_key  remove one credential\n"
-    "/gate:account login KIND:NAME              sign in with SSO (coming in a later version)\n"
+    "/gate:account login KIND:NAME              sign in with SSO (GitHub now; others later)\n"
     "/gate:account del KIND:NAME                delete it\n"
     "/gate:account list                         accounts, scope, methods (never values)"
 )
@@ -176,6 +176,8 @@ _CURRENT: dict[str, str] = {}  # the command being handled, for the hint above
 
 # Set by `run.py vault` to ask multi-field forms in the terminal.
 FIELDS_PROVIDER = None
+# Set by `run.py vault` to print an SSO one-time code instead of a page.
+LOGIN_SHOW = None
 
 
 def _fields_form(title: str, details: list[tuple[str, str]],
@@ -639,9 +641,37 @@ def run_account(rest: str) -> str:
         return _prompts_cmd(parts[0], parts[1:])
 
     if sub == "login":
-        ref = _acct_ref(tail.split()[0] if tail.split() else "", vault.load())
-        raise CommandError(f"SSO sign-in for {ref} comes in a later version of the gateway. "
-                           f"For now add a token or SSH key with /gate:account up {ref}.")
+        data = vault.load()
+        ref = _acct_ref(tail.split()[0] if tail.split() else "", data)
+        kind = data["accounts"][ref]["kind"]
+        if kind != "github":
+            raise CommandError(f"SSO sign-in for {kind} accounts comes in a later version of "
+                               f"the gateway. For now add a token or SSH key with "
+                               f"/gate:account up {ref}.")
+        host = data["accounts"][ref].get("host") or "github.com"
+        try:
+            token, user = logins.github_login(host, show=LOGIN_SHOW)
+        except logins.LoginError as e:
+            raise CommandError(f"{e}; nothing was saved.")
+        except web_form.Unavailable:
+            raise CommandError(
+                "No browser can be opened here, so nothing was saved. Run the same command "
+                "in a terminal on this machine instead (it prints the code):\n  "
+                + terminal_command(_CURRENT.get("args", "account login ...")))
+        with vault.locked():
+            data = vault.load()
+            a = data["accounts"].get(ref)
+            if a is None:
+                raise CommandError(f"{ref} was deleted meanwhile; nothing was saved.")
+            a.setdefault("secrets", {})["token"] = token
+            a["token_source"] = "gh-oauth"
+            if user and not a.get("login"):
+                a["login"] = user
+            a["updated"] = vault.now()
+            vault.save(data)
+            who = f" as {user}" if user else ""
+            return (f"Signed in to {host}{who}; {ref} now uses that sign-in's token "
+                    f"(OAuth, through gh).\n{_describe_account(ref, a, data)}")
 
     with vault.locked():
         data = vault.load()

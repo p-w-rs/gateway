@@ -1628,5 +1628,251 @@ else:
         pass
 _gsrv.shutdown()
 
+# --- git tool, gh tool, GitHub sign-in ---------------------------------------------
+print("git tool:")
+from gateway import ghops, gitops, logins, mcp_server  # noqa: E402
+
+P = gitops.parse_remote
+check("parse: https", P("https://github.com/Acme/repo.git") ==
+      {"scheme": "https", "host": "github.com", "port": None, "owner": "Acme", "repo": "repo",
+       "cred_host": "github.com"})
+check("parse: scp-style ssh", P("git@github.com:acme/r.git")["scheme"] == "ssh"
+      and P("git@github.com:acme/r.git")["owner"] == "acme")
+check("parse: ssh:// with port", P("ssh://git@host.x:2222/o/r")["cred_host"] == "host.x:2222")
+check("parse: local paths and file:// are local", P("/srv/repo.git") is None
+      and P("file:///srv/repo.git") is None and P("../other") is None)
+try:
+    P("https://user:pw@github.com/o/r")
+    check("parse: password in URL refused", False)
+except gitops.GitRefused:
+    check("parse: password in URL refused", True)
+
+_D = {"accounts": {
+    "github:acme": {"kind": "github", "hosts": ["github.com", "api.github.com"], "owners": ["acme"]},
+    "github:me": {"kind": "github", "hosts": ["github.com", "api.github.com"], "owners": []},
+    "hf:me": {"kind": "hf", "hosts": ["huggingface.co"], "owners": []}}}
+_R = lambda owner, host="github.com": {"host": host, "owner": owner}  # noqa: E731
+check("choose: the owner's account wins over a catch-all",
+      gitops.choose_account(_R("Acme"), None, _D)[0] == "github:acme")
+check("choose: other owners get the catch-all account",
+      gitops.choose_account(_R("someone"), None, _D)[0] == "github:me")
+check("choose: no account for an unknown host", gitops.choose_account(_R("x", "gitlab.com"), None, _D) is None)
+try:
+    gitops.choose_account(_R("someone"), "github:acme", _D)
+    check("choose: a named account outside its owners is refused, with the allow hint", False)
+except gitops.GitRefused as e:
+    check("choose: a named account outside its owners is refused, with the allow hint",
+          "/gate:account allow github:acme someone" in str(e))
+_D2 = {"accounts": {"github:a": {"kind": "github", "hosts": ["github.com"], "owners": []},
+                    "github:b": {"kind": "github", "hosts": ["github.com"], "owners": []}}}
+try:
+    gitops.choose_account(_R("x"), None, _D2)
+    check("choose: two catch-alls are ambiguous", False)
+except gitops.GitRefused as e:
+    check("choose: two catch-alls are ambiguous", "pass account=" in str(e))
+for args, want in ((["status"], "local"), (["commit", "-m", "x"], "local"), (["fetch", "origin"], "read"),
+                   (["clone", "u"], "read"), (["push", "origin", "main"], "write"),
+                   (["push", "origin", "--delete", "b"], "delete"), (["push", "origin", ":b"], "delete"),
+                   (["push", "--force-with-lease", "origin", "main"], "delete"),
+                   (["push", "-f", "origin", "main"], "force"), (["push", "origin", "+main"], "force"),
+                   (["lfs", "push", "origin"], "write"), (["lfs", "fetch"], "read")):
+    check(f"classify git {' '.join(args)}", gitops.classify(args[0], args[1:]) == want)
+
+# A GitHub-like account on the loopback git server (owner "acme").
+_acme_srv = RT / "srv" / "acme"
+_acme_srv.mkdir(parents=True)
+_git("init", "-q", "--bare", "-b", "main", str(_acme_srv / "repo.git"))
+_git("config", "http.receivepack", "true", cwd=_acme_srv / "repo.git")
+_gsrv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GitHTTP)
+threading.Thread(target=_gsrv2.serve_forever, daemon=True).start()
+ACME_URL = f"http://127.0.0.1:{_gsrv2.server_address[1]}/acme/repo.git"
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:acme"] = {
+        "kind": "github", "description": "test", "host": "127.0.0.1", "login": "octo",
+        "name": "Octo Acme", "email": "octo@acme.example", "owners": ["acme"],
+        "hosts": ["127.0.0.1"], "secrets": {"token": RUN_TOKEN}, "prompts": {}}
+    _d["accounts"].pop("github:work", None)  # its 127.0.0.1 scope would compete
+    vault.save(_d)
+
+W = RT / "work"
+W.mkdir()
+G = lambda *a, **k: gitops.git_tool(list(a), str(W), **k)  # noqa: E731
+check("git tool: local init", G("init", "-q", "-b", "main")["ok"])
+r = gitops.git_identity(str(W), "github:acme")
+check("git_identity: repo commits as the account",
+      r["ok"] and _git("config", "user.email", cwd=W).stdout.strip() == "octo@acme.example")
+(W / "a.txt").write_text("a\n")
+check("git tool: add + commit (non-interactive)", G("add", "a.txt")["ok"]
+      and G("commit", "-q", "-m", "first")["ok"])
+r = G("commit", "--allow-empty")
+check("git tool: an editor is never opened (with a hint)", not r["ok"] and "-m" in r.get("hint", ""))
+G("remote", "add", "origin", ACME_URL)
+n = len(GIT_SEEN)
+r = G("push", "origin", "main")
+check("git tool: push picks the account for host+owner", r["ok"] and r["account"] == "github:acme"
+      and r["class"] == "write")
+check("git tool: the token reached the server, not the result",
+      len(GIT_SEEN) > n and RUN_TOKEN not in json.dumps(r))
+check("git tool: fetch works too", G("fetch", "origin")["ok"])
+
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:acme"]["prompts"] = {"write": "ask"}
+    vault.save(_d)
+(W / "b.txt").write_text("b\n")
+G("add", "b.txt")
+G("commit", "-q", "-m", "second")
+r = G("push", "origin", "main")
+check("prompt policy ask: git refuses and points at git_confirm",
+      r.get("refused") and r.get("use") == "git_confirm")
+r = G("push", "origin", "main", confirmed=True)
+check("prompt policy ask: git_confirm runs it", r["ok"])
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:acme"]["prompts"] = {"write": "refuse"}
+    vault.save(_d)
+check("prompt policy refuse: even git_confirm is refused",
+      G("push", "origin", "main", confirmed=True).get("refused") is True)
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:acme"]["prompts"] = {}
+    vault.save(_d)
+G("push", "origin", "main:tmpbranch")
+r = G("push", "origin", "--delete", "tmpbranch")
+check("deletes ask by default (git_confirm)", r.get("use") == "git_confirm")
+check("git_confirm deletes", G("push", "origin", "--delete", "tmpbranch", confirmed=True)["ok"])
+check("plain force push refused, even confirmed",
+      G("push", "-f", "origin", "main", confirmed=True).get("refused") is True)
+
+check("vault guard: cwd in the vault refused",
+      gitops.git_tool(["status"], str(vault.home())).get("refused") is True)
+check("vault guard: diff --no-index on the vault key refused",
+      G("diff", "--no-index", str(vault.key_path()), "/dev/null").get("refused") is True)
+check("git config: credential/ssh/hook keys can't be set",
+      G("config", "core.sshCommand", "x").get("refused") is True
+      and G("config", "credential.helper", "x").get("refused") is True
+      and G("config", "url.https://evil/.insteadOf", "https://github.com/").get("refused") is True)
+check("git config: ordinary keys and reads are fine",
+      G("config", "pull.rebase", "true")["ok"] and G("config", "--get", "pull.rebase")["ok"])
+check("plain http to a non-loopback host refused",
+      G("ls-remote", "http://example.com/acme/repo.git").get("refused") is True)
+r = G("ls-remote", f"http://localhost:{_gsrv2.server_address[1]}/other/repo.git")
+check("no matching account: runs without credentials and says so",
+      not r["ok"] and r["account"].startswith("none"))
+check("args must be a list", G.__call__ and gitops.git_tool("status", str(W))["ok"] is False)
+
+print("gh tool:")
+FAKE_GH = RT / "fake-gh"
+FAKE_GH.write_text(f'''#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = login ]; then
+  echo "! One-time code (ABCD-1234) copied to clipboard"
+  echo "Open this URL to continue in your web browser: https://github.com/login/device"
+  sleep "${{FAKE_GH_SLEEP:-1}}"
+  printf 'github.com:\\n    oauth_token: gho_fakeLOGINtoken123456\\n    user: octo-login\\n' > "$GH_CONFIG_DIR/hosts.yml"
+  exit 0
+fi
+echo "args: $*"
+[ -n "$GH_ENTERPRISE_TOKEN" ] && [ -z "$GH_TOKEN" ] && echo "gh-token-present"
+echo "raw=$GH_ENTERPRISE_TOKEN"
+[ -n "$GH_TOKEN" ] && [ -z "$GH_ENTERPRISE_TOKEN" ] && echo "dotcom-token-present"
+echo "gh-host=$GH_HOST"
+echo "ambient: [$GITHUB_TOKEN]"
+[ -n "$GH_CONFIG_DIR" ] && case "$GH_CONFIG_DIR" in *gw-run-*) echo "config: temp";; esac
+exit 0
+''')
+FAKE_GH.chmod(0o755)
+os.environ["GATEWAY_BIN_GH"] = str(FAKE_GH)
+os.environ["GITHUB_TOKEN"] = "ghp_ambient_must_not_show_0000"
+try:
+    r = ghops.gh_tool(["pr", "list"], cwd=str(W))
+    check("gh: account from the repo's origin", r["ok"] and r["account"] == "github:acme"
+          and r["class"] == "read")
+    check("gh: GHES host gets GH_ENTERPRISE_TOKEN, hidden from the result",
+          "gh-token-present" in r["stdout"] and RUN_TOKEN not in json.dumps(r))
+    check("gh: host pinned, temp config dir, no ambient token",
+          "gh-host=127.0.0.1" in r["stdout"] and "config: temp" in r["stdout"]
+          and "ambient: []" in r["stdout"])
+finally:
+    os.environ.pop("GITHUB_TOKEN", None)
+for args in (["auth", "token"], ["repo", "clone", "a/b"], ["pr", "checkout", "1"],
+             ["extension", "install", "x"], ["pr", "view", "--web"],
+             ["api", "https://evil.example.com/x"], ["config", "set", "x", "y"],
+             ["repo", "create", "a/b", "--clone"], ["repo", "fork", "a/b", "--remote"]):
+    check(f"gh refuses {' '.join(args)}",
+          ghops.gh_tool(args, cwd=str(W)).get("refused") is True)
+for args, want in ((["pr", "list"], "read"), (["pr", "create", "-t", "x"], "write"),
+                   (["repo", "delete", "a/b"], "delete"), (["api", "repos/a/b"], "read"),
+                   (["api", "-X", "DELETE", "repos/a/b"], "delete"),
+                   (["api", "repos/a/b/issues", "-f", "title=x"], "write")):
+    check(f"classify gh {' '.join(args)}", ghops.classify(args) == want)
+check("gh repo create without clone/push is allowed",
+      ghops.gh_tool(["repo", "create", "acme/new", "--private"], cwd=str(W))["ok"])
+r = ghops.gh_tool(["repo", "delete", "acme/repo", "--yes"], cwd=str(W))
+check("gh: deletes ask by default (gh_confirm)", r.get("use") == "gh_confirm")
+check("gh_confirm runs it", ghops.gh_tool(["repo", "delete", "acme/repo", "--yes"],
+                                          cwd=str(W), confirmed=True)["ok"])
+
+print("GitHub sign-in:")
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:sso"] = {"kind": "github", "description": "SSO org", "host": "github.com",
+                                    "owners": ["asirobots"], "hosts": ["github.com", "api.github.com"],
+                                    "secrets": {}, "prompts": {}}
+    vault.save(_d)
+acct_form(None)  # the fake browser only opens the page
+ACCT_PLAN.write_text("null")
+os.environ["GATEWAY_BROWSER"] = str(ACCT_BROWSER_SH)
+out = acct("/gate:account login github:sso")
+a = vault.account("github:sso")
+check("login: token from gh's sign-in stored in the vault",
+      a["secrets"].get("token") == "gho_fakeLOGINtoken123456" and a.get("token_source") == "gh-oauth")
+check("login: login name filled in from gh", a.get("login") == "octo-login")
+check("login: the result never holds the token",
+      passed(out) and "gho_fakeLOGINtoken123456" not in out["reason"])
+check("login: gh's temp config dir is removed",
+      not list(Path(tempfile.gettempdir()).glob("gw-login-*")))
+ACCT_PLAN.write_text(json.dumps({"action": "cancel", "fields": {}}))
+os.environ["FAKE_GH_SLEEP"] = "20"
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["github:sso"]["secrets"] = {}
+    vault.save(_d)
+t0 = time.time()
+out = acct("/gate:account login github:sso")
+os.environ.pop("FAKE_GH_SLEEP")
+check("login: Cancel on the page stops gh, nothing saved",
+      "cancelled" in out["reason"] and not vault.account("github:sso")["secrets"].get("token")
+      and time.time() - t0 < 15)
+_shown = []
+_cmds.LOGIN_SHOW = lambda code, url: _shown.append((code, url))
+try:
+    msg = _cmds.run_account("login github:sso")
+finally:
+    _cmds.LOGIN_SHOW = None
+check("login (terminal): prints the code instead of a page",
+      _shown == [("ABCD-1234", "https://github.com/login/device")] and "Signed in" in msg)
+r = ghops.gh_tool(["issue", "list"], account="github:sso")
+check("gh: a github.com account gets GH_TOKEN", r["ok"] and "dotcom-token-present" in r["stdout"]
+      and "gho_fakeLOGINtoken123456" not in json.dumps(r))
+check("login: other kinds say it comes later",
+      "later version" in acct("/gate:account login azure:work")["reason"])
+os.environ.pop("GATEWAY_BIN_GH")
+
+print("MCP + settings:")
+_names = {t["name"] for t in mcp_server.TOOLS}
+check("MCP lists the new tools",
+      {"account_list", "git", "git_confirm", "git_identity", "gh", "gh_confirm"} <= _names)
+r = mcp_server.dispatch("git", {"args": ["status", "--short"], "cwd": str(W)})
+check("MCP dispatch: git", r["ok"] is True)
+r = mcp_server.dispatch("account_list", {})
+check("MCP account_list: never values", r["ok"] and RUN_TOKEN not in json.dumps(r)
+      and "github:acme" in r["accounts"])
+_rules = json.loads((ROOT.parents[1] / "settings.rules.json").read_text())["permissions"]
+check("settings rules: git/gh allowed, the _confirm tools ask",
+      all(f"mcp__plugin_gate_gw__{t}" in _rules["allow"] for t in ("git", "gh", "git_identity", "account_list"))
+      and all(f"mcp__plugin_gate_gw__{t}" in _rules["ask"] for t in ("git_confirm", "gh_confirm")))
+_gsrv2.shutdown()
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

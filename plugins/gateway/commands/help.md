@@ -41,8 +41,11 @@ Reference:
     tools using it ask first (classes read, write, delete, exec).
   - `/gate:account pubkey`, `import KIND:NAME SECRET`, `forget`, `up`,
     `desc`, `disallow`, `del`, `list`, `help`.
-  - An account with a token works as `auth_ref` on `http_request` now; the
-    git/gh/hf/pijul tools and SSO sign-in come in later versions.
+  - `/gate:account login github:NAME`: sign in with GitHub's web flow (works
+    for SSO-only orgs); a page shows the one-time code.
+  - Claude runs git and gh through the gateway's `git` and `gh` tools as the
+    right account; an account with a token also works as `auth_ref` on
+    `http_request`. hf/pijul/Azure tools come later.
 - **No browser here** (ssh, headless Linux)? Run the same command in a
   terminal, which asks at a hidden prompt:
   `pixi run --manifest-path <plugin dir>/pixi.toml vault secret add NAME description`

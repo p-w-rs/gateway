@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, policy
+from . import __version__, actions, ghops, gitops, policy, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -32,6 +32,32 @@ _PRIV_SCHEMA: dict[str, Any] = {
                     "description": "seconds, max 600"},
     },
     "required": ["host", "argv"],
+}
+
+_GIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "git arguments without 'git', e.g. [\"push\", \"origin\", \"main\"]"},
+        "cwd": {"type": "string", "description": "the repository (absolute path); for clone, "
+                                                 "the directory to clone into"},
+        "account": {"type": "string", "description": "KIND:NAME, only to choose between "
+                                                     "several accounts that fit the remote"},
+        "timeout": {"type": "integer", "default": 300},
+    },
+    "required": ["args", "cwd"],
+}
+_GH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "gh arguments without 'gh', e.g. [\"pr\", \"list\"]"},
+        "cwd": {"type": "string", "description": "a repository (absolute path), so gh knows "
+                                                 "the repo and the account"},
+        "account": {"type": "string", "description": "github:NAME"},
+        "timeout": {"type": "integer", "default": 300},
+    },
+    "required": ["args"],
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -147,6 +173,57 @@ TOOLS: list[dict[str, Any]] = [
                            "algo": {"type": "string", "default": "sha256"}},
             "required": ["path"],
         },
+    },
+    {
+        "name": "account_list",
+        "description": ("The user's gateway accounts (KIND:NAME, e.g. github:work): kind, "
+                        "login, owners/hosts they are for, methods (token, ssh_key), prompt "
+                        "policy. Never values. The git and gh tools pick the matching "
+                        "account themselves; pass account= only to choose between several."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "git",
+        "description": ("Run ANY git command (use INSTEAD OF git in Bash). Local commands run "
+                        "without credentials. fetch/pull/push/clone/ls-remote use the "
+                        "user's account for that remote's host and owner (token for https, "
+                        "SSH key for ssh), never the user's own environment. If the "
+                        "account's policy asks first, the call is refused with use: "
+                        "git_confirm: then call git_confirm with the same arguments. Plain "
+                        "force pushes are refused (use --force-with-lease via git_confirm). "
+                        "Non-interactive only: pass -m messages, no editors or -i/-p."),
+        "inputSchema": _GIT_SCHEMA,
+    },
+    {
+        "name": "git_confirm",
+        "description": ("Same as git, after Claude Code asks the user: for calls the account's "
+                        "policy marks ask (often deletes or force-with-lease), or that the "
+                        "user should see first."),
+        "inputSchema": _GIT_SCHEMA,
+    },
+    {
+        "name": "git_identity",
+        "description": ("Make this repo commit as an account: sets the repo's own user.name "
+                        "and user.email from the account (and gateway.account). No secrets."),
+        "inputSchema": {"type": "object",
+                        "properties": {"cwd": {"type": "string", "description": "the repo (absolute path)"},
+                                       "account": {"type": "string", "description": "KIND:NAME"}},
+                        "required": ["cwd", "account"]},
+    },
+    {
+        "name": "gh",
+        "description": ("Run GitHub's CLI as a gateway account (use INSTEAD OF gh in Bash): "
+                        "pr/issue/run/release/repo view|list|create|..., gh api. The account "
+                        "comes from account=, else the repo's origin, else the only GitHub "
+                        "account. Refused: auth, extensions, alias, config, browse/--web, "
+                        "repo clone/sync, pr checkout, and repo create/fork with clone/push/remote options (use the git tool). If the "
+                        "policy asks first, call gh_confirm with the same arguments."),
+        "inputSchema": _GH_SCHEMA,
+    },
+    {
+        "name": "gh_confirm",
+        "description": "Same as gh, after Claude Code asks the user.",
+        "inputSchema": _GH_SCHEMA,
     },
 ]
 
@@ -297,6 +374,22 @@ def dispatch(name: str, args: dict[str, Any],
         return actions.cert_inspect(args["host"], args.get("port", 443))
     if name == "file_hash":
         return actions.file_hash(args["path"], args.get("algo", "sha256"))
+    if name == "account_list":
+        cat = vault.catalog()
+        policy.audit("account_list", {})
+        return {"ok": True, "accounts": cat["accounts"],
+                "note": "Never values. Missing one? Ask the user to run /gate:account add "
+                        "KIND NAME <description> (or /gate:account login KIND:NAME for SSO)."}
+    if name in ("git", "git_confirm"):
+        return gitops.git_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
+                               confirmed=name == "git_confirm",
+                               timeout=min(int(args.get("timeout", 300)), 1800))
+    if name == "git_identity":
+        return gitops.git_identity(args.get("cwd", ""), args.get("account", ""))
+    if name in ("gh", "gh_confirm"):
+        return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
+                             confirmed=name == "gh_confirm",
+                             timeout=min(int(args.get("timeout", 300)), 1800))
     return {"ok": False, "reason": f"unknown tool {name}"}
 
 

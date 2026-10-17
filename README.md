@@ -55,10 +55,12 @@ several GitHub accounts side by side, Hugging Face, Pijul (the Nest or your own
 server), Azure, the ASI ML Catalog, SSH hosts and container registries
 (`KIND:NAME`, e.g. `github:work`). Each is scoped to its hosts and owners, and
 its prompt policy (`read`, `write`, `delete`, `exec` = `auto`, `ask` or
-`refuse`) lives in the vault, so Claude can't loosen it. An account with a
-token already works as `auth_ref` on `http_request`; the tools that run git,
-gh, hf, pijul and the rest as an account, and SSO sign-in
-(`/gate:account login`), are coming in later versions.
+`refuse`) lives in the vault, so Claude can't loosen it. Claude uses them through the gateway's
+`git` tool (every git command; the account is picked from the remote's host
+and owner) and `gh` tool (the plugin's own GitHub CLI), and an account with
+a token works as `auth_ref` on `http_request`. `/gate:account login
+github:NAME` signs in with GitHub's web flow, including SSO-only orgs. hf,
+pijul, Azure and the rest come in later versions.
 
 - **Values never go in the chat.** A one-time page opens in your browser on
   `127.0.0.1` with a masked field; you paste and Save. Claude never sees the

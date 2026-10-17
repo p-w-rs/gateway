@@ -96,8 +96,11 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _which(tool: str) -> str:
-    """The plugin's own pixi binary first (its OpenSSH matches the agent we
-    start), then PATH."""
+    """GATEWAY_BIN_<TOOL> (tests), then the plugin's own pixi binary (its
+    OpenSSH matches the agent we start), then PATH."""
+    forced = os.environ.get("GATEWAY_BIN_" + tool.upper().replace("-", "_"))
+    if forced:
+        return forced
     own = Path(sys.executable).parent / tool
     if own.is_file() and os.access(own, os.X_OK):
         return str(own)
@@ -340,25 +343,9 @@ def run(tool: str, argv: list[str], *, cwd: str | Path, creds: Creds | None = No
             **(env_extra or {})})
         cmd = [_which("git"), *git_config_overrides(tmp, creds, helper, allow_http),
                *_with_pack_flag(argv)]
-        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin
-                                else subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, start_new_session=True)
-        timed_out = False
-        try:
-            out, err = proc.communicate(stdin, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_group(proc)
-            out, err = proc.communicate()
-        truncated = len(out) > max_output or len(err) > max_output
-        seen = [l for l in kh.read_text().splitlines() if l.strip()] \
-            if not (creds and creds.known_hosts) else []
-        res = Result(ok=proc.returncode == 0 and not timed_out,
-                     exit_code=None if timed_out else proc.returncode,
-                     stdout=_clean(out[:max_output], secrets),
-                     stderr=_clean(err[:max_output], secrets),
-                     truncated=truncated, timed_out=timed_out, seen_host_keys=seen,
-                     duration_s=time.time() - started)
+        res = _exec(cmd, cwd, env, timeout, stdin, max_output, secrets, started)
+        if not (creds and creds.known_hosts):
+            res.seen_host_keys = [l for l in kh.read_text().splitlines() if l.strip()]
     finally:
         if feed is not None:
             feed.close()
@@ -370,6 +357,60 @@ def run(tool: str, argv: list[str], *, cwd: str | Path, creds: Creds | None = No
                          "timed_out": res.timed_out,
                          "duration_s": round(res.duration_s, 2)})
     return res
+
+
+# CLIs other than git that run as an account. Their argv rules live with
+# their tools (ghops.py, ...); here they only get a clean env, a temp dir
+# for config, scrubbed output and the audit.
+CLI_TOOLS = {"gh"}
+
+
+def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list[str],
+            env_fn=None, timeout: float = DEFAULT_TIMEOUT, account: str = "",
+            stdin: bytes | None = None, max_output: int = MAX_OUTPUT) -> Result:
+    """Run `tool argv` with env_fn(tmp) -> extra env (credentials, config
+    dirs). The child never inherits the user's environment."""
+    if tool not in CLI_TOOLS:
+        raise RunnerError(f"{tool} is not run through the gateway (yet)")
+    cwd = Path(cwd) if cwd else Path(tempfile.gettempdir())
+    if not cwd.is_dir():
+        raise RunnerError(f"{cwd} is not a directory")
+    tmp = Path(tempfile.mkdtemp(prefix="gw-run-"))
+    started = time.time()
+    try:
+        os.chmod(tmp, 0o700)
+        env = child_env({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                         "GIT_CONFIG_GLOBAL": os.devnull, "PAGER": "cat",
+                         **(env_fn(tmp) if env_fn else {})})
+        res = _exec([_which(tool), *argv], cwd, env, timeout, stdin, max_output, secrets,
+                    started)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    policy.audit("run", {"tool": tool, "account": account, "argv": argv[:40],
+                         "cwd": str(cwd), "exit_code": res.exit_code, "ok": res.ok,
+                         "timed_out": res.timed_out, "duration_s": round(res.duration_s, 2)})
+    return res
+
+
+def _exec(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float,
+          stdin: bytes | None, max_output: int, secrets: list[str], started: float) -> Result:
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env,
+                            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    timed_out = False
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        out, err = proc.communicate()
+    return Result(ok=proc.returncode == 0 and not timed_out,
+                  exit_code=None if timed_out else proc.returncode,
+                  stdout=_clean(out[:max_output], secrets),
+                  stderr=_clean(err[:max_output], secrets),
+                  truncated=len(out) > max_output or len(err) > max_output,
+                  timed_out=timed_out, duration_s=time.time() - started)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
