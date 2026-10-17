@@ -256,15 +256,16 @@ KINDS: dict[str, dict[str, Any]] = {
               "fields": ("host", "login", "name", "email", "remote_pijul"),
               "secrets": ("ssh_key",), "owners": True},
     "azure": {"label": "Azure (Microsoft Entra ID)", "host": "management.azure.com",
-              "fields": ("tenant", "client_id", "login"), "secrets": (), "owners": False},
+              "fields": ("tenant", "client_id", "login"), "secrets": ("refresh_token",),
+              "owners": False},
     "mlcat": {"label": "ASI ML Catalog", "host": "app-dev-ai-mlreg.azurewebsites.net",
-              "fields": ("host", "login"), "secrets": (), "owners": False},
+              "fields": ("host", "login"), "secrets": ("refresh_token",), "owners": False},
     "ssh": {"label": "SSH host", "host": "",
             "fields": ("host", "user", "port", "jump"), "secrets": ("ssh_key",), "owners": False},
     "registry": {"label": "Container registry", "host": "",
                  "fields": ("host", "login"), "secrets": ("token",), "owners": True},
 }
-SECRET_FIELDS = ("token", "ssh_key")
+SECRET_FIELDS = ("token", "ssh_key", "refresh_token")  # refresh_token: an SSO sign-in
 
 
 # The Nest's SSH host key (ed25519, SHA256:iJjr1ZMOZNRGcEtLSDXFUUH0C4+5t7X9Wmhu4T4vcQI),

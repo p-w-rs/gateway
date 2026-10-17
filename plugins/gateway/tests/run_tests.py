@@ -26,6 +26,7 @@ os.environ["GATEWAY_AUDIT_LOG"] = str(TMP / "audit.jsonl")
 os.environ["GATEWAY_HOME"] = str(TMP / "vault")
 os.environ["GATEWAY_DIALOG"] = "none"
 os.environ["GATEWAY_KEYSCAN"] = "none"  # no network: host keys are pinned by hand in tests
+os.environ["GATEWAY_ENTRA_AUTHORITY"] = "http://127.0.0.1:9"  # never Microsoft; a fake later
 
 from gateway import actions, policy  # noqa: E402
 
@@ -1176,6 +1177,9 @@ check("account add: needs a description",
       "Add a description" in acct("/gate:account add github nodesc")["reason"])
 check("account add: bad name refused",
       "not an account name" in acct("/gate:account add github Bad/Name d")["reason"])
+check("host names with digits are not mistaken for tokens",
+      "decision" not in acct("/gate:account allow github:work adb-1234567890123456.7.azuredatabricks.net"))
+acct("/gate:account disallow github:work adb-1234567890123456.7.azuredatabricks.net")
 check("pasted token in the command is blocked, nothing saved",
       acct(f"/gate:account add github leak {GH_TOKEN_V}").get("decision") == "block"
       and vault.account("github:leak") is None)
@@ -1287,8 +1291,8 @@ acct_form({"tenant": "contoso.onmicrosoft.com", "client_id": "", "login": ""})
 acct("/gate:account add azure work Work Azure")
 check("azure: default client id is the Azure CLI's public client",
       vault.account("azure:work")["client_id"] == vault.AZURE_CLI_CLIENT_ID)
-check("login: not available yet, says so",
-      "later version" in acct("/gate:account login azure:work")["reason"])
+check("login: kinds without SSO say so",
+      "no SSO sign-in" in acct("/gate:account login ssh:box")["reason"])
 
 # http_request with an account as auth_ref: only to its hosts.
 n = len(HITS)
@@ -1863,8 +1867,8 @@ check("login (terminal): prints the code instead of a page",
 r = ghops.gh_tool(["issue", "list"], account="github:sso")
 check("gh: a github.com account gets GH_TOKEN", r["ok"] and "dotcom-token-present" in r["stdout"]
       and "gho_fakeLOGINtoken123456" not in json.dumps(r))
-check("login: other kinds say it comes later",
-      "later version" in acct("/gate:account login azure:work")["reason"])
+check("login: kinds without SSO say so (hf)",
+      "no SSO sign-in" in acct("/gate:account login hf:me")["reason"])
 os.environ.pop("GATEWAY_BIN_GH")
 
 print("MCP + settings:")
@@ -2242,6 +2246,158 @@ check("sudo targets find their ssh account (by host or account name)",
       and sshops.account_for_sudo("box.lan", "joshua", _dd) is None)
 check("MCP lists ssh_exec/ssh_copy (+confirm)",
       {"ssh_exec", "ssh_exec_confirm", "ssh_copy", "ssh_copy_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
+
+print("entra / azure:")
+import base64 as _b64e  # noqa: E402
+import hashlib as _hl  # noqa: E402
+from gateway import dbops, entra  # noqa: E402
+
+ENTRA = {"challenge": "", "rt": "", "n": 0, "token_hits": 0, "device_polls": 0, "scopes": []}
+
+
+def _jwt(claims):
+    enc = lambda d: _b64e.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")  # noqa: E731
+    return f"{enc({'alg': 'none'})}.{enc(claims)}.sig"
+
+
+class FakeEntra(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        if u.path.endswith("/authorize"):
+            ENTRA["challenge"] = q["code_challenge"]
+            ENTRA["scopes"].append(q["scope"])
+            self.send_response(302)
+            self.send_header("Location", f"{q['redirect_uri']}?code=CODE1&state={q['state']}")
+            self.end_headers()
+            return
+        self._json(404, {})
+
+    def do_POST(self):
+        f = {k: v[0] for k, v in urllib.parse.parse_qs(
+            self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()).items()}
+        if self.path.endswith("/devicecode"):
+            self._json(200, {"user_code": "DEV-123", "device_code": "dc1", "interval": 0.1,
+                             "expires_in": 30, "verification_uri": "https://microsoft.com/devicelogin"})
+            return
+        ENTRA["token_hits"] += 1
+        g = f.get("grant_type")
+        if g == "authorization_code":
+            ok = (f.get("code") == "CODE1" and _b64e.urlsafe_b64encode(
+                _hl.sha256(f["code_verifier"].encode()).digest()).decode().rstrip("=") == ENTRA["challenge"])
+            if not ok:
+                self._json(400, {"error": "invalid_grant", "error_description": "PKCE mismatch"})
+                return
+        elif g == "urn:ietf:params:oauth:grant-type:device_code":
+            ENTRA["device_polls"] += 1
+            if ENTRA["device_polls"] < 2:
+                self._json(400, {"error": "authorization_pending"})
+                return
+        elif g == "refresh_token":
+            if f.get("refresh_token") != ENTRA["rt"]:
+                self._json(400, {"error": "invalid_grant", "error_description": "stale refresh token"})
+                return
+        ENTRA["n"] += 1
+        ENTRA["rt"] = f"rt-{ENTRA['n']}"
+        self._json(200, {"access_token": f"at-{ENTRA['n']}-{_hl.sha1(f.get('scope', '').encode()).hexdigest()[:6]}",
+                         "refresh_token": ENTRA["rt"], "expires_in": 3600,
+                         "id_token": _jwt({"preferred_username": "jpowers@asirobots.com",
+                                           "tid": "794c042e-da02-4688-96e8-1ddf59b497ff"})})
+
+
+_esrv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeEntra)
+threading.Thread(target=_esrv.serve_forever, daemon=True).start()
+os.environ["GATEWAY_ENTRA_AUTHORITY"] = f"http://127.0.0.1:{_esrv.server_address[1]}"
+FOLLOW = RT / "follow.py"
+FOLLOW.write_text("import sys, urllib.request\nurllib.request.urlopen(sys.argv[1], timeout=10).read()\n")
+FOLLOW_SH = RT / "follow.sh"
+FOLLOW_SH.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FOLLOW}" "$1"\n')
+FOLLOW_SH.chmod(0o755)
+_prev_browser = os.environ["GATEWAY_BROWSER"]
+os.environ["GATEWAY_BROWSER"] = str(FOLLOW_SH)
+try:
+    out = acct("/gate:account login azure:work")
+finally:
+    os.environ["GATEWAY_BROWSER"] = _prev_browser
+a = vault.account("azure:work")
+check("entra login (browser, PKCE): refresh token stored", a["secrets"].get("refresh_token") == "rt-1")
+check("entra login: login and tenant id from the sign-in",
+      a.get("login") == "jpowers@asirobots.com" and a.get("tenant_id") == "794c042e-da02-4688-96e8-1ddf59b497ff")
+check("entra login: asks for offline access with the ARM scope",
+      "offline_access" in ENTRA["scopes"][-1] and "management.azure.com" in ENTRA["scopes"][-1])
+check("entra login: result holds no token", passed(out) and "rt-1" not in out["reason"]
+      and "at-1" not in out["reason"])
+n = len(HITS)
+r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="storage")
+check("azure token refused for a host outside the account", r.get("refused") is True and len(HITS) == n)
+acct("/gate:account allow azure:work 127.0.0.1")
+_hits = ENTRA["token_hits"]
+r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="storage")
+_auth = echoed(r).get("authorization", "")
+check("azure: a minted access token is sent to an allowed host (and scrubbed from the echo)",
+      r.get("ok") and _auth.startswith("Bearer ") and ENTRA["token_hits"] == _hits + 1)
+check("azure: minted token hidden from the result", "at-2" not in json.dumps({k: v for k, v in r.items() if k != "body"}))
+check("azure: the rotated refresh token replaced the old one",
+      vault.account("azure:work")["secrets"].get("refresh_token") == "rt-2")
+actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="storage")
+check("azure: the access token is cached (no second refresh)", ENTRA["token_hits"] == _hits + 1)
+r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="graph")
+check("azure: another scope mints another token", ENTRA["token_hits"] == _hits + 2 and r.get("ok"))
+_shown2 = []
+_cmds.LOGIN_SHOW = lambda code, url: _shown2.append(code)
+try:
+    msg = _cmds.run_account("login azure:work")
+finally:
+    _cmds.LOGIN_SHOW = None
+check("entra login (terminal): device code shown, then signed in",
+      _shown2 == ["DEV-123"] and "Signed in" in msg)
+
+FAKE_DB = RT / "fake-databricks"
+FAKE_DB.write_text('''#!/bin/sh
+echo "args: $*"
+echo "host=$DATABRICKS_HOST"
+[ -n "$DATABRICKS_TOKEN" ] && echo "db-token-present"
+echo "auth=$DATABRICKS_AUTH_TYPE"
+[ -s "$DATABRICKS_CONFIG_FILE" ] || echo "cfg-empty"
+''')
+FAKE_DB.chmod(0o755)
+os.environ["GATEWAY_BIN_DATABRICKS"] = str(FAKE_DB)
+try:
+    WS = "adb-123.4.azuredatabricks.net"
+    check("databricks: workspace outside the account refused",
+          dbops.databricks_tool(["clusters", "list"], "azure:work", WS).get("refused") is True)
+    acct(f"/gate:account allow azure:work {WS}")
+    r = dbops.databricks_tool(["clusters", "list"], "azure:work", f"https://{WS}/")
+    check("databricks: Entra token for the workspace, pat auth, no profiles",
+          r["ok"] and f"host=https://{WS}" in r["stdout"] and "db-token-present" in r["stdout"]
+          and "auth=pat" in r["stdout"] and "cfg-empty" in r["stdout"])
+    check("databricks: the token was minted for the Databricks resource",
+          any("2ff814a6" in s for s in [entra.resolve_scope("databricks")]))
+    for args in (["auth", "token"], ["configure"], ["clusters", "list", "--profile", "x"]):
+        check(f"databricks refuses {' '.join(args)}",
+              dbops.databricks_tool(args, "azure:work", WS).get("refused") is True)
+    for args, want in ((["clusters", "list"], "read"), (["jobs", "create", "--json", "{}"], "write"),
+                       (["clusters", "delete", "x"], "delete"), (["api", "get", "/x"], "read"),
+                       (["api", "post", "/x"], "write")):
+        check(f"classify databricks {' '.join(args)}", dbops.classify(args) == want)
+    check("databricks: deletes ask (databricks_confirm)",
+          dbops.databricks_tool(["clusters", "delete", "x"], "azure:work", WS).get("use") == "databricks_confirm")
+finally:
+    os.environ.pop("GATEWAY_BIN_DATABRICKS")
+check("MCP lists databricks (+confirm) and http_request has auth_scope",
+      {"databricks", "databricks_confirm"} <= {t["name"] for t in mcp_server.TOOLS}
+      and "auth_scope" in json.dumps([t for t in mcp_server.TOOLS if t["name"] == "http_request"]))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

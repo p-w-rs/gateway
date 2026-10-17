@@ -134,7 +134,7 @@ def _hide(obj: Any, secrets: list[str]) -> Any:
 def http_request(method: str, url: str, headers: dict | None = None,
                  body: str | None = None, auth_ref: str | None = None,
                  approve: Approver = None, auth_header: str = "Authorization",
-                 auth_scheme: str = "Bearer") -> dict[str, Any]:
+                 auth_scheme: str = "Bearer", auth_scope: str | None = None) -> dict[str, Any]:
     method = method.upper()
     host = policy.url_host(url)
     action = "read_request" if method in READ_METHODS else "write_request"
@@ -159,7 +159,7 @@ def http_request(method: str, url: str, headers: dict | None = None,
         if not re.fullmatch(r"[A-Za-z0-9-]+", auth_header or ""):
             return {"ok": False, "reason": "auth_header must be a plain header name."}
         try:
-            value = _resolve_secret(auth_ref, cfg)
+            value = _resolve_secret(auth_ref, cfg, auth_scope)
         except Exception as e:
             return {"ok": False, "reason": f"Could not resolve auth ref: {e}"}
         headers[auth_header] = f"{auth_scheme} {value}" if auth_scheme else value
@@ -292,11 +292,19 @@ def _how_to_allow(ref: str, host: str) -> str:
             f"/gate:{cmd} allow {ref} {host} - then retry.")
 
 
-def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None) -> str:
+def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None,
+                    scope: str | None = None) -> str:
     """Resolve a vault secret NAME, or an account's token (KIND:NAME), to its
-    raw value. Never returned to Claude."""
+    raw value. Never returned to Claude. azure/mlcat accounts mint an Entra
+    access token for `scope` (default: ARM, or the catalog's API)."""
     if vault.parse_account_ref(ref or ""):
         a = vault.account(ref)
+        if a is not None and a.get("kind") in ("azure", "mlcat"):
+            from . import entra
+            if a["kind"] == "mlcat":
+                from . import mlcat
+                return mlcat.api_token(ref, a)
+            return entra.access_token(ref, scope or "arm")
         token = (a or {}).get("secrets", {}).get("token")
         if not token:
             raise RuntimeError(f"the account {ref} has no token" if a else

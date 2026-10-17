@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import logins, policy, vault, web_form
+from . import entra, logins, policy, vault, web_form
 
 PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo|account)(?=\s|$)(.*)$", re.S)
 
@@ -79,7 +79,7 @@ ACCOUNT_HELP = (
     "/gate:account pubkey KIND:NAME             show its public SSH key (to paste on the site)\n"
     "/gate:account import KIND:NAME SECRET      use a /gate:secret value as its token\n"
     "/gate:account forget KIND:NAME token|ssh_key  remove one credential\n"
-    "/gate:account login KIND:NAME              sign in with SSO (GitHub now; others later)\n"
+    "/gate:account login KIND:NAME              sign in with SSO (GitHub, Azure, ML Catalog)\n"
     "/gate:account del KIND:NAME                delete it\n"
     "/gate:account list                         accounts, scope, methods (never values)"
 )
@@ -131,8 +131,15 @@ _TOKEN_LIKE = re.compile(
     r"|^(?=\S*[A-Za-z])(?=\S*\d)\S{20,}$")
 
 
+_KNOWN_PREFIX = re.compile(r"^(?:hf_|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|sk-|xox[abprs]-|AKIA)")
+_HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$")
+
+
 def _guard_text(words: list[str]) -> None:
-    hits = [w for w in words if _TOKEN_LIKE.match(w)]
+    # A host name (adb-1234567890.7.azuredatabricks.net) is long and mixes
+    # letters and digits too; only a known token prefix flags one.
+    hits = [w for w in words if _TOKEN_LIKE.match(w)
+            and (_KNOWN_PREFIX.match(w) or not _HOSTNAME.match(w.lower()))]
     if hits:
         raise LooksLikeValue(
             "That looks like it contains a secret value, so it was not sent to "
@@ -559,6 +566,53 @@ def _apply_form(ref: str, kind: str, got: dict[str, str],
     return rec, note
 
 
+def _entra_settings(ref: str, a: dict[str, Any]) -> tuple[str, str, str]:
+    """(tenant, client_id, scope) to sign in with."""
+    if a["kind"] == "mlcat":
+        from . import mlcat
+        cfg = mlcat.catalog_config(a.get("host", ""))
+        return cfg["tenantId"], cfg["cliClientId"], mlcat.api_scope(cfg)
+    if not a.get("tenant"):
+        raise CommandError(f"{ref} has no tenant; set it with /gate:account up {ref}")
+    return a["tenant"], a.get("client_id") or vault.AZURE_CLI_CLIENT_ID, entra.SCOPES["arm"]
+
+
+def _entra_login(ref: str, data: dict[str, Any]) -> str:
+    a = data["accounts"][ref]
+    try:
+        tenant, client_id, scope = _entra_settings(ref, a)
+        if LOGIN_SHOW is not None:
+            tok = entra.login_device(tenant, client_id, scope, LOGIN_SHOW)
+        else:
+            tok = entra.login_browser(tenant, client_id, scope)
+    except entra.EntraError as e:
+        raise CommandError(f"{e}; nothing was saved.")
+    except web_form.Unavailable:
+        raise CommandError(
+            "No browser can be opened here, so nothing was saved. Run the same command in a "
+            "terminal on this machine instead (it shows a device code):\n  "
+            + terminal_command(_CURRENT.get("args", "account login ...")))
+    except Exception as e:  # e.g. the catalog's config couldn't be read
+        raise CommandError(f"{e}; nothing was saved.")
+    if not tok.get("refresh_token"):
+        raise CommandError("Entra returned no refresh token; nothing was saved.")
+    claims = tok.get("claims", {})
+    with vault.locked():
+        data = vault.load()
+        a = data["accounts"].get(ref)
+        if a is None:
+            raise CommandError(f"{ref} was deleted meanwhile; nothing was saved.")
+        a.setdefault("secrets", {})["refresh_token"] = tok["refresh_token"]
+        a["client_id"], a["tenant_id"] = client_id, claims.get("tid") or tenant
+        if claims.get("preferred_username"):
+            a["login"] = claims["preferred_username"]
+        a["token_source"] = "entra"
+        a["updated"] = vault.now()
+        vault.save(data)
+        who = f" as {a.get('login')}" if a.get("login") else ""
+        return f"Signed in{who}; {ref} can now get tokens.\n{_describe_account(ref, a, data)}"
+
+
 def _prompts_cmd(target: str, words: list[str]) -> str:
     with vault.locked():
         data = vault.load()
@@ -627,8 +681,7 @@ def run_account(rest: str) -> str:
         details = [("Account", ref), ("Kind", spec["label"]),
                    ("Description", desc.strip() or (old or {}).get("description", ""))]
         if kind in ("azure", "mlcat"):
-            details.append(("Sign-in", "SSO sign-in comes with /gate:account login "
-                                       "in a later version"))
+            details.append(("Sign-in", f"after saving, run /gate:account login {ref}"))
         got = _fields_form(f"{'Add' if sub == 'add' else 'Update'} the account {ref}",
                            details, _account_fields(kind, old))
         if got is None:
@@ -654,10 +707,11 @@ def run_account(rest: str) -> str:
         data = vault.load()
         ref = _acct_ref(tail.split()[0] if tail.split() else "", data)
         kind = data["accounts"][ref]["kind"]
+        if kind in ("azure", "mlcat"):
+            return _entra_login(ref, data)
         if kind != "github":
-            raise CommandError(f"SSO sign-in for {kind} accounts comes in a later version of "
-                               f"the gateway. For now add a token or SSH key with "
-                               f"/gate:account up {ref}.")
+            raise CommandError(f"There is no SSO sign-in for {kind} accounts; add a token or "
+                               f"SSH key with /gate:account up {ref}.")
         host = data["accounts"][ref].get("host") or "github.com"
         try:
             token, user = logins.github_login(host, show=LOGIN_SHOW)

@@ -17,7 +17,8 @@
       "mcp__plugin_gate_gw__hf",
       "mcp__plugin_gate_gw__pijul",
       "mcp__plugin_gate_gw__ssh_exec",
-      "mcp__plugin_gate_gw__ssh_copy"
+      "mcp__plugin_gate_gw__ssh_copy",
+      "mcp__plugin_gate_gw__databricks"
     ],
     "ask": [
       "mcp__plugin_gate_gw__port_check",
@@ -27,7 +28,8 @@
       "mcp__plugin_gate_gw__hf_confirm",
       "mcp__plugin_gate_gw__pijul_confirm",
       "mcp__plugin_gate_gw__ssh_exec_confirm",
-      "mcp__plugin_gate_gw__ssh_copy_confirm"
+      "mcp__plugin_gate_gw__ssh_copy_confirm",
+      "mcp__plugin_gate_gw__databricks_confirm"
     ],
     "deny": [
       "Bash(curl:*)",

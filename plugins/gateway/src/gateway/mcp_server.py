@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, ghops, gitops, hfops, mirrors, pijulops, policy, sshops, vault
+from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, pijulops, policy, sshops, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -97,6 +97,19 @@ _COPY_SCHEMA: dict[str, Any] = {
     "required": ["account", "direction", "local", "remote"],
 }
 
+_DB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "databricks arguments, e.g. [\"clusters\", \"list\"]"},
+        "account": {"type": "string", "description": "azure:NAME"},
+        "workspace": {"type": "string", "description": "the workspace host or URL"},
+        "cwd": {"type": "string"},
+        "timeout": {"type": "integer", "default": 600},
+    },
+    "required": ["args", "account", "workspace"],
+}
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "http_request",
@@ -118,6 +131,10 @@ TOOLS: list[dict[str, Any]] = [
                 "body": {"type": "string"},
                 "auth_ref": {"type": "string",
                              "description": "Secret NAME from the vault (e.g. HF_TOKEN), or an account with a token (e.g. github:work)"},
+                "auth_scope": {"type": "string",
+                               "description": "azure accounts only: arm (default), storage, "
+                                              "graph, databricks, or a full scope like "
+                                              "api://<app>/.default"},
                 "auth_header": {"type": "string", "default": "Authorization",
                                 "description": "Header to put the secret in, e.g. X-Api-Key"},
                 "auth_scheme": {"type": "string", "default": "Bearer",
@@ -338,6 +355,21 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _COPY_SCHEMA,
     },
     {
+        "name": "databricks",
+        "description": ("Run the Databricks CLI as a gateway azure account (use INSTEAD OF "
+                        "databricks in Bash): workspace is the workspace host (e.g. "
+                        "adb-123.4.azuredatabricks.net, which must be one of the account's "
+                        "hosts); an Entra token is minted for it. auth/configure/sync and "
+                        "--profile/--host are refused. If the policy asks first, call "
+                        "databricks_confirm."),
+        "inputSchema": _DB_SCHEMA,
+    },
+    {
+        "name": "databricks_confirm",
+        "description": "Same as databricks, after Claude Code asks the user.",
+        "inputSchema": _DB_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -474,7 +506,7 @@ def dispatch(name: str, args: dict[str, Any],
             args.get("method", "GET"), args["url"], args.get("headers"),
             args.get("body"), args.get("auth_ref"), approve=approve,
             auth_header=args.get("auth_header", "Authorization"),
-            auth_scheme=args.get("auth_scheme", "Bearer"))
+            auth_scheme=args.get("auth_scheme", "Bearer"), auth_scope=args.get("auth_scope"))
     if name == "download":
         return actions.download(args["url"], approve=approve)
     if name == "port_check":
@@ -524,6 +556,11 @@ def dispatch(name: str, args: dict[str, Any],
                                args.get("local", ""), args.get("remote", ""),
                                bool(args.get("recursive")), confirmed=name == "ssh_copy_confirm",
                                timeout=min(int(args.get("timeout", 1800)), 7200))
+    if name in ("databricks", "databricks_confirm"):
+        return dbops.databricks_tool(args.get("args"), args.get("account", ""),
+                                     args.get("workspace", ""), args.get("cwd"),
+                                     confirmed=name == "databricks_confirm",
+                                     timeout=min(int(args.get("timeout", 600)), 3600))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",
