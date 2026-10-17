@@ -414,6 +414,7 @@ FIELD_INFO = {
                   "the app to sign in with; empty = the Azure CLI's public client"),
     "user": ("User", "the login user on that host"),
     "port": ("Port (optional)", "empty = 22"),
+    "jump": ("Jump host (optional)", "another ssh account to go through, e.g. ssh:bastion"),
 }
 
 
@@ -486,7 +487,8 @@ def _clean_setting(kind: str, f: str, v: str) -> str:
           "remote_pijul": lambda x: x.startswith("/") and x.isprintable() and " " not in x,
           "tenant": lambda x: vault.GUID_RE.fullmatch(x) or vault.HOST_RE.fullmatch(x.lower()),
           "client_id": vault.GUID_RE.fullmatch,
-          "port": lambda x: x.isdigit() and 0 < int(x) < 65536}[f]
+          "port": lambda x: x.isdigit() and 0 < int(x) < 65536,
+          "jump": lambda x: vault.parse_account_ref(x) and x.startswith("ssh:")}[f]
     if not ok(v):
         raise CommandError(f"'{v}' is not a valid {FIELD_INFO[f][0].lower()}.")
     return v.lower() if f in ("host",) else v

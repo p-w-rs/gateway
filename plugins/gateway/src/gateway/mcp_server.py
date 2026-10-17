@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, ghops, gitops, hfops, mirrors, pijulops, policy, vault
+from . import __version__, actions, ghops, gitops, hfops, mirrors, pijulops, policy, sshops, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -82,6 +82,19 @@ _PIJUL_SCHEMA: dict[str, Any] = {
         "timeout": {"type": "integer", "default": 600},
     },
     "required": ["args", "cwd"],
+}
+
+_COPY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "account": {"type": "string", "description": "ssh:NAME"},
+        "direction": {"type": "string", "enum": ["up", "down"]},
+        "local": {"type": "string", "description": "absolute local path"},
+        "remote": {"type": "string", "description": "path on the server"},
+        "recursive": {"type": "boolean", "default": False},
+        "timeout": {"type": "integer", "default": 1800},
+    },
+    "required": ["account", "direction", "local", "remote"],
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -293,6 +306,38 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _PIJUL_SCHEMA,
     },
     {
+        "name": "ssh_exec",
+        "description": ("Run a command on a server as a gateway ssh account (use INSTEAD OF ssh "
+                        "in Bash). argv is a list (no shell strings). The account's key and "
+                        "pinned host key are used, never the user's own ssh setup. Most "
+                        "accounts ask first (exec=ask): then call ssh_exec_confirm. For root, "
+                        "use run_privileged."),
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "ssh:NAME"},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "integer", "default": 300}},
+            "required": ["account", "argv"]},
+    },
+    {
+        "name": "ssh_exec_confirm",
+        "description": "Same as ssh_exec, after Claude Code asks the user.",
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "integer", "default": 300}}, "required": ["account", "argv"]},
+    },
+    {
+        "name": "ssh_copy",
+        "description": ("Copy a file or folder to (up) or from (down) a server as a gateway ssh "
+                        "account (use INSTEAD OF scp/rsync/sftp in Bash). If the policy asks "
+                        "first, call ssh_copy_confirm."),
+        "inputSchema": _COPY_SCHEMA,
+    },
+    {
+        "name": "ssh_copy_confirm",
+        "description": "Same as ssh_copy, after Claude Code asks the user.",
+        "inputSchema": _COPY_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -470,6 +515,15 @@ def dispatch(name: str, args: dict[str, Any],
         return pijulops.pijul_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
                                    confirmed=name == "pijul_confirm",
                                    timeout=min(int(args.get("timeout", 600)), 3600))
+    if name in ("ssh_exec", "ssh_exec_confirm"):
+        return sshops.ssh_exec(args.get("account", ""), args.get("argv"),
+                               confirmed=name == "ssh_exec_confirm",
+                               timeout=min(int(args.get("timeout", 300)), 3600))
+    if name in ("ssh_copy", "ssh_copy_confirm"):
+        return sshops.ssh_copy(args.get("account", ""), args.get("direction", ""),
+                               args.get("local", ""), args.get("remote", ""),
+                               bool(args.get("recursive")), confirmed=name == "ssh_copy_confirm",
+                               timeout=min(int(args.get("timeout", 1800)), 7200))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",

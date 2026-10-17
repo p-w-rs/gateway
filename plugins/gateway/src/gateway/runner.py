@@ -144,7 +144,7 @@ AGENT_PIDS: list[int] = []  # every private agent started (the tests check they'
 class _Agent:
     """A private ssh-agent holding one key, for the length of one call."""
 
-    def __init__(self, tmp: Path, private_key: str):
+    def __init__(self, tmp: Path, private_key: str | list[str]):
         self.sock = tmp / "agent.sock"
         self.proc = subprocess.Popen([_which("ssh-agent"), "-D", "-a", str(self.sock)],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -156,13 +156,14 @@ class _Agent:
                 self.close()
                 raise RunnerError("could not start a private ssh-agent")
             time.sleep(0.02)
-        add = subprocess.run([_which("ssh-add"), "-q", "-"],
-                             input=private_key.strip().encode() + b"\n",
-                             env=child_env({"SSH_AUTH_SOCK": str(self.sock)}),
-                             capture_output=True, timeout=15)
-        if add.returncode != 0:
-            self.close()
-            raise RunnerError("the account's SSH key could not be loaded")
+        for key in [private_key] if isinstance(private_key, str) else private_key:
+            add = subprocess.run([_which("ssh-add"), "-q", "-"],
+                                 input=key.strip().encode() + b"\n",
+                                 env=child_env({"SSH_AUTH_SOCK": str(self.sock)}),
+                                 capture_output=True, timeout=15)
+            if add.returncode != 0:
+                self.close()
+                raise RunnerError("the account's SSH key could not be loaded")
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -404,7 +405,7 @@ CLI_TOOLS = {"gh", "hf", "pijul", "ssh", "scp", "rsync", "databricks", "dvc",
 def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list[str],
             env_fn=None, timeout: float = DEFAULT_TIMEOUT, account: str = "",
             stdin: bytes | None = None, max_output: int = MAX_OUTPUT,
-            ssh_key: str = "", argv_fn=None) -> Result:
+            ssh_key: str | list[str] = "", argv_fn=None) -> Result:
     """Run `tool argv` with env_fn(tmp) -> extra env (credentials, config
     dirs). With ssh_key, a private agent holds it: SSH_AUTH_SOCK points at
     it and tmp/agent.sock is its socket. argv_fn(tmp) may rewrite argv once
@@ -418,12 +419,14 @@ def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list
     tmp = Path(tempfile.mkdtemp(prefix="gw-run-"))
     started = time.time()
     agent: _Agent | None = None
-    secrets = list(secrets) + ([ssh_key.strip()] if ssh_key else [])
+    keys = [ssh_key] if isinstance(ssh_key, str) else list(ssh_key)
+    keys = [k for k in keys if k]
+    secrets = list(secrets) + [k.strip() for k in keys]
     try:
         os.chmod(tmp, 0o700)
         extra: dict[str, str] = {}
-        if ssh_key:
-            agent = _Agent(tmp, ssh_key)
+        if keys:
+            agent = _Agent(tmp, keys)
             extra["SSH_AUTH_SOCK"] = str(agent.sock)
         env = child_env({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
                          "GIT_CONFIG_GLOBAL": os.devnull, "PAGER": "cat", **extra,

@@ -2072,7 +2072,8 @@ def _start_sshd(d: Path, client_pub: str) -> tuple[int, str] | None:
     (d / "sshd_config").write_text(
         f"Port {port}\nListenAddress 127.0.0.1\nHostKey {d / 'host'}\nPidFile {d / 'pid'}\n"
         f"AuthorizedKeysFile {d / 'authorized_keys'}\nPasswordAuthentication no\n"
-        "KbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n")
+        "KbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n"
+        "Subsystem sftp internal-sftp\n")
     subprocess.run([sshd, "-f", str(d / "sshd_config"), "-E", str(d / "log")])
     for _ in range(100):
         try:
@@ -2159,6 +2160,88 @@ else:
     except (OSError, ValueError):
         pass
 check("MCP lists pijul/pijul_confirm", {"pijul", "pijul_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
+
+print("ssh hosts:")
+from gateway import sshops  # noqa: E402
+
+SH = RT / "sshhosts"
+SH.mkdir()
+_t = _start_sshd(SH / "target", (SSHD_DIR / "client.pub").read_text()) if _ssh_ok else None
+_j = _start_sshd(SH / "jump", (SSHD_DIR / "client.pub").read_text()) if _ssh_ok else None
+if not (_t and _j):
+    print("  skip ssh host checks (no sshd)")
+else:
+    TPORT, TKNOWN = _t
+    JPORT, JKNOWN = _j
+    _key = (SSHD_DIR / "client").read_text()
+    _pub = (SSHD_DIR / "client.pub").read_text().strip()
+    with vault.locked():
+        _d = vault.load()
+        for _ref, _port, _kh, _jump in (("ssh:lab", TPORT, TKNOWN, ""), ("ssh:jump", JPORT, JKNOWN, ""),
+                                        ("ssh:via", TPORT, TKNOWN, "ssh:jump")):
+            _d["accounts"][_ref] = {"kind": "ssh", "description": "test", "host": "127.0.0.1",
+                                    "user": ME, "port": str(_port), "jump": _jump,
+                                    "hosts": ["127.0.0.1"], "known_hosts": _kh,
+                                    "secrets": {"ssh_key": _key}, "public_key": _pub, "prompts": {}}
+        vault.save(_d)
+    r = sshops.ssh_exec("ssh:lab", ["echo", "hi there"])
+    check("ssh_exec: asks by default (exec=ask), points at ssh_exec_confirm",
+          r.get("use") == "ssh_exec_confirm")
+    r = sshops.ssh_exec("ssh:lab", ["echo", "hi there"], confirmed=True)
+    check("ssh_exec_confirm runs the command with the account's key", r["ok"] and "hi there" in r["stdout"])
+    r = sshops.ssh_exec("ssh:lab", ["printf", "%s|", "a b", "$HOME", ";id"], confirmed=True)
+    check("ssh_exec: argv is quoted once (no shell expansion or injection)",
+          r["ok"] and r["stdout"] == "a b|$HOME|;id|")
+    check("ssh_exec: blocked commands refused there too",
+          sshops.ssh_exec("ssh:lab", ["curl", "https://x"], confirmed=True).get("refused") is True)
+    r = sshops.ssh_exec("ssh:via", ["echo", "through the jump"], confirmed=True)
+    check("ssh_exec: through a jump host (both keys in the private agent)",
+          r["ok"] and "through the jump" in r["stdout"])
+    _src = SH / "up.txt"
+    _src.write_text("payload\n")
+    r = sshops.ssh_copy("ssh:lab", "up", str(_src), str(SH / "uploaded.txt"))
+    check("ssh_copy up (write=auto)", r["ok"] and (SH / "uploaded.txt").read_text() == "payload\n")
+    r = sshops.ssh_copy("ssh:lab", "down", str(SH / "down.txt"), str(SH / "uploaded.txt"))
+    check("ssh_copy down", r["ok"] and (SH / "down.txt").read_text() == "payload\n")
+    check("ssh_copy refuses the vault as local path",
+          sshops.ssh_copy("ssh:lab", "down", str(vault.home() / "x"), "/etc/hosts").get("refused") is True)
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["ssh:lab"]["known_hosts"] = JKNOWN.replace(str(JPORT), str(TPORT))
+        vault.save(_d)
+    r = sshops.ssh_exec("ssh:lab", ["true"], confirmed=True)
+    check("ssh_exec: a host key that doesn't match the pin is refused, with a hint",
+          not r["ok"] and "pinned" in r.get("hint", ""))
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["ssh:lab"]["known_hosts"] = ""
+        vault.save(_d)
+    check("ssh_exec: no pinned host key, no connection",
+          sshops.ssh_exec("ssh:lab", ["true"], confirmed=True).get("refused") is True)
+    # Pinning at /gate:account add time (the user's command) reads the host key.
+    os.environ.pop("GATEWAY_KEYSCAN")
+    try:
+        acct_form({"host": "127.0.0.1", "user": ME, "port": str(TPORT), "jump": "",
+                   "ssh_key_mode": "none", "ssh_key": ""})
+        out = acct("/gate:account add ssh scanned Scanned host")
+        _kh = vault.account("ssh:scanned").get("known_hosts", "")
+        check("account add: the host key is read and pinned, fingerprint shown",
+              TKNOWN.split()[2] in _kh and "Host key pinned" in out["reason"])
+    finally:
+        os.environ["GATEWAY_KEYSCAN"] = "none"
+    for _sd in ("target", "jump"):
+        try:
+            os.kill(int((SH / _sd / "pid").read_text()), 15)
+        except (OSError, ValueError):
+            pass
+_dd = {"accounts": {"ssh:powerslabs": {"kind": "ssh", "host": "10.0.0.5", "user": "joshua"},
+                    "ssh:box": {"kind": "ssh", "host": "box.lan", "user": "root"}}}
+check("sudo targets find their ssh account (by host or account name)",
+      sshops.account_for_sudo("powerslabs", "joshua", _dd)[0] == "ssh:powerslabs"
+      and sshops.account_for_sudo("box.lan", "root", _dd)[0] == "ssh:box"
+      and sshops.account_for_sudo("box.lan", "joshua", _dd) is None)
+check("MCP lists ssh_exec/ssh_copy (+confirm)",
+      {"ssh_exec", "ssh_exec_confirm", "ssh_copy", "ssh_copy_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

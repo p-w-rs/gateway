@@ -260,7 +260,7 @@ KINDS: dict[str, dict[str, Any]] = {
     "mlcat": {"label": "ASI ML Catalog", "host": "app-dev-ai-mlreg.azurewebsites.net",
               "fields": ("host", "login"), "secrets": (), "owners": False},
     "ssh": {"label": "SSH host", "host": "",
-            "fields": ("host", "user", "port"), "secrets": ("ssh_key",), "owners": False},
+            "fields": ("host", "user", "port", "jump"), "secrets": ("ssh_key",), "owners": False},
     "registry": {"label": "Container registry", "host": "",
                  "fields": ("host", "login"), "secrets": ("token",), "owners": True},
 }
