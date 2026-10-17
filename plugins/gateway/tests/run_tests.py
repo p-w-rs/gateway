@@ -2399,5 +2399,136 @@ check("MCP lists databricks (+confirm) and http_request has auth_scope",
       {"databricks", "databricks_confirm"} <= {t["name"] for t in mcp_server.TOOLS}
       and "auth_scope" in json.dumps([t for t in mcp_server.TOOLS if t["name"] == "http_request"]))
 
+print("ml catalog:")
+from gateway import mlcat  # noqa: E402
+
+CAT = {"pushed": {}, "auth": [], "store": RT / "catstore"}
+CAT["store"].mkdir()
+FAKE_SAS = "sv=2024-05-04&sr=c&sp=rl&se=2099-01-01&sig=FAKEsasSIGNATURE0123456789"
+
+
+class FakeCatalog(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _authed(self):
+        a = self.headers.get("Authorization", "")
+        CAT["auth"].append(a)
+        if not a.startswith("Bearer at-"):
+            self._json(401, {})
+            return False
+        return True
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/config":
+            self._json(200, {"signInRequired": True, "tenantId": "794c042e-da02-4688-96e8-1ddf59b497ff",
+                             "clientId": "34dce8bc-5d26-4252-9902-1c2117db3664",
+                             "cliClientId": "54e38007-5a3f-4b26-85da-e0c986b33421"})
+            return
+        if not self._authed():
+            return
+        if u.path == "/api/catalog":
+            self._json(200, {"items": [{"kind": "dataset", "name": "haul-road"}], "total": 1})
+        elif u.path.startswith("/api/items/"):
+            self._json(200, {"kind": "dataset", "name": u.path.split("/")[-1], "readmeHtml": "<h1/>",
+                             "readme": "# x"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        op = self.path.rsplit("/", 1)[-1]
+        key = f"{body['kind']}/{body['folder']}"
+        if op == "push":
+            self._json(200, {"account": "stfake", "remoteUrl": str(CAT["store"] / key),
+                             "sasToken": FAKE_SAS, "expiresOn": "2099-01-01T00:00:00Z"})
+        elif op == "complete":
+            CAT["pushed"][key] = body["revision"]
+            self._json(200, {})
+        elif op == "pull":
+            md5 = CAT["pushed"].get(key)
+            if not md5:
+                self._json(404, {"error": f"Artifact revision not found ({FAKE_SAS})"})
+                return
+            self._json(200, {"account": "stfake", "remoteUrl": str(CAT["store"] / key),
+                             "sasToken": FAKE_SAS, "md5": md5, "size": 0, "nFiles": 0,
+                             "expiresOn": "2099-01-01T00:00:00Z"})
+
+
+_csrv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeCatalog)
+threading.Thread(target=_csrv.serve_forever, daemon=True).start()
+CHOST = f"127.0.0.1:{_csrv.server_address[1]}"
+acct_form({"host": CHOST, "login": ""})
+acct("/gate:account add mlcat asi ASI ML Catalog (test)")
+check("mlcat account: default host is the catalog (host name, no port)",
+      vault.account("mlcat:asi")["hosts"] == ["127.0.0.1"] and vault.account("mlcat:asi")["host"] == CHOST)
+os.environ["GATEWAY_BROWSER"] = str(FOLLOW_SH)
+try:
+    out = acct("/gate:account login mlcat:asi")
+finally:
+    os.environ["GATEWAY_BROWSER"] = _prev_browser
+a = vault.account("mlcat:asi")
+check("mlcat login: signs in with the catalog's CLI app and API scope",
+      a["secrets"].get("refresh_token", "").startswith("rt-")
+      and a["client_id"] == "54e38007-5a3f-4b26-85da-e0c986b33421"
+      and "api://34dce8bc-5d26-4252-9902-1c2117db3664/access_as_user" in ENTRA["scopes"][-1])
+r = mlcat.mlcat_tool("search")
+check("mlcat search: API called with a minted token", r["ok"] and r["result"]["total"] == 1
+      and CAT["auth"][-1].startswith("Bearer at-") and "at-" not in json.dumps(r))
+r = mlcat.mlcat_tool("item", kind="dataset", name="haul-road")
+check("mlcat item: readmeHtml dropped", r["ok"] and "readmeHtml" not in r["result"])
+check("mlcat item: bad name refused", not mlcat.mlcat_tool("item", kind="dataset", name="../x")["ok"])
+r = actions.http_request("GET", f"http://{CHOST}/api/catalog", auth_ref="mlcat:asi")
+check("http_request with an mlcat account uses the catalog API token", r.get("ok") and r.get("status") == 200)
+_dvc_bin = ROOT / ".pixi" / "envs" / "dvc" / "bin" / "dvc"
+if not _dvc_bin.exists():
+    print("  skip mlcat workspace checks (pixi env 'dvc' not installed)")
+else:
+    WS1 = RT / "ws" / "haul"
+    r = mlcat.mlcat_workspace("init", str(WS1), artifact="datasets/haul-road")
+    check("mlcat init: asiml-format workspace", r["ok"] and json.loads(
+        (WS1 / ".asiml" / "workspace.json").read_text())["artifactId"] == "datasets/haul-road")
+    (WS1 / "data" / "img1.txt").write_text("pixel data\n")
+    r = mlcat.mlcat_workspace("push", str(WS1))
+    check("mlcat push: published, revision registered", r["ok"] and "dataset/haul-road" in CAT["pushed"])
+    check("mlcat push: the storage pass never appears", FAKE_SAS not in json.dumps(r)
+          and "FAKEsas" not in json.dumps(r))
+    check("mlcat push: workspace remembers the revision",
+          json.loads((WS1 / ".asiml" / "workspace.json").read_text())["revision"]
+          == CAT["pushed"].get("dataset/haul-road"))
+    WS2 = RT / "ws" / "clone"
+    r = mlcat.mlcat_workspace("clone", str(WS2), artifact="datasets/haul-road")
+    check("mlcat clone: files arrive", r["ok"] and (WS2 / "data" / "img1.txt").read_text() == "pixel data\n"
+          or (print("    clone:", json.dumps(r)[:600]) and False))
+    check("mlcat clone: pointer + gitignore like asiml",
+          (WS2 / "data.dvc").exists() and "/data" in (WS2 / ".gitignore").read_text())
+    r = mlcat.mlcat_workspace("status", str(WS2))
+    check("mlcat status", r["ok"] and "datasets/haul-road" in r["result"])
+    r = mlcat.mlcat_workspace("clone", str(RT / "ws" / "missing"), artifact="datasets/nope")
+    check("mlcat: catalog errors are reported with the pass redacted",
+          not r["ok"] and FAKE_SAS not in r["reason"] and "FAKEsas" not in r["reason"])
+    check("mlcat clone into a non-empty dir refused",
+          not mlcat.mlcat_workspace("clone", str(WS1), artifact="datasets/haul-road")["ok"])
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["mlcat:asi"]["prompts"] = {"write": "ask"}
+        vault.save(_d)
+    check("mlcat push asks when the policy says so",
+          mlcat.mlcat_workspace("push", str(WS1)).get("use") == "mlcat_workspace_confirm")
+check("MCP lists mlcat tools", {"mlcat", "mlcat_workspace", "mlcat_workspace_confirm"}
+      <= {t["name"] for t in mcp_server.TOOLS})
+_csrv.shutdown()
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

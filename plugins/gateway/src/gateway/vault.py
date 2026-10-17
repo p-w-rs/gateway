@@ -306,7 +306,9 @@ def host_key_fingerprints(known_hosts: str) -> list[str]:
 
 
 def default_hosts(kind: str, host: str) -> list[str]:
-    """Where an account's credentials may go by default."""
+    """Where an account's credentials may go by default (host names, no ports)."""
+    if host and not host.startswith("[") and host.count(":") == 1:
+        host = host.split(":", 1)[0]
     if kind == "github" and (host == "github.com" or host.endswith(".ghe.com")):
         return [host, f"api.{host}"]
     if kind == "hf":

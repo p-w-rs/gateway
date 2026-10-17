@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, pijulops, policy, sshops, vault
+from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, mlcat, pijulops, policy, sshops, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -108,6 +108,20 @@ _DB_SCHEMA: dict[str, Any] = {
         "timeout": {"type": "integer", "default": 600},
     },
     "required": ["args", "account", "workspace"],
+}
+
+_MLW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["init", "clone", "pull", "push", "status"]},
+        "cwd": {"type": "string", "description": "the workspace folder (absolute path)"},
+        "artifact": {"type": "string", "description": "datasets/NAME[@rev] or models/NAME[@rev]"},
+        "revision": {"type": "string", "description": "pull: a revision hash, or latest"},
+        "data_dir": {"type": "string", "default": "data"},
+        "account": {"type": "string", "description": "mlcat:NAME"},
+        "timeout": {"type": "integer", "default": 3600},
+    },
+    "required": ["action", "cwd"],
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -370,6 +384,35 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _DB_SCHEMA,
     },
     {
+        "name": "mlcat",
+        "description": ("Read the ASI ML Catalog as a gateway mlcat account: action=search "
+                        "(kind, query, page), item (kind=dataset|model, name, version), files "
+                        "(version, prefix, skip, take). Use mlcat_workspace to get or publish "
+                        "data. Never run asiml or dvc in Bash."),
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["search", "item", "files"]},
+            "account": {"type": "string"}, "kind": {"type": "string"}, "name": {"type": "string"},
+            "version": {"type": "string"}, "query": {"type": "string"},
+            "page": {"type": "integer"}, "page_size": {"type": "integer"},
+            "prefix": {"type": "string"}, "skip": {"type": "integer"}, "take": {"type": "integer"}},
+            "required": ["action"]},
+    },
+    {
+        "name": "mlcat_workspace",
+        "description": ("asiml's workspace commands, as a gateway mlcat account (same "
+                        ".asiml format): init (artifact=datasets/NAME or models/NAME, data_dir), "
+                        "clone (artifact=datasets/NAME[@rev] into an empty cwd), pull "
+                        "(revision, or latest), push (publish the data folder; needs "
+                        "Catalog.Writer), status. Storage passes stay inside the gateway. If "
+                        "the policy asks first, call mlcat_workspace_confirm."),
+        "inputSchema": _MLW_SCHEMA,
+    },
+    {
+        "name": "mlcat_workspace_confirm",
+        "description": "Same as mlcat_workspace, after Claude Code asks the user.",
+        "inputSchema": _MLW_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -561,6 +604,18 @@ def dispatch(name: str, args: dict[str, Any],
                                      args.get("workspace", ""), args.get("cwd"),
                                      confirmed=name == "databricks_confirm",
                                      timeout=min(int(args.get("timeout", 600)), 3600))
+    if name == "mlcat":
+        return mlcat.mlcat_tool(args.get("action", ""), args.get("account"), args.get("kind", ""),
+                                args.get("name", ""), args.get("version", ""),
+                                args.get("query", ""), int(args.get("page", 1)),
+                                int(args.get("page_size", 30)), args.get("prefix", ""),
+                                int(args.get("skip", 0)), int(args.get("take", 200)))
+    if name in ("mlcat_workspace", "mlcat_workspace_confirm"):
+        return mlcat.mlcat_workspace(args.get("action", ""), args.get("cwd", ""),
+                                     args.get("artifact", ""), args.get("revision", ""),
+                                     args.get("data_dir", "data"), args.get("account"),
+                                     confirmed=name == "mlcat_workspace_confirm",
+                                     timeout=min(int(args.get("timeout", 3600)), 14400))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",
