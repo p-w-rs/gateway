@@ -184,7 +184,9 @@ def classify(sub: str, args: list[str]) -> str:
             return "delete"
         return "write"
     if sub == "lfs":
-        return "write" if _positionals(args)[:1] == ["push"] else "read"
+        op = _positionals(args)[:1]
+        return {"push": "write", "fetch": "read", "pull": "read"}.get(op[0] if op else "",
+                                                                      "local")
     return "read"
 
 
@@ -279,6 +281,10 @@ def git_tool(args: list[str], cwd: str, account: str | None = None,
     except (GitRefused, runner.RunnerError) as e:
         policy.audit("refused", {"action": "git", "reason": str(e)[:200]})
         return {"ok": False, "refused": True, "reason": str(e)}
+    if sub == "push" and _uses_lfs(cwdp):
+        lfs = _lfs_push_first(args[1:], cwdp, creds, ref, timeout, allow_http)
+        if lfs is not None:
+            return lfs
     res = runner.run("git", args, cwd=cwdp, creds=creds, account=ref or "", timeout=timeout,
                      allow_http=allow_http).as_dict()
     res["class"] = cls
@@ -293,6 +299,31 @@ def git_tool(args: list[str], cwd: str, account: str | None = None,
                        + "; ".join(k.split(" ", 1)[1][:80] for k in res["seen_host_keys"]))
         res.pop("seen_host_keys")
     return res
+
+
+def _uses_lfs(cwd: Path) -> bool:
+    try:
+        runner._which("git-lfs")
+    except runner.RunnerError:
+        return False
+    r = runner.run("git", ["lfs", "ls-files", "-n"], cwd=cwd, timeout=60)
+    return r.ok and bool(r.stdout.strip())
+
+
+def _lfs_push_first(args: list[str], cwd: Path, creds, ref, timeout, allow_http):
+    """The pre-push hook normally uploads LFS objects; hooks are off, so the
+    gateway does it, as the same account, before the git push."""
+    pos = _positionals(args)
+    remote = pos[0] if pos else "origin"
+    refs = [r.split(":", 1)[0] for r in pos[1:] if r.split(":", 1)[0]] or ["HEAD"]
+    res = runner.run("git", ["lfs", "push", remote, *refs], cwd=cwd, creds=creds,
+                     account=ref or "", timeout=timeout, allow_http=allow_http)
+    if res.ok:
+        return None
+    out = res.as_dict()
+    out.update({"reason": "uploading LFS objects failed, so nothing was pushed",
+                "account": ref or "none", "class": "write"})
+    return out
 
 
 def _refuse(ref: str, cls: str, reason: str, needs_confirm: bool = False) -> dict[str, Any]:

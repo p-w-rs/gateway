@@ -13,13 +13,15 @@
       "mcp__plugin_gate_gw__git",
       "mcp__plugin_gate_gw__git_identity",
       "mcp__plugin_gate_gw__gh",
-      "mcp__plugin_gate_gw__git_mirror"
+      "mcp__plugin_gate_gw__git_mirror",
+      "mcp__plugin_gate_gw__hf"
     ],
     "ask": [
       "mcp__plugin_gate_gw__port_check",
       "mcp__plugin_gate_gw__run_privileged_confirm",
       "mcp__plugin_gate_gw__git_confirm",
-      "mcp__plugin_gate_gw__gh_confirm"
+      "mcp__plugin_gate_gw__gh_confirm",
+      "mcp__plugin_gate_gw__hf_confirm"
     ],
     "deny": [
       "Bash(curl:*)",

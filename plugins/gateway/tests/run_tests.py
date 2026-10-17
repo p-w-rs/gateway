@@ -1620,8 +1620,14 @@ else:
     r = runner.run("git", ["push", SSH_URL, "main:tofu"], cwd=cs, creds=_tofu, timeout=60)
     check("runner: unpinned host: works, and reports the host key it saw",
           r.ok and any(_hostpub[1] in k for k in r.seen_host_keys))
-    _agents = subprocess.run(["pgrep", "-f", "gw-run-"], capture_output=True, text=True).stdout
-    check("runner: the private agent is gone after the call", _agents.strip() == "")
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    check("runner: the private agent is gone after the call",
+          runner.AGENT_PIDS and not any(_alive(p) for p in runner.AGENT_PIDS))
     try:
         os.kill(int((SSHD_DIR / "pid").read_text()), 15)
     except (OSError, ValueError):
@@ -1675,7 +1681,8 @@ for args, want in ((["status"], "local"), (["commit", "-m", "x"], "local"), (["f
                    (["push", "origin", "--delete", "b"], "delete"), (["push", "origin", ":b"], "delete"),
                    (["push", "--force-with-lease", "origin", "main"], "delete"),
                    (["push", "-f", "origin", "main"], "force"), (["push", "origin", "+main"], "force"),
-                   (["lfs", "push", "origin"], "write"), (["lfs", "fetch"], "read")):
+                   (["lfs", "push", "origin"], "write"), (["lfs", "fetch"], "read"),
+                   (["lfs", "ls-files"], "local"), (["lfs", "track", "*.bin"], "local")):
     check(f"classify git {' '.join(args)}", gitops.classify(args[0], args[1:]) == want)
 
 # A GitHub-like account on the loopback git server (owner "acme").
@@ -1941,6 +1948,107 @@ _skill = (ROOT / "skills" / "accounts" / "SKILL.md").read_text()
 check("accounts skill: frontmatter + mirrors + confirm guidance",
       _skill.startswith("---\nname: accounts\n") and "git_mirror" in _skill
       and "git_confirm" in _skill and "/gate:account login" in _skill)
+
+print("hugging face:")
+from gateway import hfops  # noqa: E402
+
+os.environ["HF_HUB_CACHE"] = str(TMP / "hf-cache")  # never the user's real cache
+(TMP / "hf-cache").mkdir()
+
+HF_TOKEN_V = "hf_testTOKEN0123456789abcdefghij"
+with vault.locked():
+    _d = vault.load()
+    for _r in [r for r in _d["accounts"] if r.startswith("hf:")]:
+        _d["accounts"].pop(_r)
+    _d["accounts"]["hf:me"] = {"kind": "hf", "description": "me", "host": "huggingface.co",
+                               "login": "jpp46", "owners": ["jpp46"],
+                               "hosts": ["huggingface.co", "hf.co"],
+                               "secrets": {"token": HF_TOKEN_V}, "prompts": {}}
+    _d["accounts"]["hf:work"] = {"kind": "hf", "description": "work org", "host": "huggingface.co",
+                                 "login": "jpp46", "owners": ["asi-org"],
+                                 "hosts": ["huggingface.co", "hf.co"],
+                                 "secrets": {"token": "hf_workTOKEN0123456789abcdefgh"}, "prompts": {}}
+    vault.save(_d)
+for args, want in ((["download", "org/m"], "read"), (["upload", "org/m", "."], "write"),
+                   (["repo", "create", "org/m"], "write"), (["repo", "delete", "org/m"], "delete"),
+                   (["upload", "org/m", ".", "--delete", "*.bin"], "delete"),
+                   (["cache", "scan"], "read"), (["auth", "whoami"], "read")):
+    check(f"classify hf {' '.join(args)}", hfops.classify(args) == want)
+_dd = vault.load()
+check("hf: two accounts and no owner to go by: ambiguous",
+      hfops.hf_tool(["cache", "ls"]).get("refused") is True)
+check("hf: account picked by the repo's owner",
+      hfops.pick(None, ["upload", "asi-org/model", "."], _dd)[0] == "hf:work"
+      and hfops.pick(None, ["download", "jpp46/x"], _dd)[0] == "hf:me")
+try:
+    hfops.pick("hf:me", ["upload", "asi-org/model", "."], _dd)
+    check("hf: a named account outside its owners is refused", False)
+except gitops.GitRefused:
+    check("hf: a named account outside its owners is refused", True)
+FAKE_HF = RT / "fake-hf"
+FAKE_HF.write_text('''#!/bin/sh
+echo "args: $*"
+[ -n "$HF_TOKEN" ] && echo "hf-token-present"
+echo "raw=$HF_TOKEN"
+echo "endpoint=$HF_ENDPOINT"
+case "$HF_HOME" in *gw-run-*) echo "home: temp";; esac
+case "$HF_TOKEN_PATH" in *gw-run-*) echo "tp-in-temp";; esac
+echo "cache=$HF_HUB_CACHE"
+''')
+FAKE_HF.chmod(0o755)
+os.environ["GATEWAY_BIN_HF"] = str(FAKE_HF)
+try:
+    r = hfops.hf_tool(["download", "jpp46/x"])
+    check("hf: token injected, hidden from the result",
+          r["ok"] and "hf-token-present" in r["stdout"] and HF_TOKEN_V not in json.dumps(r))
+    check("hf: endpoint pinned, token file in the temp dir, normal cache kept",
+          "endpoint=https://huggingface.co" in r["stdout"] and "home: temp" in r["stdout"]
+          and "tp-in-temp" in r["stdout"] and "cache=" in r["stdout"]
+          and "gw-run-" not in r["stdout"].split("cache=")[1])
+    for args, why in ((["auth", "login"], "sign-in"), (["auth", "token"], "sign-in"),
+                      (["login"], "sign-in"), (["env"], "sign-in"),
+                      (["download", "jpp46/y", "--token", "abc"], "--token"),
+                      (["upload", "jpp46/y", ".", "--endpoint", "e"], "--endpoint")):
+        _r = hfops.hf_tool(args, account="hf:me")
+        check(f"hf refuses {' '.join(args)}", _r.get("refused") is True and why in _r["reason"])
+    r = hfops.hf_tool(["repo", "delete", "jpp46/x"])
+    check("hf: deletes ask by default (hf_confirm)", r.get("use") == "hf_confirm")
+    check("hf_confirm runs it", hfops.hf_tool(["repo", "delete", "jpp46/x"], confirmed=True)["ok"])
+finally:
+    os.environ.pop("GATEWAY_BIN_HF")
+_real_hf = ROOT / ".pixi" / "envs" / "hf" / "bin" / "hf"
+if _real_hf.exists():
+    r = hfops.hf_tool(["cache", "ls"], account="hf:me")
+    check("hf (real CLI): runs offline as the account, no token in output",
+          r["ok"] and HF_TOKEN_V not in json.dumps(r))
+else:
+    print("  skip real hf check (pixi env 'hf' not installed)")
+check("MCP lists hf/hf_confirm", {"hf", "hf_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
+
+# LFS: the git tool registers git-lfs's filters itself (global config is
+# isolated) and uploads LFS objects before a push (hooks are off).
+if _shutil.which("git-lfs") or (Path(sys.executable).parent / "git-lfs").exists():
+    LF = RT / "lfs"
+    LF.mkdir()
+    _git("init", "-q", "--bare", "-b", "main", str(LF / "remote.git"))
+    LW = LF / "work"
+    LW.mkdir()
+    L = lambda *a: gitops.git_tool(list(a), str(LW))  # noqa: E731
+    L("init", "-q", "-b", "main")
+    _git("config", "user.email", "l@example.com", cwd=LW)
+    _git("config", "user.name", "L", cwd=LW)
+    L("lfs", "track", "*.bin")
+    (LW / "big.bin").write_bytes(os.urandom(4096))
+    L("add", ".gitattributes", "big.bin")
+    L("commit", "-q", "-m", "lfs file")
+    _blob = _git("cat-file", "-p", "HEAD:big.bin", cwd=LW).stdout
+    check("lfs: git add stored a pointer, not the file", _blob.startswith("version https://git-lfs"))
+    L("remote", "add", "origin", str(LF / "remote.git"))
+    r = L("push", "origin", "main")
+    _objs = list((LF / "remote.git" / "lfs" / "objects").rglob("*")) if (LF / "remote.git" / "lfs").exists() else []
+    check("lfs: push uploaded the LFS object first", r["ok"] and any(p.is_file() for p in _objs))
+else:
+    print("  skip lfs checks (git-lfs not found)")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

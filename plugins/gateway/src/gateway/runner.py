@@ -95,24 +95,50 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+# Tools that live in an optional pixi environment of the plugin.
+FEATURE_OF = {"hf": "hf", "git-xet": "hf", "databricks": "databricks", "dvc": "dvc",
+              "crane": "registry", "oras": "registry", "skopeo": "registry", "pijul": "pijul"}
+
+
+def install_hint(tool: str) -> str:
+    feat = FEATURE_OF.get(tool)
+    manifest = policy.plugin_root() / "pixi.toml"
+    if feat == "pijul":
+        return (f"pijul isn't installed for the gateway; ask the user to run (once, about two "
+                f"minutes): pixi run --manifest-path {manifest} -e pijul install-pijul")
+    if feat:
+        return (f"{tool} isn't installed for the gateway; ask the user to run: "
+                f"pixi install --manifest-path {manifest} -e {feat}")
+    return f"{tool} was not found"
+
+
 def _which(tool: str) -> str:
     """GATEWAY_BIN_<TOOL> (tests), then the plugin's own pixi binary (its
-    OpenSSH matches the agent we start), then PATH."""
+    OpenSSH matches the agent we start), then the tool's optional pixi
+    environment, then PATH."""
     forced = os.environ.get("GATEWAY_BIN_" + tool.upper().replace("-", "_"))
     if forced:
         return forced
-    own = Path(sys.executable).parent / tool
-    if own.is_file() and os.access(own, os.X_OK):
-        return str(own)
+    cands = [Path(sys.executable).parent / tool]
+    feat = FEATURE_OF.get(tool)
+    if feat:
+        root = policy.plugin_root() / ".pixi"
+        cands.append(root / ("pijul" if feat == "pijul" else f"envs/{feat}") / "bin" / tool)
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
     path = shutil.which(tool)
     if not path:
-        raise RunnerError(f"{tool} was not found on PATH")
+        raise RunnerError(install_hint(tool))
     return path
 
 
 # ---------------------------------------------------------------------------
 # Private ssh-agent
 # ---------------------------------------------------------------------------
+
+
+AGENT_PIDS: list[int] = []  # every private agent started (the tests check they're gone)
 
 
 class _Agent:
@@ -123,6 +149,7 @@ class _Agent:
         self.proc = subprocess.Popen([_which("ssh-agent"), "-D", "-a", str(self.sock)],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env=child_env())
+        AGENT_PIDS.append(self.proc.pid)
         deadline = time.time() + 5
         while not self.sock.exists():
             if time.time() > deadline or self.proc.poll() is not None:
@@ -290,6 +317,14 @@ def git_config_overrides(tmp: Path, creds: Creds | None, helper: Path | None,
     ]
     if allow_http:  # tests and loopback servers only
         pairs.append("protocol.http.allow=always")
+    lfs = shutil.which("git-lfs") or ""
+    own_lfs = Path(sys.executable).parent / "git-lfs"
+    if own_lfs.is_file():
+        lfs = str(own_lfs)
+    if lfs:  # git-lfs's filters (normally in the global config, isolated here)
+        q = shlex.quote(lfs)
+        pairs += [f"filter.lfs.clean={q} clean -- %f", f"filter.lfs.smudge={q} smudge -- %f",
+                  f"filter.lfs.process={q} filter-process", "filter.lfs.required=true"]
     if helper is not None and creds is not None:
         for proto in creds.protocols:
             pairs.append(f"credential.{proto}://{creds.host}.helper={helper}")
@@ -362,7 +397,7 @@ def run(tool: str, argv: list[str], *, cwd: str | Path, creds: Creds | None = No
 # CLIs other than git that run as an account. Their argv rules live with
 # their tools (ghops.py, ...); here they only get a clean env, a temp dir
 # for config, scrubbed output and the audit.
-CLI_TOOLS = {"gh"}
+CLI_TOOLS = {"gh", "hf"}
 
 
 def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list[str],

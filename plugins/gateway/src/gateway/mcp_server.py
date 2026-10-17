@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, ghops, gitops, mirrors, policy, vault
+from . import __version__, actions, ghops, gitops, hfops, mirrors, policy, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -56,6 +56,18 @@ _GH_SCHEMA: dict[str, Any] = {
                                                  "the repo and the account"},
         "account": {"type": "string", "description": "github:NAME"},
         "timeout": {"type": "integer", "default": 300},
+    },
+    "required": ["args"],
+}
+
+_HF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "hf arguments without 'hf', e.g. [\"download\", \"org/model\"]"},
+        "cwd": {"type": "string", "description": "working directory (absolute path)"},
+        "account": {"type": "string", "description": "hf:NAME"},
+        "timeout": {"type": "integer", "default": 1800},
     },
     "required": ["args"],
 }
@@ -239,6 +251,21 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["cwd", "action"]},
     },
     {
+        "name": "hf",
+        "description": ("Run the Hugging Face CLI as a gateway account (use INSTEAD OF hf / "
+                        "huggingface-cli in Bash): download, upload (Xet), repo create/delete, "
+                        "ls, jobs, cache. The account comes from account=, else the repo id's "
+                        "owner, else the only HF account. Sign-in (hf auth) is the gateway's. "
+                        "Git pushes to the Hub go through the git tool. If the policy asks "
+                        "first, call hf_confirm with the same arguments."),
+        "inputSchema": _HF_SCHEMA,
+    },
+    {
+        "name": "hf_confirm",
+        "description": "Same as hf, after Claude Code asks the user.",
+        "inputSchema": _HF_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -408,6 +435,10 @@ def dispatch(name: str, args: dict[str, Any],
         return mirrors.git_mirror(args.get("cwd", ""), args.get("action", "status"),
                                   args.get("remotes"), args.get("branches"),
                                   args.get("tags", True))
+    if name in ("hf", "hf_confirm"):
+        return hfops.hf_tool(args.get("args"), args.get("cwd"), args.get("account"),
+                             confirmed=name == "hf_confirm",
+                             timeout=min(int(args.get("timeout", 1800)), 7200))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",
