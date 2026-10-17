@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -266,6 +267,43 @@ KINDS: dict[str, dict[str, Any]] = {
 SECRET_FIELDS = ("token", "ssh_key")
 
 
+# The Nest's SSH host key (ed25519, SHA256:iJjr1ZMOZNRGcEtLSDXFUUH0C4+5t7X9Wmhu4T4vcQI),
+# read 2026-10-17. Pijul can't ask whether to trust a new key without a
+# terminal, so pijul and ssh accounts carry pinned keys.
+NEST_KNOWN_HOSTS = ("nest.pijul.com ssh-ed25519 "
+                    "AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6")
+PINNED_KINDS = ("pijul", "ssh")
+
+
+def keyscan(host: str, port: str = "") -> str:
+    """The host's SSH keys as known_hosts lines (ssh-keyscan), or "".
+    Used only from the user's /gate:account add/up (their trust decision);
+    GATEWAY_KEYSCAN=none turns it off (tests)."""
+    if host == "nest.pijul.com" and port in ("", "22"):
+        return NEST_KNOWN_HOSTS
+    if os.environ.get("GATEWAY_KEYSCAN") == "none" or not HOST_RE.fullmatch(host):
+        return ""
+    tool = Path(sys.executable).parent / "ssh-keyscan"
+    cmd = [str(tool) if tool.exists() else (shutil.which("ssh-keyscan") or "ssh-keyscan"),
+           "-T", "5", "-t", "ed25519,ecdsa,rsa"]
+    if port and port != "22":
+        cmd += ["-p", port]
+    try:
+        out = subprocess.run(cmd + ["--", host], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "\n".join(l for l in out.stdout.splitlines() if l.strip() and not l.startswith("#"))
+
+
+def host_key_fingerprints(known_hosts: str) -> list[str]:
+    out = []
+    for line in known_hosts.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out.append(f"{parts[1]} {fingerprint_of(' '.join(parts[1:3]))}")
+    return out
+
+
 def default_hosts(kind: str, host: str) -> list[str]:
     """Where an account's credentials may go by default."""
     if kind == "github" and (host == "github.com" or host.endswith(".ghe.com")):
@@ -388,6 +426,8 @@ def account_view(ref: str, acct: dict[str, Any], data: dict[str, Any]) -> dict[s
     view["methods"] = methods(acct)
     if acct.get("public_key"):
         view["key_fingerprint"] = acct.get("key_fingerprint", "")
+    if kind in PINNED_KINDS:
+        view["host_keys"] = host_key_fingerprints(acct.get("known_hosts", ""))
     view["prompts"] = effective_prompts(acct, data)
     return view
 

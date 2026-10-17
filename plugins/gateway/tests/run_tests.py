@@ -25,6 +25,7 @@ os.environ["GATEWAY_AUDIT_LOG"] = str(TMP / "audit.jsonl")
 # ...nor touch the real vault, nor ever open a real pop-up on screen.
 os.environ["GATEWAY_HOME"] = str(TMP / "vault")
 os.environ["GATEWAY_DIALOG"] = "none"
+os.environ["GATEWAY_KEYSCAN"] = "none"  # no network: host keys are pinned by hand in tests
 
 from gateway import actions, policy  # noqa: E402
 
@@ -2049,6 +2050,115 @@ if _shutil.which("git-lfs") or (Path(sys.executable).parent / "git-lfs").exists(
     check("lfs: push uploaded the LFS object first", r["ok"] and any(p.is_file() for p in _objs))
 else:
     print("  skip lfs checks (git-lfs not found)")
+
+print("pijul:")
+from gateway import pijulops  # noqa: E402
+
+
+def _start_sshd(d: Path, client_pub: str) -> tuple[int, str] | None:
+    """A user-level sshd on 127.0.0.1 for tests; (port, known_hosts line)."""
+    sshd = _shutil.which("sshd")
+    if not sshd:
+        return None
+    d.mkdir(exist_ok=True)
+    if not (d / "host").exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / "host")],
+                       check=True)
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    (d / "authorized_keys").write_text(client_pub)
+    (d / "sshd_config").write_text(
+        f"Port {port}\nListenAddress 127.0.0.1\nHostKey {d / 'host'}\nPidFile {d / 'pid'}\n"
+        f"AuthorizedKeysFile {d / 'authorized_keys'}\nPasswordAuthentication no\n"
+        "KbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n")
+    subprocess.run([sshd, "-f", str(d / "sshd_config"), "-E", str(d / "log")])
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            hp = (d / "host.pub").read_text().split()
+            return port, f"[127.0.0.1]:{port} {hp[0]} {hp[1]}"
+        except OSError:
+            time.sleep(0.05)
+    return None
+
+
+check("pijul: parse ssh URL", pijulops.parse_remote("ssh://powers@nest.pijul.com/powers/repo")
+      == {"host": "nest.pijul.com", "port": "", "user": "powers", "owner": "powers", "repo": "repo"})
+check("pijul: the Nest's host key is built in",
+      vault.keyscan("nest.pijul.com").startswith("nest.pijul.com ssh-ed25519 AAAAC3"))
+for args, want in ((["push", "x"], "write"), (["pull"], "read"), (["clone", "u", "d"], "read"),
+                   (["record", "-a"], "local"), (["log"], "local")):
+    check(f"classify pijul {' '.join(args)}", pijulops.classify(args[0]) == want)
+_pj = ROOT / ".pixi" / "pijul" / "bin" / "pijul"
+PJ = RT / "pijul"
+PJ.mkdir()
+_srv = _start_sshd(PJ / "sshd", (SSHD_DIR / "client.pub").read_text()) if _pj.exists() and _ssh_ok else None
+if not _srv:
+    print("  skip pijul live-lab checks (no pijul build or no sshd)")
+else:
+    PPORT, PKNOWN = _srv
+    _real_cfg = Path.home() / ".config" / "pijul"
+    _cfg_before = _real_cfg.stat().st_mtime if _real_cfg.exists() else None
+    _remote = PJ / "remote"
+    _remote.mkdir()
+    subprocess.run([str(_pj), "init"], cwd=_remote, capture_output=True,
+                   env={**runner.child_env(), "PIJUL_CONFIG_DIR": str(PJ / "srvcfg")})
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["pijul:lab"] = {
+            "kind": "pijul", "description": "lab", "host": "127.0.0.1", "login": "lab",
+            "name": "Lab Person", "email": "lab@example.invalid", "owners": [],
+            "hosts": ["127.0.0.1"], "remote_pijul": str(_pj), "known_hosts": PKNOWN,
+            "secrets": {"ssh_key": (SSHD_DIR / "client").read_text()},
+            "public_key": (SSHD_DIR / "client.pub").read_text().strip(), "prompts": {}}
+        _d["accounts"].pop("pijul:nest", None)
+        vault.save(_d)
+    PW = PJ / "work"
+    PW.mkdir()
+    PJT = lambda *a, **k: pijulops.pijul_tool(list(a), str(PW), **k)  # noqa: E731
+    check("pijul: init (local)", PJT("init")["ok"])
+    (PW / "a.txt").write_text("hello\n")
+    check("pijul: add", PJT("add", "a.txt")["ok"])
+    r = PJT("record", "-a", "-m", "first change")
+    check("pijul: record signs as the account (private agent)", r["ok"] and r.get("account") == "pijul:lab")
+    _log = PJT("log")
+    check("pijul: the change's author is the account", "Lab Person" in _log["stdout"])
+    PURL = f"ssh://{ME}@127.0.0.1:{PPORT}{_remote}"
+    r = PJT("push", PURL, "-a")
+    check("pijul: push over ssh as the account", r["ok"] and r["class"] == "write"
+          and "PRIVATE KEY" not in json.dumps(r))
+    _rl = subprocess.run([str(_pj), "log"], cwd=_remote, capture_output=True, text=True,
+                         env={**runner.child_env(), "PIJUL_CONFIG_DIR": str(PJ / "srvcfg")})
+    check("pijul: the change arrived on the server", "first change" in _rl.stdout)
+    check("pijul: the user's own ~/.config/pijul is untouched",
+          (_real_cfg.stat().st_mtime if _real_cfg.exists() else None) == _cfg_before)
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["pijul:lab"]["known_hosts"] = (
+            f"[127.0.0.1]:{PPORT} ssh-ed25519 "
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFnM1NquNb+tyuxnElS3PHRWHsDaqb+vuZXJq9vKl1m7")
+        vault.save(_d)
+    r = PJT("push", PURL, "-a")
+    check("pijul: a host key that doesn't match the pin is refused", not r["ok"])
+    with vault.locked():
+        _d = vault.load()
+        _d["accounts"]["pijul:lab"]["known_hosts"] = PKNOWN
+        _d["accounts"]["pijul:lab"]["prompts"] = {"write": "ask"}
+        vault.save(_d)
+    r = PJT("push", PURL, "-a")
+    check("pijul: policy ask points at pijul_confirm", r.get("use") == "pijul_confirm")
+    check("pijul_confirm pushes", PJT("push", PURL, "-a", confirmed=True)["ok"])
+    check("pijul: no account for a host refused",
+          PJT("push", "ssh://x@pijul.example.org/o/r", "-a").get("refused") is True)
+    for args in (["identity", "new", "x"], ["key", "generate"], ["log", "--config", "a=b"]):
+        check(f"pijul refuses {' '.join(args)}", PJT(*args).get("refused") is True)
+    try:
+        os.kill(int((PJ / "sshd" / "pid").read_text()), 15)
+    except (OSError, ValueError):
+        pass
+check("MCP lists pijul/pijul_confirm", {"pijul", "pijul_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

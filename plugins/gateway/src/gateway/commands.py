@@ -544,6 +544,14 @@ def _apply_form(ref: str, kind: str, got: dict[str, str],
         secrets["ssh_key"] = priv + "\n"
     if rec.get("public_key") and secrets.get("ssh_key"):
         rec["key_fingerprint"] = vault.fingerprint_of(rec["public_key"])
+    if kind in vault.PINNED_KINDS and (not rec.get("known_hosts") or host != old.get("host")
+                                       or rec.get("port") != old.get("port")):
+        rec["known_hosts"] = vault.keyscan(host, rec.get("port", ""))
+        fps = vault.host_key_fingerprints(rec["known_hosts"])
+        note += ("\n" if note else "") + (
+            f"Host key pinned for {host}: " + "; ".join(fps) + " (check it if you can)"
+            if fps else f"Could not read {host}'s SSH host key, so connections will be refused "
+                        f"until it can be read: run /gate:account up {ref} again.")
     rec["secrets"] = secrets
     rec["updated"] = vault.now()
     return rec, note

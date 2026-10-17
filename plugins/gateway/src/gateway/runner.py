@@ -397,14 +397,19 @@ def run(tool: str, argv: list[str], *, cwd: str | Path, creds: Creds | None = No
 # CLIs other than git that run as an account. Their argv rules live with
 # their tools (ghops.py, ...); here they only get a clean env, a temp dir
 # for config, scrubbed output and the audit.
-CLI_TOOLS = {"gh", "hf"}
+CLI_TOOLS = {"gh", "hf", "pijul", "ssh", "scp", "rsync", "databricks", "dvc",
+             "crane", "oras", "skopeo"}
 
 
 def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list[str],
             env_fn=None, timeout: float = DEFAULT_TIMEOUT, account: str = "",
-            stdin: bytes | None = None, max_output: int = MAX_OUTPUT) -> Result:
+            stdin: bytes | None = None, max_output: int = MAX_OUTPUT,
+            ssh_key: str = "", argv_fn=None) -> Result:
     """Run `tool argv` with env_fn(tmp) -> extra env (credentials, config
-    dirs). The child never inherits the user's environment."""
+    dirs). With ssh_key, a private agent holds it: SSH_AUTH_SOCK points at
+    it and tmp/agent.sock is its socket. argv_fn(tmp) may rewrite argv once
+    the temp dir exists (e.g. to point at files in it). The child never
+    inherits the user's environment."""
     if tool not in CLI_TOOLS:
         raise RunnerError(f"{tool} is not run through the gateway (yet)")
     cwd = Path(cwd) if cwd else Path(tempfile.gettempdir())
@@ -412,14 +417,23 @@ def run_cli(tool: str, argv: list[str], *, cwd: str | Path | None, secrets: list
         raise RunnerError(f"{cwd} is not a directory")
     tmp = Path(tempfile.mkdtemp(prefix="gw-run-"))
     started = time.time()
+    agent: _Agent | None = None
+    secrets = list(secrets) + ([ssh_key.strip()] if ssh_key else [])
     try:
         os.chmod(tmp, 0o700)
+        extra: dict[str, str] = {}
+        if ssh_key:
+            agent = _Agent(tmp, ssh_key)
+            extra["SSH_AUTH_SOCK"] = str(agent.sock)
         env = child_env({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
-                         "GIT_CONFIG_GLOBAL": os.devnull, "PAGER": "cat",
+                         "GIT_CONFIG_GLOBAL": os.devnull, "PAGER": "cat", **extra,
                          **(env_fn(tmp) if env_fn else {})})
-        res = _exec([_which(tool), *argv], cwd, env, timeout, stdin, max_output, secrets,
+        args = argv_fn(tmp) if argv_fn else argv
+        res = _exec([_which(tool), *args], cwd, env, timeout, stdin, max_output, secrets,
                     started)
     finally:
+        if agent is not None:
+            agent.close()
         shutil.rmtree(tmp, ignore_errors=True)
     policy.audit("run", {"tool": tool, "account": account, "argv": argv[:40],
                          "cwd": str(cwd), "exit_code": res.exit_code, "ok": res.ok,

@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, ghops, gitops, hfops, mirrors, policy, vault
+from . import __version__, actions, ghops, gitops, hfops, mirrors, pijulops, policy, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -70,6 +70,18 @@ _HF_SCHEMA: dict[str, Any] = {
         "timeout": {"type": "integer", "default": 1800},
     },
     "required": ["args"],
+}
+
+_PIJUL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "pijul arguments without 'pijul', e.g. [\"record\", \"-a\", \"-m\", \"msg\"]"},
+        "cwd": {"type": "string", "description": "the repository (absolute path)"},
+        "account": {"type": "string", "description": "pijul:NAME"},
+        "timeout": {"type": "integer", "default": 600},
+    },
+    "required": ["args", "cwd"],
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -266,6 +278,21 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _HF_SCHEMA,
     },
     {
+        "name": "pijul",
+        "description": ("Run ANY pijul command as a gateway Pijul account (use INSTEAD OF pijul "
+                        "in Bash): init/add/record/log/diff/channel locally; push/pull/clone "
+                        "over ssh://user@host/owner/repo (the Nest is nest.pijul.com). record "
+                        "signs with the account's key; push/pull authenticate with it. The "
+                        "user's own pijul config and identities are never used. If the "
+                        "policy asks first, call pijul_confirm with the same arguments."),
+        "inputSchema": _PIJUL_SCHEMA,
+    },
+    {
+        "name": "pijul_confirm",
+        "description": "Same as pijul, after Claude Code asks the user.",
+        "inputSchema": _PIJUL_SCHEMA,
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -439,6 +466,10 @@ def dispatch(name: str, args: dict[str, Any],
         return hfops.hf_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "hf_confirm",
                              timeout=min(int(args.get("timeout", 1800)), 7200))
+    if name in ("pijul", "pijul_confirm"):
+        return pijulops.pijul_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
+                                   confirmed=name == "pijul_confirm",
+                                   timeout=min(int(args.get("timeout", 600)), 3600))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",
