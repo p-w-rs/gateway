@@ -27,7 +27,7 @@ Python.
 | Event | Runs | Does |
 |---|---|---|
 | SessionStart | `run.py hook-session` | Injects the network policy plus a **catalog**: secret names, descriptions, allowed hosts, sudo targets and their state for *this* session. Never values. If sudo is enabled for the session, it also shows the user a `systemMessage` warning. |
-| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes ordinary prompts through without starting Python. For `/gate:secret` or `/gate:sudo` (or bare `/secret`, `/sudo`) it calls `commands.handle`. |
+| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes ordinary prompts through without starting Python. For `/gate:secret`, `/gate:sudo` or `/gate:account` (or bare `/secret`, `/sudo`, `/account`) it calls `commands.handle`. |
 | PreToolUse(Bash) | `run.py hook-route` | `policy.match_blocked(command)`; on a hit, it returns `permissionDecision: deny` with the gateway equivalent. It fails open on its own errors. |
 
 ### The slash commands and the prompt hook
@@ -40,7 +40,9 @@ Python.
   `commands/secret.md`/`sudo.md`, whose body tells Claude to relay the result
   in a line and call no tools. There's no "blocked by hook" popup, and the
   input box isn't refilled.
-- **Values** (`secret add/up`, `sudo add/up`) come from `web_form.ask(…)`, a
+- **Values** (`secret add/up`, `sudo add/up`, `account add/up`) come from
+  `web_form.ask(…)` (one masked field) or `web_form.ask_form(…)` (an
+  account's settings plus masked token and key fields), a
   one-time page on 127.0.0.1 the hook opens in the browser and waits on (up to
   300 s; the hook timeout is 330 s). The typed command never contains a value.
 - **No browser** (`web_form.gui_available()` is false: Linux without
@@ -106,12 +108,40 @@ store.age   age-encrypted JSON, mode 600, replaced atomically; plaintext only vi
 ```
 
 ```json
-{"version": 1,
+{"version": 2,
  "secrets": {"HF_TOKEN": {"value": "…", "description": "…", "hosts": ["huggingface.co"], "updated": "…"}},
  "sudo": {"admin@myserver": {"user": "admin", "host": "myserver", "password": "…", "updated": "…"}},
  "sudo_enabled": ["…hosts enabled in every session…"],
- "sudo_session": {"myserver": ["<session ids>"]}}
+ "sudo_session": {"myserver": ["<session ids>"]},
+ "accounts": {"github:work": {"kind": "github", "description": "…", "host": "github.com",
+                              "login": "…", "name": "…", "email": "…", "owners": ["asirobots"],
+                              "hosts": ["github.com", "api.github.com"],
+                              "secrets": {"token": "…", "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----…"},
+                              "public_key": "ssh-ed25519 …", "key_fingerprint": "SHA256:…",
+                              "prompts": {"write": "ask"}, "updated": "…"}},
+ "account_prompts": {"delete": "ask"}}
 ```
+
+A version 1 vault (no accounts) loads as-is and is written back as version 2.
+
+**Accounts** (`/gate:account`, `KINDS` in vault.py): `github`, `hf`, `pijul`,
+`azure`, `mlcat`, `ssh`, `registry`.
+
+- **Values vs. catalog.** Everything under `secrets` is a value; the rest is
+  what `account_view()` shows Claude.
+- **Scope.** `hosts` (defaults from the kind and host, e.g. github.com +
+  api.github.com), plus `owners` for kinds that have them.
+- **Prompt policy.** `read`/`write`/`delete`/`exec` = `auto`/`ask`/`refuse`,
+  per account over a vault-wide default (`account_prompts`). It's kept in
+  the vault because Claude can edit `policy.json` from Bash.
+- **SSH keys.**
+  - A pasted OpenSSH key is parsed in Python: the public key is in its
+    unencrypted header, and a passphrase-protected key is refused.
+  - A generated key comes from `ssh-keygen` (pixi's OpenSSH), which can only
+    write files. It writes into a 0700 temp dir in the vault home that is
+    read and removed immediately.
+- **As `auth_ref`.** An account with a token works as `auth_ref` on
+  `http_request`, under the same host check as a secret.
 
 The host is normalized (`127.0.0.1`, `::1`, `local` → `localhost`). Host
 names must match `HOST_RE`, so a leading `-` (an ssh option) is impossible.

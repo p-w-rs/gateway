@@ -5,7 +5,8 @@ Subcommands (run as `pixi run --manifest-path …/pixi.toml <task>` or
   server                  Run the MCP stdio server.
   log [N]                 Show the last N audit entries (default 20).
   check <command>         Report whether a shell command would be redirected.
-  vault secret|sudo ...   Terminal fallback for the slash commands (hidden prompt).
+  vault secret|sudo|account ...
+                          Terminal fallback for the slash commands (hidden prompt).
 """
 from __future__ import annotations
 
@@ -95,9 +96,10 @@ def cmd_vault(argv: list[str]) -> int:
 
     from . import commands
 
-    if not argv or argv[0] not in ("secret", "sudo"):
-        print("usage: vault secret|sudo <command...>   (same as the slash commands)\n")
-        print(commands.SECRET_HELP + "\n\n" + commands.SUDO_HELP)
+    if not argv or argv[0] not in ("secret", "sudo", "account"):
+        print("usage: vault secret|sudo|account <command...>   (same as the slash commands)\n")
+        print(commands.SECRET_HELP + "\n\n" + commands.SUDO_HELP + "\n\n"
+              + commands.ACCOUNT_HELP)
         return 2
     if not sys.stdin.isatty():
         print("vault: run this in an interactive terminal (values are read at a "
@@ -118,13 +120,56 @@ def cmd_vault(argv: list[str]) -> int:
                 return None
         return value
 
+    def fields(title, details, specs):
+        """The account form, one field at a time. A pasted key can't be typed
+        at a hidden prompt, so 'paste' asks for the path of a key file."""
+        print(title)
+        for k, v in details:
+            if v:
+                print(f"  {k}: {v}")
+        got = {}
+        for f in specs:
+            kind, label = f.get("type", "text"), f["label"]
+            if kind == "password":
+                got[f["name"]] = getpass.getpass(f"{label} (hidden; Enter to skip): ")
+            elif kind == "select":
+                opts = f["options"]
+                for i, (_, text) in enumerate(opts, 1):
+                    print(f"  {i}. {text}")
+                pick = input(f"{label} [1]: ").strip() or "1"
+                if not pick.isdigit() or not 1 <= int(pick) <= len(opts):
+                    print("Not one of the choices; nothing was saved.")
+                    return None
+                got[f["name"]] = opts[int(pick) - 1][0]
+            elif kind == "textarea":
+                if got.get("ssh_key_mode") != "paste":
+                    got[f["name"]] = ""
+                    continue
+                path = input("Path of the private key file to store: ").strip()
+                try:
+                    from pathlib import Path
+                    got[f["name"]] = Path(path).expanduser().read_text()
+                except OSError as e:
+                    print(f"Could not read it ({e}); nothing was saved.")
+                    return None
+            else:
+                shown = f" [{f['value']}]" if f.get("value") else ""
+                got[f["name"]] = input(f"{label}{shown}: ").strip() or f.get("value", "")
+            if f.get("required") and not got[f["name"]]:
+                print(f"{label} is required; nothing was saved.")
+                return None
+        return got
+
     commands.VALUE_PROVIDER = prompt
+    commands.FIELDS_PROVIDER = fields
     kind, rest = argv[0], " ".join(argv[1:])
     try:
         if kind == "secret":
             print(commands.run_secret(rest))
-        else:
+        elif kind == "sudo":
             print(commands.run_sudo(rest, session_id=""))
+        else:
+            print(commands.run_account(rest))
     except (commands.CommandError, commands.LooksLikeValue) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

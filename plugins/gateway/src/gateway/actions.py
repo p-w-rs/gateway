@@ -266,8 +266,12 @@ def port_check(target: str, ports: list[int] | None = None,
 
 
 def _allowed_hosts(ref: str, cfg: dict[str, Any] | None = None) -> list[str]:
-    """Hosts a vault secret may be sent to (set with /gate:secret allow)."""
-    s = vault.secret(ref)
+    """Hosts a vault secret or account token may be sent to (set with
+    /gate:secret allow or /gate:account allow)."""
+    if vault.parse_account_ref(ref):
+        s = vault.account(ref)
+    else:
+        s = vault.secret(ref)
     return [h for h in (s or {}).get("hosts", []) if h and h != "*"]
 
 
@@ -283,12 +287,22 @@ def _ask_new_host(ref: str, host: str, method: str, url: str, bound: list[str],
 
 
 def _how_to_allow(ref: str, host: str) -> str:
+    cmd = "account" if vault.parse_account_ref(ref) else "secret"
     return (f"If the task needs it, ask the user to run: "
-            f"/gate:secret allow {ref} {host} - then retry.")
+            f"/gate:{cmd} allow {ref} {host} - then retry.")
 
 
 def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None) -> str:
-    """Resolve a vault secret NAME to its raw value. Never returned to Claude."""
+    """Resolve a vault secret NAME, or an account's token (KIND:NAME), to its
+    raw value. Never returned to Claude."""
+    if vault.parse_account_ref(ref or ""):
+        a = vault.account(ref)
+        token = (a or {}).get("secrets", {}).get("token")
+        if not token:
+            raise RuntimeError(f"the account {ref} has no token" if a else
+                               f"no account named {ref}; ask the user to run: "
+                               f"/gate:account add {ref.replace(':', ' ', 1)} <description>")
+        return token
     s = vault.secret(ref) if vault.NAME_RE.fullmatch(ref or "") else None
     if not s:
         raise RuntimeError(f"no secret named {ref}; ask the user to run: "
@@ -307,10 +321,12 @@ def secret_list(approve: Approver = None) -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "reason": f"vault unavailable: {e}"}
     return {"ok": True, "secrets": cat["secrets"], "sudo": cat["sudo"],
-            "note": "Names only, never values. Use a secret's NAME as auth_ref on "
-                    "http_request, only for its hosts. Missing one? Ask the user to "
-                    "run /gate:secret add NAME <description> (a browser form "
-                    "asks them for the value)."}
+            "accounts": cat["accounts"],
+            "note": "Names only, never values. Use a secret's NAME, or an account "
+                    "with a token (KIND:NAME), as auth_ref on http_request, only for "
+                    "its hosts. Missing one? Ask the user to run /gate:secret add "
+                    "NAME <description> or /gate:account add KIND NAME <description> "
+                    "(a browser form asks them for the value)."}
 
 
 def secret_use_check(ref: str, approve: Approver = None) -> dict[str, Any]:

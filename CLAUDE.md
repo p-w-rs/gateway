@@ -26,7 +26,7 @@ plugins/gateway/
   .mcp.json                       MCP server "gw" (stdio, via pixi)
   hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse(Bash)
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
-  commands/{help,secret,sudo,log}.md   slash commands
+  commands/{help,secret,sudo,account,log}.md   slash commands
   install.py                      `pixi run install`: register plugin + merge settings.rules.json
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
@@ -36,11 +36,11 @@ plugins/gateway/
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
-    commands.py    /gate:secret and /gate:sudo handling, transcript scrubber
-    vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches
+    commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
+    vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches, accounts (KINDS)
     web_form.py    one-time 127.0.0.1 browser form for entering values
     cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
-                   fallback for /secret and /sudo when no browser can open)
+                   fallback for /secret, /sudo and /account when no browser can open)
   tests/run_tests.py              single offline test script (no pytest)
 ```
 
@@ -72,8 +72,9 @@ your change (mutation-check it).
 2. **Secrets go only to their allowed hosts.** Redirects drop credentials when
    they cross hosts or downgrade to http (`_GatewayRedirect`). There are no
    `keychain:`/`env:` refs; the vault is the only source.
-3. **Claude can't grant itself anything.** Vault changes and sudo switches
-   happen only in the UserPromptSubmit hook (user-typed prompts). The slash
+3. **Claude can't grant itself anything.** Vault changes (including account
+   scopes and prompt policies) and sudo switches happen only in the
+   UserPromptSubmit hook (user-typed prompts). The slash
    commands are `disable-model-invocation: true`. No MCP tool may add a
    secret, allow a host, or enable sudo.
 4. **Approvals come from Claude Code's permission prompt**, i.e. `ask` rules in
@@ -88,7 +89,7 @@ your change (mutation-check it).
 6. **The prompt hook fails closed.** If it can't run, a /secret or /sudo
    prompt is blocked, never passed through (`prompt.sh`).
 7. **Stdlib only** in `src/`. The only external binaries are `age`/`age-keygen`
-   (from pixi), the system `sudo`/`ssh`, and the browser.
+   and OpenSSH's `ssh-keygen` (from pixi), the system `sudo`/`ssh`, and the browser.
 
 ## Gotchas when working here
 
@@ -113,7 +114,20 @@ your change (mutation-check it).
 - The audit log is shared by all sessions on the machine; entries from other
   sessions are normal.
 
-## Status (2026-10-15, v0.3.0)
+## Status (2026-10-17, v0.4.0)
+
+v0.4.0 adds accounts (`/gate:account`, vault v2). This is phase 1 of the
+accounts plan:
+
+- kinds, scope and the prompt policy;
+- the kind-aware form, with SSH key paste or generate;
+- the terminal fallback;
+- accounts as `auth_ref`.
+
+Covered by tests (6 mutation-checked); not yet tried live. The tools that
+use accounts (git, gh, hf, pijul, …) come next.
+
+### v0.3.0 (2026-10-15)
 
 Verified live (macOS, desktop app): Bash redirect; vault add/up/allow/del/list
 through the browser form with no popup; secret use to allowed hosts and refusal

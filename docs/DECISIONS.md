@@ -84,3 +84,27 @@ Each of these was tried in order:
   since a GET can carry data too. The real control is per-secret hosts.
 - **Regex Bash blocklist:** steers a cooperative model. The user declined
   OS-level sandboxing.
+
+## Accounts (v0.4, 2026-10-17)
+
+The full research and plan are in `.work/accounts/PLAN.md` (local, not in
+git). The parts that shape the code:
+
+- **Separate identities, not more secrets.** A secret is one value with
+  hosts. An account is an identity of a known kind with settings, a scope
+  (hosts + owners), one or more credentials and a prompt policy, so several
+  per service can be used side by side.
+- **The prompt policy lives in the vault**, per account. `policy.json` can be
+  edited from Claude's Bash, so it can't hold the setting that decides
+  whether Claude gets asked. Approvals still come only from Claude Code's
+  permission prompt (`*_confirm` tools, in later phases).
+- **Pasted SSH keys are parsed in Python.** `ssh-keygen -y -f /dev/stdin`
+  works from a shell redirect but not from a pipe, and writing the key to a
+  file to read it back is what we avoid. Passphrase keys are refused because
+  the key goes into a private ssh-agent unattended. Only key generation
+  touches a (private, immediately removed) temp file, since ssh-keygen can
+  only write files.
+- **SSO sign-in waits for its own phase.** For SSO-only GitHub orgs
+  (asirobots), gh's own OAuth web flow works, verified 2026-10-17. The
+  gateway will run its own pixi `gh` in a temp config dir and move the token
+  into the vault, rather than copy gh's client id into our code.

@@ -5,7 +5,7 @@ session_main -> SessionStart: inject the network policy and the vault catalog
                 (names, descriptions, hosts; never values) so Claude uses the
                 gateway on the first try.
 prompt_main  -> UserPromptSubmit (via hooks/prompt.sh): handle
-                /gate:secret and /gate:sudo, then let the prompt
+                /gate:secret, /gate:sudo and /gate:account, then let the prompt
                 through with the result (or block it if it may hold a value).
 """
 from __future__ import annotations
@@ -38,7 +38,13 @@ SESSION_NOTE = (
     "  /gate:sudo add USER HOST               (a browser form asks the password)\n"
     "  /gate:sudo enable HOST [always]        (this session, or every session)\n"
     "  /gate:sudo disable HOST\n"
-    "  (/gate:secret help and /gate:sudo help list the rest.)\n"
+    "  /gate:account add KIND NAME <description>  (GitHub, Hugging Face, Pijul, "
+    "Azure, ML Catalog, SSH, registry identities; a browser form asks the token/key)\n"
+    "  (/gate:secret help, /gate:sudo help and /gate:account help list the rest.)\n"
+    "- Accounts (KIND:NAME, e.g. github:work) are the user's separate identities. "
+    "One with a token works as auth_ref on http_request, for its hosts only. Never "
+    "fall back to the user's own environment credentials for a service that has an "
+    "account here.\n"
     "When a <gateway-result> block is attached to the user's message, the "
     "gateway already handled their command: just relay the result in a line.\n"
     "NEVER ask the user to paste a secret or password into the chat; if they do "
@@ -93,6 +99,10 @@ def _catalog_note(session_id: str = "") -> str:
             hosts = (", ".join(s["hosts"])
                      or f"none yet: ask the user to run /gate:secret allow {n} HOST")
             lines.append(f"- {n}: {s['description'] or '(no description)'} [hosts: {hosts}]")
+    if cat["accounts"]:
+        lines.append("Accounts in the gateway vault (KIND:NAME; never values):")
+        for ref in cat["accounts"]:
+            lines.append("- " + commands._describe_account(ref, data["accounts"][ref], data))
     if cat["sudo"]:
         lines.append("Stored sudo passwords:")
         for key in cat["sudo"]:

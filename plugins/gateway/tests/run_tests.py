@@ -1087,5 +1087,247 @@ check("terminal fallback refuses without a real terminal (never reads a piped va
 check("/gate:help command exists, mentions the fallback",
       "vault secret add" in (ROOT / "commands" / "help.md").read_text())
 
+# --- Accounts: vault v2 + /gate:account --------------------------------------
+print("accounts:")
+from gateway import hooks as _hooks  # noqa: E402
+
+# A fake browser that fills every field of the form (plan["fields"]).
+ACCT_BROWSER = TMP / "acct_browser.py"
+ACCT_BROWSER.write_text(r'''
+import json, os, re, sys, urllib.parse, urllib.request
+url = sys.argv[1]
+plan = json.loads(open(os.environ["ACCT_PLAN"]).read() or "null")
+if not plan:
+    sys.exit(0)
+page = urllib.request.urlopen(url, timeout=10).read().decode()
+open(os.environ["ACCT_PAGE"], "w").write(page)
+nonce = re.search(r'name="nonce" value="([^"]+)"', page).group(1)
+fields = {"nonce": nonce, "action": plan["action"]}
+fields.update(plan.get("fields", {}))
+urllib.request.urlopen(urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode()),
+                       timeout=10).read()
+''')
+ACCT_BROWSER_SH = TMP / "acct_browser.sh"
+ACCT_BROWSER_SH.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{ACCT_BROWSER}" "$1"\n')
+ACCT_BROWSER_SH.chmod(0o755)
+ACCT_PLAN, ACCT_PAGE = TMP / "acct.plan", TMP / "acct.html"
+_old_browser = os.environ["GATEWAY_BROWSER"]
+os.environ.update(GATEWAY_BROWSER=str(ACCT_BROWSER_SH), ACCT_PLAN=str(ACCT_PLAN),
+                  ACCT_PAGE=str(ACCT_PAGE), GATEWAY_FORM_TIMEOUT="10")
+
+
+def acct_form(fields=None, action="save"):
+    ACCT_PLAN.write_text(json.dumps({"action": action, "fields": fields or {}}))
+    if ACCT_PAGE.exists():
+        ACCT_PAGE.unlink()
+
+
+def acct(prompt):
+    out = commands.handle({"prompt": prompt, "session_id": SID,
+                           "transcript_path": str(TRANSCRIPT)})
+    if out is not None:
+        out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
+    return out
+
+
+# v1 vault (no accounts) still reads, and is saved as v2.
+_main_home = os.environ["GATEWAY_HOME"]
+os.environ["GATEWAY_HOME"] = str(TMP / "vault-v1")
+_recipient = vault._ensure_key()
+subprocess.run([vault._age(), "-e", "-r", _recipient, "-o", str(vault.store_path())],
+               input=json.dumps({"version": 1, "secrets": {"OLD": {"value": "old_value_1",
+                                 "description": "d", "hosts": ["a.com"]}}, "sudo": {},
+                                 "sudo_enabled": [], "sudo_session": {}}).encode(),
+               check=True, capture_output=True)
+_d = vault.load()
+check("v1 vault loads with an empty accounts section",
+      _d["accounts"] == {} and _d["secrets"]["OLD"]["value"] == "old_value_1")
+vault.save(_d)
+check("v1 vault is saved as version 2", vault.load()["version"] == 2)
+os.environ["GATEWAY_HOME"] = _main_home
+
+GH_TOKEN_V = "gho_testtoken0123456789abcdefABCDEF"
+acct_form({"host": "github.com", "login": "octo-work", "name": "Octo Work",
+           "email": "octo@example.com", "owners": "asirobots, other-org",
+           "token": GH_TOKEN_V, "ssh_key_mode": "none", "ssh_key": ""})
+out = acct("/gate:account add github work Work GitHub (SSO org)")
+a = vault.account("github:work")
+check("account add: passes through (no block)", passed(out))
+check("account add: token came from the form", a and a["secrets"]["token"] == GH_TOKEN_V)
+check("account add: settings and owners stored",
+      a["login"] == "octo-work" and a["owners"] == ["asirobots", "other-org"])
+check("account add: default hosts for github.com",
+      a["hosts"] == ["github.com", "api.github.com"])
+check("account add: result never holds the token", GH_TOKEN_V not in out["reason"])
+_page = ACCT_PAGE.read_text()
+check("account form: kind-specific fields, masked token, no value prefilled",
+      'name="login"' in _page and 'name="token" type="password"' in _page
+      and 'name="ssh_key_mode"' in _page and GH_TOKEN_V not in _page)
+_cat = json.dumps(vault.catalog())
+check("catalog: account listed with methods, never the token",
+      '"github:work"' in _cat and '"token"' in _cat and GH_TOKEN_V not in _cat)
+check("all_values covers account tokens", GH_TOKEN_V in vault.all_values())
+check("account add: refuses an existing name",
+      "already exists" in acct("/gate:account add github work again")["reason"])
+check("account add: unknown kind refused",
+      "Unknown kind" in acct("/gate:account add gitlab x desc")["reason"])
+check("account add: needs a description",
+      "Add a description" in acct("/gate:account add github nodesc")["reason"])
+check("account add: bad name refused",
+      "not an account name" in acct("/gate:account add github Bad/Name d")["reason"])
+check("pasted token in the command is blocked, nothing saved",
+      acct(f"/gate:account add github leak {GH_TOKEN_V}").get("decision") == "block"
+      and vault.account("github:leak") is None)
+acct_form(action="cancel")
+check("account form cancelled: nothing stored",
+      "Cancelled" in acct("/gate:account add hf c desc")["reason"]
+      and vault.account("hf:c") is None)
+
+# up: an empty token keeps the old one; the token field is never prefilled.
+acct_form({"host": "github.com", "login": "octo-work", "name": "", "email": "",
+           "owners": "asirobots", "token": "", "ssh_key_mode": "none", "ssh_key": ""})
+out = acct("/gate:account up github:work Work GitHub, asirobots only")
+a = vault.account("github:work")
+check("account up: empty token keeps it; owners and description updated",
+      a["secrets"]["token"] == GH_TOKEN_V and a["owners"] == ["asirobots"]
+      and a["description"] == "Work GitHub, asirobots only")
+check("account up: form shows current settings but not the token",
+      'value="octo-work"' in ACCT_PAGE.read_text() and GH_TOKEN_V not in ACCT_PAGE.read_text())
+
+# SSH keys: generate, paste, refuse a passphrase-protected key.
+acct_form({"host": "nest.pijul.com", "login": "powers", "name": "", "email": "",
+           "remote_pijul": "", "owners": "", "ssh_key_mode": "generate", "ssh_key": ""})
+out = acct("/gate:account add pijul nest My Nest account")
+a = vault.account("pijul:nest")
+check("ssh key generated: private key only in the vault",
+      a and a["secrets"]["ssh_key"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----"))
+check("ssh key generated: the public key is shown to the user",
+      a["public_key"].startswith("ssh-ed25519 ") and a["public_key"] in out["reason"])
+check("ssh key generated: private key never in the result or catalog",
+      "PRIVATE KEY" not in out["reason"] and "PRIVATE KEY" not in json.dumps(vault.catalog()))
+check("ssh key generated: fingerprint in the catalog",
+      vault.catalog()["accounts"]["pijul:nest"]["key_fingerprint"].startswith("SHA256:"))
+check("ssh key generated: no key files left behind",
+      not list(vault.home().glob(".keygen-*")))
+check("all_values covers account ssh keys", a["secrets"]["ssh_key"].strip() in
+      [v.strip() for v in vault.all_values()])
+_kd = TMP / "keys"
+_kd.mkdir()
+subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "x", "-f", str(_kd / "plain")],
+               check=True)
+subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "a passphrase", "-C", "x",
+                "-f", str(_kd / "locked")], check=True)
+acct_form({"host": "box.example.com", "user": "deploy", "port": "",
+           "ssh_key_mode": "paste", "ssh_key": (_kd / "plain").read_text()})
+out = acct("/gate:account add ssh box Deploy box")
+a = vault.account("ssh:box")
+check("ssh key pasted: stored, public key derived (no file)",
+      a and a["public_key"] == (_kd / "plain.pub").read_text().strip().rsplit(" ", 1)[0])
+check("fingerprint matches ssh-keygen -l", a["key_fingerprint"] == subprocess.run(
+      ["ssh-keygen", "-l", "-f", str(_kd / "plain.pub")], capture_output=True, text=True).stdout.split()[1])
+acct_form({"host": "box2.example.com", "user": "deploy", "port": "",
+           "ssh_key_mode": "paste", "ssh_key": (_kd / "locked").read_text()})
+out = acct("/gate:account add ssh box2 Locked key")
+check("passphrase-protected key refused, nothing saved",
+      "passphrase" in out["reason"] and vault.account("ssh:box2") is None)
+acct_form({"host": "box3.example.com", "user": "deploy", "port": "",
+           "ssh_key_mode": "paste", "ssh_key": "not a key"})
+check("garbage key refused", "not an OpenSSH private key" in
+      acct("/gate:account add ssh box3 Bad key")["reason"])
+acct_form({"host": "-oProxyCommand=x", "user": "deploy", "port": "",
+           "ssh_key_mode": "none", "ssh_key": ""})
+check("host that looks like an ssh option refused",
+      "not a valid host" in acct("/gate:account add ssh evil Bad host")["reason"])
+check("pubkey shows the public key",
+      vault.account("pijul:nest")["public_key"] in acct("/gate:account pubkey pijul:nest")["reason"])
+
+# Scope: owners and hosts.
+acct("/gate:account allow github:work p-w-rs ghe.example.com")
+a = vault.account("github:work")
+check("allow: owner and host (dot = host)",
+      "p-w-rs" in a["owners"] and "ghe.example.com" in a["hosts"])
+acct("/gate:account disallow github:work p-w-rs ghe.example.com")
+a = vault.account("github:work")
+check("disallow: owner and host removed",
+      "p-w-rs" not in a["owners"] and "ghe.example.com" not in a["hosts"])
+check("owners refused on a host-only kind",
+      "scoped by host only" in acct("/gate:account allow ssh:box someone")["reason"])
+
+# Prompt policy (stored in the vault, so Claude can't loosen it).
+check("prompts: defaults", "read=auto, write=auto, delete=ask, exec=ask"
+      in acct("/gate:account prompts github:work")["reason"])
+acct("/gate:account prompts github:work write=ask delete=refuse")
+check("prompts: per account", vault.effective_prompts(vault.account("github:work"), vault.load())
+      == {"read": "auto", "write": "ask", "delete": "refuse", "exec": "ask"})
+acct("/gate:account prompts * read=ask")
+check("prompts: '*' default applies to other accounts",
+      vault.effective_prompts(vault.account("pijul:nest"), vault.load())["read"] == "ask")
+check("prompts: bad value refused",
+      "should look like" in acct("/gate:account prompts github:work write=yes")["reason"])
+acct("/gate:account prompts * reset")
+acct("/gate:account prompts github:work reset")
+check("prompts: reset", vault.effective_prompts(vault.account("github:work"), vault.load())
+      == vault.DEFAULT_PROMPTS)
+
+# Import a /gate:secret value as a token; forget; azure default client.
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"]["HF_IMPORT"] = {"value": "hf_importvalue123456", "description": "to import",
+                                  "hosts": [], "updated": ""}
+    vault.save(_d)
+acct_form({"login": "me", "owners": "", "token": "", "ssh_key_mode": "none", "ssh_key": ""})
+acct("/gate:account add hf me My HF")
+acct("/gate:account import hf:me HF_IMPORT")
+check("import: secret value becomes the account token",
+      vault.account("hf:me")["secrets"]["token"] == "hf_importvalue123456")
+acct("/gate:account forget hf:me token")
+check("forget: token removed", "token" not in vault.account("hf:me")["secrets"])
+acct_form({"tenant": "contoso.onmicrosoft.com", "client_id": "", "login": ""})
+acct("/gate:account add azure work Work Azure")
+check("azure: default client id is the Azure CLI's public client",
+      vault.account("azure:work")["client_id"] == vault.AZURE_CLI_CLIENT_ID)
+check("login: not available yet, says so",
+      "later version" in acct("/gate:account login azure:work")["reason"])
+
+# http_request with an account as auth_ref: only to its hosts.
+n = len(HITS)
+r = actions.http_request("GET", A + "/x", auth_ref="github:work")
+check("account auth_ref refused for a host outside its scope, with the allow hint",
+      r.get("refused") is True and "/gate:account allow github:work 127.0.0.1" in r["reason"]
+      and len(HITS) == n)
+acct("/gate:account allow github:work 127.0.0.1")
+r = actions.http_request("GET", A + "/x", auth_ref="github:work")
+check("account auth_ref sent to an allowed host", r.get("ok") is True
+      and "authorization" in echoed(r))
+check("account token hidden from the result", GH_TOKEN_V not in json.dumps(r))
+r = actions.http_request("GET", A + "/x", auth_ref="pijul:nest")
+check("account without a token can't be used as auth_ref", r.get("ok") is False)
+
+# Logs, session note, wrapper, terminal fallback, delete.
+_log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
+check("audit log: account commands logged, no token or key",
+      '"account add"' in _log and GH_TOKEN_V not in _log and "PRIVATE KEY" not in _log)
+_note = _hooks._catalog_note(SID)
+check("session note lists accounts, never values",
+      "github:work" in _note and "pijul:nest" in _note and GH_TOKEN_V not in _note
+      and "PRIVATE KEY" not in _note)
+check("session note tells Claude about /gate:account", "/gate:account add" in _hooks.SESSION_NOTE)
+out = json.loads(run_sh("/gate:account list"))
+check("wrapper routes /gate:account", "decision" not in out
+      and "github:work" in out["hookSpecificOutput"]["additionalContext"])
+_cmds.FIELDS_PROVIDER = lambda title, details, fields: {
+    "host": "registry.example.com", "login": "bot", "owners": "", "token": "tok_terminal_123456"}
+try:
+    msg = _cmds.run_account("add registry term From a terminal")
+    check("terminal fallback: account add stores the token, reply has none",
+          vault.account("registry:term")["secrets"]["token"] == "tok_terminal_123456"
+          and "tok_terminal_123456" not in msg)
+finally:
+    _cmds.FIELDS_PROVIDER = None
+acct("/gate:account del registry:term")
+check("del", vault.account("registry:term") is None)
+check("account help lists the kinds", "github, hf, pijul" in acct("/gate:account help")["reason"])
+os.environ["GATEWAY_BROWSER"] = _old_browser
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

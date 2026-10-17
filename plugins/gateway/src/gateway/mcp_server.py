@@ -54,7 +54,7 @@ TOOLS: list[dict[str, Any]] = [
                 "headers": {"type": "object"},
                 "body": {"type": "string"},
                 "auth_ref": {"type": "string",
-                             "description": "Secret NAME from the vault, e.g. HF_TOKEN"},
+                             "description": "Secret NAME from the vault (e.g. HF_TOKEN), or an account with a token (e.g. github:work)"},
                 "auth_header": {"type": "string", "default": "Authorization",
                                 "description": "Header to put the secret in, e.g. X-Api-Key"},
                 "auth_scheme": {"type": "string", "default": "Bearer",

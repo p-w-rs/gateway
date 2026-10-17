@@ -1,5 +1,5 @@
 ---
-description: Quick guide to gateway - what it does and how to manage secrets and sudo
+description: Quick guide to gateway - what it does and how to manage secrets, sudo and accounts
 ---
 
 Give the user a short, friendly guide to the gateway plugin, based on the
@@ -31,10 +31,22 @@ Reference:
     for this session only. Add `always` for every session.
   - `/gate:sudo disable HOST`: back to asking before each root command
     (the default). Also `up`, `del`, `list`, `help`.
+- **Accounts** (separate identities: GitHub, Hugging Face, Pijul, Azure, ASI ML
+  Catalog, SSH hosts, container registries; several per service is fine):
+  - `/gate:account add KIND NAME description`: the browser page asks the
+    login, owners/orgs, a token and/or an SSH key (paste one or generate one;
+    the public key is shown so you can add it on the site).
+  - `/gate:account allow KIND:NAME OWNER|HOST`: what it may be used for.
+  - `/gate:account prompts KIND:NAME|* write=ask delete=refuse ...`: when
+    tools using it ask first (classes read, write, delete, exec).
+  - `/gate:account pubkey`, `import KIND:NAME SECRET`, `forget`, `up`,
+    `desc`, `disallow`, `del`, `list`, `help`.
+  - An account with a token works as `auth_ref` on `http_request` now; the
+    git/gh/hf/pijul tools and SSO sign-in come in later versions.
 - **No browser here** (ssh, headless Linux)? Run the same command in a
   terminal, which asks at a hidden prompt:
   `pixi run --manifest-path <plugin dir>/pixi.toml vault secret add NAME description`
-  (and `vault sudo ...`; per-session enable needs a Claude session, so use
+  (and `vault sudo ...`, `vault account ...`; per-session enable needs a Claude session, so use
   `enable HOST always` there).
 - **Auto mode:**
   - **Silent:** web requests, downloads, cert checks, file hashes, secrets to

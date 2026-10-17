@@ -26,7 +26,7 @@ host), and log everything.
 | `sudo` with a typed password | **run_privileged** / **run_privileged_confirm** |
 | keychain / env tokens | secrets in the gateway's own vault, used by NAME |
 
-## Managing secrets and sudo (you, in the chat)
+## Managing secrets, sudo and accounts (you, in the chat)
 
 ```
 /gate:secret add HF_TOKEN Hugging Face Hub token   → a browser page asks for the value
@@ -40,7 +40,25 @@ host), and log everything.
 /gate:sudo enable myserver always                → ...in every session
 /gate:sudo disable myserver                      → back to asking (all sessions)
 /gate:sudo up | del | list | help
+
+/gate:account add github work Work GitHub (asirobots)  → a browser page asks login, owners,
+                                                         token and/or SSH key (paste or generate)
+/gate:account allow github:work asirobots           → owners/orgs (or hosts, with a dot) it is for
+/gate:account prompts github:work write=ask         → when tools using it must ask you first
+/gate:account pubkey github:work                    → the public key to paste on the site
+/gate:account import github:work GITHUB_TOKEN       → reuse a /gate:secret value as its token
+/gate:account up | desc | disallow | forget | del | list | help
 ```
+
+**Accounts** are separate identities, kept apart from your own environment:
+several GitHub accounts side by side, Hugging Face, Pijul (the Nest or your own
+server), Azure, the ASI ML Catalog, SSH hosts and container registries
+(`KIND:NAME`, e.g. `github:work`). Each is scoped to its hosts and owners, and
+its prompt policy (`read`, `write`, `delete`, `exec` = `auto`, `ask` or
+`refuse`) lives in the vault, so Claude can't loosen it. An account with a
+token already works as `auth_ref` on `http_request`; the tools that run git,
+gh, hf, pijul and the rest as an account, and SSO sign-in
+(`/gate:account login`), are coming in later versions.
 
 - **Values never go in the chat.** A one-time page opens in your browser on
   `127.0.0.1` with a masked field; you paste and Save. Claude never sees the
@@ -100,6 +118,7 @@ Updating later: `git pull` in the clone, then start a new Claude Code session.
 
   ```bash
   pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault secret add NAME description
+  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault account add KIND NAME description
   pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault sudo add USER HOST
   ```
 

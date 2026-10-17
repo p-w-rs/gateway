@@ -1,4 +1,4 @@
-"""The /gate:secret and /gate:sudo chat commands.
+"""The /gate:secret, /gate:sudo and /gate:account chat commands.
 
 A UserPromptSubmit hook handles them. Values (secrets, sudo passwords) are
 never typed in the chat: the hook opens a one-time browser form with a masked
@@ -25,6 +25,8 @@ transcript and prompt history.
     /gate:sudo enable HOST [always]           this session only, or all sessions
     /gate:sudo disable HOST
     /gate:sudo list
+    /gate:account add KIND NAME description   (browser form: settings, token, ssh key)
+    /gate:account up|desc|allow|disallow|prompts|pubkey|import|forget|del|list ...
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ from typing import Any
 
 from . import policy, vault, web_form
 
-PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo)(?=\s|$)(.*)$", re.S)
+PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo|account)(?=\s|$)(.*)$", re.S)
 
 SECRET_HELP = (
     "/gate:secret add NAME description     store a secret (a browser form asks the value)\n"
@@ -60,6 +62,26 @@ SUDO_HELP = (
     "/gate:sudo enable HOST always  ...in every session\n"
     "/gate:sudo disable HOST        every root command asks again (the default)\n"
     "/gate:sudo list                stored USER@HOST entries and where sudo is enabled"
+)
+
+
+KIND_LIST = ", ".join(vault.KINDS)
+ACCOUNT_HELP = (
+    "/gate:account add KIND NAME description   new account; a browser form asks its settings,\n"
+    f"                                            token and/or SSH key. KIND: {KIND_LIST}\n"
+    "/gate:account up KIND:NAME [description]   change settings, replace the token or key\n"
+    "/gate:account desc KIND:NAME description   change only the description\n"
+    "/gate:account allow KIND:NAME OWNER|HOST.. what it may be used for (a name with a dot\n"
+    "                                            is a host, otherwise an owner/org)\n"
+    "/gate:account disallow KIND:NAME OWNER|HOST..\n"
+    "/gate:account prompts KIND:NAME|* [read|write|delete|exec=auto|ask|refuse ...|reset]\n"
+    "                                            when tools using it must ask you first\n"
+    "/gate:account pubkey KIND:NAME             show its public SSH key (to paste on the site)\n"
+    "/gate:account import KIND:NAME SECRET      use a /gate:secret value as its token\n"
+    "/gate:account forget KIND:NAME token|ssh_key  remove one credential\n"
+    "/gate:account login KIND:NAME              sign in with SSO (coming in a later version)\n"
+    "/gate:account del KIND:NAME                delete it\n"
+    "/gate:account list                         accounts, scope, methods (never values)"
 )
 
 
@@ -151,6 +173,22 @@ def _form(title: str, details: list[tuple[str, str]], label: str,
 
 
 _CURRENT: dict[str, str] = {}  # the command being handled, for the hint above
+
+# Set by `run.py vault` to ask multi-field forms in the terminal.
+FIELDS_PROVIDER = None
+
+
+def _fields_form(title: str, details: list[tuple[str, str]],
+                 fields: list[dict[str, Any]]) -> dict[str, str] | None:
+    if FIELDS_PROVIDER is not None:
+        return FIELDS_PROVIDER(title, details, fields)
+    try:
+        return web_form.ask_form(title, details, fields)
+    except web_form.Unavailable:
+        raise CommandError(
+            "No browser can be opened here (no desktop, e.g. over ssh), so nothing "
+            "was saved. Run the same command in a terminal on this machine instead:\n  "
+            + terminal_command(_CURRENT.get("args", "account ...")))
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +397,329 @@ def run_sudo(rest: str, session_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# /account
+# ---------------------------------------------------------------------------
+
+FIELD_INFO = {
+    "host": ("Host", "where it lives, e.g. github.com, a GitHub Enterprise host, nest.pijul.com"),
+    "login": ("Login / username", "your user name on that service"),
+    "name": ("Name for commits", "the author name to commit as"),
+    "email": ("Email for commits", "the author email to commit as"),
+    "remote_pijul": ("pijul on the server (optional)",
+                     "absolute path to pijul on a self-hosted server, if not on its PATH"),
+    "tenant": ("Tenant", "the directory (tenant) ID or domain, e.g. contoso.onmicrosoft.com"),
+    "client_id": ("Client ID (optional)",
+                  "the app to sign in with; empty = the Azure CLI's public client"),
+    "user": ("User", "the login user on that host"),
+    "port": ("Port (optional)", "empty = 22"),
+}
+
+
+def _acct_ref(ref: str, data: dict[str, Any] | None = None, exists: bool = True) -> str:
+    ref = ref.strip()
+    if not vault.parse_account_ref(ref):
+        raise CommandError(f"'{ref}' is not an account name like github:work "
+                           f"(kinds: {KIND_LIST}).")
+    if data is not None and exists and ref not in data["accounts"]:
+        raise CommandError(f"No account named {ref}; see /gate:account list.")
+    return ref
+
+
+def _describe_account(ref: str, a: dict[str, Any], data: dict[str, Any]) -> str:
+    v = vault.account_view(ref, a, data)
+    who = v.get("login") or v.get("user") or ""
+    bits = [f"{ref}: {v['description'] or '(no description)'}"]
+    if who:
+        bits.append(f"as {who}")
+    if "owners" in v:
+        bits.append("owners: " + (", ".join(v["owners"]) or "any"))
+    bits.append("hosts: " + (", ".join(v["hosts"]) or "none yet"))
+    bits.append("methods: " + (", ".join(v["methods"]) or "none yet"))
+    if v.get("key_fingerprint"):
+        bits.append(f"key {v['key_fingerprint']}")
+    p = v["prompts"]
+    asks = [k for k in vault.PROMPT_CLASSES if p[k] != "auto"]
+    bits.append("prompts: " + (", ".join(f"{k}={p[k]}" for k in asks) or "never ask"))
+    return " | ".join(bits)
+
+
+def _account_fields(kind: str, old: dict[str, Any] | None) -> list[dict[str, Any]]:
+    spec = vault.KINDS[kind]
+    old = old or {}
+    fields: list[dict[str, Any]] = []
+    for f in spec["fields"]:
+        label, helptext = FIELD_INFO[f]
+        value = old.get(f, spec["host"] if f == "host" else "")
+        fields.append({"name": f, "label": label, "help": helptext, "value": str(value),
+                       "required": f in ("host", "tenant") or (f == "user" and kind == "ssh")})
+    if spec["owners"]:
+        fields.append({"name": "owners", "label": "Owners / orgs (optional)",
+                       "value": " ".join(old.get("owners", [])),
+                       "help": "which owners it is for, e.g. asirobots; empty = any on its hosts"})
+    if "token" in spec["secrets"]:
+        fields.append({"name": "token", "label": "Token (optional)", "type": "password",
+                       "help": ("leave empty to keep the current one" if old.get("secrets", {}).get("token")
+                                else "a personal access token; leave empty to use SSH or sign in later")})
+    if "ssh_key" in spec["secrets"]:
+        has = bool(old.get("secrets", {}).get("ssh_key"))
+        opts = ([("keep", "Keep the current SSH key")] if has else [("none", "No SSH key")])
+        opts += [("generate", "Generate a new SSH key (shows the public key to add on the site)"),
+                 ("paste", "Use a private key I paste below")]
+        fields.append({"name": "ssh_key_mode", "label": "SSH key", "type": "select",
+                       "options": opts, "value": opts[0][0]})
+        fields.append({"name": "ssh_key", "label": "Private key (only for 'paste')",
+                       "type": "textarea",
+                       "help": "an OpenSSH private key without a passphrase; it stays in the vault"})
+    return fields
+
+
+def _clean_setting(kind: str, f: str, v: str) -> str:
+    v = v.strip()
+    if not v:
+        return ""
+    ok = {"host": lambda x: vault.HOST_RE.fullmatch(x.lower()),
+          "login": vault.LOGIN_RE.fullmatch, "user": vault.USER_RE.fullmatch,
+          "email": vault.EMAIL_RE.fullmatch,
+          "name": lambda x: len(x) <= 100 and x.isprintable(),
+          "remote_pijul": lambda x: x.startswith("/") and x.isprintable() and " " not in x,
+          "tenant": lambda x: vault.GUID_RE.fullmatch(x) or vault.HOST_RE.fullmatch(x.lower()),
+          "client_id": vault.GUID_RE.fullmatch,
+          "port": lambda x: x.isdigit() and 0 < int(x) < 65536}[f]
+    if not ok(v):
+        raise CommandError(f"'{v}' is not a valid {FIELD_INFO[f][0].lower()}.")
+    return v.lower() if f in ("host",) else v
+
+
+def _owners(words: list[str]) -> list[str]:
+    for w in words:
+        if not vault.OWNER_RE.fullmatch(w):
+            raise CommandError(f"'{w}' is not an owner or org name.")
+    return [w for w in words if w]
+
+
+def _apply_form(ref: str, kind: str, got: dict[str, str],
+                old: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+    """The new account record from the submitted form, plus a note for the
+    user (e.g. the generated public key). Raises CommandError if invalid."""
+    spec = vault.KINDS[kind]
+    old = old or {}
+    rec = {k: v for k, v in old.items()}
+    rec["kind"] = kind
+    for f in spec["fields"]:
+        rec[f] = _clean_setting(kind, f, got.get(f, ""))
+    if kind == "azure" and not rec.get("client_id"):
+        rec["client_id"] = vault.AZURE_CLI_CLIENT_ID
+    if spec["owners"]:
+        rec["owners"] = _owners(got.get("owners", "").replace(",", " ").split())
+    host = rec.get("host") or spec["host"]
+    if "host" in spec["fields"] or spec["host"]:
+        rec["host"] = host
+    old_defaults = vault.default_hosts(kind, old.get("host", "")) if old else []
+    extra = [h for h in old.get("hosts", []) if h not in old_defaults]
+    rec["hosts"] = list(dict.fromkeys(vault.default_hosts(kind, host) + extra))
+    secrets = dict(old.get("secrets", {}))
+    note = ""
+    token = got.get("token", "").strip()
+    if token:
+        if any(c.isspace() for c in token) or len(token) > 4096:
+            raise CommandError("That token has spaces in it or is too long; nothing was saved.")
+        secrets["token"] = token
+    mode = got.get("ssh_key_mode", "")
+    if mode == "generate":
+        priv, pub = vault.generate_ssh_key(f"gateway {ref}")
+        secrets["ssh_key"] = priv
+        rec["public_key"] = pub
+        note = f"New SSH public key (add it on {host}):\n{pub}"
+    elif mode == "paste":
+        priv = got.get("ssh_key", "").strip()
+        if not priv:
+            raise CommandError("'Use a private key I paste' was chosen but no key was pasted; "
+                               "nothing was saved.")
+        try:
+            rec["public_key"] = vault.public_key_of(priv)
+        except ValueError as e:
+            raise CommandError(f"{e}; nothing was saved.")
+        secrets["ssh_key"] = priv + "\n"
+    if rec.get("public_key") and secrets.get("ssh_key"):
+        rec["key_fingerprint"] = vault.fingerprint_of(rec["public_key"])
+    rec["secrets"] = secrets
+    rec["updated"] = vault.now()
+    return rec, note
+
+
+def _prompts_cmd(target: str, words: list[str]) -> str:
+    with vault.locked():
+        data = vault.load()
+        if target == "*":
+            store = data.setdefault("account_prompts", {})
+            label = "the default for all accounts"
+        else:
+            ref = _acct_ref(target, data)
+            store = data["accounts"][ref].setdefault("prompts", {})
+            label = ref
+        if not words:
+            shown = (vault.effective_prompts({}, data) if target == "*"
+                     else vault.effective_prompts(data["accounts"][target], data))
+            return f"Prompts for {label}: " + ", ".join(f"{k}={v}" for k, v in shown.items())
+        if words == ["reset"]:
+            store.clear()
+        else:
+            for w in words:
+                k, _, v = w.partition("=")
+                if k not in vault.PROMPT_CLASSES or v not in vault.PROMPT_VALUES:
+                    raise CommandError(f"'{w}' should look like write=ask (classes: "
+                                       f"{', '.join(vault.PROMPT_CLASSES)}; values: "
+                                       f"{', '.join(vault.PROMPT_VALUES)}).")
+                store[k] = v
+        vault.save(data)
+        shown = (vault.effective_prompts({}, data) if target == "*"
+                 else vault.effective_prompts(data["accounts"][target], data))
+    return f"Prompts for {label}: " + ", ".join(f"{k}={v}" for k, v in shown.items())
+
+
+def run_account(rest: str) -> str:
+    sub, tail = _words(rest, 1)
+    sub = sub.lower()
+    _guard_text(tail.split())
+    if sub in ("", "help"):
+        return ACCOUNT_HELP
+    if sub == "list":
+        data = vault.load()
+        if not data["accounts"]:
+            return "No accounts yet. Add one with /gate:account add KIND NAME description."
+        return "\n".join(_describe_account(r, a, data) for r, a in sorted(data["accounts"].items()))
+
+    if sub in ("add", "up", "update"):
+        if sub == "add":
+            kind, name, desc = _words(tail, 2)
+            kind = kind.lower()
+            if kind not in vault.KINDS:
+                raise CommandError(f"Unknown kind '{kind}'. Kinds: {KIND_LIST}.")
+            if ":" in name:
+                raise CommandError(f"Give the kind and the name separately: "
+                                   f"/gate:account add {kind} NAME description")
+            ref = _acct_ref(f"{kind}:{name.lower()}", exists=False)
+            if not desc.strip():
+                raise CommandError("Add a description so Claude knows what it is for: "
+                                   f"/gate:account add {kind} {name} what it is for")
+            old = None
+            if vault.account(ref):
+                raise CommandError(f"{ref} already exists; use /gate:account up {ref}.")
+        else:
+            target, desc = _words(tail, 1)
+            data = vault.load()
+            ref = _acct_ref(target, data)
+            kind = ref.split(":", 1)[0]
+            old = data["accounts"][ref]
+        spec = vault.KINDS[kind]
+        details = [("Account", ref), ("Kind", spec["label"]),
+                   ("Description", desc.strip() or (old or {}).get("description", ""))]
+        if kind in ("azure", "mlcat"):
+            details.append(("Sign-in", "SSO sign-in comes with /gate:account login "
+                                       "in a later version"))
+        got = _fields_form(f"{'Add' if sub == 'add' else 'Update'} the account {ref}",
+                           details, _account_fields(kind, old))
+        if got is None:
+            return f"Cancelled; nothing was saved for {ref}."
+        rec, note = _apply_form(ref, kind, got, old)
+        rec["description"] = desc.strip() or (old or {}).get("description", "")
+        with vault.locked():
+            data = vault.load()
+            if sub == "add" and ref in data["accounts"]:
+                raise CommandError(f"{ref} already exists; use /gate:account up {ref}.")
+            data["accounts"][ref] = rec
+            vault.save(data)
+            msg = f"{'Added' if sub == 'add' else 'Updated'} {_describe_account(ref, rec, data)}."
+        return msg + (f"\n{note}" if note else "")
+
+    if sub == "prompts":
+        parts = tail.split()
+        if not parts:
+            raise CommandError("Usage: /gate:account prompts KIND:NAME|* [class=value ...|reset]")
+        return _prompts_cmd(parts[0], parts[1:])
+
+    if sub == "login":
+        ref = _acct_ref(tail.split()[0] if tail.split() else "", vault.load())
+        raise CommandError(f"SSO sign-in for {ref} comes in a later version of the gateway. "
+                           f"For now add a token or SSH key with /gate:account up {ref}.")
+
+    with vault.locked():
+        data = vault.load()
+        accounts = data["accounts"]
+        parts = tail.split()
+        if sub == "pubkey":
+            ref = _acct_ref(parts[0] if parts else "", data)
+            pub = accounts[ref].get("public_key")
+            if not pub:
+                raise CommandError(f"{ref} has no SSH key; add one with /gate:account up {ref}.")
+            return f"Public SSH key of {ref} ({accounts[ref].get('key_fingerprint', '')}):\n{pub}"
+        if sub == "desc":
+            target, desc = _words(tail, 1)
+            ref = _acct_ref(target, data)
+            accounts[ref]["description"] = desc.strip()
+            vault.save(data)
+            return f"Updated {_describe_account(ref, accounts[ref], data)}."
+        if sub in ("allow", "disallow"):
+            if len(parts) < 2:
+                raise CommandError(f"Usage: /gate:account {sub} KIND:NAME OWNER|HOST [...]")
+            ref = _acct_ref(parts[0], data)
+            a = accounts[ref]
+            hosts = [w.lower() for w in parts[1:] if "." in w]
+            owners = [w for w in parts[1:] if "." not in w]
+            for h in hosts:
+                if not vault.HOST_RE.fullmatch(h):
+                    raise CommandError(f"'{h}' is not a host name.")
+            if owners and not vault.KINDS[a["kind"]]["owners"]:
+                raise CommandError(f"{ref} is scoped by host only; give host names "
+                                   "(with a dot).")
+            _owners(owners)
+            if sub == "allow":
+                a["hosts"] = list(dict.fromkeys(a.get("hosts", []) + hosts))
+                a["owners"] = list(dict.fromkeys(a.get("owners", []) + owners)) \
+                    if vault.KINDS[a["kind"]]["owners"] else a.get("owners", [])
+            else:
+                a["hosts"] = [h for h in a.get("hosts", []) if h not in hosts]
+                if "owners" in a:
+                    a["owners"] = [o for o in a["owners"] if o not in owners]
+            vault.save(data)
+            return f"Updated {_describe_account(ref, a, data)}."
+        if sub == "import":
+            if len(parts) != 2:
+                raise CommandError("Usage: /gate:account import KIND:NAME SECRET_NAME")
+            ref = _acct_ref(parts[0], data)
+            name = _name(parts[1])
+            if "token" not in vault.KINDS[accounts[ref]["kind"]]["secrets"]:
+                raise CommandError(f"{ref} can't hold a token.")
+            sec = data["secrets"].get(name)
+            if not sec:
+                raise CommandError(f"No secret named {name}.")
+            accounts[ref].setdefault("secrets", {})["token"] = sec["value"]
+            accounts[ref]["updated"] = vault.now()
+            vault.save(data)
+            return (f"{ref} now uses the value of {name} as its token. The secret {name} "
+                    f"is still there; remove it with /gate:secret del {name} if you no "
+                    f"longer need it.\n{_describe_account(ref, accounts[ref], data)}")
+        if sub == "forget":
+            if len(parts) != 2 or parts[1] not in vault.SECRET_FIELDS:
+                raise CommandError("Usage: /gate:account forget KIND:NAME token|ssh_key")
+            ref = _acct_ref(parts[0], data)
+            a = accounts[ref]
+            if a.get("secrets", {}).pop(parts[1], None) is None:
+                raise CommandError(f"{ref} has no {parts[1]}.")
+            if parts[1] == "ssh_key":
+                a.pop("public_key", None)
+                a.pop("key_fingerprint", None)
+            vault.save(data)
+            return f"Removed the {parts[1]} of {ref}.\n{_describe_account(ref, a, data)}"
+        if sub in ("del", "delete", "rm"):
+            ref = _acct_ref(tail.strip(), data)
+            accounts.pop(ref)
+            vault.save(data)
+            return f"Deleted the account {ref}."
+    raise CommandError(f"Unknown command '{sub}'.\n{ACCOUNT_HELP}")
+
+
+# ---------------------------------------------------------------------------
 # Hook glue
 # ---------------------------------------------------------------------------
 
@@ -390,7 +751,8 @@ def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
     session_id = payload.get("session_id") or ""
     _CURRENT["args"] = f"{kind} {' '.join(rest.split())}".strip()
     try:
-        result = run_secret(rest) if kind == "secret" else run_sudo(rest, session_id)
+        result = (run_secret(rest) if kind == "secret" else run_sudo(rest, session_id)
+                  if kind == "sudo" else run_account(rest))
         outcome = "cancelled" if result.startswith("Cancelled") else "ok"
     except LooksLikeValue as e:
         _spawn_scrubber(payload.get("transcript_path", ""), e.typed)
@@ -421,6 +783,16 @@ def _log_detail(kind: str, rest: str, outcome: str) -> dict[str, Any]:
             hosts = [h for h in words[2:] if vault.HOST_RE.fullmatch(h)
                      and not _TOKEN_LIKE.match(h)]
             target += " -> " + ", ".join(hosts)
+    elif kind == "account":
+        if safe and (vault.parse_account_ref(safe[0]) or safe[0] == "*"):
+            target = safe[0]
+        elif sub == "add" and len(safe) >= 2 and safe[0].lower() in vault.KINDS \
+                and vault.ACCOUNT_RE.fullmatch(f"{safe[0].lower()}:{safe[1].lower()}"):
+            target = f"{safe[0].lower()}:{safe[1].lower()}"
+        if target and sub in ("allow", "disallow"):
+            scope = [w for w in words[2:] if vault.OWNER_RE.fullmatch(w)
+                     and not _TOKEN_LIKE.match(w)]
+            target += " -> " + ", ".join(scope)
     elif kind == "sudo":
         if sub in ("add", "up", "update", "del", "delete", "rm") and len(safe) >= 2 \
                 and vault.USER_RE.fullmatch(safe[0]) and vault.HOST_RE.fullmatch(safe[1]):
@@ -458,7 +830,8 @@ def _needles(value: str) -> list[bytes]:
     return sorted((n for n in out if n), key=len, reverse=True)
 
 
-MARKERS = (b"/secret", b"/sudo", b"gate:secret", b"gate:sudo")
+MARKERS = (b"/secret", b"/sudo", b"/account", b"gate:secret", b"gate:sudo",
+           b"gate:account")
 
 
 def scrub_file(path: Path, values: list[str]) -> int:
