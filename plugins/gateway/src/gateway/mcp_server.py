@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, ghops, gitops, policy, vault
+from . import __version__, actions, ghops, gitops, mirrors, policy, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -221,6 +221,24 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _GH_SCHEMA,
     },
     {
+        "name": "git_mirror",
+        "description": ("Keep a repo's branches and tags the same on several remotes (e.g. "
+                        "personal and work GitHub), each fetched/pushed as its own account. "
+                        "action: status (compare), sync (fast-forward the remotes that are "
+                        "behind; diverged branches and conflicting tags are left alone, never "
+                        "forced), add/remove (the saved set, in the repo's gateway.mirror "
+                        "config). See the accounts skill."),
+        "inputSchema": {"type": "object", "properties": {
+            "cwd": {"type": "string", "description": "the repo (absolute path)"},
+            "action": {"type": "string", "enum": ["status", "sync", "add", "remove"]},
+            "remotes": {"type": "array", "items": {"type": "string"},
+                        "description": "remote names; default: the saved set"},
+            "branches": {"type": "array", "items": {"type": "string"},
+                         "description": "only these branches (default: all on any remote)"},
+            "tags": {"type": "boolean", "default": True}},
+            "required": ["cwd", "action"]},
+    },
+    {
         "name": "gh_confirm",
         "description": "Same as gh, after Claude Code asks the user.",
         "inputSchema": _GH_SCHEMA,
@@ -386,6 +404,10 @@ def dispatch(name: str, args: dict[str, Any],
                                timeout=min(int(args.get("timeout", 300)), 1800))
     if name == "git_identity":
         return gitops.git_identity(args.get("cwd", ""), args.get("account", ""))
+    if name == "git_mirror":
+        return mirrors.git_mirror(args.get("cwd", ""), args.get("action", "status"),
+                                  args.get("remotes"), args.get("branches"),
+                                  args.get("tags", True))
     if name in ("gh", "gh_confirm"):
         return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
                              confirmed=name == "gh_confirm",

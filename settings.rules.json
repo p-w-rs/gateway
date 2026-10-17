@@ -12,7 +12,8 @@
       "mcp__plugin_gate_gw__account_list",
       "mcp__plugin_gate_gw__git",
       "mcp__plugin_gate_gw__git_identity",
-      "mcp__plugin_gate_gw__gh"
+      "mcp__plugin_gate_gw__gh",
+      "mcp__plugin_gate_gw__git_mirror"
     ],
     "ask": [
       "mcp__plugin_gate_gw__port_check",

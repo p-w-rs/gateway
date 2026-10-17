@@ -1874,5 +1874,73 @@ check("settings rules: git/gh allowed, the _confirm tools ask",
       and all(f"mcp__plugin_gate_gw__{t}" in _rules["ask"] for t in ("git_confirm", "gh_confirm")))
 _gsrv2.shutdown()
 
+print("mirrors:")
+from gateway import mirrors  # noqa: E402
+
+MR = RT / "mirror"
+MR.mkdir()
+for name in ("a", "b", "c"):
+    _git("init", "-q", "--bare", "-b", "main", str(MR / f"{name}.git"))
+M = MR / "work"
+MG = lambda *a, **k: gitops.git_tool(list(a), str(M), **k)  # noqa: E731
+MG.__name__ = "MG"
+M.mkdir()
+MG("init", "-q", "-b", "main")
+_git("config", "user.email", "m@example.com", cwd=M)
+_git("config", "user.name", "M", cwd=M)
+for name in ("a", "b", "c"):
+    MG("remote", "add", name, str(MR / f"{name}.git"))
+(M / "x.txt").write_text("1\n")
+MG("add", "x.txt")
+MG("commit", "-q", "-m", "one")
+MG("tag", "v1")
+MG("push", "a", "main")
+MG("push", "a", "v1")
+check("mirror: needs two remotes", not mirrors.git_mirror(str(M), "status", ["a"])["ok"])
+r = mirrors.git_mirror(str(M), "add", ["a", "b", "c"])
+check("mirror: set saved in the repo's config", r["ok"] and mirrors.mirror_set(M) == ["a", "b", "c"])
+r = mirrors.git_mirror(str(M), "status")
+check("mirror status: b and c are missing main",
+      r["branches"]["main"]["state"] == "behind" and sorted(r["branches"]["main"]["missing"]) == ["b", "c"])
+check("mirror status: tag v1 missing on b and c", r["tags"]["v1"]["state"] == "missing")
+r = mirrors.git_mirror(str(M), "sync")
+check("mirror sync: fast-forwards b and c (branch and tag)",
+      r["ok"] and len(r["pushed"]) == 4
+      and mirrors.git_mirror(str(M), "status")["branches"]["main"]["state"] == "in sync")
+(M / "x.txt").write_text("2\n")
+MG("commit", "-q", "-am", "two")
+MG("push", "b", "main")
+r = mirrors.git_mirror(str(M), "sync")
+check("mirror sync: a remote ahead is copied to the others",
+      r["ok"] and sorted(p.split()[0] for p in r["pushed"]) == ["a", "c"])
+# Diverge c: a different commit on top of the old one.
+_d = MR / "other"
+_git("clone", "-q", str(MR / "c.git"), str(_d))
+_git("config", "user.email", "o@example.com", cwd=_d)
+_git("config", "user.name", "O", cwd=_d)
+(_d / "y.txt").write_text("other\n")
+_git("add", "y.txt", cwd=_d)
+_git("commit", "-q", "-m", "other side", cwd=_d)
+_git("reset", "-q", "--hard", "HEAD~2", cwd=_d)  # off the older commit
+(_d / "z.txt").write_text("z\n")
+_git("add", "z.txt", cwd=_d)
+_git("commit", "-q", "-m", "diverged", cwd=_d)
+_git("push", "-q", "-f", "origin", "main", cwd=_d)
+_before = _git("rev-parse", "main", cwd=MR / "c.git").stdout.strip()
+r = mirrors.git_mirror(str(M), "sync")
+check("mirror: a diverged branch is reported and left alone (never forced)",
+      r["branches"]["main"]["state"] == "diverged" and "main" in r.get("left_alone", [])
+      and _git("rev-parse", "main", cwd=MR / "c.git").stdout.strip() == _before)
+check("mirror: branches= limits what is compared",
+      list(mirrors.git_mirror(str(M), "status", branches=["nope"])["branches"]) == ["nope"])
+r = mirrors.git_mirror(str(M), "remove", ["c"])
+check("mirror: remove drops a remote from the set", r["mirror_set"] == ["a", "b"])
+check("mirror: refuses a non-repo", not mirrors.git_mirror(str(MR), "status")["ok"])
+check("MCP lists git_mirror", "git_mirror" in {t["name"] for t in mcp_server.TOOLS})
+_skill = (ROOT / "skills" / "accounts" / "SKILL.md").read_text()
+check("accounts skill: frontmatter + mirrors + confirm guidance",
+      _skill.startswith("---\nname: accounts\n") and "git_mirror" in _skill
+      and "git_confirm" in _skill and "/gate:account login" in _skill)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
