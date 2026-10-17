@@ -1329,5 +1329,304 @@ check("del", vault.account("registry:term") is None)
 check("account help lists the kinds", "github, hf, pijul" in acct("/gate:account help")["reason"])
 os.environ["GATEWAY_BROWSER"] = _old_browser
 
+# --- Runner core: credentials for one call, hardened git -----------------------
+print("runner:")
+import base64 as _b64  # noqa: E402
+import shutil as _shutil  # noqa: E402
+from gateway import runner  # noqa: E402
+
+RT = TMP / "runner"
+RT.mkdir()
+RUN_TOKEN = "gho_runnerTOKEN0123456789abcdefXYZ"
+GIT_SEEN: list[str] = []
+_HTTP_BACKEND = Path(subprocess.run(["git", "--exec-path"], capture_output=True,
+                                    text=True).stdout.strip()) / "git-http-backend"
+
+
+def _git(*a, cwd=None, check=True):
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    return subprocess.run(["git", *a], cwd=cwd, env=env, capture_output=True, text=True,
+                          check=check)
+
+
+class GitHTTP(http.server.BaseHTTPRequestHandler):
+    """git smart HTTP via git-http-backend, behind Basic auth with RUN_TOKEN."""
+    def _handle(self):
+        auth = self.headers.get("Authorization", "")
+        GIT_SEEN.append(auth)
+        want = "Basic " + _b64.b64encode(f"x-access-token:{RUN_TOKEN}".encode()).decode()
+        if auth != want:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="test"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            body = b""
+            while True:
+                n = int(self.rfile.readline().strip(), 16)
+                if n == 0:
+                    self.rfile.readline()
+                    break
+                body += self.rfile.read(n)
+                self.rfile.readline()
+        else:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        path, _, query = self.path.partition("?")
+        env = {"PATH": os.environ["PATH"], "GIT_PROJECT_ROOT": str(RT / "srv"),
+               "GIT_HTTP_EXPORT_ALL": "1", "PATH_INFO": path, "QUERY_STRING": query,
+               "REQUEST_METHOD": self.command, "REMOTE_USER": "tester",
+               "REMOTE_ADDR": "127.0.0.1", "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+               "CONTENT_LENGTH": str(len(body)), "GIT_CONFIG_NOSYSTEM": "1",
+               "HOME": str(RT), "HTTP_CONTENT_ENCODING": self.headers.get("Content-Encoding", ""),
+               "GIT_PROTOCOL": self.headers.get("Git-Protocol", "")}
+        p = subprocess.run([str(_HTTP_BACKEND)], input=body, env=env, capture_output=True)
+        head, _, rest = p.stdout.partition(b"\r\n\r\n")
+        status, headers = 200, []
+        for line in head.decode().split("\r\n"):
+            k, _, v = line.partition(":")
+            if k.lower() == "status":
+                status = int(v.strip().split()[0])
+            elif k:
+                headers.append((k, v.strip()))
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(rest)))
+        self.end_headers()
+        self.wfile.write(rest)
+
+    do_GET = do_POST = _handle
+
+    def log_message(self, *a):
+        pass
+
+
+(RT / "srv").mkdir()
+_git("init", "-q", "--bare", "-b", "main", str(RT / "srv" / "repo.git"))
+_git("config", "http.receivepack", "true", cwd=RT / "srv" / "repo.git")
+_gsrv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GitHTTP)
+threading.Thread(target=_gsrv.serve_forever, daemon=True).start()
+GPORT = _gsrv.server_address[1]
+GURL = f"http://127.0.0.1:{GPORT}/repo.git"
+
+
+def _client(name):
+    d = RT / name
+    _git("init", "-q", "-b", "main", str(d))
+    _git("config", "user.email", "t@example.com", cwd=d)
+    _git("config", "user.name", "T", cwd=d)
+    (d / "f.txt").write_text(name + "\n")
+    _git("add", "f.txt", cwd=d)
+    _git("commit", "-q", "-m", name, cwd=d)
+    return d
+
+
+HTTP_CREDS = runner.Creds(host=f"127.0.0.1:{GPORT}", token=RUN_TOKEN, protocols=("http",))
+
+c1 = _client("c1")
+n = len(GIT_SEEN)
+r = runner.run("git", ["push", GURL, "main"], cwd=c1, creds=HTTP_CREDS, allow_http=True,
+               account="github:test", timeout=30)
+check("runner: push over http with the account token", r.ok)
+check("runner: the server got exactly that token",
+      any(RUN_TOKEN not in a and a.startswith("Basic ") for a in GIT_SEEN[n:]))
+check("runner: the token is not in the output", RUN_TOKEN not in r.stdout + r.stderr)
+check("runner: the pushed commit arrived",
+      _git("rev-parse", "main", cwd=RT / "srv" / "repo.git").stdout.strip()
+      == _git("rev-parse", "HEAD", cwd=c1).stdout.strip())
+
+c2 = _client("c2")
+t0 = time.time()
+r = runner.run("git", ["push", GURL, "main:other"], cwd=c2, creds=None, allow_http=True,
+               timeout=30)
+check("runner: without credentials the push fails at once (no prompt, no hang)",
+      not r.ok and time.time() - t0 < 15)
+
+n = len(GIT_SEEN)
+r = runner.run("git", ["push", f"http://localhost:{GPORT}/repo.git", "main:other"], cwd=c2,
+               creds=HTTP_CREDS, allow_http=True, timeout=30)
+check("runner: the token is never offered to another host",
+      not r.ok and all("Basic" not in a for a in GIT_SEEN[n:]))
+
+# The user's own environment never reaches the child.
+_saved = {k: os.environ.get(k) for k in ("GITHUB_TOKEN", "SSH_AUTH_SOCK", "HTTPS_PROXY", "HF_TOKEN")}
+os.environ.update(GITHUB_TOKEN="ghp_ambient_should_not_leak_1234", SSH_AUTH_SOCK="/tmp/nope",
+                  HTTPS_PROXY="http://127.0.0.1:9", HF_TOKEN="hf_ambient_should_not_leak")
+try:
+    _env = runner.child_env()
+    check("runner: ambient tokens, agent and proxies are not inherited",
+          not any(k in _env for k in ("GITHUB_TOKEN", "SSH_AUTH_SOCK", "HTTPS_PROXY", "HF_TOKEN")))
+    r = runner.run("git", ["push", GURL, "main:ambient"], cwd=c2, creds=HTTP_CREDS,
+                   allow_http=True, timeout=30)
+    check("runner: works with ambient junk set (proxy ignored)", r.ok)
+finally:
+    for k, v in _saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+_fake_home = RT / "home"
+_fake_home.mkdir()
+(_fake_home / ".gitconfig").write_text("[gwtest]\n\tglobalmarker = yes\n")
+_saved_home = os.environ["HOME"]
+os.environ["HOME"] = str(_fake_home)
+try:
+    r = runner.run("git", ["config", "--list", "--show-origin"], cwd=c1)
+finally:
+    os.environ["HOME"] = _saved_home
+check("runner: no global or system git config is read",
+      r.ok and "globalmarker" not in r.stdout)
+
+# A hostile repo: every config key / hook that could run code or capture
+# credentials during a credentialed call.
+evil = _client("evil")
+MARK = RT / "marks"
+MARK.mkdir()
+
+
+def _marker(name):
+    p = RT / f"{name}.sh"
+    p.write_text(f"#!/bin/sh\ntouch {MARK / name}\ncat > {MARK / (name + '.in')} 2>/dev/null\nexit 0\n")
+    p.chmod(0o755)
+    return str(p)
+
+
+for hook in ("pre-push", "reference-transaction", "post-checkout", "pre-commit"):
+    hp = evil / ".git" / "hooks" / hook
+    hp.write_text(f"#!/bin/sh\ntouch {MARK / ('hook-' + hook)}\n")
+    hp.chmod(0o755)
+for k, v in (("core.fsmonitor", _marker("fsmonitor")), ("core.sshCommand", _marker("sshcmd")),
+             ("credential.helper", "!" + _marker("credhelper")), ("core.askPass", _marker("askpass")),
+             ("http.proxy", "http://127.0.0.1:9"), ("core.hooksPath", str(evil / ".git" / "hooks")),
+             ("remote.origin.url", str(RT / "srv" / "repo.git")),
+             ("remote.origin.uploadpack", _marker("uploadpack")),
+             ("remote.origin.receivepack", _marker("receivepack"))):
+    _git("config", k, v, cwd=evil)
+r = runner.run("git", ["push", GURL, "main:evil"], cwd=evil, creds=HTTP_CREDS, allow_http=True,
+               timeout=30)
+check("hostile repo: push still works through the runner", r.ok)
+r2 = runner.run("git", ["fetch", "origin"], cwd=evil, creds=None, timeout=30)
+r3 = runner.run("git", ["push", "origin", "main:evil2"], cwd=evil, creds=None, timeout=30)
+check("hostile repo: fetch/push to a file remote work", r2.ok and r3.ok)
+_marks = sorted(p.name for p in MARK.iterdir())
+check("hostile repo: no hook, fsmonitor, sshCommand, askpass, helper or pack program ran",
+      _marks == [])
+check("hostile repo: the repo's own credential helper never saw the token",
+      not (MARK / "credhelper.in").exists())
+
+# Local commands never get a credential (no agent, no helper), but values
+# are still scrubbed from what they print.
+PLAIN_VALUE = "plain-account-value-without-any-known-prefix"
+_git("config", "test.k", PLAIN_VALUE, cwd=c1)
+_orig_agent, _orig_feed = runner._Agent, runner._TokenFeed
+runner._Agent = runner._TokenFeed = lambda *a, **k: (_ for _ in ()).throw(AssertionError("used"))
+try:
+    try:
+        r = runner.run("git", ["config", "--get", "test.k"], cwd=c1,
+                       creds=runner.Creds(host="x", token=PLAIN_VALUE, ssh_key="k"))
+    except AssertionError:
+        r = None
+    check("runner: local commands get no agent and no helper", r is not None and r.ok)
+    check("runner: account values are scrubbed from local output too",
+          r is not None and PLAIN_VALUE not in r.stdout and "***" in r.stdout)
+finally:
+    runner._Agent, runner._TokenFeed = _orig_agent, _orig_feed
+
+# Refused before anything runs.
+for argv in (["credential", "fill"], ["-c", "core.sshCommand=x", "fetch"], ["fetch", "--upload-pack=x"],
+             ["clone", "-u", "x", GURL], ["submodule", "foreach", "id"], ["filter-branch"],
+             ["difftool"], ["rebase", "--exec", "id"], ["--git-dir=/tmp", "status"],
+             ["bisect", "run", "id"], ["daemon"]):
+    try:
+        runner.run("git", argv, cwd=c1)
+        check(f"runner refuses git {' '.join(argv)[:30]}", False)
+    except runner.RunnerError:
+        check(f"runner refuses git {' '.join(argv)[:30]}", True)
+try:
+    runner.run("curl", ["x"], cwd=c1)
+    check("runner refuses tools it doesn't know", False)
+except runner.RunnerError:
+    check("runner refuses tools it doesn't know", True)
+
+# Timeout: a server that accepts and never answers.
+_hang = socket.socket()
+_hang.bind(("127.0.0.1", 0))
+_hang.listen(5)
+t0 = time.time()
+r = runner.run("git", ["ls-remote", f"http://127.0.0.1:{_hang.getsockname()[1]}/x.git"],
+               cwd=c1, allow_http=True, timeout=2)
+check("runner: timeout kills the call", r.timed_out and not r.ok and time.time() - t0 < 10)
+_hang.close()
+
+_log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
+check("runner: calls are audited without the token",
+      '"tool": "git"' in _log and '"account": "github:test"' in _log and RUN_TOKEN not in _log)
+check("runner: temp dirs are removed",
+      not list(Path(tempfile.gettempdir()).glob("gw-run-*")))
+
+# SSH: a user-level sshd on 127.0.0.1 (no root), a key only in a private agent.
+_sshd = _shutil.which("sshd")
+SSHD_DIR = RT / "sshd"
+SSHD_DIR.mkdir()
+_ssh_ok = False
+if _sshd:
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(SSHD_DIR / "host")],
+                   check=True)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "acct",
+                    "-f", str(SSHD_DIR / "client")], check=True)
+    _s = socket.socket()
+    _s.bind(("127.0.0.1", 0))
+    SPORT = _s.getsockname()[1]
+    _s.close()
+    (SSHD_DIR / "authorized_keys").write_text((SSHD_DIR / "client.pub").read_text())
+    _git_dir = os.path.dirname(_shutil.which("git"))
+    (SSHD_DIR / "sshd_config").write_text(
+        f"Port {SPORT}\nListenAddress 127.0.0.1\nHostKey {SSHD_DIR / 'host'}\n"
+        f"PidFile {SSHD_DIR / 'pid'}\nAuthorizedKeysFile {SSHD_DIR / 'authorized_keys'}\n"
+        "PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n"
+        f"StrictModes no\nSetEnv PATH={_git_dir}:/usr/bin:/bin\n")
+    subprocess.run([_sshd, "-f", str(SSHD_DIR / "sshd_config"), "-E", str(SSHD_DIR / "log")])
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", SPORT), timeout=0.2).close()
+            _ssh_ok = True
+            break
+        except OSError:
+            time.sleep(0.05)
+if not _ssh_ok:
+    print("  skip ssh runner tests (no sshd could start)")
+else:
+    _hostpub = (SSHD_DIR / "host.pub").read_text().split()
+    KNOWN = f"[127.0.0.1]:{SPORT} {_hostpub[0]} {_hostpub[1]}"
+    SSH_URL = f"ssh://{ME}@127.0.0.1:{SPORT}{RT / 'srv' / 'repo.git'}"
+    SSH_CREDS = runner.Creds(host=f"127.0.0.1:{SPORT}",
+                             ssh_key=(SSHD_DIR / "client").read_text(),
+                             public_key=(SSHD_DIR / "client.pub").read_text().strip(),
+                             known_hosts=KNOWN)
+    cs = _client("cs")
+    r = runner.run("git", ["push", SSH_URL, "main:viassh"], cwd=cs, creds=SSH_CREDS, timeout=60)
+    check("runner: push over ssh with the account key (private agent)", r.ok)
+    check("runner: the private key is never in the output",
+          "PRIVATE KEY" not in r.stdout + r.stderr)
+    r = runner.run("git", ["push", SSH_URL, "main:nokey"], cwd=cs, creds=None, timeout=60)
+    check("runner: ssh without the account key fails (no user keys or agent used)", not r.ok)
+    _wrong = runner.Creds(**{**SSH_CREDS.__dict__,
+                             "known_hosts": f"[127.0.0.1]:{SPORT} ssh-ed25519 "
+                             "AAAAC3NzaC1lZDI1NTE5AAAAIFnM1NquNb+tyuxnElS3PHRWHsDaqb+vuZXJq9vKl1m7"})
+    r = runner.run("git", ["push", SSH_URL, "main:wronghost"], cwd=cs, creds=_wrong, timeout=60)
+    check("runner: a pinned host key that doesn't match is refused", not r.ok)
+    _tofu = runner.Creds(**{**SSH_CREDS.__dict__, "known_hosts": ""})
+    r = runner.run("git", ["push", SSH_URL, "main:tofu"], cwd=cs, creds=_tofu, timeout=60)
+    check("runner: unpinned host: works, and reports the host key it saw",
+          r.ok and any(_hostpub[1] in k for k in r.seen_host_keys))
+    _agents = subprocess.run(["pgrep", "-f", "gw-run-"], capture_output=True, text=True).stdout
+    check("runner: the private agent is gone after the call", _agents.strip() == "")
+    try:
+        os.kill(int((SSHD_DIR / "pid").read_text()), 15)
+    except (OSError, ValueError):
+        pass
+_gsrv.shutdown()
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

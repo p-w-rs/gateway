@@ -147,6 +147,46 @@ The host is normalized (`127.0.0.1`, `::1`, `local` → `localhost`). Host
 names must match `HOST_RE`, so a leading `-` (an ssh option) is impossible.
 `catalog()` is the only view Claude ever gets.
 
+## Runner (`runner.py`)
+
+How the tools that act as an account will run a CLI (git so far; nothing
+calls it yet, the `git` MCP tool comes next). Per call:
+
+- **Environment:** an allowlist (`ENV_ALLOW`: PATH, HOME, locale, TMPDIR, …),
+  so the user's own `GITHUB_TOKEN`, `HF_TOKEN`, `SSH_AUTH_SOCK`, proxies and
+  the like never reach the child.
+- **Temp dir:** a private 0700 temp dir holds the agent socket, the
+  credential helper and FIFO, `known_hosts` and the public key file. It's
+  removed afterwards.
+- **SSH key:**
+  - `ssh-agent -D -a SOCK` (pixi's OpenSSH) plus `ssh-add -` from stdin.
+  - `GIT_SSH_COMMAND` = `ssh -F /dev/null -o BatchMode=yes
+    -o IdentitiesOnly=yes -o IdentityAgent=SOCK -o IdentityFile=<the .pub>`
+    with its own `UserKnownHostsFile`. Verified to offer only that key,
+    never `~/.ssh/id_*`.
+  - `StrictHostKeyChecking=yes` against pinned keys, or `accept-new` with
+    the keys it saw returned as `seen_host_keys`.
+  - Without a key: `IdentityAgent=none`, `IdentityFile=none`.
+- **Token:** `credential.helper=` resets the repo's and user's helpers.
+  `credential.<proto>://<host>.helper` points at a one-call script that
+  checks `host=` and `protocol=` and `cat`s a FIFO the runner writes
+  `username=`/`password=` into. The token is never in env, argv or a file.
+- **Git config overrides** (`-c`, which beat repo config): `core.hooksPath=/dev/null`,
+  `core.fsmonitor=false`, `core.askPass=`, `core.gitProxy=`,
+  `http(s).proxy=`, `http.sslVerify=true`, `http.extraHeader=`,
+  `protocol.allow=never` (https/ssh/file allowed; ext/git never), and
+  `safe.bareRepository=explicit`. Also `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, and editors set to
+  `false`. Explicit `--upload-pack`/`--receive-pack` beat a repo's
+  `remote.*.uploadpack`.
+- **Refused before anything runs:** caller `-c`/`--git-dir`/`-C`,
+  `--upload-pack`/`--exec`/`--tool`, `credential`, `daemon`, `filter-branch`,
+  `difftool`/`mergetool`, `submodule foreach`, `bisect run`, and the like.
+- **Local subcommands** (not fetch/push/clone/…) never get the credentials.
+- **Output** is capped at 1 MB per stream, and the account's values (and
+  each line of a key) plus `policy.scrub` patterns are replaced. The process
+  group is killed on timeout, and each call is audited as `run`.
+
 ## Policy and logging (`policy.py`)
 
 - `load_config()` merges `config/policy.json` over `DEFAULT_CONFIG`. An

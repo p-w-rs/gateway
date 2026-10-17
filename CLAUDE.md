@@ -34,6 +34,8 @@ plugins/gateway/
   src/gateway/
     policy.py      config, allowlists, redaction/scrubbing, audit log, Bash blocklist
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
+    runner.py      run a CLI as an account: env allowlist, private ssh-agent, one-call
+                   credential helper, hardened git config, scrubbed output
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
     commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
@@ -124,8 +126,13 @@ accounts plan:
 - the terminal fallback;
 - accounts as `auth_ref`.
 
-Covered by tests (6 mutation-checked); not yet tried live. The tools that
-use accounts (git, gh, hf, pijul, …) come next.
+Covered by tests (6 mutation-checked); not yet tried live.
+
+Phase 2 adds `runner.py`, the credentialed runner. Nothing calls it yet;
+the `git` tool comes next. It's tested against a local git-http-backend
+behind Basic auth, a user-level sshd, and a hostile repo config (hooks,
+fsmonitor, sshCommand, askpass, credential helper, proxy, pack programs).
+8 properties are mutation-checked.
 
 ### v0.3.0 (2026-10-15)
 
