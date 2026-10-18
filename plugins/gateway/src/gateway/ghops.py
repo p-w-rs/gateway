@@ -9,6 +9,7 @@ classified read / write / delete for the account's prompt policy, like git.
 """
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,40 @@ def _check(args: list[str], acct: dict[str, Any]) -> None:
                                             f"account, not {host}")
 
 
-def pick(account: str | None, cwd: str | None, data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+_OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def owner_from_args(args: list[str]) -> str | None:
+    """The repo owner a gh command names, if any: -R/--repo OWNER/REPO,
+    `repo list|view|create OWNER[/REPO]`, `api repos|orgs|users/OWNER/...`."""
+    for i, a in enumerate(args):
+        val = None
+        if a in ("-R", "--repo") and i + 1 < len(args):
+            val = args[i + 1]
+        elif a.startswith("--repo="):
+            val = a.split("=", 1)[1]
+        if val:
+            o = val.split("/")[-2] if val.count("/") >= 1 else ""
+            if _OWNER.fullmatch(o or ""):
+                return o
+    if len(args) >= 3 and args[0] == "repo" and args[1] in ("list", "view", "create", "edit",
+                                                           "delete", "archive", "rename"):
+        cand = args[2]
+        if not cand.startswith("-"):
+            o = cand.split("/")[0]
+            if _OWNER.fullmatch(o):
+                return o
+    if len(args) >= 2 and args[0] == "api":
+        for a in args[1:]:
+            parts = a.lstrip("/").split("/")
+            if len(parts) >= 2 and parts[0] in ("repos", "orgs", "users") \
+                    and _OWNER.fullmatch(parts[1]):
+                return parts[1]
+    return None
+
+
+def pick(account: str | None, cwd: str | None, data: dict[str, Any],
+         args: list[str] | None = None) -> tuple[str, dict[str, Any]]:
     if account:
         a = data["accounts"].get(account)
         if a is None or a.get("kind") != "github":
@@ -95,6 +129,11 @@ def pick(account: str | None, cwd: str | None, data: dict[str, Any]) -> tuple[st
             got = gitops.choose_account(remote, None, data)
             if got and got[1].get("kind") == "github":
                 return got
+    owner = owner_from_args(args or [])
+    if owner:
+        got = gitops.choose_account({"host": "github.com", "owner": owner}, None, data)
+        if got and got[1].get("kind") == "github":
+            return got
     gh = [(r, a) for r, a in sorted(data["accounts"].items()) if a.get("kind") == "github"]
     if len(gh) == 1:
         return gh[0]
@@ -111,7 +150,7 @@ def gh_tool(args: list[str], cwd: str | None = None, account: str | None = None,
         gitops._check_paths(Path(cwd).expanduser() if cwd else Path(tempfile.gettempdir()),
                             args)
         data = vault.load()
-        ref, acct = pick(account, cwd, data)
+        ref, acct = pick(account, cwd, data, args)
         _check(args, acct)
         token = acct.get("secrets", {}).get("token")
         if not token:

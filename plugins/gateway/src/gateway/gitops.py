@@ -228,6 +228,9 @@ def _hint(stderr: str, ref: str | None) -> str:
     if "saml" in low or "sso" in low:
         return (f"The organization requires SSO for this token. Ask the user to run "
                 f"/gate:account login {ref or 'github:NAME'} (SSO sign-in) and retry.")
+    if "author identity unknown" in low or "please tell me who you are" in low:
+        return ("git doesn't see the user's global identity here (on purpose). Call "
+                "git_identity once with this repo and the account to commit as, then retry.")
     if "editor" in low and "problem" in low:
         return "git wanted an editor; pass the message or option instead (e.g. -m)."
     if ("authentication failed" in low or "could not read username" in low
@@ -348,9 +351,26 @@ def _creds(ref: str, acct: dict[str, Any], remote: dict[str, Any]) -> runner.Cre
     if not secrets.get("ssh_key"):
         raise GitRefused(f"{ref} has no SSH key; use the https URL, or ask the user to add "
                          f"one with /gate:account up {ref}")
+    known = acct.get("known_hosts", "")
+    if not known and remote["cred_host"] == "github.com":
+        known = GITHUB_KNOWN_HOSTS
     return runner.Creds(host=remote["cred_host"], ssh_key=secrets["ssh_key"],
-                        public_key=acct.get("public_key", ""),
-                        known_hosts=acct.get("known_hosts", ""))
+                        public_key=acct.get("public_key", ""), known_hosts=known)
+
+
+# github.com's SSH host keys as GitHub publishes them (api.github.com/meta,
+# "ssh_keys"; checked 2026-10-17), so ssh to GitHub is pinned, not trusted
+# on first use.
+GITHUB_KNOWN_HOSTS = "\n".join("github.com " + k for k in (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxk"
+    "ZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1g"
+    "vwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/h"
+    "WCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY"
+    "7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT"
+    "4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/"
+    "YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk="))
 
 
 def git_identity(cwd: str, account: str) -> dict[str, Any]:

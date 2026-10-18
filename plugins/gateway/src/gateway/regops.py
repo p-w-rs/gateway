@@ -117,4 +117,13 @@ def registry_tool(args: list[str], account: str, confirmed: bool = False,
     except runner.RunnerError as e:
         return {"ok": False, "reason": str(e)}
     res.update({"account": account, "class": cls, "registry": host})
+    if not res["ok"] and host == "ghcr.io":
+        err = res.get("stderr", "")
+        if "UNSUPPORTED" in err and cls == "delete":
+            res["hint"] = ("ghcr.io doesn't support deletes through the registry API. Delete the "
+                           "package version on github.com (the package's settings) instead.")
+        elif "DENIED" in err or "expected scopes" in err:
+            res["hint"] = ("ghcr.io needs a classic token with read:packages / write:packages "
+                           "(delete:packages to delete); fine-grained tokens can't use it. Ask "
+                           f"the user to set one with /gate:account up {account} (Via empty).")
     return res

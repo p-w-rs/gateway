@@ -97,8 +97,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Authorization: Bearer xyz / Basic xyz / token xyz
         [r"(?i)\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{6,}", r"\1\2***REDACTED***"],
         # key=value / key: value for secret-looking names (headers, query, JSON)
+        # (not names that end in expiration/expires/expiry: those carry dates)
         [r"(?i)\b([\w-]*(?:api[-_]?key|token|secret|password|passwd|pwd|"
-         r"authorization|cookie)[\w-]*)([\"']?\s*[:=]\s*[\"']?)[^\s&\"',;]+",
+         r"authorization|cookie)[\w-]*)(?<!expiration)(?<!expires)(?<!expiry)"
+         r"([\"']?\s*[:=]\s*[\"']?)[^\s&\"',;]+",
          r"\1\2***REDACTED***"],
         # curl -u user:pass / --user user:pass
         [r"(\s(?:-u\s*|--user[=\s]+))\S+", r"\1***REDACTED***"],

@@ -2148,6 +2148,8 @@ else:
     check("pijul: record signs as the account (private agent)", r["ok"] and r.get("account") == "pijul:lab")
     _log = PJT("log")
     check("pijul: the change's author is the account", "Lab Person" in _log["stdout"])
+    check("pijul: the author carries the account's login (not empty parentheses)",
+          "Lab Person (lab)" in _log["stdout"])
     PURL = f"ssh://{ME}@127.0.0.1:{PPORT}{_remote}"
     r = PJT("push", PURL, "-a")
     check("pijul: push over ssh as the account", r["ok"] and r["class"] == "write"
@@ -2743,6 +2745,93 @@ check("set_takeover: turns off", install.set_takeover(False, _pd)
       and json.loads((_pd / "config" / "policy.json").read_text())["takeover"] is False)
 check("version is 0.5.0 everywhere", __import__("gateway").__version__ == "0.5.0"
       and json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"] == "0.5.0")
+
+# --- Fixes from the live test (2026-10-17) ----------------------------------
+print("live-test fixes:")
+from gateway import ghops as _gho  # noqa: E402
+_kh = gitops._creds("github:x", {"secrets": {"ssh_key": "k"}},
+                    {"scheme": "ssh", "cred_host": "github.com"}).known_hosts
+check("ssh to github.com is pinned to GitHub's published host keys",
+      _kh == gitops.GITHUB_KNOWN_HOSTS and _kh.count("github.com ") == 3
+      and "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" in _kh)
+check("an account's own pinned keys win over the GitHub defaults",
+      gitops._creds("github:x", {"secrets": {"ssh_key": "k"}, "known_hosts": "github.com ssh-ed25519 MINE"},
+                    {"scheme": "ssh", "cred_host": "github.com"}).known_hosts.endswith("MINE"))
+check("other ssh hosts are not given GitHub's keys",
+      gitops._creds("github:x", {"secrets": {"ssh_key": "k"}},
+                    {"scheme": "ssh", "cred_host": "ghe.example.com"}).known_hosts == "")
+check("git hint: unknown author points at git_identity",
+      "git_identity" in gitops._hint("Author identity unknown\n*** Please tell me who you are.", "github:x"))
+for _a, _want in ((["repo", "list", "asirobots"], "asirobots"), (["pr", "list", "-R", "p-w-rs/x"], "p-w-rs"),
+                  (["issue", "list", "--repo=github.com/acme/y"], "acme"),
+                  (["api", "repos/asirobots/x/pulls"], "asirobots"), (["pr", "list"], None),
+                  (["repo", "list", "--limit", "5"], None)):
+    check(f"gh owner from args: {' '.join(_a)}", _gho.owner_from_args(_a) == _want)
+_two = {"accounts": {
+    "github:p": {"kind": "github", "host": "github.com", "owners": ["p-w-rs"], "hosts": ["github.com"]},
+    "github:w": {"kind": "github", "host": "github.com", "owners": ["asirobots"], "hosts": ["github.com"]}}}
+check("gh picks the account from the owner in the args",
+      _gho.pick(None, None, _two, ["repo", "list", "asirobots"])[0] == "github:w"
+      and _gho.pick(None, None, _two, ["pr", "view", "1", "-R", "p-w-rs/x"])[0] == "github:p")
+try:
+    _gho.pick(None, None, _two, ["pr", "list"])
+    check("gh without an owner still asks for account= when two fit", False)
+except gitops.GitRefused as e:
+    check("gh without an owner still asks for account= when two fit", "account=" in str(e))
+_cfg = policy.load_config()
+check("redaction keeps a token's expiry date",
+      policy.scrub("Github-Authentication-Token-Expiration: 2026-11-01 17:52:18 UTC", _cfg)
+      == "Github-Authentication-Token-Expiration: 2026-11-01 17:52:18 UTC")
+check("redaction still hides token values",
+      "supersecret99" not in policy.scrub("access_token=supersecret99 X-Api-Token: abcdef123456", _cfg)
+      and "abcdef123456" not in policy.scrub("X-Api-Token: abcdef123456", _cfg))
+
+# Registry hints, with crane faked to fail the way ghcr.io does.
+_real_run_cli = regops.runner.run_cli
+
+
+class _FakeRes:
+    def __init__(self, err):
+        self.err = err
+
+    def as_dict(self):
+        return {"ok": False, "exit_code": 1, "stdout": "", "stderr": self.err}
+
+
+try:
+    regops.runner.run_cli = lambda *a, **k: _FakeRes(
+        "DENIED: permission_denied: The token *** does not match expected scopes.")
+    r = regops.registry_tool(["push", "x.tar", "ghcr.io/acme/app:1"], "registry:ghcr")
+    check("ghcr denied: hint names classic token scopes", "classic token" in r.get("hint", ""))
+    regops.runner.run_cli = lambda *a, **k: _FakeRes("UNSUPPORTED: The operation is unsupported.")
+    r = regops.registry_tool(["delete", "ghcr.io/acme/app@sha256:ab"], "registry:ghcr", confirmed=True)
+    check("ghcr delete unsupported: hint says delete on github.com", "github.com" in r.get("hint", ""))
+finally:
+    regops.runner.run_cli = _real_run_cli
+
+# The form: a token and 'sign in through' together are refused; choosing
+# 'sign in through' drops an old token; the summary shows it.
+acct_form({"host": "ghcr.io", "login": "me", "via": "", "owners": "me", "token": "ghp_classicAAAA1111"})
+acct("/gate:account add registry gh2 ghcr own token")
+check("registry with its own token: summary lists the token method",
+      "methods: token" in acct("/gate:account list")["reason"])
+acct_form({"host": "ghcr.io", "login": "me", "via": "github:pkgs", "owners": "me",
+           "token": "ghp_otherBBBB2222"})
+out = acct("/gate:account up registry:gh2")
+check("form: via and a token together are refused, nothing saved",
+      "not both" in out["reason"] and vault.account("registry:gh2").get("via", "") == ""
+      and vault.account("registry:gh2")["secrets"].get("token") == "ghp_classicAAAA1111")
+acct_form({"host": "ghcr.io", "login": "me", "via": "github:pkgs", "owners": "me", "token": ""})
+out = acct("/gate:account up registry:gh2")
+_a = vault.account("registry:gh2")
+check("form: choosing via drops the old token and says so",
+      _a.get("via") == "github:pkgs" and not _a["secrets"].get("token") and "removed" in out["reason"])
+check("summary shows the via account", "signs in through github:pkgs" in out["reason"])
+_f = {f["name"]: f for f in commands._account_fields("github", None)}
+check("owners help explains repo-URL owners and spaces",
+      "github.com/OWNER" in _f["owners"]["help"] and "spaces" in _f["owners"]["help"])
+check("ssh host help says ~/.ssh/config aliases aren't read",
+      "~/.ssh/config" in {f["name"]: f for f in commands._account_fields("ssh", None)}["host"]["help"])
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

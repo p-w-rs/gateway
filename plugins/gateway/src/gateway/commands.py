@@ -446,7 +446,10 @@ def _describe_account(ref: str, a: dict[str, Any], data: dict[str, Any]) -> str:
     if "owners" in v:
         bits.append("owners: " + (", ".join(v["owners"]) or "any"))
     bits.append("hosts: " + (", ".join(v["hosts"]) or "none yet"))
-    bits.append("methods: " + (", ".join(v["methods"]) or "none yet"))
+    if v.get("via"):
+        bits.append(f"signs in through {v['via']}")
+    else:
+        bits.append("methods: " + (", ".join(v["methods"]) or "none yet"))
     if v.get("key_fingerprint"):
         bits.append(f"key {v['key_fingerprint']}")
     p = v["prompts"]
@@ -461,13 +464,18 @@ def _account_fields(kind: str, old: dict[str, Any] | None) -> list[dict[str, Any
     fields: list[dict[str, Any]] = []
     for f in spec["fields"]:
         label, helptext = FIELD_INFO[f]
+        if kind == "ssh" and f == "host":
+            helptext = ("the real host name or IP, e.g. ssh.example.org (aliases from your "
+                        "~/.ssh/config aren't read: use its HostName and Port)")
         value = old.get(f, spec["host"] if f == "host" else "")
         fields.append({"name": f, "label": label, "help": helptext, "value": str(value),
                        "required": f in ("host", "tenant") or (f == "user" and kind == "ssh")})
     if spec["owners"]:
         fields.append({"name": "owners", "label": "Owners / orgs (optional)",
                        "value": " ".join(old.get("owners", [])),
-                       "help": "which owners it is for, e.g. asirobots; empty = any on its hosts"})
+                       "help": ("the user/org names in repo URLs it is for (github.com/OWNER/…), "
+                                "e.g. asirobots; several separated by spaces; empty = any on "
+                                "its hosts")})
     if "token" in spec["secrets"]:
         fields.append({"name": "token", "label": "Token (optional)", "type": "password",
                        "help": ("leave empty to keep the current one" if old.get("secrets", {}).get("token")
@@ -538,6 +546,12 @@ def _apply_form(ref: str, kind: str, got: dict[str, str],
         if any(c.isspace() for c in token) or len(token) > 4096:
             raise CommandError("That token has spaces in it or is too long; nothing was saved.")
         secrets["token"] = token
+    if rec.get("via"):
+        if token:
+            raise CommandError("Set either 'Sign in through' or a token, not both (the token "
+                               "would never be used); nothing was saved.")
+        if secrets.pop("token", None):
+            note = (f"{ref} now signs in through {rec['via']}; its own token was removed.")
     mode = got.get("ssh_key_mode", "")
     if mode == "generate":
         priv, pub = vault.generate_ssh_key(f"gateway {ref}")
@@ -565,7 +579,9 @@ def _apply_form(ref: str, kind: str, got: dict[str, str],
         note += ("\n" if note else "") + (
             f"Host key pinned for {host}: " + "; ".join(fps) + " (check it if you can)"
             if fps else f"Could not read {host}'s SSH host key, so connections will be refused "
-                        f"until it can be read: run /gate:account up {ref} again.")
+                        f"until it can be read: run /gate:account up {ref} again"
+                        + (" (if it is an alias from your ~/.ssh/config, give its real HostName "
+                           "and Port)." if kind == "ssh" and "." not in host else "."))
     rec["secrets"] = secrets
     rec["updated"] = vault.now()
     return rec, note

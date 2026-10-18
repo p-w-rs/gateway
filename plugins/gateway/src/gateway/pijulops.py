@@ -154,7 +154,9 @@ def pijul_tool(args: list[str], cwd: str, account: str | None = None,
             idd.mkdir()
             esc = lambda v: (v or "").replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
             (idd / "identity.toml").write_text(
+                f'username = "{esc(acct.get("login"))}"\n'
                 f'display_name = "{esc(acct.get("name") or acct.get("login") or name)}"\n'
+                f'origin = "{esc(acct.get("host"))}"\n'
                 f'email = "{esc(acct.get("email"))}"\n'
                 f'last_modified = "{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}"\n\n'
                 f'[public_key]\nkey = "{pub.split()[1] if len(pub.split()) > 1 else ""}"\n')
