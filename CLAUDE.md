@@ -144,7 +144,7 @@ your change (mutation-check it).
 - The audit log is shared by all sessions on the machine; entries from other
   sessions are normal.
 
-## Status (2026-10-17, v2 on branch accounts-phase1, not released)
+## Status (2026-10-17, v0.6.0: the v2 rework)
 
 v2 (plan and trackers in `.work/v2/`, local): one strict mode always on,
 standard plugin install (rules in the plugin's hooks), short typed commands
@@ -158,7 +158,7 @@ properties are mutation-checked.
 Live-tried on macOS (desktop app): every account kind, push/PR/mirror,
 setup through dialogs, ssh exec/copy/sudo and reuse, export / import, the
 switches. Not yet live: ssh routes (no LAN route here), Linux end to end,
-the ACR exchange. plugin.json still says 0.5.0.
+the ACR exchange.
 
 Known limitations:
 - The audit log and quarantine live in the plugin data folder
