@@ -254,6 +254,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "gate_setup",
+        "description": (
+            "Finish a setup the user started by typing /gate:add or /gate:update (read the "
+            "gate:setup skill first). Pass the grant id from that command's note and a "
+            "proposal; the gateway shows the user a native dialog with the change and asks "
+            "there for any password or token (never ask for those in chat). Proposal: "
+            "secret {what:'secret', name, description, hosts:[...], new_value?}; sudo "
+            "{what:'sudo', user, host}; account {what:'account', kind, name, description, "
+            "fields:{host, login, name, email, user, port, jump, tenant, via, ...}, owners:[...], "
+            "credentials:{browser?: true, token?: 'ask', ssh_key?: 'generate'|'file', "
+            "ssh_key_file?: path}}. For an update, give only what changes. If it answers "
+            "refused, fix the proposal and call again with the same grant."),
+        "inputSchema": {"type": "object", "properties": {
+            "grant": {"type": "string", "description": "the id from the /gate: command's note, e.g. g-1a2b3c4d"},
+            "proposal": {"type": "object"}}, "required": ["grant", "proposal"]},
+    },
+    {
         "name": "account_list",
         "description": ("The user's gateway accounts (KIND:NAME, e.g. github:work): kind, "
                         "login, owners/hosts they are for, methods (token, ssh_key), prompt "
@@ -570,6 +587,9 @@ class Server:
 
 def dispatch(name: str, args: dict[str, Any],
              approve: actions.Approver = None, form: Any = None) -> dict[str, Any]:
+    if name == "gate_setup":
+        from . import setup
+        return setup.gate_setup(str(args.get("grant", "")), args.get("proposal") or {})
     if name == "http_request":
         return actions.http_request(
             args.get("method", "GET"), args["url"], args.get("headers"),
@@ -596,8 +616,8 @@ def dispatch(name: str, args: dict[str, Any],
         cat = vault.catalog()
         policy.audit("account_list", {})
         return {"ok": True, "accounts": cat["accounts"],
-                "note": "Never values. Missing one? Ask the user to run /gate:account add "
-                        "KIND NAME <description> (or /gate:account login KIND:NAME for SSO)."}
+                "note": "Never values. Missing one? Ask the user to type /gate:add account "
+                        "(or /gate:add github, hf, ssh, ...); to change one, /gate:update KIND:NAME."}
     if name in ("git", "git_confirm"):
         return gitops.git_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
                                confirmed=name == "git_confirm",

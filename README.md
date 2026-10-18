@@ -26,29 +26,28 @@ host), and log everything.
 | `sudo` with a typed password | **run_privileged** / **run_privileged_confirm** |
 | keychain / env tokens | secrets in the gateway's own vault, used by NAME |
 
-## Managing secrets, sudo and accounts (you, in the chat)
+## Adding accounts, secrets and sudo (you type a short command)
 
 ```
-/gate:secret add HF_TOKEN Hugging Face Hub token   → a browser page asks for the value
-/gate:secret allow HF_TOKEN huggingface.co         → where it may be sent
-/gate:secret up HF_TOKEN [new description]         → new value (browser page)
-/gate:secret desc | disallow | del | list | help
-
-/gate:sudo add $USER localhost                    → a browser page asks for the password
-/gate:sudo add admin myserver                   (an ssh alias, host name or IP)
-/gate:sudo enable myserver                       → root runs WITHOUT asking, this session only
-/gate:sudo enable myserver always                → ...in every session
-/gate:sudo disable myserver                      → back to asking (all sessions)
-/gate:sudo up | del | list | help
-
-/gate:account add github work Work GitHub (asirobots)  → a browser page asks login, owners,
-                                                         token and/or SSH key (paste or generate)
-/gate:account allow github:work asirobots           → owners/orgs (or hosts, with a dot) it is for
-/gate:account prompts github:work write=ask         → when tools using it must ask you first
-/gate:account pubkey github:work                    → the public key to paste on the site
-/gate:account import github:work GITHUB_TOKEN       → reuse a /gate:secret value as its token
-/gate:account up | desc | disallow | forget | del | list | help
+/gate:add account        GitHub, Hugging Face, a server over SSH, Azure/Databricks,
+                         the ASI ML Catalog, a container registry, Pijul
+                         (or say it directly: /gate:add github, /gate:add ssh, ...)
+/gate:add secret         an API key or token for a website
+/gate:add sudo           a computer's administrator password
+/gate:update NAME        change one (e.g. /gate:update github:work)
+/gate:delete NAME        remove one
+/gate:enable sudo HOST [always]   admin commands there run without asking
+/gate:disable sudo HOST           every admin command asks again
+/gate:list               what the gateway holds (never values)
 ```
+
+After a `/gate:add` or `/gate:update`, Claude asks you a few questions in its
+pop-ups, in plain words (which service, which org, how to sign in), and
+suggests answers it can look up. Then a small **dialog from your system**
+shows exactly what will be added. The token or password is typed only
+there, hidden. For GitHub, Azure and the ML Catalog the recommended choice
+is to sign in in your browser, which works with company single sign-on and
+needs no copying.
 
 **Accounts** are separate identities, kept apart from your own environment:
 several GitHub accounts side by side, Hugging Face, Pijul (the Nest or your own
@@ -84,16 +83,19 @@ tells Claude the exact `pixi install -e …` command). Ask Claude in plain words
 to set up a mirror ("keep this repo in sync on my personal and work GitHub");
 the `gate:accounts` skill tells it how.
 
-- **Values never go in the chat.** A one-time page opens in your browser on
-  `127.0.0.1` with a masked field; you paste and Save. Claude never sees the
-  value, and it isn't written to the transcript.
-- **No popups.** The command holds no secret, so it passes through and Claude
-  just confirms the result in a line.
-- **Safety net.** If you type something that looks like a token anyway, the
-  command is blocked, nothing is saved, and your text is scrubbed from the
-  transcript.
-- **Claude can't run these commands itself.** When something is missing or not
-  allowed, it tells you the exact command to run.
+- **Values never go in the chat.** They're typed in the system dialog (macOS,
+  or zenity/kdialog on a Linux desktop), straight into the gateway's vault.
+  Without a screen (over ssh), Claude gives you a `gateway finish …` command
+  to run in a terminal there, which asks at a hidden prompt.
+- **Only your typed command starts a change.** It opens a one-time setup that
+  lasts 15 minutes, for that change and this session only. It's kept in the
+  encrypted vault, so Claude can't make one up.
+- **Safety net.** If you type something that looks like a token into a
+  command anyway, it's blocked, nothing is saved, and your text is scrubbed
+  from the transcript.
+- The v0.5 commands (`/gate:secret`, `/gate:sudo`, `/gate:account …`) still
+  work for now, but adding or changing an account goes through `/gate:add`
+  and `/gate:update`.
 
 ## How it behaves in auto mode
 

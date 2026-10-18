@@ -116,7 +116,7 @@ def pijul_tool(args: list[str], cwd: str, account: str | None = None,
                 picked = None
         if sub in REMOTE_CMDS and remote and not picked:
             raise gitops.GitRefused(f"no Pijul account is for {remote['host']}/{remote['owner']}; "
-                                    "ask the user to run /gate:account add pijul NAME <description>")
+                                    "ask the user to type /gate:add pijul")
         ref, acct = picked if picked else (None, None)
         if acct is not None and cls != "local":
             decision = vault.effective_prompts(acct, data)[cls]

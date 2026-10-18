@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import entra, logins, policy, vault, web_form
+from . import dialog, entra, logins, policy, vault, web_form
 
 PREFIX = re.compile(r"^\s*/(?:gate:)?(secret|sudo|account)(?=\s|$)(.*)$", re.S)
 
@@ -162,18 +162,19 @@ VALUE_PROVIDER = None
 def terminal_command(args: str) -> str:
     """The terminal-fallback command for the same action, for messages."""
     from . import policy as _p
-    return f"pixi run --manifest-path {_p.plugin_root() / 'pixi.toml'} vault {args}"
+    return f"pixi run --manifest-path {_p.plugin_root() / 'pixi.toml'} gateway {args}"
 
 
 def _form(title: str, details: list[tuple[str, str]], label: str,
           optional: bool = False) -> str | None:
     if VALUE_PROVIDER is not None:
         return VALUE_PROVIDER(title, details, label, optional)
+    text = title + "\n\n" + "\n".join(f"{k}: {v}" for k, v in details if v) + f"\n\n{label}:"
     try:
-        return web_form.ask(title, details, label, optional=optional)
-    except web_form.Unavailable:
+        return dialog.secret(text)
+    except dialog.Unavailable:
         raise CommandError(
-            "No browser can be opened here (no desktop, e.g. over ssh), so nothing "
+            "No dialog can be shown here (no desktop, e.g. over ssh), so nothing "
             "was saved. Run the same command in a terminal on this machine instead; "
             "it asks for the value at a hidden prompt:\n  "
             + terminal_command(_CURRENT.get("args", "secret|sudo ...")))
@@ -191,13 +192,9 @@ def _fields_form(title: str, details: list[tuple[str, str]],
                  fields: list[dict[str, Any]]) -> dict[str, str] | None:
     if FIELDS_PROVIDER is not None:
         return FIELDS_PROVIDER(title, details, fields)
-    try:
-        return web_form.ask_form(title, details, fields)
-    except web_form.Unavailable:
-        raise CommandError(
-            "No browser can be opened here (no desktop, e.g. over ssh), so nothing "
-            "was saved. Run the same command in a terminal on this machine instead:\n  "
-            + terminal_command(_CURRENT.get("args", "account ...")))
+    raise CommandError("Accounts are added and changed with /gate:add account and "
+                       "/gate:update KIND:NAME now: Claude asks a few questions and a dialog "
+                       "asks for the token. Nothing was changed.")
 
 
 # ---------------------------------------------------------------------------

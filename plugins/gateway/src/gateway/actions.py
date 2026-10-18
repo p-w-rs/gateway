@@ -308,13 +308,13 @@ def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None,
         token = (a or {}).get("secrets", {}).get("token")
         if not token:
             raise RuntimeError(f"the account {ref} has no token" if a else
-                               f"no account named {ref}; ask the user to run: "
-                               f"/gate:account add {ref.replace(':', ' ', 1)} <description>")
+                               f"no account named {ref}; ask the user to type: "
+                               f"/gate:add {ref.split(':', 1)[0]}")
         return token
     s = vault.secret(ref) if vault.NAME_RE.fullmatch(ref or "") else None
     if not s:
-        raise RuntimeError(f"no secret named {ref}; ask the user to run: "
-                           f"/gate:secret add {ref} <description>")
+        raise RuntimeError(f"no secret named {ref}; ask the user to type: "
+                           f"/gate:add secret (and suggest the name {ref})")
     return s["value"]
 
 
@@ -332,9 +332,8 @@ def secret_list(approve: Approver = None) -> dict[str, Any]:
             "accounts": cat["accounts"],
             "note": "Names only, never values. Use a secret's NAME, or an account "
                     "with a token (KIND:NAME), as auth_ref on http_request, only for "
-                    "its hosts. Missing one? Ask the user to run /gate:secret add "
-                    "NAME <description> or /gate:account add KIND NAME <description> "
-                    "(a browser form asks them for the value)."}
+                    "its hosts. Missing one? Ask the user to type /gate:add secret or "
+                    "/gate:add account (a dialog asks them for the value)."}
 
 
 def secret_use_check(ref: str, approve: Approver = None) -> dict[str, Any]:

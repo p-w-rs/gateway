@@ -84,7 +84,9 @@ def _empty() -> dict[str, Any]:
     # run_privileged runs without asking there; elsewhere it needs approval.
     # accounts / account_prompts: see the module docstring and KINDS.
     return {"version": VERSION, "secrets": {}, "sudo": {}, "sudo_enabled": [],
-            "sudo_session": {}, "accounts": {}, "account_prompts": {}}
+            "sudo_session": {}, "accounts": {}, "account_prompts": {},
+            # grants: open guided setups (setup.py), by id; never hold a value.
+            "grants": {}}
 
 
 MAX_SESSIONS_PER_HOST = 20  # oldest session grants are dropped beyond this

@@ -296,6 +296,37 @@ on while the plugin is enabled.
 - `_BLOCKED` is the Bash blocklist used by the PreToolUse hook and by
   run_privileged.
 
+## Short commands and guided setup (`setup.py`)
+
+- **Typed commands:** `/gate:add|update|delete|enable|disable|list|export|import`
+  go through the UserPromptSubmit hook (`prompt.sh` → `hooks.prompt_main` →
+  `setup.handle`, then `commands.handle` for the v0.5 commands). `delete`,
+  `enable`, `disable` and `list` act at once: the typed command is the consent.
+- **Grants:** `add` and `update` open a **grant**
+  `{op, what, target, session, expires (+15 min), used, pending}` in
+  `vault["grants"]`, inside the encrypted vault, so Claude's Bash can't
+  forge one the way it could a plain file. The note passed to Claude names
+  the grant id and the `gate:setup` skill.
+- **Guiding:** Claude asks with its question pop-ups (the skill says what to
+  ask, per kind), then calls the `gate_setup` MCP tool with the grant and a
+  proposal.
+- **`gate_setup`:**
+  1. Checks the grant: it exists and is unused and unexpired, its session is
+     the MCP server's `CLAUDE_CODE_SESSION_ID`, and its kind matches.
+  2. Validates the proposal (`_plan`). A refusal leaves the grant open, so
+     Claude can fix the proposal and retry.
+  3. Shows `dialog.confirm` with a plain-language summary, then
+     `dialog.secret` for a token or password, or opens a browser sign-in.
+  4. Saves through the same code as the v0.5 commands
+     (`commands._apply_form`, the sudo and secret records), and marks the
+     grant used.
+- **No dialog:** the proposal is kept with the grant, and the user runs
+  `pixi run … gateway finish GRANT` in a terminal. It shows the summary,
+  asks y/N and reads the value at a hidden prompt.
+- **v0.5 commands:** `/gate:secret` and `/gate:sudo` take their value from
+  the same dialog; `/gate:account add|up` point to `/gate:add` and
+  `/gate:update`.
+
 ## Native dialogs (`dialog.py`)
 
 The one place a person types a secret or approves a change. The dialog is

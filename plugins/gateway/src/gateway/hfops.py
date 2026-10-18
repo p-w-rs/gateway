@@ -63,7 +63,7 @@ def pick(account: str | None, args: list[str], data: dict[str, Any]) -> tuple[st
     if len(hfs) == 1:
         return hfs[0]
     raise gitops.GitRefused("pass account= (one of: " + (", ".join(r for r, _ in hfs) or
-                            "none yet; ask the user to run /gate:account add hf NAME") + ")")
+                            "none yet; ask the user to type /gate:add hf") + ")")
 
 
 def hf_tool(args: list[str], cwd: str | None = None, account: str | None = None,

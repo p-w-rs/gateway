@@ -81,10 +81,41 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_log(rest)
     if sub == "check":
         return cmd_check(rest)
-    if sub == "vault":
+    if sub == "gateway" and rest[:1] == ["finish"]:
+        return cmd_finish(rest[1:])
+    if sub in ("vault", "gateway"):
         return cmd_vault(rest)
     print(__doc__)
     return 0
+
+
+def cmd_finish(argv: list[str]) -> int:
+    """`gateway finish GRANT`: finish a setup Claude prepared on a machine where
+    no dialog could open. Shows the change, asks y/N, reads any secret hidden."""
+    import getpass
+
+    from . import setup
+    if len(argv) != 1:
+        print("usage: gateway finish GRANT   (the id Claude gave you, e.g. g-1a2b3c4d)")
+        return 2
+    if not sys.stdin.isatty():
+        print("gateway: run this in an interactive terminal.", file=sys.stderr)
+        return 2
+
+    def confirm(summary: str) -> bool:
+        print(summary)
+        return input("Allow? [y/N] ").strip().lower() in ("y", "yes")
+
+    def secret(label: str) -> str | None:
+        v = getpass.getpass(f"{label}: ")
+        return v if v else None
+
+    try:
+        print(setup.finish(argv[0], confirm, secret))
+        return 0
+    except setup.SetupError as e:
+        print(f"gateway: {e}", file=sys.stderr)
+        return 1
 
 
 def cmd_vault(argv: list[str]) -> int:

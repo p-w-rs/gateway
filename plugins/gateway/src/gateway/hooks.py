@@ -33,16 +33,16 @@ SESSION_NOTE = (
     "(no prompt; use it only for what the task needs); elsewhere use "
     "run_privileged_confirm (Claude Code asks the user for each call).\n"
     "- TLS certs / file hashes: gateway cert_inspect / file_hash.\n"
-    "- The user manages the vault with slash commands; you can't run them. When "
-    "something is missing or not allowed, tell the user the exact command:\n"
-    "  /gate:secret add NAME <description>   (a browser form asks the value)\n"
-    "  /gate:secret allow NAME HOST\n"
-    "  /gate:sudo add USER HOST               (a browser form asks the password)\n"
-    "  /gate:sudo enable HOST [always]        (this session, or every session)\n"
-    "  /gate:sudo disable HOST\n"
-    "  /gate:account add KIND NAME <description>  (GitHub, Hugging Face, Pijul, "
-    "Azure, ML Catalog, SSH, registry identities; a browser form asks the token/key)\n"
-    "  (/gate:secret help, /gate:sudo help and /gate:account help list the rest.)\n"
+    "- The user manages the vault with short slash commands; you can't run them. "
+    "When something is missing or not allowed, tell the user which one to type:\n"
+    "  /gate:add account | secret | sudo | ssh   (or /gate:add github, hf, azure, ...)\n"
+    "  /gate:update NAME      (e.g. to allow another host or org, or a new token)\n"
+    "  /gate:delete NAME\n"
+    "  /gate:enable sudo HOST [always]   /gate:disable sudo HOST\n"
+    "  /gate:list\n"
+    "  After /gate:add or /gate:update, the gateway's note opens a setup: follow the "
+    "gate:setup skill (ask with question pop-ups, then call gate_setup). A native "
+    "dialog takes any value; you never see it.\n"
     "- Accounts (KIND:NAME, e.g. github:work) are the user's separate identities. "
     "One with a token works as auth_ref on http_request, for its hosts only. Never "
     "fall back to the user's own environment credentials for a service that has an "
@@ -218,7 +218,10 @@ def prompt_main() -> int:
     so a typed value can never fall through to Claude."""
     try:
         payload = json.load(sys.stdin)
-        out = commands.handle(payload)
+        from . import setup
+        out = setup.handle(payload)
+        if out is None:
+            out = commands.handle(payload)
     except Exception as e:  # noqa: BLE001
         out = commands.block(
             f"gateway: could not process the command ({type(e).__name__}); "

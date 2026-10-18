@@ -25,7 +25,8 @@ plugins/gateway/
   hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse (Bash; gateway tools + file tools)
   hooks/perm.sh                   the plugin's permission rules: allow/ask gateway tools, credential-path prefilter
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
-  commands/{help,secret,sudo,account,log}.md   slash commands
+  commands/*.md                   slash commands: add, update, delete, enable, disable, list,
+                                  export, import, help, log (+ v0.5 secret, sudo, account)
   install.py                      dev only: register this checkout + remove v0.5's settings.json entries (legacy-settings.json)
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
@@ -43,11 +44,13 @@ plugins/gateway/
     hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
                    the hf, pijul, ssh_exec/ssh_copy, databricks, mlcat*, registry tools
   skills/accounts/SKILL.md        how Claude uses accounts and mirrors (gate:accounts)
+  skills/setup/SKILL.md           how Claude guides /gate:add and /gate:update (gate:setup)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
-    commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
+    commands.py    v0.5 /gate:secret|sudo|account, shared validation, transcript scrubber
     vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches, accounts (KINDS)
-    web_form.py    one-time 127.0.0.1 browser form (v0.5 commands; replaced by dialog.py in phase 3)
+    setup.py       /gate:add|update|delete|enable|disable|list, setup grants, gate_setup, `gateway finish`
+    web_form.py    browser opener + pages for GitHub/Entra sign-ins (no value form any more)
     dialog.py      native dialogs (osascript / zenity / kdialog): confirm a change, type a secret hidden
     cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
                    fallback for /secret, /sudo and /account when no browser can open)
@@ -82,11 +85,13 @@ your change (mutation-check it).
 2. **Secrets go only to their allowed hosts.** Redirects drop credentials when
    they cross hosts or downgrade to http (`_GatewayRedirect`). There are no
    `keychain:`/`env:` refs; the vault is the only source.
-3. **Claude can't grant itself anything.** Vault changes (including account
-   scopes and prompt policies) and sudo switches happen only in the
-   UserPromptSubmit hook (user-typed prompts). The slash
-   commands are `disable-model-invocation: true`. No MCP tool may add a
-   secret, allow a host, or enable sudo.
+3. **Claude can't grant itself anything.** Every vault change starts with a
+   command the user types (UserPromptSubmit hook; the slash commands are
+   `disable-model-invocation: true`). `/gate:add`/`update` open a one-time
+   setup grant (in the vault, this session, 15 min); `gate_setup` acts only
+   on a live grant and only after the user approves the native dialog, where
+   any value is typed. No MCP tool opens a grant, enables sudo, or adds a
+   secret or host without one.
 4. **Approvals come from Claude Code's permission prompt**, i.e. `ask` rules in
    settings.json (`port_check`, `run_privileged_confirm`). Never rely on MCP
    elicitation forms: the desktop app auto-cancels them without showing them

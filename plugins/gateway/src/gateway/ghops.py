@@ -138,7 +138,7 @@ def pick(account: str | None, cwd: str | None, data: dict[str, Any],
     if len(gh) == 1:
         return gh[0]
     raise gitops.GitRefused("pass account= (one of: " + (", ".join(r for r, _ in gh) or
-                            "none yet; ask the user to run /gate:account add github NAME") + ")")
+                            "none yet; ask the user to type /gate:add github") + ")")
 
 
 def gh_tool(args: list[str], cwd: str | None = None, account: str | None = None,

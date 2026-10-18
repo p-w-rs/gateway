@@ -5,6 +5,7 @@ or:
     python tests/run_tests.py
 """
 import json
+import re
 import os
 import socket
 import subprocess
@@ -328,11 +329,31 @@ os.environ.update(GATEWAY_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FI
                   GATEWAY_FORM_TIMEOUT="10")
 
 
+# A fake native dialog (dialog.py): answers per the plan (save VALUE / cancel)
+# and records what it was shown. Values are typed only in a dialog now.
+FAKE_DLG = TMP / "fake_dialog.py"
+DLG_PLAN, DLG_SEEN = TMP / "dialog.plan", TMP / "dialog.seen"
+FAKE_DLG.write_text(f"""#!{sys.executable}
+import json, os, sys
+plan = json.loads(open({str(DLG_PLAN)!r}).read() or "null") if os.path.exists({str(DLG_PLAN)!r}) else None
+with open({str(DLG_SEEN)!r}, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+if not plan or plan.get("action") != "save":
+    sys.exit(1)
+print("yes" if sys.argv[1] == "confirm" else plan.get("value", ""))
+""")
+FAKE_DLG.chmod(0o755)
+os.environ["GATEWAY_DIALOG"] = str(FAKE_DLG)
+
+
 def form_plan(plan):
-    PLAN_FILE.write_text(json.dumps(plan))
-    for f in (URL_FILE, PAGE_FILE):
-        if f.exists():
-            f.unlink()
+    DLG_PLAN.write_text(json.dumps(plan))
+    if DLG_SEEN.exists():
+        DLG_SEEN.unlink()
+
+
+def dialogs_seen():
+    return [json.loads(x) for x in DLG_SEEN.read_text().splitlines()] if DLG_SEEN.exists() else []
 
 
 def say(prompt, sid=SID):
@@ -366,16 +387,16 @@ check("/secret add: value came from the browser form",
       vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
 check("/secret add: result names it, never the value",
       "Stored HF_TOKEN" in out["reason"] and "hf_abc123456789" not in out["reason"])
-check("form page shows name and description, masked field",
-      "HF_TOKEN" in PAGE_FILE.read_text() and "Hugging Face token" in PAGE_FILE.read_text()
-      and 'type="password"' in PAGE_FILE.read_text())
+check("the value is asked in a hidden dialog that names it and its description",
+      dialogs_seen()[-1][0] == "secret" and "HF_TOKEN" in dialogs_seen()[-1][2]
+      and "Hugging Face token" in dialogs_seen()[-1][2])
 check("vault key is mode 600", oct(vault.key_path().stat().st_mode & 0o777) == "0o600")
 check("vault file is encrypted", b"hf_abc123456789" not in vault.store_path().read_bytes())
 check("ordinary prompt is not handled", say("please list my secrets") is None)
 check("short /secret form handled too", passed(say("  /secret list")))
 out = add_secret("HF_TOKEN", "other_value_123", "dup")
 check("add refuses an existing name (passed through as an error, no form)",
-      passed(out) and "already exists" in out["reason"] and not URL_FILE.exists()
+      passed(out) and "already exists" in out["reason"] and not dialogs_seen()
       and vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
 check("bad name refused", "not a valid name" in add_secret("9BAD", "v12345", "x")["reason"])
 check("add needs a description", "Add a description" in say("/gate:secret add NODESC")["reason"]
@@ -435,8 +456,8 @@ out = add_sudo(ME, "localhost", SUDO_PW)
 check("/sudo add: password from form (spaces/quotes kept), passes through",
       passed(out) and vault.sudo_entries("localhost")[0]["password"] == SUDO_PW
       and SUDO_PW not in out["reason"])
-check("sudo form page names user and host",
-      ME in PAGE_FILE.read_text() and "this machine" in PAGE_FILE.read_text())
+check("sudo dialog names user and host",
+      ME in dialogs_seen()[-1][2] and "this machine" in dialogs_seen()[-1][2])
 out = add_sudo("someoneelse", "localhost", SUDO_PW)
 check("/sudo localhost must be the current user", "asks for the password of" in out["reason"])
 add_sudo("admin", "myserver", SUDO_PW)
@@ -887,113 +908,11 @@ check("/secret allow, then MCP sees the host",
 body, el = c.call("http_request", {"url": A + "/x", "auth_ref": "MCP_KEY"})
 check("allowed secret host over MCP: sent", el is None and body.get("ok") is True)
 
-print("browser form (web_form):")
 from gateway import web_form  # noqa: E402
 import http.client  # noqa: E402
 import re as _re  # noqa: E402
 import urllib.request as _ur  # noqa: E402
-
-# A fake "browser": records the URL; then, per FAKE_FORM, fills the form like
-# a user would (save VALUE / cancel / nothing).
-FAKE_BROWSER = TMP / "fake_browser.py"
-FAKE_BROWSER.write_text(r'''
-import json, os, re, sys, urllib.parse, urllib.request
-url = sys.argv[1]
-open(os.environ["FAKE_URL_FILE"], "w").write(url)
-plan = json.loads(open(os.environ["FAKE_FORM_FILE"]).read() or "null") if os.path.exists(os.environ["FAKE_FORM_FILE"]) else None
-if not plan:
-    sys.exit(0)
-page = urllib.request.urlopen(url, timeout=10).read().decode()
-open(os.environ["FAKE_PAGE_FILE"], "w").write(page)
-nonce = re.search(r'name="nonce" value="([^"]+)"', page).group(1)
-data = urllib.parse.urlencode({"nonce": nonce, "action": plan["action"],
-                               "value": plan.get("value", "")}).encode()
-urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10).read()
-''')
-FAKE_BROWSER_SH = TMP / "fake_browser.sh"
-FAKE_BROWSER_SH.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_BROWSER}" "$1"\n')
-FAKE_BROWSER_SH.chmod(0o755)
-URL_FILE, PAGE_FILE = TMP / "form.url", TMP / "form.html"
-PLAN_FILE = TMP / "form.plan"
-os.environ.update(GATEWAY_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FILE),
-                  FAKE_PAGE_FILE=str(PAGE_FILE), FAKE_FORM_FILE=str(PLAN_FILE))
-
-
-def form_plan(plan):
-    PLAN_FILE.write_text(json.dumps(plan))
-    for f in (URL_FILE, PAGE_FILE):
-        if f.exists():
-            f.unlink()
-
-
-# Security of the form server itself: probe it while it waits.
-form_plan(None)
-os.environ["GATEWAY_FORM_TIMEOUT"] = "8"
-box = {}
-th = threading.Thread(target=lambda: box.update(
-    v=web_form.ask("Store the secret <X>", [("Description", "<b>desc</b>")], "Value")))
-th.start()
-deadline = time.time() + 5
-while not URL_FILE.exists() and time.time() < deadline:
-    time.sleep(0.05)
-url = URL_FILE.read_text()
-parsed = urllib.parse.urlparse(url)
-check("form served on loopback with a long random path",
-      parsed.hostname == "127.0.0.1" and len(parsed.path) > 20)
-
-
-def status(method, path, host=None, body=None):
-    conn = http.client.HTTPConnection("127.0.0.1", parsed.port, timeout=5)
-    headers = {"Host": host or parsed.netloc}
-    if body is not None:
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    conn.request(method, path, body=body, headers=headers)
-    r = conn.getresponse()
-    data = r.read().decode()
-    conn.close()
-    return r.status, data
-
-
-check("wrong path: 404", status("GET", "/nope")[0] == 404)
-check("rebinding Host header: 404", status("GET", parsed.path, host="evil.example")[0] == 404)
-code, page = status("GET", parsed.path)
-check("page: masked field, no autocomplete",
-      code == 200 and 'type="password"' in page and 'autocomplete="new-password"' in page)
-check("page: text is HTML-escaped", "&lt;b&gt;desc&lt;/b&gt;" in page and "<b>desc" not in page)
-conn = http.client.HTTPConnection("127.0.0.1", parsed.port, timeout=5)
-conn.request("GET", parsed.path, headers={"Host": parsed.netloc})
-resp = conn.getresponse(); resp.read(); conn.close()
-check("page headers: CSP, no-store, X-Frame-Options",
-      "default-src 'none'" in resp.getheader("Content-Security-Policy", "")
-      and resp.getheader("Cache-Control") == "no-store"
-      and resp.getheader("X-Frame-Options") == "DENY")
-check("POST without the page's nonce: 403",
-      status("POST", parsed.path, body="nonce=wrong&action=save&value=x")[0] == 403)
-nonce = _re.search(r'name="nonce" value="([^"]+)"', page).group(1)
-code, _ = status("POST", parsed.path, body=f"nonce={nonce}&action=save&value=s%20cret%3D1")
-th.join(10)
-check("correct POST: value returned exactly (spaces, =)", code == 200 and box.get("v") == "s cret=1")
-try:
-    status("GET", parsed.path)
-    check("one-time: server gone after submit", False)
-except OSError:
-    check("one-time: server gone after submit", True)
-
-form_plan(None)
-os.environ["GATEWAY_FORM_TIMEOUT"] = "1"
-t0 = time.time()
-check("not submitted: times out with None", web_form.ask("t", [], "v") is None
-      and time.time() - t0 < 5)
-os.environ["GATEWAY_FORM_TIMEOUT"] = "10"
-form_plan({"action": "cancel"})
-check("Cancel button: None", web_form.ask("t", [], "v") is None)
-os.environ["GATEWAY_BROWSER"] = "none"
-try:
-    web_form.ask("t", [], "v")
-    check("no browser: raises Unavailable", False)
-except web_form.Unavailable:
-    check("no browser: raises Unavailable", True)
-os.environ["GATEWAY_BROWSER"] = str(FAKE_BROWSER_SH)
+check("the browser value form is gone", not hasattr(web_form, "ask") and not hasattr(web_form, "ask_form"))
 
 print("tool list and settings:")
 names = {t["name"] for t in c.rpc("tools/list", {})["result"]["tools"]}
@@ -1091,13 +1010,13 @@ finally:
         else:
             os.environ[k] = v
 
-os.environ["GATEWAY_BROWSER"] = "none"
+os.environ["GATEWAY_DIALOG"] = "none"
 out = say("/gate:secret add HEADLESS_K a key added over ssh")
-check("no browser: passes through an error with the exact terminal command",
+check("no dialog: passes through an error with the exact terminal command",
       passed(out) and "pixi run --manifest-path" in out["reason"]
-      and "vault secret add HEADLESS_K a key added over ssh" in out["reason"]
+      and "gateway secret add HEADLESS_K a key added over ssh" in out["reason"]
       and not vault.secret("HEADLESS_K"))
-os.environ["GATEWAY_BROWSER"] = str(FAKE_BROWSER_SH)
+os.environ["GATEWAY_DIALOG"] = str(FAKE_DLG)
 
 # The terminal fallback reuses the same command code with a hidden prompt.
 from gateway import commands as _cmds  # noqa: E402
@@ -1121,8 +1040,9 @@ p = subprocess.run([sys.executable, str(ROOT / "run.py"), "vault", "secret", "ad
                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
 check("terminal fallback refuses without a real terminal (never reads a piped value)",
       p.returncode == 2 and "interactive terminal" in p.stderr)
-check("/gate:help command exists, mentions the fallback",
-      "vault secret add" in (ROOT / "commands" / "help.md").read_text())
+check("/gate:help command exists, mentions the short commands and the terminal",
+      "/gate:add" in (ROOT / "commands" / "help.md").read_text()
+      and "gateway finish" in (ROOT / "commands" / "help.md").read_text())
 
 # --- Accounts: vault v2 + /gate:account --------------------------------------
 print("accounts:")
@@ -1153,18 +1073,68 @@ os.environ.update(GATEWAY_BROWSER=str(ACCT_BROWSER_SH), ACCT_PLAN=str(ACCT_PLAN)
                   ACCT_PAGE=str(ACCT_PAGE), GATEWAY_FORM_TIMEOUT="10")
 
 
+from gateway import setup as _setup  # noqa: E402
+_ACCT = {"fields": None, "action": "save"}
+
+
 def acct_form(fields=None, action="save"):
-    ACCT_PLAN.write_text(json.dumps({"action": action, "fields": fields or {}}))
-    if ACCT_PAGE.exists():
-        ACCT_PAGE.unlink()
+    """What the user would settle with Claude for the next account add/up
+    (v0.5 called this 'the form'): settings, owners, token, ssh key."""
+    _ACCT.update(fields=fields, action=action)
+
+
+def _setup_account(sub, rest):
+    """/gate:account add|up through the v2 path: a grant, a proposal like
+    Claude's, the dialog (fake) for the token. Returns a hook-like result."""
+    f = dict(_ACCT["fields"] or {})
+    words = rest.split(None, 2) + ["", "", ""]
+    if sub == "add":
+        kind, name, desc = words[0].lower(), words[1], words[2].strip()
+        gid = _setup.open_grant("add", "account", kind, SID)
+        prop = {"what": "account", "kind": kind, "name": name, "description": desc}
+    else:
+        ref, desc = words[0].lower(), (words[1] + " " + words[2]).strip()
+        gid = _setup.open_grant("update", "account", ref, SID)
+        prop = {"what": "account"}
+        if desc:
+            prop["description"] = desc
+    kind = prop.get("kind") or ref.split(":", 1)[0]
+    spec = vault.KINDS.get(kind, {"fields": ()})
+    prop["fields"] = {k: v for k, v in f.items() if k in spec["fields"]}
+    if "owners" in f:
+        prop["owners"] = f["owners"].replace(",", " ").split()
+    cred = {}
+    if f.get("token"):
+        cred["token"] = "ask"
+    mode = f.get("ssh_key_mode")
+    if mode == "generate":
+        cred["ssh_key"] = "generate"
+    elif mode == "paste":
+        kf = TMP / f"pasted-key-{gid}"
+        kf.write_text(f.get("ssh_key", ""))
+        cred.update(ssh_key="file", ssh_key_file=str(kf))
+    prop["credentials"] = cred
+    form_plan({"action": _ACCT["action"], "value": f.get("token", "")})
+    r = _setup.gate_setup(gid, prop, SID)
+    text = r.get("result") or ("Cancelled: " + r["reason"] if r.get("declined") else
+                               "Error: " + r.get("reason", ""))
+    return {"reason": text, "setup": r, "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": "<gateway-result>\n" + text + "\n</gateway-result>"}}
 
 
 def acct(prompt):
+    m = re.match(r"^/gate:account (add|up|update) (.*)$", prompt, re.S)
+    if m and m.group(2).split() and not _TOKEN_IN.search(m.group(2)):
+        return _setup_account("add" if m.group(1) == "add" else "update", m.group(2))
     out = commands.handle({"prompt": prompt, "session_id": SID,
                            "transcript_path": str(TRANSCRIPT)})
     if out is not None:
         out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
     return out
+
+
+_TOKEN_IN = re.compile(r"\b(gho_|ghp_|hf_)\w{10,}")
 
 
 # v1 vault (no accounts) still reads, and is saved as v2.
@@ -1196,10 +1166,9 @@ check("account add: settings and owners stored",
 check("account add: default hosts for github.com",
       a["hosts"] == ["github.com", "api.github.com"])
 check("account add: result never holds the token", GH_TOKEN_V not in out["reason"])
-_page = ACCT_PAGE.read_text()
-check("account form: kind-specific fields, masked token, no value prefilled",
-      'name="login"' in _page and 'name="token" type="password"' in _page
-      and 'name="ssh_key_mode"' in _page and GH_TOKEN_V not in _page)
+check("account add: the token was asked in a hidden dialog after a confirm",
+      [d[0] for d in dialogs_seen()] == ["confirm", "secret"]
+      and "github:work" in dialogs_seen()[0][2] and GH_TOKEN_V not in json.dumps(dialogs_seen()))
 _cat = json.dumps(vault.catalog())
 check("catalog: account listed with methods, never the token",
       '"github:work"' in _cat and '"token"' in _cat and GH_TOKEN_V not in _cat)
@@ -1207,11 +1176,11 @@ check("all_values covers account tokens", GH_TOKEN_V in vault.all_values())
 check("account add: refuses an existing name",
       "already exists" in acct("/gate:account add github work again")["reason"])
 check("account add: unknown kind refused",
-      "Unknown kind" in acct("/gate:account add gitlab x desc")["reason"])
+      "kind must be one of" in acct("/gate:account add gitlab x desc")["reason"])
 check("account add: needs a description",
-      "Add a description" in acct("/gate:account add github nodesc")["reason"])
+      "add a short description" in acct("/gate:account add github nodesc")["reason"])
 check("account add: bad name refused",
-      "not an account name" in acct("/gate:account add github Bad/Name d")["reason"])
+      "name: a short lowercase name" in acct("/gate:account add github Bad/Name d")["reason"])
 check("host names with digits are not mistaken for tokens",
       "decision" not in acct("/gate:account allow github:work adb-1234567890123456.7.azuredatabricks.net"))
 acct("/gate:account disallow github:work adb-1234567890123456.7.azuredatabricks.net")
@@ -1219,7 +1188,7 @@ check("pasted token in the command is blocked, nothing saved",
       acct(f"/gate:account add github leak {GH_TOKEN_V}").get("decision") == "block"
       and vault.account("github:leak") is None)
 acct_form(action="cancel")
-check("account form cancelled: nothing stored",
+check("account dialog cancelled: nothing stored",
       "Cancelled" in acct("/gate:account add hf c desc")["reason"]
       and vault.account("hf:c") is None)
 
@@ -1231,8 +1200,8 @@ a = vault.account("github:work")
 check("account up: empty token keeps it; owners and description updated",
       a["secrets"]["token"] == GH_TOKEN_V and a["owners"] == ["asirobots"]
       and a["description"] == "Work GitHub, asirobots only")
-check("account up: form shows current settings but not the token",
-      'value="octo-work"' in ACCT_PAGE.read_text() and GH_TOKEN_V not in ACCT_PAGE.read_text())
+check("account up: no token asked when none is being replaced",
+      [d[0] for d in dialogs_seen()] == ["confirm"] and GH_TOKEN_V not in json.dumps(dialogs_seen()))
 
 # SSH keys: generate, paste, refuse a passphrase-protected key.
 acct_form({"host": "nest.pijul.com", "login": "powers", "name": "", "email": "",
@@ -1363,25 +1332,22 @@ check("account without a token can't be used as auth_ref", r.get("ok") is False)
 
 # Logs, session note, wrapper, terminal fallback, delete.
 _log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
-check("audit log: account commands logged, no token or key",
-      '"account add"' in _log and GH_TOKEN_V not in _log and "PRIVATE KEY" not in _log)
+check("audit log: account setups logged, no token or key",
+      '"gate_setup"' in _log and '"github:work"' in _log and GH_TOKEN_V not in _log
+      and "PRIVATE KEY" not in _log)
 _note = _hooks._catalog_note(SID)
 check("session note lists accounts, never values",
       "github:work" in _note and "pijul:nest" in _note and GH_TOKEN_V not in _note
       and "PRIVATE KEY" not in _note)
-check("session note tells Claude about /gate:account", "/gate:account add" in _hooks.SESSION_NOTE)
+check("session note tells Claude the short commands", "/gate:add account" in _hooks.SESSION_NOTE and "gate:setup" in _hooks.SESSION_NOTE)
 out = json.loads(run_sh("/gate:account list"))
 check("wrapper routes /gate:account", "decision" not in out
       and "github:work" in out["hookSpecificOutput"]["additionalContext"])
-_cmds.FIELDS_PROVIDER = lambda title, details, fields: {
-    "host": "registry.example.com", "login": "bot", "owners": "", "token": "tok_terminal_123456"}
-try:
-    msg = _cmds.run_account("add registry term From a terminal")
-    check("terminal fallback: account add stores the token, reply has none",
-          vault.account("registry:term")["secrets"]["token"] == "tok_terminal_123456"
-          and "tok_terminal_123456" not in msg)
-finally:
-    _cmds.FIELDS_PROVIDER = None
+check("old /gate:account add (typed in full) points to /gate:add",
+      "/gate:add account" in commands.handle({"prompt": "/gate:account add registry term From a terminal",
+                                              "session_id": SID})["hookSpecificOutput"]["additionalContext"])
+acct_form({"host": "registry.example.com", "login": "bot", "owners": "", "token": "tok_terminal_123456"})
+acct("/gate:account add registry term From a terminal")
 acct("/gate:account del registry:term")
 check("del", vault.account("registry:term") is None)
 check("account help lists the kinds", "github, hf, pijul" in acct("/gate:account help")["reason"])
@@ -2855,12 +2821,15 @@ check("ssh host help says ~/.ssh/config aliases aren't read",
 print("dialogs:")
 from gateway import dialog  # noqa: E402
 
+_dlg_before = os.environ["GATEWAY_DIALOG"]
+os.environ["GATEWAY_DIALOG"] = "none"
 check("dialog: GATEWAY_DIALOG=none means no dialogs (tests never pop up)", not dialog.available())
 try:
     dialog.secret("x")
     check("dialog: unavailable raises", False)
 except dialog.Unavailable:
     check("dialog: unavailable raises", True)
+os.environ["GATEWAY_DIALOG"] = _dlg_before
 FAKE_DIALOG = TMP / "fake-dialog.sh"
 DIALOG_LOG = TMP / "dialog-args.jsonl"
 FAKE_DIALOG.write_text(f"""#!{sys.executable}
@@ -2981,6 +2950,153 @@ check("perm: Claude may read its downloads in the data dir",
 check("perm: Claude may not edit the data dir (audit log)",
       perm("Edit", {"file_path": _D + "/audit.jsonl"}) == "deny"
       and perm("Write", {"file_path": _D + "/quarantine/x"}) == "deny")
+
+# --- v2 phase 3: short commands, setup grants, gate_setup ---------------------
+print("setup grants and short commands:")
+from gateway import setup as _st  # noqa: E402
+
+
+def gsay(prompt, sid=SID):
+    out = _st.handle({"prompt": prompt, "session_id": sid, "transcript_path": str(TRANSCRIPT)})
+    if out is not None:
+        out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
+    return out
+
+
+def grant_of(out):
+    m = re.search(r"\b(g-[0-9a-f]{8})\b", out["reason"])
+    return m.group(1) if m else ""
+
+
+check("ordinary prompt is not a /gate: v2 command", gsay("add a secret please") is None)
+out = gsay("/gate:add secret for my OpenCode key")
+gid = grant_of(out)
+check("/gate:add secret opens a setup and tells Claude to use the gate:setup skill",
+      passed(out) and gid and "gate:setup" in out["reason"] and "gate_setup" in out["reason"]
+      and "OpenCode" in out["reason"])
+check("the grant is stored inside the encrypted vault, not in plain files",
+      gid in vault.load()["grants"] and gid.encode() not in vault.store_path().read_bytes()
+      and not any(gid in p.read_text(errors="ignore") for p in Path(os.environ["GATEWAY_DATA"]).rglob("*")
+                  if p.is_file()))
+_prop = {"what": "secret", "name": "OPENCODE_API_KEY", "description": "OpenCode API key",
+         "hosts": ["opencode.ai"]}
+check("gate_setup: no grant refused", _st.gate_setup("", _prop, SID).get("refused") is True)
+check("gate_setup: forged grant id refused", _st.gate_setup("g-deadbeef", _prop, SID).get("refused") is True)
+check("gate_setup: grant from another session refused",
+      _st.gate_setup(gid, _prop, "another-session").get("refused") is True)
+check("gate_setup: kind mismatch refused",
+      "this setup is for secret" in _st.gate_setup(gid, {"what": "account", "kind": "github"}, SID)["reason"])
+check("gate_setup: a bad host is refused before any dialog",
+      _st.gate_setup(gid, {**_prop, "hosts": ["*"]}, SID).get("refused") is True)
+form_plan({"action": "cancel"})
+r = _st.gate_setup(gid, _prop, SID)
+check("dialog Cancel: nothing saved, the setup stays open to retry",
+      r.get("declined") is True and not vault.secret("OPENCODE_API_KEY")
+      and gid in vault.load()["grants"])
+form_plan({"action": "save", "value": "oc_secret_value_123456"})
+r = _st.gate_setup(gid, _prop, SID)
+check("gate_setup saves after the dialog: value from the hidden dialog, hosts set",
+      r.get("ok") is True and vault.secret("OPENCODE_API_KEY")["value"] == "oc_secret_value_123456"
+      and vault.secret("OPENCODE_API_KEY")["hosts"] == ["opencode.ai"])
+check("the dialogs were a confirm with the summary, then a hidden field",
+      [d[0] for d in dialogs_seen()] == ["confirm", "secret"]
+      and "opencode.ai" in dialogs_seen()[0][2] and "OPENCODE_API_KEY" in dialogs_seen()[1][2])
+check("result and log never hold the value",
+      "oc_secret_value_123456" not in json.dumps(r)
+      and "oc_secret_value_123456" not in Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text())
+_r2 = _st.gate_setup(gid, {**_prop, "name": "REPLAYED_KEY"}, SID)
+check("a grant is used once: a second, otherwise valid proposal is refused",
+      _r2.get("refused") is True and "no open setup" in _r2["reason"]
+      and not vault.secret("REPLAYED_KEY"))
+_g = _st.open_grant("add", "secret", "", SID)
+with vault.locked():
+    _d = vault.load()
+    _d["grants"][_g]["expires"] = time.time() - 1
+    vault.save(_d)
+check("an expired grant is refused", _st.gate_setup(_g, {**_prop, "name": "LATE"}, SID).get("refused") is True)
+check("gate_setup is an MCP tool; nothing else opens a grant",
+      "gate_setup" in {t["name"] for t in mcp_server.TOOLS}
+      and not any("grant" in t["name"] for t in mcp_server.TOOLS))
+
+out = gsay("/gate:add sudo")
+form_plan({"action": "save", "value": SUDO_PW})
+r = _st.gate_setup(grant_of(out), {"what": "sudo", "user": "admin", "host": "box9"}, SID)
+check("sudo setup: password from the dialog", r.get("ok") is True
+      and vault.sudo_entries("box9")[0]["password"] == SUDO_PW and SUDO_PW not in json.dumps(r))
+out = gsay("/gate:add github")
+check("/gate:add github opens an account setup for kind github",
+      "add account (kind github)" in out["reason"])
+form_plan({"action": "save", "value": "gho_setupTOKEN1234567890"})
+r = _st.gate_setup(grant_of(out), {
+    "what": "account", "kind": "github", "name": "setup", "description": "set up by chat",
+    "fields": {"login": "octo-setup", "email": "o@example.com"}, "owners": ["octo-setup"],
+    "credentials": {"token": "ask"}}, SID)
+a = vault.account("github:setup")
+check("account setup: token from the dialog, fields and owners stored",
+      r.get("ok") and a["secrets"]["token"] == "gho_setupTOKEN1234567890"
+      and a["login"] == "octo-setup" and a["owners"] == ["octo-setup"]
+      and "gho_setupTOKEN" not in json.dumps(r))
+out = gsay("/gate:update github:setup")
+form_plan({"action": "save", "value": ""})
+r = _st.gate_setup(grant_of(out), {"what": "account", "fields": {"email": "new@example.com"}}, SID)
+check("/gate:update: only what changes; the token is kept",
+      r.get("ok") and vault.account("github:setup")["email"] == "new@example.com"
+      and vault.account("github:setup")["secrets"]["token"] == "gho_setupTOKEN1234567890")
+check("/gate:update of something unknown: error", "Nothing named" in gsay("/gate:update nope:x")["reason"])
+check("/gate:list shows accounts, secrets and sudo, never values",
+      all(x in gsay("/gate:list")["reason"] for x in ("github:setup", "OPENCODE_API_KEY", "admin@box9"))
+      and "oc_secret_value" not in gsay("/gate:list")["reason"])
+check("/gate:enable sudo HOST: this session", "THIS session only" in gsay("/gate:enable sudo box9")["reason"]
+      and vault.sudo_enabled("box9", SID))
+check("/gate:disable HOST", "disabled" in gsay("/gate:disable box9")["reason"]
+      and not vault.sudo_enabled("box9", SID))
+check("/gate:delete a secret", "Deleted" in gsay("/gate:delete OPENCODE_API_KEY")["reason"]
+      and not vault.secret("OPENCODE_API_KEY"))
+check("/gate:delete an account", "Deleted" in gsay("/gate:delete github:setup")["reason"]
+      and not vault.account("github:setup"))
+check("/gate:delete USER@HOST sudo", "Deleted" in gsay("/gate:delete admin@box9")["reason"]
+      and not vault.sudo_entries("box9"))
+out = gsay("/gate:add secret ghp_abcdefghijklmnop1234 my token")
+check("a token typed into /gate:add is blocked and never reaches Claude",
+      out.get("decision") == "block" and "ghp_abcdefghijklmnop1234" not in out["reason"])
+_o = json.loads(run_sh("/gate:add secret") or "{}")
+check("prompt.sh routes /gate:add to the gateway",
+      "<gateway-result>" in _o.get("hookSpecificOutput", {}).get("additionalContext", ""))
+
+# No screen: the proposal waits for the terminal.
+out = gsay("/gate:add secret")
+gid = grant_of(out)
+os.environ["GATEWAY_DIALOG"] = "none"
+try:
+    r = _st.gate_setup(gid, {"what": "secret", "name": "TERM_SET", "description": "from ssh",
+                             "hosts": ["example.com"]}, SID)
+finally:
+    os.environ["GATEWAY_DIALOG"] = str(FAKE_DLG)
+check("no dialog: needs the terminal, with the exact command",
+      r.get("needs_terminal") and f"gateway finish {gid}" in r["reason"] and not vault.secret("TERM_SET"))
+_seen_summary = []
+res = _st.finish(gid, lambda summary: _seen_summary.append(summary) or True, lambda label: "term_set_value_99")
+check("gateway finish: shows the summary, reads the value, saves",
+      "TERM_SET" in _seen_summary[0] and vault.secret("TERM_SET")["value"] == "term_set_value_99"
+      and "term_set_value_99" not in res)
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"].pop("TERM_SET", None)  # so a replay would succeed if allowed
+    vault.save(_d)
+try:
+    _st.finish(gid, lambda s: True, lambda l: "x")
+    check("gateway finish: a finished setup can't be replayed", False)
+except _st.SetupError as e:
+    check("gateway finish: a finished setup can't be replayed",
+          "no open setup" in str(e) and not vault.secret("TERM_SET"))
+p = subprocess.run([sys.executable, str(ROOT / "run.py"), "gateway", "finish", "g-00000000"],
+                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+check("gateway finish refuses without a real terminal", p.returncode == 2 and "interactive terminal" in p.stderr)
+for _f in ("add", "update", "delete", "enable", "disable", "list", "export", "import"):
+    _txt = (ROOT / "commands" / f"{_f}.md").read_text()
+    check(f"/gate:{_f} can't be run by Claude itself", "disable-model-invocation: true" in _txt)
+check("gate:setup skill exists and says secrets go only in the dialog",
+      "never in the chat" in (ROOT / "skills" / "setup" / "SKILL.md").read_text())
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

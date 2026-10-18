@@ -188,3 +188,26 @@ git). The parts that shape the code:
   -u`, `rebase -x`), including attached and grouped forms. `add -u`, `push
   -u` and `cherry-pick -x` work.
 
+## Short commands and guided setup (v0.6)
+
+- **Only a typed command starts a change; Claude guides the rest.** The user
+  wanted short commands (`/gate:add secret`), with Claude helping and native
+  pop-ups for the rest, instead of exact syntax and a browser form. The typed
+  command opens a grant; Claude can only fill in a proposal for it; the
+  native dialog shows the change and takes the value. So invariant 3 still
+  holds: Claude can't start a change, and can't approve or supply a value.
+- **Grants live in the vault.** A plain file in the data folder could be
+  written by Claude's Bash, which the file-tool hook doesn't cover. Inside
+  the age-encrypted vault, a grant is as hard to forge as a secret is to
+  read.
+- **Question pop-ups for choices, native dialog for values.** Claude Code's
+  question pop-ups (AskUserQuestion) are friendly, but their answers go to
+  the model, so they're used only for non-secret choices: names, orgs,
+  sign-in method.
+- **A refused proposal keeps the grant open.** Claude can fix a typo without
+  making the user retype the command. A grant is still used only once, and
+  only on success.
+- **The web form is gone.** The native dialog replaces it: smaller, familiar,
+  no local web server. `web_form.py` keeps only the browser opener and the
+  pages used by GitHub's and Entra's sign-ins.
+
