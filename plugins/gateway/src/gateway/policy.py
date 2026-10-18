@@ -46,11 +46,36 @@ def config_path() -> Path:
     return plugin_root() / "config" / "policy.json"
 
 
+def data_dir() -> Path:
+    """The plugin's own data folder (audit log, quarantine): Claude Code's
+    CLAUDE_PLUGIN_DATA, which survives plugin updates. Outside a hook or the
+    MCP server (e.g. `run.py log` from a terminal) it is worked out the same
+    way Claude Code does: <config dir>/plugins/data/gate-gateway."""
+    override = os.environ.get("GATEWAY_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
+    if override:
+        return Path(override)
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return Path(base) / "plugins" / "data" / "gate-gateway"
+
+
 def audit_log_path() -> Path:
     override = os.environ.get("GATEWAY_AUDIT_LOG")
     if override:
         return Path(override)
-    return plugin_root() / "logs" / "audit.jsonl"
+    new = data_dir() / "audit.jsonl"
+    old = plugin_root() / "logs" / "audit.jsonl"
+    if old.exists() and not new.exists():  # v0.5 kept it inside the plugin folder
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.replace(new)
+        except OSError:
+            return old
+    return new
+
+
+def quarantine_dir(cfg: dict[str, Any]) -> Path:
+    d = Path(os.path.expanduser(str(cfg.get("download_dir", "quarantine"))))
+    return d if d.is_absolute() else data_dir() / d
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +118,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Authorization: Bearer xyz / Basic xyz / token xyz
         [r"(?i)\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{6,}", r"\1\2***REDACTED***"],
         # key=value / key: value for secret-looking names (headers, query, JSON)
+        # (not names that end in expiration/expires/expiry: those carry dates)
         [r"(?i)\b([\w-]*(?:api[-_]?key|token|secret|password|passwd|pwd|"
-         r"authorization|cookie)[\w-]*)([\"']?\s*[:=]\s*[\"']?)[^\s&\"',;]+",
+         r"authorization|cookie)[\w-]*)(?<!expiration)(?<!expires)(?<!expiry)"
+         r"([\"']?\s*[:=]\s*[\"']?)[^\s&\"',;]+",
          r"\1\2***REDACTED***"],
         # curl -u user:pass / --user user:pass
         [r"(\s(?:-u\s*|--user[=\s]+))\S+", r"\1***REDACTED***"],
@@ -277,7 +304,10 @@ _BLOCKED = [
     # Common evasions: absolute paths, env/exec wrappers.
     (r"/(usr/bin|bin|opt/\S+?/bin)/(curl|wget)\b", "curl/wget (full path)",
      "WebFetch or the http_request / download tools"),
-    (r"(?i)\bpython3?\b.*-c.*\b(requests|urllib|http\.client|socket)\b",
+    # Inline python that actually makes a call (an import alone is fine).
+    (r"(?i)\bpython3?\b.*\s-c\s.*\b(requests\.(get|post|put|patch|delete|head|request|"
+     r"Session)|urlopen|urlretrieve|http\.client\.HTTPS?Connection|"
+     r"socket\.create_connection|\.connect\s*\(\s*\()",
      "python inline network call", "the http_request tool"),
     (r"(?i)\bnode\b.*-e.*\bfetch\s*\(", "node inline fetch", "the http_request tool"),
     # Secret stores: values must stay inside the gateway. The gateway's own
@@ -287,12 +317,128 @@ _BLOCKED = [
     (r"\bage\b[^|;&]*\s(-d|--decrypt)\b", "age --decrypt",
      "the secret's NAME as auth_ref on http_request (secret_list shows names)"),
     (r"\bsecret\s+(get|run|edit|reload)\b", "the user's personal secret store",
-     "only secrets the user added with /secret (secret_list shows names)"),
+     "only secrets the user added with /gate:add secret (secret_list shows names)"),
     (r"age/keys\.txt|secrets\.env\.age", "the user's personal age store",
-     "only secrets the user added with /secret (secret_list shows names)"),
+     "only secrets the user added with /gate:add secret (secret_list shows names)"),
 ]
 
 _BLOCKED_COMPILED = [(re.compile(p), name, route) for p, name, route in _BLOCKED]
+
+
+# A command word at a command position: the start, after ; & | ( ` $( or a
+# newline, after sudo/env/exec/time/nohup/xargs/then/do/else (with their
+# options), and after VAR=value assignments. So `echo git`, `ssh-keygen` or
+# `cat .gitignore` don't match.
+_CMD = (r"(?:^|[;&|(`\n]\s*|\$\(\s*|\b(?:sudo|env|command|exec|time|nohup|xargs|then|do|"
+        r"else)\s+(?:-\S+\s+)*)(?:\w+=\S*\s+)*(?:\S*/)?")
+TAKEOVER = [
+    (_CMD + r"git(?:-lfs|-xet)?(?=\s|$)", "git",
+     "the git tool (every git command; remote ones run as the right account), "
+     "git_mirror for mirrors"),
+    (_CMD + r"gh(?=\s|$)", "gh", "the gh tool (GitHub CLI as an account)"),
+    (_CMD + r"(?:hf|huggingface-cli)(?=\s|$)", "hf", "the hf tool (Hugging Face as an account)"),
+    (_CMD + r"pijul(?=\s|$)", "pijul", "the pijul tool (Pijul as an account)"),
+    (_CMD + r"(?:asiml|dvc)(?=\s|$)", "asiml/dvc",
+     "mlcat (catalog search) and mlcat_workspace (init/clone/pull/push/status)"),
+    (_CMD + r"az(?=\s|$)", "az",
+     "http_request with auth_ref=azure:NAME and auth_scope (arm, storage, graph, ...); "
+     "the Azure CLI isn't used"),
+    (_CMD + r"(?:databricks|mlflow)(?=\s|$)", "databricks", "the databricks tool"),
+    (_CMD + r"(?:ssh|scp|sftp|sshpass)(?=\s|$)", "ssh/scp/sftp",
+     "ssh_exec / ssh_copy (an ssh account), or run_privileged for root"),
+    (_CMD + r"rsync\b[^;&|\n]*\s(?:\S+@)?[A-Za-z0-9.\-\[\]]+:", "rsync to a host",
+     "ssh_copy (an ssh account)"),
+    (_CMD + r"(?:docker|podman)\s+(?:\S+\s+)*?(?:login|push|pull|logout)\b",
+     "docker/podman registry", "the registry tool (crane as a registry account, no daemon)"),
+    (_CMD + r"(?:skopeo|oras|crane)(?=\s|$)", "skopeo/oras/crane", "the registry tool"),
+    # Ways back to the user's ssh-agent after the hook unsets SSH_AUTH_SOCK.
+    (_CMD + r"ssh-add(?=\s|$)", "ssh-add", "an ssh account's key (ssh_exec / ssh_copy / git)"),
+    (r"\blaunchctl\s+getenv\s+SSH_AUTH_SOCK\b|com\.apple\.launchd\.[^/\s]*/Listeners",
+     "the user's ssh-agent", "an ssh account's key (ssh_exec / ssh_copy / git)"),
+]
+_TAKEOVER_COMPILED = [(re.compile(p), name, route) for p, name, route in TAKEOVER]
+
+
+def match_takeover(command: str) -> tuple[str, str] | None:
+    """(tool_name, route) for a Bash command an account tool replaces. Always
+    on while the plugin is enabled: the gateway is the only way to these."""
+    for rx, name, route in _TAKEOVER_COMPILED:
+        if rx.search(command):
+            return name, route
+    return None
+
+
+# Credential variables removed from every Bash command (SessionStart writes
+# `unset ...` to CLAUDE_ENV_FILE). Settings `env` can't do it: plugins can't
+# ship it, and the desktop app's SSH_AUTH_SOCK survives it anyway.
+ENV_UNSET = (
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS",
+    "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN",
+    "AZURE_STORAGE_KEY", "AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_CLIENT_SECRET", "ARM_CLIENT_SECRET", "ARM_ACCESS_KEY",
+    "DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DOCKER_AUTH_CONFIG",
+    "REGISTRY_AUTH_FILE",
+)
+
+
+# Files Claude's own file tools may not touch (hook-files). Read-type tools
+# are refused on secrets; write-type tools also on the gateway's config.
+# Paths are relative to $HOME; a trailing "/" means everything under it.
+PROTECTED_READ = (
+    ".config/gateway/", ".config/age/", ".config/secrets/",
+    ".git-credentials", ".config/git/credentials", ".config/gh/hosts.yml",
+    ".docker/config.json", ".cache/huggingface/token", ".cache/huggingface/stored_tokens",
+    ".huggingface/token", ".azure/", ".databrickscfg", ".databricks/",
+    ".config/pijul/identities/", ".local/share/ASI/asiml/",
+)
+# In ~/.ssh only these are readable (so Claude can help import hosts);
+# private keys and agent sockets are not.
+SSH_READABLE = ("config", "known_hosts", "known_hosts.old", "authorized_keys")
+
+
+def protected_path(path: str, write: bool = False, plugin_root: str = "",
+                   contents: bool = False) -> str | None:
+    """Why `path` is off limits to Claude's file tools, or None. `contents`:
+    the tool reads everything under a folder (Grep), so ~/.ssh itself counts."""
+    if not path:
+        return None
+    try:
+        p = Path(os.path.expanduser(path)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return "unreadable path"
+    home = Path.home().resolve()
+    vault_home = Path(os.environ.get("GATEWAY_HOME") or
+                      Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "gateway").resolve()
+    if p == vault_home or vault_home in p.parents:
+        return "the gateway's vault"
+    try:
+        rel = p.relative_to(home).as_posix()
+    except ValueError:
+        rel = None
+    if rel is not None:
+        if rel == ".ssh":
+            return ("SSH private keys (the gateway keeps its own keys)" if contents
+                    else None)  # the folder itself (listing names) is fine
+        if rel.startswith(".ssh/"):
+            name = rel[len(".ssh/"):]
+            if "/" not in name and (name in SSH_READABLE or name.endswith(".pub")):
+                return None
+            return "an SSH private key or agent (the gateway keeps its own keys)"
+        for prot in PROTECTED_READ:
+            if rel == prot.rstrip("/") or (prot.endswith("/") and rel.startswith(prot)):
+                return "a credential file (the gateway holds credentials itself)"
+        if rel.endswith(".pem") and ("/.ssh/" in "/" + rel or rel.startswith(".ssh")):
+            return "a private key"
+    if write:
+        data = data_dir().resolve()
+        if p == data or data in p.parents:
+            return "the gateway's own data (its log and downloads; read them, don't edit them)"
+    if write and plugin_root:
+        cfg = (Path(plugin_root) / "config").resolve()
+        if p == cfg or cfg in p.parents:
+            return "the gateway's configuration (change it with /gate: commands)"
+    return None
 
 
 def match_blocked(command: str) -> tuple[str, str] | None:

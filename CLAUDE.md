@@ -18,29 +18,45 @@ that way, and keep it working on macOS and Linux (desktop and headless).
 
 ```
 .claude-plugin/marketplace.json   marketplace "gateway" -> ./plugins/gateway
-settings.rules.json               permission rules the plugin expects (template; install.py merges it)
-settings.snippet.json             deny-only backstop for if the plugin is disabled
 docs/                             ARCHITECTURE, DECISIONS, history/
 plugins/gateway/
   .claude-plugin/plugin.json      name, version
   .mcp.json                       MCP server "gw" (stdio, via pixi)
-  hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse(Bash)
+  hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse (Bash; gateway tools + file tools)
+  hooks/perm.sh                   the plugin's permission rules: allow/ask gateway tools, credential-path prefilter
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
-  commands/{help,secret,sudo,log}.md   slash commands
-  install.py                      `pixi run install`: register plugin + merge settings.rules.json
+  commands/*.md                   slash commands: add, update, delete, enable, disable, block,
+                                  list, export, import, help, log
+  install.py                      dev only: register this checkout + remove v0.5's settings.json entries (legacy-settings.json)
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
-  run.py                          single entry: server | hook-* | log | check | scrub | vault
+  run.py                          single entry: server | hook-* | log | check | scrub | gateway finish
   src/gateway/
     policy.py      config, allowlists, redaction/scrubbing, audit log, Bash blocklist
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
+    runner.py      run a CLI as an account: env allowlist, private ssh-agent, one-call
+                   credential helper, hardened git config, scrubbed output
+    gitops.py      the git / git_confirm / git_identity tools (account by remote URL)
+    ghops.py       the gh / gh_confirm tools (the plugin's own gh)
+    logins.py      GitHub browser sign-in (gh's web flow), from a setup
+    entra.py       Entra sign-in (PKCE / device code) and per-scope tokens
+    mirrors.py     git_mirror
+    hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
+                   the hf, pijul, ssh_exec/ssh_copy/ssh_hosts, databricks, mlcat*, registry tools
+    sshconf.py     the gateway's own ssh_config per call: routes, host-key policy, keys, reuse
+    transfer.py    /gate:export and /gate:import: age -p under a private pty, validate, merge
+  skills/accounts/SKILL.md        how Claude uses accounts and mirrors (gate:accounts)
+  skills/setup/SKILL.md           how Claude guides /gate:add and /gate:update (gate:setup)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
-    commands.py    /gate:secret and /gate:sudo handling, transcript scrubber
-    vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches
-    web_form.py    one-time 127.0.0.1 browser form for entering values
-    cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
-                   fallback for /secret and /sudo when no browser can open)
+    common.py      shared by the commands and gate_setup: validation, account records,
+                   list/delete, sudo switches, sign-in, hook output, transcript scrubber
+    vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches, accounts (KINDS)
+    setup.py       /gate:add|update|delete|enable|disable|list, setup grants, gate_setup, `gateway finish`
+    web_form.py    browser opener + pages for GitHub/Entra sign-ins (no value form any more)
+    dialog.py      native dialogs (osascript / zenity / kdialog): confirm a change, type a secret hidden
+    cli.py         `run.py log` (the /gate:log viewer), `check`, and `gateway finish GRANT`
+                   (a setup, export or import where no dialog can open)
   tests/run_tests.py              single offline test script (no pytest)
 ```
 
@@ -53,7 +69,7 @@ claude plugin validate .         # plugin manifest
 claude plugin validate ../..     # marketplace manifest
 pixi run --frozen python run.py check 'some bash command'   # would the hook redirect it?
 pixi run --frozen python run.py log 40                      # audit log viewer
-pixi run install --dry-run       # what the installer would add to settings.json
+pixi run install --dry-run       # what the dev installer would register / remove
 ```
 
 The tests are hermetic. They set `GATEWAY_HOME`, `GATEWAY_CONFIG` and
@@ -72,12 +88,17 @@ your change (mutation-check it).
 2. **Secrets go only to their allowed hosts.** Redirects drop credentials when
    they cross hosts or downgrade to http (`_GatewayRedirect`). There are no
    `keychain:`/`env:` refs; the vault is the only source.
-3. **Claude can't grant itself anything.** Vault changes and sudo switches
-   happen only in the UserPromptSubmit hook (user-typed prompts). The slash
-   commands are `disable-model-invocation: true`. No MCP tool may add a
-   secret, allow a host, or enable sudo.
-4. **Approvals come from Claude Code's permission prompt**, i.e. `ask` rules in
-   settings.json (`port_check`, `run_privileged_confirm`). Never rely on MCP
+3. **Claude can't grant itself anything.** Every vault change starts with a
+   command the user types (UserPromptSubmit hook; the slash commands are
+   `disable-model-invocation: true`). `/gate:add`/`update` open a one-time
+   setup grant (in the vault, this session, 15 min); `gate_setup` acts only
+   on a live grant and only after the user approves the native dialog, where
+   any value is typed. No MCP tool opens a grant, enables sudo, or adds a
+   secret or host without one.
+4. **Approvals come from Claude Code's permission prompt**, i.e. the plugin's
+   own PreToolUse hook answering `ask` (`hooks/perm.sh`: the `*_confirm` tools,
+   `port_check`). Switches that skip a prompt (`/gate:enable sudo|reuse|CLASS`)
+   exist only as typed commands, stored in the vault. Never rely on MCP
    elicitation forms: the desktop app auto-cancels them without showing them
    (see DECISIONS). Never add a model-settable "approved" parameter.
 5. **Root commands**: argv lists only (no shell strings); the password goes
@@ -85,10 +106,10 @@ your change (mutation-check it).
    afterwards; commands the Bash blocklist matches are refused here too;
    `run_privileged` runs only where sudo is enabled (persistently, or for this
    session via `CLAUDE_CODE_SESSION_ID`).
-6. **The prompt hook fails closed.** If it can't run, a /secret or /sudo
-   prompt is blocked, never passed through (`prompt.sh`).
+6. **The prompt hook fails closed.** If it can't run, a typed /gate: command
+   is blocked, never passed through (`prompt.sh`).
 7. **Stdlib only** in `src/`. The only external binaries are `age`/`age-keygen`
-   (from pixi), the system `sudo`/`ssh`, and the browser.
+   and OpenSSH's `ssh-keygen` (from pixi), the system `sudo`/`ssh`, and the browser.
 
 ## Gotchas when working here
 
@@ -98,6 +119,16 @@ your change (mutation-check it).
   includes heredocs, commit messages, `grep` patterns and scripts written
   inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
   use `git commit -F file`. Check with `run.py check '…'`.
+- **Take-over is always on** while the plugin is enabled: the hook refuses git, gh, hf, pijul, ssh,
+  dvc, … in Bash in every session, including yours, and your Bash has no SSH_AUTH_SOCK or
+  token variables (SessionStart writes `unset …` to CLAUDE_ENV_FILE). Use the `git` tool then,
+  even for local commits (`git commit -F` works through it too). In a session
+  whose MCP server predates a tool change, use `git -C` from your own terminal.
+- **Plugins can't ship permission rules or env** (only `agent` settings are
+  honored); every rule is a hook decision (perm.sh, hooks.py). Hook config
+  (hooks.json) loads at session start; the Python behind it runs fresh each call.
+- **pixi-guard** (another plugin) refuses `python3` outside pixi here: use
+  `pixi run python …`.
 - **You can't read the vault** (`Read(~/.config/gateway/**)` is denied) and
   must not try. Use the `secret_list` tool for names.
 - **Tool and hook changes need a new session** to be picked up (the MCP server
@@ -113,32 +144,32 @@ your change (mutation-check it).
 - The audit log is shared by all sessions on the machine; entries from other
   sessions are normal.
 
-## Status (2026-10-15, v0.3.0)
+## Status (2026-10-17, v0.6.0: the v2 rework)
 
-Verified live (macOS, desktop app): Bash redirect; vault add/up/allow/del/list
-through the browser form with no popup; secret use to allowed hosts and refusal
-elsewhere; sudo on a remote Linux host with approve, decline, session enable and
-disable; the safety-net block with transcript scrub; the vault read denial; the
-/gate:log view.
+v2 (plan and trackers in `.work/v2/`, local): one strict mode always on,
+standard plugin install (rules in the plugin's hooks), short typed commands
+(`/gate:add|update|delete|enable|disable|block|list|export|import`, plus
+help and log) with guided setup and native dialogs, the gateway's own SSH
+config (routes, host-key policy, key rotation, opt-in connection reuse),
+export / import, per-account switches. The skills are for Claude only
+(`user-invocable: false`). About 790 tests pass; each phase's security
+properties are mutation-checked.
 
-Linux: the test suite covers headless detection (no `DISPLAY` means no
-browser and the terminal fallback) and the installer's path handling, and the
-pixi lock includes linux-64 and linux-aarch64. Not yet run end-to-end on a
-Linux desktop.
+Live-tried on macOS (desktop app): every account kind, push/PR/mirror,
+setup through dialogs, ssh exec/copy/sudo and reuse, export / import, the
+switches. Not yet live: ssh routes (no LAN route here), Linux end to end,
+the ACR exchange.
 
-Not yet verified live: the session-start "sudo enabled" warning; per-session
-isolation in two real sessions (covered by tests); `pixi run install` on a fresh
-machine; Windows (sudo can't work there; the rest should).
-
-Known limitations / ideas:
-- Logs and the quarantine folder live inside the plugin folder (gitignored).
-  Could move to `CLAUDE_PLUGIN_DATA`.
+Known limitations:
+- The audit log and quarantine live in the plugin data folder
+  (`CLAUDE_PLUGIN_DATA`, `~/.claude/plugins/data/gate-gateway`): Claude may
+  read them, not edit them. Tests set `GATEWAY_DATA` and `GATEWAY_DIALOG=none`.
 - The Bash blocklist is regex-based: false positives (e.g. `git commit -m
   "...curl..."`) and easy bypasses (`c''url`, base64, `nc`). It steers a
   cooperative model; it isn't a sandbox.
 - Plain `sudo` in Bash isn't redirected. It can't prompt for a password
   from Claude's Bash, so it only works for NOPASSWD rules; password-based root
   goes through run_privileged.
-- The `/gate:` prefix is required (plugin commands can't register a
-  bare name). The hook also accepts bare `/secret` and `/sudo`, but the app
-  shows "isn't a command" above the input for those.
+- The `/gate:` prefix is required (plugin commands can't register a bare
+  name).
+- Windows isn't supported (no sudo; export needs a pty).

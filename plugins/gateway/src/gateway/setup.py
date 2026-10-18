@@ -1,0 +1,937 @@
+"""Short commands and guided setup (v2).
+
+You type a short command; Claude guides the rest; a native dialog is the only
+place a secret is typed or a change is approved.
+
+    /gate:add secret|sudo|account|ssh|github|hf|...   start a guided setup
+    /gate:update NAME                                  change something (guided)
+    /gate:delete NAME                                  delete it (now)
+    /gate:enable [sudo] HOST [always]                  root commands without asking
+    /gate:disable [sudo] HOST                          every root command asks again
+    /gate:enable CLASS KIND:NAME [always]              no prompt for read|write|delete|exec there
+    /gate:disable CLASS KIND:NAME                      back to the default
+    /gate:block CLASS KIND:NAME                        refuse that class of calls
+    /gate:enable reuse ssh:NAME                        keep ssh connections open (this session)
+    /gate:disable reuse ssh:NAME                       close them; every call connects anew
+    /gate:list                                         what the gateway holds
+    /gate:export [PATH]                                everything, encrypted with a passphrase
+    /gate:import FILE                                  merge an export (summary dialog first)
+
+How the guided part stays safe: a typed /gate:add or /gate:update opens a
+**setup grant**. It is stored inside the encrypted vault, so Claude's Bash
+can't forge one. It is for this session only, for that one kind of change,
+expires in 15 minutes, and can be used once. Claude asks the questions (in
+Claude Code's question pop-ups), then calls the gate_setup tool with the
+grant and a proposal. The gateway checks the grant and shows the proposal in
+a native dialog. A secret is typed there (hidden), or the provider's sign-in
+page opens. Only then is anything saved. Without a display, the gateway
+keeps the proposal with the grant and the person finishes it in a terminal
+(`gateway finish GRANT`).
+"""
+from __future__ import annotations
+
+import os
+import re
+import secrets as _rand
+import time
+from pathlib import Path
+from typing import Any
+
+from . import common, dialog, policy, vault
+
+GRANT_TTL = 15 * 60
+PREFIX = re.compile(r"^\s*/gate:(add|update|delete|enable|disable|block|list|export|import)(?=\s|$)(.*)$",
+                    re.S)
+WHATS = ("secret", "sudo", "account")
+ACCOUNT_WORDS = {"ssh": "ssh", "github": "github", "gh": "github", "huggingface": "hf",
+                 "hf": "hf", "pijul": "pijul", "nest": "pijul", "azure": "azure",
+                 "databricks": "azure", "catalog": "mlcat", "mlcat": "mlcat",
+                 "registry": "registry", "docker": "registry", "ghcr": "registry"}
+
+HELP = (
+    "/gate:add secret|sudo|account|ssh   add something; Claude asks a few questions, and a\n"
+    "                                    dialog asks for any password or token\n"
+    "/gate:update NAME                   change it (e.g. /gate:update github:work)\n"
+    "/gate:delete NAME                   delete a secret, an account or USER@HOST sudo\n"
+    "/gate:enable sudo HOST [always]     root commands there run without asking\n"
+    "                                    (this session, or always)\n"
+    "/gate:disable sudo HOST             every root command there asks again\n"
+    "/gate:enable CLASS KIND:NAME [always]  no prompt for read|write|delete|exec calls of\n"
+    "                                    that account (this session, or always)\n"
+    "/gate:disable CLASS KIND:NAME       back to the default\n"
+    "/gate:block CLASS KIND:NAME         refuse those calls (e.g. block write github:work)\n"
+    "/gate:enable reuse ssh:NAME         keep that server's connection open (this session)\n"
+    "/gate:disable reuse ssh:NAME        close it; every call connects anew\n"
+    "/gate:list                          what the gateway holds (never values)\n"
+    "/gate:export [PATH]                 save it all to a passphrase-encrypted file\n"
+    "/gate:import FILE                   bring an export in (shows what changes first)"
+)
+
+
+class SetupError(Exception):
+    pass
+
+
+def is_command(prompt: str) -> bool:
+    return bool(PREFIX.match(prompt or ""))
+
+
+def terminal_command(args: str) -> str:
+    return f"pixi run --manifest-path {policy.plugin_root() / 'pixi.toml'} gateway {args}"
+
+
+# ---------------------------------------------------------------------------
+# Grants
+# ---------------------------------------------------------------------------
+
+
+def _prune(data: dict[str, Any]) -> None:
+    now = time.time()
+    data["grants"] = {g: v for g, v in data.get("grants", {}).items()
+                      if v.get("expires", 0) > now and not v.get("used")}
+
+
+def open_grant(op: str, what: str, target: str, session_id: str) -> str:
+    gid = "g-" + _rand.token_hex(4)
+    with vault.locked():
+        data = vault.load()
+        _prune(data)
+        data["grants"][gid] = {"op": op, "what": what, "target": target,
+                               "session": session_id, "expires": time.time() + GRANT_TTL,
+                               "used": False, "pending": None}
+        vault.save(data)
+    return gid
+
+
+def _grant(data: dict[str, Any], gid: str, session_id: str | None) -> dict[str, Any]:
+    g = data.get("grants", {}).get(gid or "")
+    if not g or g.get("used") or g.get("expires", 0) <= time.time():
+        raise SetupError("no open setup for that id: ask the user to type the /gate: command "
+                         "again (setups last 15 minutes and are used once)")
+    if session_id is not None and g.get("session") and g["session"] != session_id:
+        raise SetupError("that setup was opened in another session")
+    return g
+
+
+# ---------------------------------------------------------------------------
+# The typed commands (UserPromptSubmit hook)
+# ---------------------------------------------------------------------------
+
+
+def _what(word: str) -> tuple[str, str]:
+    """(what, account kind) for the word after /gate:add."""
+    w = word.lower()
+    if w in WHATS:
+        return w, ""
+    if w in ACCOUNT_WORDS:
+        return "account", ACCOUNT_WORDS[w]
+    if w in vault.KINDS:
+        return "account", w
+    return "", ""
+
+
+def _guided(gid: str, op: str, what: str, kind: str, target: str, extra: str) -> str:
+    bits = [f"Setup {gid} is open for: {op} {what}"
+            + (f" (kind {kind})" if kind else "") + (f" {target}" if target else "") + "."]
+    if extra.strip():
+        bits.append(f"The user also said: {extra.strip()!r}.")
+    bits.append("Load the gate:setup skill and follow it: ask the user the few questions "
+                "it lists with your question pop-ups (AskUserQuestion), in plain words, then "
+                f"call the gate_setup tool with grant=\"{gid}\" and the proposal. A native "
+                "dialog then shows the user the change and asks for any secret; never ask "
+                "for a password, token or key in the chat.")
+    return " ".join(bits)
+
+
+def _list(session_id: str) -> str:
+    return common.list_all(session_id)
+
+
+def _delete(words: list[str], session_id: str) -> str:
+    if not words:
+        raise common.CommandError("Say what to delete, e.g. /gate:delete github:work, "
+                                    "/gate:delete OPENCODE_API_KEY or /gate:delete joshua@powerslabs.")
+    if words[0].lower() in ("secret", "account", "sudo"):
+        words = words[1:]
+    target = " ".join(words)
+    if vault.parse_account_ref(target.lower()):
+        return common.delete_account(target.lower())
+    if "@" in target and len(words) == 1:
+        user, host = target.split("@", 1)
+        return common.delete_sudo(user, host)
+    if len(words) == 2 and vault.load()["sudo"].get(f"{words[0]}@{vault.norm_host(words[1])}"):
+        return common.delete_sudo(words[0], words[1])
+    return common.delete_secret(target)
+
+
+def _reuse(verb: str, words: list[str], session_id: str) -> str:
+    """/gate:enable reuse ssh:NAME (this session only) and /gate:disable reuse
+    ssh:NAME (every session; open connections are closed)."""
+    from . import sshconf
+    if len(words) != 1:
+        return ("Usage: /gate:enable reuse ssh:NAME (keeps the connection open for this "
+                "session) or /gate:disable reuse ssh:NAME")
+    ref = words[0].lower()
+    with vault.locked():
+        data = vault.load()
+        a = data["accounts"].get(ref)
+        if a is None or a.get("kind") != "ssh":
+            raise common.CommandError(f"{ref} is not an ssh account; see /gate:list.")
+        reuse = data.setdefault("ssh_reuse", {})
+        if verb == "enable":
+            if not session_id:
+                raise common.CommandError("This session has no id, so reuse can't be "
+                                            "turned on for it.")
+            ids = reuse.setdefault(ref, [])
+            if session_id not in ids:
+                ids.append(session_id)
+            del ids[:-vault.MAX_SESSIONS_PER_HOST]
+        else:
+            reuse.pop(ref, None)
+        vault.save(data)
+    if verb == "enable":
+        mins = int({**sshconf.COMFORT, **(a.get("comfort") or {})}["reuse_minutes"])
+        return (f"Connection reuse is on for {ref} in this session: after a call, the "
+                f"connection stays open for {mins} minutes so the next one is quicker. "
+                f"While it's open, anything on this computer running as you could use it. "
+                f"/gate:disable reuse {ref} turns it off and closes it.")
+    n = sshconf.close_masters(ref)
+    return (f"Connection reuse is off for {ref} in every session"
+            + (f"; closed {n} open connection{'s' if n != 1 else ''}." if n else "."))
+
+
+CLASS_WORDS = {"read": "reading (clone, fetch, pull, download)",
+               "write": "writing (push a branch, open a PR, upload)",
+               "delete": "deleting (branches, tags, releases, force-with-lease)",
+               "exec": "running commands (ssh_exec, workflow runs, jobs)"}
+
+
+def _account_switch(verb: str, words: list[str], session_id: str) -> str:
+    """/gate:enable CLASS ACCOUNT [always]: no prompt for that kind of call
+    (this session, or always); /gate:disable CLASS ACCOUNT: back to the
+    default; /gate:block CLASS ACCOUNT: refused."""
+    usage = ("Usage: /gate:enable CLASS KIND:NAME [always], /gate:disable CLASS KIND:NAME, "
+             "/gate:block CLASS KIND:NAME, where CLASS is read, write, delete or exec.")
+    low = [w.lower() for w in words]
+    always = "always" in low
+    rest = [w for w in low if w != "always"]
+    cls = [w for w in rest if w in vault.PROMPT_CLASSES]
+    refs = [w for w in rest if vault.parse_account_ref(w)]
+    if len(cls) != 1 or len(refs) != 1 or len(rest) != 2 or (always and verb != "enable"):
+        return usage
+    cls, ref = cls[0], refs[0]
+    with vault.locked():
+        data = vault.load()
+        a = data["accounts"].get(ref)
+        if a is None:
+            raise common.CommandError(f"No account named {ref}; see /gate:list.")
+        prompts = a.setdefault("prompts", {})
+        sess = a.setdefault("session_prompts", {})
+        if verb == "enable" and not always:
+            if not session_id:
+                raise common.CommandError("This session has no id, so the switch can't be "
+                                            "limited to it; add 'always' or try again.")
+            ids = sess.setdefault(cls, [])
+            if session_id not in ids:
+                ids.append(session_id)
+            del ids[:-vault.MAX_SESSIONS_PER_HOST]
+        else:
+            sess.pop(cls, None)
+            if verb == "enable":
+                prompts[cls] = "auto"
+            elif verb == "block":
+                prompts[cls] = "refuse"
+            else:
+                prompts.pop(cls, None)
+        if not sess:
+            a.pop("session_prompts")
+        vault.save(data)
+        now = vault.effective_prompts(a, data, "")[cls]
+    what = CLASS_WORDS[cls]
+    if verb == "enable":
+        return (f"{ref}: {what} now runs without asking "
+                + ("in every session." if always else "in this session.")
+                + f" /gate:disable {cls} {ref} turns the prompt back on.")
+    if verb == "block":
+        return (f"{ref}: {what} is now refused in every session. /gate:disable {cls} {ref} "
+                "goes back to the default.")
+    return (f"{ref}: {what} is back to the default ("
+            + {"auto": "runs without asking", "ask": "asks each time",
+               "refuse": "refused"}[now] + ") in every session.")
+
+
+def _transfer_command(verb: str, arg: str, session_id: str) -> str:
+    """/gate:export [PATH] and /gate:import FILE open a grant; the path is
+    only ever what the user typed (or the default export path)."""
+    from . import transfer
+    if verb == "import":
+        if not arg:
+            return "Usage: /gate:import FILE (a .age file made by /gate:export)"
+        path = Path(os.path.expanduser(arg))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise common.CommandError(f"{path} is not a file.")
+        if path.stat().st_size > transfer.MAX_FILE:
+            raise common.CommandError(f"{path} is too big for a gateway export.")
+        gid = open_grant("import", "import", str(path), session_id)
+        return (f"Setup {gid} is open for: import {path}. Ask the user with one question "
+                "pop-up whether items that already exist here should be replaced by the "
+                "file's versions or kept (only new items added); then call gate_setup with "
+                f"grant=\"{gid}\" and {{\"what\": \"import\", \"keep_existing\": true|false}}. "
+                "The gateway asks for the file's passphrase and shows what changes in its "
+                "own dialog; never ask for the passphrase in the chat.")
+    target = ""
+    if arg:
+        try:
+            target = str(transfer.check_export_path(arg))
+        except transfer.TransferError as e:
+            raise common.CommandError(str(e))
+    gid = open_grant("export", "export", target, session_id)
+    return (f"Setup {gid} is open for: export"
+            + (f" to {target}" if target else f" (to {transfer.default_path()})") + ". Ask the "
+            "user with one question pop-up: a full copy (with the secret values, to move to "
+            "another machine of theirs) or a shareable copy (accounts, hosts and settings "
+            "without any token, key or password)? Then call gate_setup with "
+            f"grant=\"{gid}\" and {{\"what\": \"export\", \"without_secrets\": true|false}}. "
+            "The gateway asks for a passphrase in its own dialog; never ask for it in the chat.")
+
+
+def _transfer_plan(g: dict[str, Any], p: dict[str, Any]) -> dict[str, Any]:
+    from . import transfer
+    what = g["op"]
+    if g["what"] != what or str(p.get("what", what)).lower() != what:
+        raise SetupError(f"this setup is for {g['op']} {g['what']}, not {p.get('what')}")
+    extra = set(p) - {"what", "without_secrets", "keep_existing"}
+    if extra:
+        raise SetupError(f"{what} takes no {', '.join(sorted(extra))} (the file path is "
+                         "what the user typed)")
+    if what == "export":
+        ws = p.get("without_secrets")
+        if not isinstance(ws, bool):
+            raise SetupError("without_secrets: true (shareable copy) or false (full copy)")
+        try:
+            path = (transfer.check_export_path(g["target"]) if g["target"]
+                    else transfer.default_path())
+        except transfer.TransferError as e:
+            raise SetupError(str(e))
+        data = vault.load()
+        line = (f"Export the gateway to {path}: {len(data['accounts'])} accounts, "
+                f"{len(data['secrets'])} secrets, {len(data['sudo'])} sudo passwords, "
+                + ("WITHOUT any secret value (a shareable copy)." if ws else
+                   "WITH their secret values, encrypted with a passphrase you choose next."))
+        return {"op": "export", "what": "export", "path": path, "without_secrets": ws,
+                "lines": [line]}
+    keep = p.get("keep_existing")
+    if not isinstance(keep, bool):
+        raise SetupError("keep_existing: true (only add new items) or false (the file wins)")
+    path = Path(g["target"])
+    if not path.is_file():
+        raise SetupError(f"{path} is gone; ask the user to type /gate:import again")
+    return {"op": "import", "what": "import", "path": path, "keep_existing": keep,
+            "lines": [f"Import {path}" + (" (keeping what's already here)." if keep else ".")]}
+
+
+def _run_transfer(plan: dict[str, Any], confirm, secret) -> str:
+    from . import transfer
+    try:
+        if plan["what"] == "export":
+            return transfer.run_export(plan, confirm, secret)
+        return transfer.run_import(plan, confirm, secret)
+    except transfer.TransferError as e:
+        raise SetupError(str(e))
+
+
+def _typed_password(words: list[str]) -> None:
+    """Words after `/gate:add sudo USER HOST` (or `/gate:update USER@HOST`) can
+    only be a password typed into the chat: block the prompt and scrub them."""
+    raise common.LooksLikeValue(
+        "That looks like a password typed after the command, so it was not sent to Claude "
+        "and nothing was saved. Type only /gate:add sudo (or /gate:add sudo USER HOST); "
+        "the password is typed in the gateway's own dialog. (Your typed text has been "
+        "scrubbed from the transcript.)", [" ".join(words)] + words)
+
+
+def run(verb: str, rest: str, session_id: str) -> str:
+    words = rest.split()
+    common._guard_text(words)
+    if verb == "list":
+        return _list(session_id)
+    if verb in ("export", "import"):
+        return _transfer_command(verb, rest.strip(), session_id)
+    if verb == "block" or (verb in ("enable", "disable") and any(
+            w.lower() in vault.PROMPT_CLASSES for w in words[:2])):
+        return _account_switch(verb, words, session_id)
+    if verb in ("enable", "disable"):
+        if words and words[0].lower() == "reuse":
+            return _reuse(verb, words[1:], session_id)
+        if words and words[0].lower() == "sudo":
+            words = words[1:]
+        if not words:
+            return HELP
+        return common.sudo_switch(verb, words, session_id)
+    if verb == "delete":
+        return _delete(words, session_id)
+    if verb == "add":
+        what, kind = _what(words[0]) if words else ("", "")
+        extra = " ".join(words[1:])
+        if not what:
+            gid = open_grant("add", "", "", session_id)
+            return (f"Setup {gid} is open for: add (the user didn't say what). Ask them with a "
+                    "question pop-up whether it's an account (GitHub, Hugging Face, a server "
+                    "over SSH, Azure, the ML Catalog, a container registry, Pijul), a secret "
+                    "(an API key or token for a web service) or sudo (a root password for a "
+                    "machine), then follow the gate:setup skill with grant=\"" + gid + "\".")
+        if what == "sudo" and len(words) > 3:
+            _typed_password(words[3:])
+        gid = open_grant("add", what, kind, session_id)
+        return _guided(gid, "add", what, kind, "", extra)
+    if verb == "update":
+        if not words:
+            gid = open_grant("update", "", "", session_id)
+            return _guided(gid, "update", "", "", "", "Ask which item to change (show "
+                           "them the names from the session note).")
+        target = words[0]
+        data = vault.load()
+        if vault.parse_account_ref(target.lower()) and target.lower() in data["accounts"]:
+            what, target = "account", target.lower()
+        elif target in data["secrets"]:
+            what = "secret"
+        elif target in data["sudo"]:
+            what = "sudo"
+            if len(words) > 1:
+                _typed_password(words[1:])
+        else:
+            raise common.CommandError(f"Nothing named {target}; see /gate:list.")
+        gid = open_grant("update", what, target, session_id)
+        return _guided(gid, "update", what, "", target, " ".join(words[1:]))
+    raise common.CommandError(HELP)
+
+
+def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
+    prompt = payload.get("prompt") or ""
+    m = PREFIX.match(prompt)
+    if not m:
+        return None
+    verb, rest = m.group(1), m.group(2)
+    try:
+        result = run(verb, rest, payload.get("session_id") or "")
+        outcome = "ok"
+    except common.LooksLikeValue as e:
+        common._spawn_scrubber(payload.get("transcript_path", ""), e.typed)
+        policy.audit("gate_command", {"command": verb, "outcome": "blocked: looked like a value"})
+        return common.block(f"gateway: {e}")
+    except (common.CommandError, SetupError) as e:
+        result, outcome = f"Error: {e}", "error"
+    policy.audit("gate_command", {"command": verb, "target": " ".join(rest.split()[:2])[:80],
+                                  "outcome": outcome})
+    return common.passthrough(result)
+
+
+# ---------------------------------------------------------------------------
+# gate_setup (MCP tool): check the grant, show the dialog, save
+# ---------------------------------------------------------------------------
+
+
+def _hosts(v: Any) -> list[str]:
+    hosts = [str(h).strip().lower() for h in (v or []) if str(h).strip()]
+    for h in hosts:
+        if h == "*" or not vault.HOST_RE.fullmatch(h):
+            raise SetupError(f"'{h}' is not a host name")
+    return hosts
+
+
+def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """Validate a proposal against its grant; return a normalized plan with a
+    plain-language summary. Raises SetupError so Claude can fix and retry."""
+    op, what = g["op"], g["what"] or str(p.get("what", "")).lower()
+    if op in ("export", "import") or what in ("export", "import"):
+        if op not in ("export", "import"):
+            raise SetupError("export and import start only from /gate:export or /gate:import")
+        return _transfer_plan(g, p)
+    if g["what"] and p.get("what") and str(p["what"]).lower() != g["what"]:
+        raise SetupError(f"this setup is for {g['what']}, not {p['what']}")
+    if what not in WHATS:
+        raise SetupError("say what this is: what = secret, sudo or account")
+    plan: dict[str, Any] = {"op": op, "what": what, "lines": []}
+    L = plan["lines"]
+    if what == "secret":
+        name = str(p.get("name") or g["target"] or "")
+        try:
+            common._name(name)
+        except common.CommandError as e:
+            raise SetupError(str(e))
+        exists = name in data["secrets"]
+        if op == "add" and exists:
+            raise SetupError(f"a secret named {name} already exists; use /gate:update {name}")
+        if op == "update" and not exists:
+            raise SetupError(f"no secret named {name}")
+        old = data["secrets"].get(name, {})
+        desc = str(p.get("description") or old.get("description", "")).strip()
+        if op == "add" and not desc:
+            raise SetupError("add a short description of what the secret is for")
+        hosts = _hosts(p["hosts"]) if "hosts" in p else list(old.get("hosts", []))
+        new_value = op == "add" or bool(p.get("new_value"))
+        plan.update(name=name, description=desc, hosts=hosts, ask_secret=new_value)
+        L.append(f"{'Add' if op == 'add' else 'Change'} the secret “{name}”: {desc}.")
+        L.append("It may be sent only to: " + (", ".join(hosts) or "nowhere yet") + ".")
+        if new_value:
+            L.append("You'll type its value next (hidden). Claude never sees it.")
+        return plan
+    if what == "sudo":
+        target = g["target"]
+        user, host = (target.split("@", 1) if target else
+                      (str(p.get("user", "")), str(p.get("host", ""))))
+        try:
+            user, host = common._sudo_target(user, host)
+        except common.CommandError as e:
+            raise SetupError(str(e))
+        key = f"{user}@{host}"
+        if op == "add" and key in data["sudo"]:
+            raise SetupError(f"{key} already has a password; use /gate:update {key}")
+        plan.update(user=user, host=host, ask_secret=True)
+        where = "this computer" if host == "localhost" else host
+        L.append(f"Store the sudo (administrator) password of {user} on {where}.")
+        L.append("Claude can then run commands as root there through the gateway; each one "
+                 "still asks you unless you /gate:enable sudo " + host + ".")
+        L.append("You'll type the password next (hidden). Claude never sees it.")
+        return plan
+    # account
+    if op == "add":
+        kind = str(p.get("kind") or g["target"] or "").lower()
+        kind = ACCOUNT_WORDS.get(kind, kind)
+        if kind not in vault.KINDS:
+            raise SetupError(f"kind must be one of {', '.join(vault.KINDS)}")
+        name = str(p.get("name", "")).lower()
+        ref = f"{kind}:{name}"
+        if not vault.parse_account_ref(ref):
+            raise SetupError("name: a short lowercase name, e.g. work or personal")
+        if ref in data["accounts"]:
+            raise SetupError(f"{ref} already exists; use /gate:update {ref}")
+        old = None
+    else:
+        ref = str(g["target"] or p.get("account", "")).lower()
+        if ref not in data["accounts"]:
+            raise SetupError(f"no account named {ref}")
+        kind, old = data["accounts"][ref]["kind"], data["accounts"][ref]
+    spec = vault.KINDS[kind]
+    fields = dict(p.get("fields") or {})
+    ssh_opts = _ssh_opts(kind, p.get("ssh"), p.get("credentials") or {}, old)
+    if ssh_opts.get("routes"):
+        # The last route is the default one (host/port); the others come first.
+        fields["host"] = ssh_opts["routes"][-1]["host"]
+        fields["port"] = ssh_opts["routes"][-1]["port"]
+    for f in fields:
+        if f not in spec["fields"]:
+            raise SetupError(f"{kind} accounts have no field {f!r} (fields: "
+                             f"{', '.join(spec['fields'])})")
+    got = {f: str(fields.get(f, (old or {}).get(f, spec["host"] if f == "host" else ""))
+                  or "") for f in spec["fields"]}
+    for f, v in got.items():
+        try:
+            common._clean_setting(kind, f, v)
+        except common.CommandError as e:
+            raise SetupError(str(e))
+        if f in ("host", "tenant") and not v.strip():
+            raise SetupError(f"{f} is required for {kind} accounts")
+    if kind == "ssh" and not got.get("user"):
+        raise SetupError("user is required for ssh accounts")
+    if not spec["owners"] and p.get("owners"):
+        raise SetupError(f"{kind} accounts are scoped by host only, not owners")
+    if spec["owners"]:
+        owners = p.get("owners")
+        if owners is None:
+            owners = (old or {}).get("owners", [])
+        if isinstance(owners, str):
+            owners = owners.replace(",", " ").split()
+        try:
+            common._owners(list(owners))
+        except common.CommandError as e:
+            raise SetupError(str(e))
+        got["owners"] = " ".join(owners)
+    extra_hosts = None
+    if "hosts" in p:  # hosts beyond the kind's own (e.g. a Databricks workspace)
+        extra_hosts = _hosts(p["hosts"] if isinstance(p["hosts"], list) else [p["hosts"]])
+    desc = str(p.get("description") or (old or {}).get("description", "")).strip()
+    if op == "add" and not desc:
+        raise SetupError("add a short description, e.g. 'work GitHub (asirobots)'")
+    cred = p.get("credentials") or {}
+    token = cred.get("token")  # "ask" | None
+    key = cred.get("ssh_key")  # "generate" | "file" | None
+    browser = bool(cred.get("browser"))
+    forget = cred.get("forget") or []
+    if isinstance(forget, str):
+        forget = [forget]
+    if forget:
+        if op != "update":
+            raise SetupError("credentials.forget is for /gate:update")
+        bad = [f for f in forget if f not in spec["secrets"]]
+        if bad or not isinstance(forget, list):
+            raise SetupError(f"credentials.forget: any of {', '.join(spec['secrets'])}")
+        if (token and "token" in forget) or (key and "ssh_key" in forget):
+            raise SetupError("don't add and forget the same credential at once")
+    if token not in (None, "ask") or key not in (None, "generate", "file"):
+        raise SetupError("credentials: token = 'ask', ssh_key = 'generate' or 'file', "
+                         "browser = true/false")
+    if token and "token" not in spec["secrets"]:
+        raise SetupError(f"{kind} accounts don't use a token")
+    if key and "ssh_key" not in spec["secrets"]:
+        raise SetupError(f"{kind} accounts don't use an SSH key")
+    if browser and kind not in ("github", "azure", "mlcat"):
+        raise SetupError("browser sign-in is for GitHub, Azure and the ML Catalog")
+    key_file = ""
+    if key == "file":
+        key_file = os.path.expanduser(str(cred.get("ssh_key_file", "")))
+        if not key_file or not Path(key_file).is_file():
+            raise SetupError("ssh_key_file: the path of an existing private key file "
+                             "(the gateway reads it; Claude doesn't)")
+    if kind == "registry" and got.get("via") and token:
+        raise SetupError("a registry signs in either through another account (via) or "
+                         "with its own token, not both")
+    plan.update(ref=ref, kind=kind, got=got, description=desc, old=old,
+                ask_secret=token == "ask", key=key, key_file=key_file, browser=browser,
+                ssh=ssh_opts, forget=list(forget), extra_hosts=extra_hosts)
+    who = got.get("login") or got.get("user") or ""
+    L.append(f"{'Add' if op == 'add' else 'Change'} the {spec['label']} account “{ref}”: {desc}."
+             + (f" Login: {who}." if who else ""))
+    if spec["owners"]:
+        L.append("Used for: " + (", ".join(got["owners"].split()) or "anything") + " on "
+                 + (got.get("host") or spec["host"]) + ".")
+        clash = overlapping(ref, kind, got.get("host") or spec["host"], got["owners"].split(),
+                            data)
+        if clash:
+            L.append("Note: " + ", ".join(clash) + (" is" if len(clash) == 1 else " are")
+                     + " also used for some of these. For repos both cover, Claude will have to "
+                     "say which account to use each time; giving each account its own owners "
+                     "avoids that.")
+    elif got.get("host"):
+        L.append(f"Host: {got['host']}" + (f", port {got['port']}" if got.get("port") else "") + ".")
+    if browser:
+        L.append("Sign-in: the provider's page opens in your browser.")
+    if token:
+        L.append("You'll type the token next (hidden). Claude never sees it.")
+    if key == "generate":
+        L.append("A new SSH key is made for it; you'll get its public half to add on the site.")
+    if key == "file":
+        L.append(f"Its SSH key is read from {key_file} (Claude never reads the file).")
+    if extra_hosts is not None:
+        base = vault.default_hosts(kind, got.get("host") or spec["host"])
+        L.append("Its credentials may go to: " + ", ".join(dict.fromkeys(base + extra_hosts))
+                 + ".")
+    for f in forget:
+        L.append({"token": "Its token is removed.", "ssh_key": "Its SSH key is removed.",
+                  "refresh_token": "Its sign-in is removed (sign in again to use it)."}[f])
+    L.extend(_ssh_lines(ssh_opts, old))
+    return plan
+
+
+def overlapping(ref: str, kind: str, host: str, owners: list[str],
+                data: dict[str, Any]) -> list[str]:
+    """Other accounts of the same kind and host whose owners meet these
+    (no owners means any): the git/gh tools can't choose between them."""
+    mine = {o.lower() for o in owners}
+    out = []
+    for r, a in sorted(data["accounts"].items()):
+        if r == ref or a.get("kind") != kind:
+            continue
+        if (a.get("host") or vault.KINDS[kind]["host"]) != host:
+            continue
+        theirs = {o.lower() for o in a.get("owners", [])}
+        if not mine or not theirs or mine & theirs:
+            out.append(r)
+    return out
+
+
+SSH_COMFORT_LIMITS = {"connect_timeout": (1, 120), "keepalive": (0, 600),
+                      "reuse_minutes": (1, 240)}
+
+
+def _ssh_opts(kind: str, raw: Any, cred: dict[str, Any], old: dict[str, Any] | None) -> dict[str, Any]:
+    """The ssh-only part of a proposal: {"ssh": {routes, host_key_policy,
+    connect_timeout, keepalive, compression, reuse_minutes}} and the key
+    rotation flags in credentials (keep_old_key, remove_old_keys)."""
+    from . import sshconf
+    out: dict[str, Any] = {}
+    rot = {k: cred.get(k) for k in ("keep_old_key", "remove_old_keys") if cred.get(k) is not None}
+    if kind != "ssh":
+        if raw is not None or rot:
+            raise SetupError("routes, host-key policy and key rotation are for ssh accounts")
+        return out
+    for k, v in rot.items():
+        if not isinstance(v, bool):
+            raise SetupError(f"credentials.{k} is true or false")
+    if rot.get("keep_old_key") and cred.get("ssh_key") not in ("generate", "file"):
+        raise SetupError("keep_old_key goes with a new key (ssh_key: generate or file)")
+    if rot.get("keep_old_key") and not (old or {}).get("secrets", {}).get("ssh_key"):
+        raise SetupError("keep_old_key: there's no current key to keep")
+    out.update({k: v for k, v in rot.items() if v})
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        raise SetupError("ssh: {routes, host_key_policy, connect_timeout, keepalive, "
+                         "compression, reuse_minutes}")
+    unknown = set(raw) - {"routes", "host_key_policy", "compression", *SSH_COMFORT_LIMITS}
+    if unknown:
+        raise SetupError(f"ssh settings have no {', '.join(sorted(unknown))}")
+    if "routes" in raw:
+        try:
+            out["routes"] = sshconf.check_routes(raw["routes"])
+        except ValueError as e:
+            raise SetupError(str(e))
+    if "host_key_policy" in raw:
+        if raw["host_key_policy"] not in sshconf.POLICIES:
+            raise SetupError("host_key_policy: pinned, accept-new or ask")
+        out["host_key_policy"] = raw["host_key_policy"]
+    comfort = {}
+    for k, (lo, hi) in SSH_COMFORT_LIMITS.items():
+        if k in raw:
+            v = raw[k]
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise SetupError(f"{k}: a whole number from {lo} to {hi}")
+            comfort[k] = v
+    if "compression" in raw:
+        if not isinstance(raw["compression"], bool):
+            raise SetupError("compression is true or false")
+        comfort["compression"] = raw["compression"]
+    if comfort:
+        out["comfort"] = comfort
+    return out
+
+
+def _ssh_lines(o: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
+    L = []
+    if o.get("routes"):
+        L.append("Ways in, tried in this order: " + "; ".join(
+            f"{r['name']}: {r['host']}" + (f" port {r['port']}" if r["port"] else "")
+            + (f" (only on {r['when']})" if r["when"] else "") for r in o["routes"]) + ".")
+    pol = o.get("host_key_policy")
+    if pol:
+        L.append({"pinned": "Host key: pinned; a changed key is refused.",
+                  "accept-new": "Host key: if it changes (e.g. after a reinstall), the new key is "
+                                "trusted and logged. Only for test machines.",
+                  "ask": "Host key: if it changes, a dialog like this one asks you."}[pol])
+    if o.get("comfort"):
+        L.append("Connection settings: " + ", ".join(f"{k} {v}" for k, v in o["comfort"].items())
+                 + ".")
+    if o.get("keep_old_key"):
+        L.append("The current key is kept as an older key, so both work until you remove it.")
+    if o.get("remove_old_keys"):
+        n = len((old or {}).get("old_public_keys", []))
+        L.append(f"Older keys are removed ({n}).")
+    return L
+
+
+def _apply_ssh(rec: dict[str, Any], o: dict[str, Any], old: dict[str, Any] | None) -> str:
+    """Routes, policy, comfort and key rotation onto an ssh account record.
+    Every route must show the same host key (one machine)."""
+    from . import sshconf
+    old = old or {}
+    note = []
+    if o.get("keep_old_key"):
+        prev = old.get("secrets", {}).get("ssh_key")
+        if prev and prev != rec["secrets"].get("ssh_key"):
+            rec["secrets"]["old_ssh_keys"] = ([prev] + list(old.get("secrets", {})
+                                              .get("old_ssh_keys", [])))[:3]
+            rec["old_public_keys"] = ([old.get("public_key", "")]
+                                      + list(old.get("old_public_keys", [])))[:3]
+    if o.get("remove_old_keys"):
+        rec["secrets"].pop("old_ssh_keys", None)
+        rec.pop("old_public_keys", None)
+    if "host_key_policy" in o:
+        rec["host_key_policy"] = o["host_key_policy"]
+    if o.get("comfort"):
+        rec["comfort"] = {**(old.get("comfort") or {}), **o["comfort"]}
+    if o.get("routes"):
+        rec["routes"] = o["routes"]
+        rec["hosts"] = list(dict.fromkeys(r["host"] for r in o["routes"]))
+        pinned = sshconf._key_set(rec.get("known_hosts", ""))
+        for r in o["routes"]:
+            got = vault.keyscan(r["host"], r["port"])
+            if not got:
+                note.append(f"route {r['name']} didn't answer now; its host key will be "
+                            "checked against the pinned one when used")
+                continue
+            if not pinned:
+                rec["known_hosts"], pinned = got, sshconf._key_set(got)
+                note.append(f"Host key pinned from route {r['name']}: "
+                            + "; ".join(vault.host_key_fingerprints(got)))
+            elif sshconf._key_set(got) != pinned:
+                raise SetupError(f"route {r['name']} ({r['host']}) shows a different host key "
+                                 "than the others, so it is a different machine; check the "
+                                 "routes. Nothing was saved.")
+    return "\n".join(note)
+
+
+def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> str:
+    what, op = plan["what"], plan["op"]
+    if what == "secret":
+        with vault.locked():
+            data = vault.load()
+            old = data["secrets"].get(plan["name"], {})
+            data["secrets"][plan["name"]] = {
+                "value": secret_value if plan["ask_secret"] else old.get("value", ""),
+                "description": plan["description"], "hosts": plan["hosts"],
+                "updated": vault.now()}
+            vault.save(data)
+            s = data["secrets"][plan["name"]]
+        return (f"{'Stored' if op == 'add' else 'Updated'} {common._describe(plan['name'], s)}.")
+    if what == "sudo":
+        key = f"{plan['user']}@{plan['host']}"
+        with vault.locked():
+            data = vault.load()
+            data["sudo"][key] = {"user": plan["user"], "host": plan["host"],
+                                 "password": secret_value, "updated": vault.now()}
+            vault.save(data)
+        return (f"Stored the sudo password for {key}. sudo there: "
+                f"{vault.sudo_state(plan['host'], session_id)}.")
+    got = dict(plan["got"])
+    if plan["ask_secret"]:
+        got["token"] = secret_value or ""
+    got["ssh_key_mode"] = {"generate": "generate", "file": "paste"}.get(plan["key"] or "",
+                                                                        "keep" if plan["old"] else "none")
+    if plan["key"] == "file":
+        got["ssh_key"] = Path(plan["key_file"]).read_text()
+    try:
+        rec, note = common._apply_form(plan["ref"], plan["kind"], got, plan["old"])
+    except common.CommandError as e:
+        raise SetupError(str(e))
+    rec["description"] = plan["description"]
+    if plan.get("extra_hosts") is not None:
+        rec["hosts"] = list(dict.fromkeys(vault.default_hosts(plan["kind"], rec.get("host", ""))
+                                          + plan["extra_hosts"]))
+    for f in plan.get("forget", []):
+        rec["secrets"].pop(f, None)
+        if f == "ssh_key":
+            for k in ("public_key", "key_fingerprint", "old_public_keys"):
+                rec.pop(k, None)
+            rec["secrets"].pop("old_ssh_keys", None)
+    if plan["kind"] == "ssh" and plan.get("ssh"):
+        extra = _apply_ssh(rec, plan["ssh"], plan["old"])
+        if extra:
+            note = (note + "\n" if note else "") + extra
+    with vault.locked():
+        data = vault.load()
+        if op == "add" and plan["ref"] in data["accounts"]:
+            raise SetupError(f"{plan['ref']} already exists")
+        data["accounts"][plan["ref"]] = rec
+        vault.save(data)
+        msg = f"{'Added' if op == 'add' else 'Updated'} {common._describe_account(plan['ref'], rec, data)}."
+    if note:
+        msg += "\n" + note
+    if plan["browser"]:
+        try:
+            msg += "\n" + common.login(plan["ref"])
+        except common.CommandError as e:
+            msg += f"\nThe account is saved, but sign-in didn't finish: {e} Run /gate:update {plan['ref']} to try again."
+    return msg
+
+
+def _use(gid: str, pending: dict[str, Any] | None = None) -> None:
+    with vault.locked():
+        data = vault.load()
+        g = data.get("grants", {}).get(gid)
+        if g:
+            if pending is None:
+                g["used"] = True
+            else:
+                g["pending"] = pending
+            vault.save(data)
+
+
+def gate_setup(grant: str, proposal: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
+    """The MCP tool. Never returns or logs a secret value."""
+    if session_id is None:
+        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    try:
+        if not isinstance(proposal, dict):
+            raise SetupError("proposal must be an object")
+        data = vault.load()
+        g = _grant(data, grant, session_id)
+        plan = _plan(g, proposal, data)
+    except SetupError as e:
+        policy.audit("gate_setup", {"grant": str(grant)[:16], "outcome": f"refused: {e}"[:200]})
+        return {"ok": False, "refused": True, "reason": str(e)}
+    summary = "\n".join(plan["lines"])
+    if plan["what"] in ("export", "import") and dialog.available():
+        from . import transfer
+        try:
+            result = _run_transfer(plan, dialog.confirm, dialog.secret)
+        except transfer.Declined as e:
+            policy.audit("gate_setup", {"grant": grant, "what": plan["what"],
+                                        "outcome": "declined"})
+            return {"ok": False, "declined": True, "reason": str(e)}
+        except SetupError as e:
+            policy.audit("gate_setup", {"grant": grant, "what": plan["what"],
+                                        "outcome": f"refused: {e}"[:200]})
+            return {"ok": False, "refused": True, "reason": str(e)}
+        except dialog.Unavailable:
+            _use(grant, pending=proposal)
+            return {"ok": False, "needs_terminal": True, "summary": summary,
+                    "reason": "The dialog couldn't open. Ask the user to finish in a terminal:\n  "
+                              + terminal_command(f"finish {grant}")}
+        _use(grant)
+        policy.audit("gate_setup", {"grant": grant, "what": plan["what"], "outcome": "ok"})
+        return {"ok": True, "result": result}
+    if not dialog.available():
+        _use(grant, pending=proposal)
+        policy.audit("gate_setup", {"grant": grant, "outcome": "needs terminal"})
+        return {"ok": False, "needs_terminal": True, "summary": summary,
+                "reason": ("There's no screen to show a dialog on here (e.g. over ssh). Ask the "
+                           "user to finish it in a terminal on this machine:\n  "
+                           + terminal_command(f"finish {grant}"))}
+    try:
+        if not dialog.confirm(summary + "\n\nAllow?"):
+            policy.audit("gate_setup", {"grant": grant, "outcome": "declined in the dialog"})
+            return {"ok": False, "declined": True,
+                    "reason": "The user chose Cancel in the dialog; nothing was saved. Ask what "
+                              "to change, and call gate_setup again with the same grant."}
+        value = None
+        if plan.get("ask_secret"):
+            label = {"secret": f"the value of “{plan.get('name')}”",
+                     "sudo": f"the password of {plan.get('user')} on {plan.get('host')}"}.get(
+                plan["what"], f"the token for “{plan.get('ref')}”")
+            value = dialog.secret(f"Type {label}.\nIt goes straight into the gateway's vault.")
+            if value is None or (plan["what"] != "secret" and not value):
+                return {"ok": False, "declined": True,
+                        "reason": "No value was entered; nothing was saved."}
+        result = _apply(plan, value, session_id)
+    except dialog.Unavailable:
+        _use(grant, pending=proposal)
+        return {"ok": False, "needs_terminal": True, "summary": summary,
+                "reason": "The dialog couldn't open. Ask the user to finish in a terminal:\n  "
+                          + terminal_command(f"finish {grant}")}
+    except SetupError as e:
+        return {"ok": False, "refused": True, "reason": str(e)}
+    _use(grant)
+    policy.audit("gate_setup", {"grant": grant, "what": plan["what"], "op": plan["op"],
+                                "target": plan.get("ref") or plan.get("name")
+                                or f"{plan.get('user')}@{plan.get('host')}", "outcome": "ok"})
+    return {"ok": True, "result": result}
+
+
+def finish(gid: str, ask_confirm, ask_secret) -> str:
+    """Terminal fallback: finish a setup Claude prepared where no dialog could
+    open. The callables read the answers at the terminal (hidden for secrets)."""
+    data = vault.load()
+    g = _grant(data, gid, None)
+    if not g.get("pending"):
+        raise SetupError(f"setup {gid} has nothing to finish yet")
+    plan = _plan(g, g["pending"], data)
+    if plan["what"] in ("export", "import"):
+        from . import transfer
+        try:
+            result = _run_transfer(plan, ask_confirm, ask_secret)
+        except transfer.Declined as e:
+            return str(e)
+        _use(gid)
+        return result
+    if not ask_confirm("\n".join(plan["lines"])):
+        return "Cancelled; nothing was saved."
+    value = None
+    if plan.get("ask_secret"):
+        value = ask_secret("Value (hidden)")
+        if value is None or (plan["what"] != "secret" and not value):
+            return "No value entered; nothing was saved."
+    result = _apply(plan, value, g.get("session", ""))
+    _use(gid)
+    return result

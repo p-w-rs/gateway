@@ -11,7 +11,18 @@ The JSON looks like:
      "secrets": {"HF_TOKEN": {"value": "...", "description": "...",
                               "hosts": ["huggingface.co"], "updated": "..."}},
      "sudo": {"alice@localhost": {"user": "alice", "host": "localhost",
-                                   "password": "...", "updated": "..."}}}
+                                   "password": "...", "updated": "..."}},
+     "accounts": {"github:work": {"kind": "github", "host": "github.com",
+                                  "login": "...", "owners": ["asirobots"],
+                                  "hosts": ["github.com", "api.github.com"],
+                                  "secrets": {"token": "...", "ssh_key": "..."},
+                                  "public_key": "ssh-ed25519 ...", "prompts": {},
+                                  "updated": "..."}},
+     "account_prompts": {"read": "auto", "write": "auto", ...}}
+
+An account is a named identity of a known kind (KINDS). Everything under its
+"secrets" is a value; the rest is what Claude may see (catalog()). Version 1
+vaults (no accounts) are read as-is and saved as version 2.
 
 Values are only ever decrypted into memory. The `age` binary comes from the
 plugin's pixi env, so this works the same on macOS, Linux and Windows.
@@ -24,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -63,12 +75,21 @@ def _age(tool: str = "age") -> str:
     return path
 
 
+VERSION = 2
+
+
 def _empty() -> dict[str, Any]:
-    # sudo_enabled: hosts enabled in every session (`/sudo enable HOST always`).
+    # sudo_enabled: hosts enabled in every session (`/gate:enable sudo HOST always`).
     # sudo_session: {host: [session ids]} enabled for those sessions only.
     # run_privileged runs without asking there; elsewhere it needs approval.
-    return {"version": 1, "secrets": {}, "sudo": {}, "sudo_enabled": [],
-            "sudo_session": {}}
+    # accounts / account_prompts: see the module docstring and KINDS.
+    return {"version": VERSION, "secrets": {}, "sudo": {}, "sudo_enabled": [],
+            "sudo_session": {}, "accounts": {}, "account_prompts": {},
+            # grants: open guided setups (setup.py), by id; never hold a value.
+            "grants": {},
+            # ssh_reuse: {ssh account: [session ids]} where the user typed
+            # /gate:enable reuse ACCOUNT (connection reuse, sshconf.py).
+            "ssh_reuse": {}}
 
 
 MAX_SESSIONS_PER_HOST = 20  # oldest session grants are dropped beyond this
@@ -113,6 +134,7 @@ def _ensure_key() -> str:
 def save(data: dict[str, Any]) -> None:
     """Encrypt and atomically replace the vault. Plaintext goes via stdin only."""
     recipient = _ensure_key()
+    data["version"] = VERSION
     tmp = store_path().with_name(f"store.age.{os.getpid()}.tmp")
     old = os.umask(0o077)
     try:
@@ -206,6 +228,234 @@ def clear_sudo(data: dict[str, Any], host: str) -> None:
     data["sudo_session"].pop(h, None)
 
 
+# ---------------------------------------------------------------------------
+# Accounts: named identities of a known kind
+# ---------------------------------------------------------------------------
+
+# kind:name, e.g. github:work. The name part is lower case so refs are stable.
+ACCOUNT_RE = re.compile(r"([a-z]+):([a-z0-9][a-z0-9._-]{0,63})")
+# A GitHub/HF owner or org, a Nest user, ... (no '/', never a leading '-').
+OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}")
+EMAIL_RE = re.compile(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+")
+GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+PROMPT_CLASSES = ("read", "write", "delete", "exec")
+PROMPT_VALUES = ("auto", "ask", "refuse")
+DEFAULT_PROMPTS = {"read": "auto", "write": "auto", "delete": "ask", "exec": "ask"}
+
+# The Azure CLI's public client: Microsoft's own SDKs default to it for
+# interactive sign-in, and it is pre-authorized for ARM, Storage and Databricks.
+AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+
+# fields: the non-secret settings the form asks for (besides description).
+# secrets: which credential kinds the account can hold.
+# owners: whether the scope includes owners/orgs (beyond hosts).
+KINDS: dict[str, dict[str, Any]] = {
+    "github": {"label": "GitHub", "host": "github.com",
+               "fields": ("host", "login", "name", "email"),
+               "secrets": ("token", "ssh_key"), "owners": True},
+    "hf": {"label": "Hugging Face", "host": "huggingface.co",
+           "fields": ("login",), "secrets": ("token", "ssh_key"), "owners": True},
+    "pijul": {"label": "Pijul (the Nest or a self-hosted server)", "host": "nest.pijul.com",
+              "fields": ("host", "login", "name", "email", "remote_pijul"),
+              "secrets": ("ssh_key",), "owners": True},
+    "azure": {"label": "Azure (Microsoft Entra ID)", "host": "management.azure.com",
+              "fields": ("tenant", "client_id", "login"), "secrets": ("refresh_token",),
+              "owners": False},
+    "mlcat": {"label": "ASI ML Catalog", "host": "app-dev-ai-mlreg.azurewebsites.net",
+              "fields": ("host", "login"), "secrets": ("refresh_token",), "owners": False},
+    "ssh": {"label": "SSH host", "host": "",
+            "fields": ("host", "user", "port", "jump"), "secrets": ("ssh_key",), "owners": False},
+    "registry": {"label": "Container registry", "host": "",
+                 "fields": ("host", "login", "via"), "secrets": ("token",), "owners": True},
+}
+SECRET_FIELDS = ("token", "ssh_key", "refresh_token")  # refresh_token: an SSO sign-in
+
+
+# The Nest's SSH host key (ed25519, SHA256:iJjr1ZMOZNRGcEtLSDXFUUH0C4+5t7X9Wmhu4T4vcQI),
+# read 2026-10-17. Pijul can't ask whether to trust a new key without a
+# terminal, so pijul and ssh accounts carry pinned keys.
+NEST_KNOWN_HOSTS = ("nest.pijul.com ssh-ed25519 "
+                    "AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6")
+PINNED_KINDS = ("pijul", "ssh")
+
+
+def keyscan(host: str, port: str = "") -> str:
+    """The host's SSH keys as known_hosts lines (ssh-keyscan), or "".
+    Used only from a setup the user started (/gate:add, /gate:update: their trust decision);
+    GATEWAY_KEYSCAN=none turns it off (tests)."""
+    if host == "nest.pijul.com" and port in ("", "22"):
+        return NEST_KNOWN_HOSTS
+    if os.environ.get("GATEWAY_KEYSCAN") == "none" or not HOST_RE.fullmatch(host):
+        return ""
+    tool = Path(sys.executable).parent / "ssh-keyscan"
+    cmd = [str(tool) if tool.exists() else (shutil.which("ssh-keyscan") or "ssh-keyscan"),
+           "-T", "5", "-t", "ed25519,ecdsa,rsa"]
+    if port and port != "22":
+        cmd += ["-p", port]
+    try:
+        out = subprocess.run(cmd + ["--", host], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "\n".join(l for l in out.stdout.splitlines() if l.strip() and not l.startswith("#"))
+
+
+def host_key_fingerprints(known_hosts: str) -> list[str]:
+    out = []
+    for line in known_hosts.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out.append(f"{parts[1]} {fingerprint_of(' '.join(parts[1:3]))}")
+    return out
+
+
+def default_hosts(kind: str, host: str) -> list[str]:
+    """Where an account's credentials may go by default (host names, no ports)."""
+    if host and not host.startswith("[") and host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    if kind == "github" and (host == "github.com" or host.endswith(".ghe.com")):
+        return [host, f"api.{host}"]
+    if kind == "hf":
+        return [host, "hf.co"] if host == "huggingface.co" else [host]
+    return [host] if host else []
+
+
+def parse_account_ref(ref: str) -> tuple[str, str] | None:
+    m = ACCOUNT_RE.fullmatch(ref or "")
+    return (m.group(1), m.group(2)) if m and m.group(1) in KINDS else None
+
+
+def account(ref: str, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    data = data if data is not None else load()
+    return data["accounts"].get(ref)
+
+
+def effective_prompts(acct: dict[str, Any], data: dict[str, Any],
+                      session_id: str | None = None) -> dict[str, str]:
+    """Per-class prompt policy: a switch the user typed for this session
+    (/gate:enable CLASS ACCOUNT), then the account's own, then the vault
+    default, then DEFAULT_PROMPTS. The session is the MCP server's
+    (CLAUDE_CODE_SESSION_ID) unless given."""
+    if session_id is None:
+        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    out = dict(DEFAULT_PROMPTS)
+    out.update({k: v for k, v in data.get("account_prompts", {}).items()
+                if k in PROMPT_CLASSES and v in PROMPT_VALUES})
+    out.update({k: v for k, v in acct.get("prompts", {}).items()
+                if k in PROMPT_CLASSES and v in PROMPT_VALUES})
+    if session_id:
+        for k, ids in acct.get("session_prompts", {}).items():
+            if k in PROMPT_CLASSES and session_id in ids:
+                out[k] = "auto"
+    return out
+
+
+def methods(acct: dict[str, Any]) -> list[str]:
+    return [k for k in SECRET_FIELDS if acct.get("secrets", {}).get(k)]
+
+
+def _ssh_keygen() -> str:
+    path = shutil.which("ssh-keygen")
+    if not path:
+        raise RuntimeError("ssh-keygen was not found (it ships with OpenSSH)")
+    return path
+
+
+def _ssh_string(buf: bytes, pos: int) -> tuple[bytes, int]:
+    n = int.from_bytes(buf[pos:pos + 4], "big")
+    if pos + 4 + n > len(buf):
+        raise ValueError("truncated")
+    return buf[pos + 4:pos + 4 + n], pos + 4 + n
+
+
+def normalize_key(private_key: str) -> str:
+    """A pasted key as ssh-add wants it: LF line endings (browsers submit
+    textareas with CRLF), no stray spaces, one trailing newline."""
+    return "\n".join(line.strip() for line in private_key.strip().splitlines()) + "\n"
+
+
+def public_key_of(private_key: str) -> str:
+    """The OpenSSH public key line for an OpenSSH private key, parsed here
+    (stdlib only; nothing written to disk). Keys with a passphrase are
+    refused: the gateway loads keys into a private ssh-agent unattended."""
+    import base64
+    text = private_key.strip()
+    head, tail = "-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----"
+    if not (text.startswith(head) and text.endswith(tail)):
+        raise ValueError("that is not an OpenSSH private key (convert older PEM keys with "
+                         "ssh-keygen -p -f KEYFILE)")
+    try:
+        raw = base64.b64decode("".join(text[len(head):-len(tail)].split()), validate=True)
+        if not raw.startswith(b"openssh-key-v1\0"):
+            raise ValueError("bad magic")
+        pos = len(b"openssh-key-v1\0")
+        cipher, pos = _ssh_string(raw, pos)
+        _kdf, pos = _ssh_string(raw, pos)
+        _kdfopts, pos = _ssh_string(raw, pos)
+        nkeys = int.from_bytes(raw[pos:pos + 4], "big")
+        pos += 4
+        blob, pos = _ssh_string(raw, pos)
+        priv, pos = _ssh_string(raw, pos)
+        keytype, _ = _ssh_string(blob, 0)
+    except (ValueError, IndexError) as e:
+        raise ValueError("that is not an OpenSSH private key") from e
+    if cipher != b"none":
+        raise ValueError("that key has a passphrase; the gateway needs a key without one "
+                         "(it never leaves the vault and a private agent)")
+    if nkeys != 1 or priv[:4] != priv[4:8]:
+        raise ValueError("that is not an OpenSSH private key")
+    return f"{keytype.decode()} {base64.b64encode(blob).decode()}"
+
+
+def fingerprint_of(public_key: str) -> str:
+    """SHA256:… as ssh-keygen -l prints it."""
+    import base64
+    import hashlib
+    try:
+        blob = base64.b64decode(public_key.split()[1])
+    except (IndexError, ValueError):
+        return ""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def generate_ssh_key(comment: str) -> tuple[str, str]:
+    """A new ed25519 key pair (private, public). ssh-keygen can only write
+    files, so it writes into a private temp dir inside the vault home, which
+    is read and removed at once."""
+    import tempfile
+    home().mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".keygen-", dir=home()))
+    try:
+        os.chmod(tmp, 0o700)
+        subprocess.run([_ssh_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", comment,
+                        "-f", str(tmp / "k")], check=True, capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=15)
+        return (tmp / "k").read_text().strip() + "\n", (tmp / "k.pub").read_text().strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def account_view(ref: str, acct: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """What Claude may know about one account: never a value."""
+    kind = acct.get("kind", "")
+    view = {"kind": kind, "description": acct.get("description", "")}
+    for f in KINDS.get(kind, {}).get("fields", ()):
+        if acct.get(f):
+            view[f] = acct[f]
+    if KINDS.get(kind, {}).get("owners"):
+        view["owners"] = list(acct.get("owners", []))
+    view["hosts"] = list(acct.get("hosts", []))
+    view["methods"] = methods(acct)
+    if acct.get("public_key"):
+        view["key_fingerprint"] = acct.get("key_fingerprint", "")
+        view["public_key"] = acct["public_key"]  # the half to paste on a site; not a secret
+    if kind in PINNED_KINDS:
+        view["host_keys"] = host_key_fingerprints(acct.get("known_hosts", ""))
+    view["prompts"] = effective_prompts(acct, data)
+    return view
+
+
 def catalog(data: dict[str, Any] | None = None) -> dict[str, Any]:
     """Everything Claude may know about the vault: never a value."""
     data = data if data is not None else load()
@@ -216,6 +466,7 @@ def catalog(data: dict[str, Any] | None = None) -> dict[str, Any]:
         "sudo": sorted(data["sudo"]),
         "sudo_enabled": sorted(data["sudo_enabled"]),
         "sudo_session": {h: list(ids) for h, ids in data["sudo_session"].items() if ids},
+        "accounts": {r: account_view(r, a, data) for r, a in sorted(data["accounts"].items())},
     }
 
 
@@ -223,4 +474,6 @@ def all_values(data: dict[str, Any] | None = None) -> list[str]:
     data = data if data is not None else load()
     vals = [s["value"] for s in data["secrets"].values()]
     vals += [e["password"] for e in data["sudo"].values()]
+    vals += [v for a in data["accounts"].values()
+             for v in a.get("secrets", {}).values() if isinstance(v, str)]
     return [v for v in vals if v]

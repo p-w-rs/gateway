@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from . import __version__, actions, policy
+from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, mlcat, pijulops, policy, regops, sshops, vault
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -34,6 +34,107 @@ _PRIV_SCHEMA: dict[str, Any] = {
     "required": ["host", "argv"],
 }
 
+_GIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "git arguments without 'git', e.g. [\"push\", \"origin\", \"main\"]"},
+        "cwd": {"type": "string", "description": "the repository (absolute path); for clone, "
+                                                 "the directory to clone into"},
+        "account": {"type": "string", "description": "KIND:NAME, only to choose between "
+                                                     "several accounts that fit the remote"},
+        "timeout": {"type": "integer", "default": 300},
+    },
+    "required": ["args", "cwd"],
+}
+_GH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "gh arguments without 'gh', e.g. [\"pr\", \"list\"]"},
+        "cwd": {"type": "string", "description": "a repository (absolute path), so gh knows "
+                                                 "the repo and the account"},
+        "account": {"type": "string", "description": "github:NAME"},
+        "timeout": {"type": "integer", "default": 300},
+    },
+    "required": ["args"],
+}
+
+_HF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "hf arguments without 'hf', e.g. [\"download\", \"org/model\"]"},
+        "cwd": {"type": "string", "description": "working directory (absolute path)"},
+        "account": {"type": "string", "description": "hf:NAME"},
+        "timeout": {"type": "integer", "default": 1800},
+    },
+    "required": ["args"],
+}
+
+_PIJUL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "pijul arguments without 'pijul', e.g. [\"record\", \"-a\", \"-m\", \"msg\"]"},
+        "cwd": {"type": "string", "description": "the repository (absolute path)"},
+        "account": {"type": "string", "description": "pijul:NAME"},
+        "timeout": {"type": "integer", "default": 600},
+    },
+    "required": ["args", "cwd"],
+}
+
+_COPY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "account": {"type": "string", "description": "ssh:NAME"},
+        "direction": {"type": "string", "enum": ["up", "down"]},
+        "local": {"type": "string", "description": "absolute local path"},
+        "remote": {"type": "string", "description": "path on the server"},
+        "recursive": {"type": "boolean", "default": False},
+        "timeout": {"type": "integer", "default": 1800},
+    },
+    "required": ["account", "direction", "local", "remote"],
+}
+
+_DB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "databricks arguments, e.g. [\"clusters\", \"list\"]"},
+        "account": {"type": "string", "description": "azure:NAME"},
+        "workspace": {"type": "string", "description": "the workspace host or URL"},
+        "cwd": {"type": "string"},
+        "timeout": {"type": "integer", "default": 600},
+    },
+    "required": ["args", "account", "workspace"],
+}
+
+_MLW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["init", "clone", "pull", "push", "status"]},
+        "cwd": {"type": "string", "description": "the workspace folder (absolute path)"},
+        "artifact": {"type": "string", "description": "datasets/NAME[@rev] or models/NAME[@rev]"},
+        "revision": {"type": "string", "description": "pull: a revision hash, or latest"},
+        "data_dir": {"type": "string", "default": "data"},
+        "account": {"type": "string", "description": "mlcat:NAME"},
+        "timeout": {"type": "integer", "default": 3600},
+    },
+    "required": ["action", "cwd"],
+}
+
+_REG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "args": {"type": "array", "items": {"type": "string"},
+                 "description": "crane arguments, e.g. [\"ls\", \"ghcr.io/org/image\"]"},
+        "account": {"type": "string", "description": "registry:NAME"},
+        "timeout": {"type": "integer", "default": 1800},
+    },
+    "required": ["args", "account"],
+}
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "http_request",
@@ -43,7 +144,7 @@ TOOLS: list[dict[str, Any]] = [
             "simply reading a web page, prefer the built-in WebFetch tool. "
             "Only http:// and https:// URLs. If policy requires approval, the "
             "user is prompted directly. Authenticate with auth_ref = the NAME of "
-            "a secret the user stored with /secret (see secret_list or the "
+            "a secret the user stored with /gate:add secret (see secret_list or the "
             "session's vault catalog); it is sent only to hosts the user allowed "
             "and its value is never shown to you."),
         "inputSchema": {
@@ -54,7 +155,11 @@ TOOLS: list[dict[str, Any]] = [
                 "headers": {"type": "object"},
                 "body": {"type": "string"},
                 "auth_ref": {"type": "string",
-                             "description": "Secret NAME from the vault, e.g. HF_TOKEN"},
+                             "description": "Secret NAME from the vault (e.g. HF_TOKEN), or an account with a token (e.g. github:work)"},
+                "auth_scope": {"type": "string",
+                               "description": "azure accounts only: arm (default), storage, "
+                                              "graph, databricks, or a full scope like "
+                                              "api://<app>/.default"},
                 "auth_header": {"type": "string", "default": "Authorization",
                                 "description": "Header to put the secret in, e.g. X-Api-Key"},
                 "auth_scheme": {"type": "string", "default": "Bearer",
@@ -147,6 +252,224 @@ TOOLS: list[dict[str, Any]] = [
                            "algo": {"type": "string", "default": "sha256"}},
             "required": ["path"],
         },
+    },
+    {
+        "name": "gate_setup",
+        "description": (
+            "Finish a setup the user started by typing /gate:add or /gate:update (read the "
+            "gate:setup skill first). Pass the grant id from that command's note and a "
+            "proposal; the gateway shows the user a native dialog with the change and asks "
+            "there for any password or token (never ask for those in chat). Proposal: "
+            "secret {what:'secret', name, description, hosts:[...], new_value?}; sudo "
+            "{what:'sudo', user, host}; account {what:'account', kind, name, description, "
+            "fields:{host, login, name, email, user, port, jump, tenant, via, ...}, owners:[...], "
+            "credentials:{browser?: true, token?: 'ask', ssh_key?: 'generate'|'file', "
+            "ssh_key_file?: path}}. For an update, give only what changes. If it answers "
+            "refused, fix the proposal and call again with the same grant."),
+        "inputSchema": {"type": "object", "properties": {
+            "grant": {"type": "string", "description": "the id from the /gate: command's note, e.g. g-1a2b3c4d"},
+            "proposal": {"type": "object"}}, "required": ["grant", "proposal"]},
+    },
+    {
+        "name": "account_list",
+        "description": ("The user's gateway accounts (KIND:NAME, e.g. github:work): kind, "
+                        "login, owners/hosts they are for, methods (token, ssh_key), prompt "
+                        "policy. Never values. The git and gh tools pick the matching "
+                        "account themselves; pass account= only to choose between several."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "git",
+        "description": ("Run ANY git command (use INSTEAD OF git in Bash). Local commands run "
+                        "without credentials. fetch/pull/push/clone/ls-remote use the "
+                        "user's account for that remote's host and owner (token for https, "
+                        "SSH key for ssh), never the user's own environment. If the "
+                        "account's policy asks first, the call is refused with use: "
+                        "git_confirm: then call git_confirm with the same arguments. Plain "
+                        "force pushes are refused (use --force-with-lease via git_confirm). "
+                        "Non-interactive only: pass -m messages, no editors or -i/-p."),
+        "inputSchema": _GIT_SCHEMA,
+    },
+    {
+        "name": "git_confirm",
+        "description": ("Same as git, after Claude Code asks the user: for calls the account's "
+                        "policy marks ask (often deletes or force-with-lease), or that the "
+                        "user should see first."),
+        "inputSchema": _GIT_SCHEMA,
+    },
+    {
+        "name": "git_identity",
+        "description": ("Make this repo commit as an account: sets the repo's own user.name "
+                        "and user.email from the account (and gateway.account). No secrets."),
+        "inputSchema": {"type": "object",
+                        "properties": {"cwd": {"type": "string", "description": "the repo (absolute path)"},
+                                       "account": {"type": "string", "description": "KIND:NAME"}},
+                        "required": ["cwd", "account"]},
+    },
+    {
+        "name": "gh",
+        "description": ("Run GitHub's CLI as a gateway account (use INSTEAD OF gh in Bash): "
+                        "pr/issue/run/release/repo view|list|create|..., gh api. The account "
+                        "comes from account=, else the repo's origin, else the only GitHub "
+                        "account. Refused: auth, extensions, alias, config, browse/--web, "
+                        "repo clone/sync, pr checkout, and repo create/fork with clone/push/remote options (use the git tool). If the "
+                        "policy asks first, call gh_confirm with the same arguments."),
+        "inputSchema": _GH_SCHEMA,
+    },
+    {
+        "name": "git_mirror",
+        "description": ("Keep a repo's branches and tags the same on several remotes (e.g. "
+                        "personal and work GitHub), each fetched/pushed as its own account. "
+                        "action: status (compare), sync (fast-forward the remotes that are "
+                        "behind; diverged branches and conflicting tags are left alone, never "
+                        "forced), add/remove (the saved set, in the repo's gateway.mirror "
+                        "config). See the accounts skill."),
+        "inputSchema": {"type": "object", "properties": {
+            "cwd": {"type": "string", "description": "the repo (absolute path)"},
+            "action": {"type": "string", "enum": ["status", "sync", "add", "remove"]},
+            "remotes": {"type": "array", "items": {"type": "string"},
+                        "description": "remote names; default: the saved set"},
+            "branches": {"type": "array", "items": {"type": "string"},
+                         "description": "only these branches (default: all on any remote)"},
+            "tags": {"type": "boolean", "default": True}},
+            "required": ["cwd", "action"]},
+    },
+    {
+        "name": "hf",
+        "description": ("Run the Hugging Face CLI as a gateway account (use INSTEAD OF hf / "
+                        "huggingface-cli in Bash): download, upload (Xet), repo create/delete, "
+                        "ls, jobs, cache. The account comes from account=, else the repo id's "
+                        "owner, else the only HF account. Sign-in (hf auth) is the gateway's. "
+                        "Git pushes to the Hub go through the git tool. If the policy asks "
+                        "first, call hf_confirm with the same arguments."),
+        "inputSchema": _HF_SCHEMA,
+    },
+    {
+        "name": "hf_confirm",
+        "description": "Same as hf, after Claude Code asks the user.",
+        "inputSchema": _HF_SCHEMA,
+    },
+    {
+        "name": "pijul",
+        "description": ("Run ANY pijul command as a gateway Pijul account (use INSTEAD OF pijul "
+                        "in Bash): init/add/record/log/diff/channel locally; push/pull/clone "
+                        "over ssh://user@host/owner/repo (the Nest is nest.pijul.com). record "
+                        "signs with the account's key; push/pull authenticate with it. The "
+                        "user's own pijul config and identities are never used. If the "
+                        "policy asks first, call pijul_confirm with the same arguments."),
+        "inputSchema": _PIJUL_SCHEMA,
+    },
+    {
+        "name": "pijul_confirm",
+        "description": "Same as pijul, after Claude Code asks the user.",
+        "inputSchema": _PIJUL_SCHEMA,
+    },
+    {
+        "name": "ssh_exec",
+        "description": ("Run a command on a server as a gateway ssh account (use INSTEAD OF ssh "
+                        "in Bash). argv is a list (no shell strings). The account's key and "
+                        "pinned host key are used, never the user's own ssh setup. Most "
+                        "accounts ask first (exec=ask): then call ssh_exec_confirm. For root, "
+                        "use run_privileged."),
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "ssh:NAME"},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "integer", "default": 300}},
+            "required": ["account", "argv"]},
+    },
+    {
+        "name": "ssh_exec_confirm",
+        "description": "Same as ssh_exec, after Claude Code asks the user.",
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "integer", "default": 300}}, "required": ["account", "argv"]},
+    },
+    {
+        "name": "ssh_copy",
+        "description": ("Copy a file or folder to (up) or from (down) a server as a gateway ssh "
+                        "account (use INSTEAD OF scp/rsync/sftp in Bash). If the policy asks "
+                        "first, call ssh_copy_confirm."),
+        "inputSchema": _COPY_SCHEMA,
+    },
+    {
+        "name": "ssh_copy_confirm",
+        "description": "Same as ssh_copy, after Claude Code asks the user.",
+        "inputSchema": _COPY_SCHEMA,
+    },
+    {
+        "name": "ssh_hosts",
+        "description": ("The gateway's ssh accounts (read-only): routes (ways in, tried in "
+                        "order), jump host, host-key policy and pinned fingerprints, key "
+                        "fingerprints, whether connection reuse is on for this session. With "
+                        "probe=true, also which route it would use right now and why. Use it "
+                        "to explain or troubleshoot ssh; never shows a key or password."),
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "ssh:NAME (default: all)"},
+            "probe": {"type": "boolean", "default": False}}},
+    },
+    {
+        "name": "databricks",
+        "description": ("Run the Databricks CLI as a gateway azure account (use INSTEAD OF "
+                        "databricks in Bash): workspace is the workspace host (e.g. "
+                        "adb-123.4.azuredatabricks.net, which must be one of the account's "
+                        "hosts); an Entra token is minted for it. auth/configure/sync and "
+                        "--profile/--host are refused. If the policy asks first, call "
+                        "databricks_confirm."),
+        "inputSchema": _DB_SCHEMA,
+    },
+    {
+        "name": "databricks_confirm",
+        "description": "Same as databricks, after Claude Code asks the user.",
+        "inputSchema": _DB_SCHEMA,
+    },
+    {
+        "name": "mlcat",
+        "description": ("Read the ASI ML Catalog as a gateway mlcat account: action=search "
+                        "(kind, query, page), item (kind=dataset|model, name, version), files "
+                        "(version, prefix, skip, take). Use mlcat_workspace to get or publish "
+                        "data. Never run asiml or dvc in Bash."),
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["search", "item", "files"]},
+            "account": {"type": "string"}, "kind": {"type": "string"}, "name": {"type": "string"},
+            "version": {"type": "string"}, "query": {"type": "string"},
+            "page": {"type": "integer"}, "page_size": {"type": "integer"},
+            "prefix": {"type": "string"}, "skip": {"type": "integer"}, "take": {"type": "integer"}},
+            "required": ["action"]},
+    },
+    {
+        "name": "mlcat_workspace",
+        "description": ("asiml's workspace commands, as a gateway mlcat account (same "
+                        ".asiml format): init (artifact=datasets/NAME or models/NAME, data_dir), "
+                        "clone (artifact=datasets/NAME[@rev] into an empty cwd), pull "
+                        "(revision, or latest), push (publish the data folder; needs "
+                        "Catalog.Writer), status. Storage passes stay inside the gateway. If "
+                        "the policy asks first, call mlcat_workspace_confirm."),
+        "inputSchema": _MLW_SCHEMA,
+    },
+    {
+        "name": "mlcat_workspace_confirm",
+        "description": "Same as mlcat_workspace, after Claude Code asks the user.",
+        "inputSchema": _MLW_SCHEMA,
+    },
+    {
+        "name": "registry",
+        "description": ("Container images as a gateway registry account, no Docker needed (use "
+                        "INSTEAD OF docker/podman login/push/pull, skopeo, oras or crane in "
+                        "Bash): crane commands such as ls, manifest, digest, pull IMAGE "
+                        "FILE.tar, push FILE.tar IMAGE, copy SRC DST, tag, delete. ghcr.io can "
+                        "sign in through a GitHub account, ACR through an azure account. If the "
+                        "policy asks first, call registry_confirm."),
+        "inputSchema": _REG_SCHEMA,
+    },
+    {
+        "name": "registry_confirm",
+        "description": "Same as registry, after Claude Code asks the user.",
+        "inputSchema": _REG_SCHEMA,
+    },
+    {
+        "name": "gh_confirm",
+        "description": "Same as gh, after Claude Code asks the user.",
+        "inputSchema": _GH_SCHEMA,
     },
 ]
 
@@ -275,12 +598,15 @@ class Server:
 
 def dispatch(name: str, args: dict[str, Any],
              approve: actions.Approver = None, form: Any = None) -> dict[str, Any]:
+    if name == "gate_setup":
+        from . import setup
+        return setup.gate_setup(str(args.get("grant", "")), args.get("proposal") or {})
     if name == "http_request":
         return actions.http_request(
             args.get("method", "GET"), args["url"], args.get("headers"),
             args.get("body"), args.get("auth_ref"), approve=approve,
             auth_header=args.get("auth_header", "Authorization"),
-            auth_scheme=args.get("auth_scheme", "Bearer"))
+            auth_scheme=args.get("auth_scheme", "Bearer"), auth_scope=args.get("auth_scope"))
     if name == "download":
         return actions.download(args["url"], approve=approve)
     if name == "port_check":
@@ -297,6 +623,66 @@ def dispatch(name: str, args: dict[str, Any],
         return actions.cert_inspect(args["host"], args.get("port", 443))
     if name == "file_hash":
         return actions.file_hash(args["path"], args.get("algo", "sha256"))
+    if name == "account_list":
+        cat = vault.catalog()
+        policy.audit("account_list", {})
+        return {"ok": True, "accounts": cat["accounts"],
+                "note": "Never values. Missing one? Ask the user to type /gate:add account "
+                        "(or /gate:add github, hf, ssh, ...); to change one, /gate:update KIND:NAME."}
+    if name in ("git", "git_confirm"):
+        return gitops.git_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
+                               confirmed=name == "git_confirm",
+                               timeout=min(int(args.get("timeout", 300)), 1800))
+    if name == "git_identity":
+        return gitops.git_identity(args.get("cwd", ""), args.get("account", ""))
+    if name == "git_mirror":
+        return mirrors.git_mirror(args.get("cwd", ""), args.get("action", "status"),
+                                  args.get("remotes"), args.get("branches"),
+                                  args.get("tags", True))
+    if name in ("hf", "hf_confirm"):
+        return hfops.hf_tool(args.get("args"), args.get("cwd"), args.get("account"),
+                             confirmed=name == "hf_confirm",
+                             timeout=min(int(args.get("timeout", 1800)), 7200))
+    if name in ("pijul", "pijul_confirm"):
+        return pijulops.pijul_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
+                                   confirmed=name == "pijul_confirm",
+                                   timeout=min(int(args.get("timeout", 600)), 3600))
+    if name in ("ssh_exec", "ssh_exec_confirm"):
+        return sshops.ssh_exec(args.get("account", ""), args.get("argv"),
+                               confirmed=name == "ssh_exec_confirm",
+                               timeout=min(int(args.get("timeout", 300)), 3600))
+    if name == "ssh_hosts":
+        return sshops.ssh_hosts(args.get("account") or "", bool(args.get("probe")))
+    if name in ("ssh_copy", "ssh_copy_confirm"):
+        return sshops.ssh_copy(args.get("account", ""), args.get("direction", ""),
+                               args.get("local", ""), args.get("remote", ""),
+                               bool(args.get("recursive")), confirmed=name == "ssh_copy_confirm",
+                               timeout=min(int(args.get("timeout", 1800)), 7200))
+    if name in ("databricks", "databricks_confirm"):
+        return dbops.databricks_tool(args.get("args"), args.get("account", ""),
+                                     args.get("workspace", ""), args.get("cwd"),
+                                     confirmed=name == "databricks_confirm",
+                                     timeout=min(int(args.get("timeout", 600)), 3600))
+    if name == "mlcat":
+        return mlcat.mlcat_tool(args.get("action", ""), args.get("account"), args.get("kind", ""),
+                                args.get("name", ""), args.get("version", ""),
+                                args.get("query", ""), int(args.get("page", 1)),
+                                int(args.get("page_size", 30)), args.get("prefix", ""),
+                                int(args.get("skip", 0)), int(args.get("take", 200)))
+    if name in ("mlcat_workspace", "mlcat_workspace_confirm"):
+        return mlcat.mlcat_workspace(args.get("action", ""), args.get("cwd", ""),
+                                     args.get("artifact", ""), args.get("revision", ""),
+                                     args.get("data_dir", "data"), args.get("account"),
+                                     confirmed=name == "mlcat_workspace_confirm",
+                                     timeout=min(int(args.get("timeout", 3600)), 14400))
+    if name in ("registry", "registry_confirm"):
+        return regops.registry_tool(args.get("args"), args.get("account", ""),
+                                    confirmed=name == "registry_confirm",
+                                    timeout=min(int(args.get("timeout", 1800)), 7200))
+    if name in ("gh", "gh_confirm"):
+        return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
+                             confirmed=name == "gh_confirm",
+                             timeout=min(int(args.get("timeout", 300)), 1800))
     return {"ok": False, "reason": f"unknown tool {name}"}
 
 

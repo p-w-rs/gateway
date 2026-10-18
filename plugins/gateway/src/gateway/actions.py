@@ -134,7 +134,7 @@ def _hide(obj: Any, secrets: list[str]) -> Any:
 def http_request(method: str, url: str, headers: dict | None = None,
                  body: str | None = None, auth_ref: str | None = None,
                  approve: Approver = None, auth_header: str = "Authorization",
-                 auth_scheme: str = "Bearer") -> dict[str, Any]:
+                 auth_scheme: str = "Bearer", auth_scope: str | None = None) -> dict[str, Any]:
     method = method.upper()
     host = policy.url_host(url)
     action = "read_request" if method in READ_METHODS else "write_request"
@@ -159,7 +159,7 @@ def http_request(method: str, url: str, headers: dict | None = None,
         if not re.fullmatch(r"[A-Za-z0-9-]+", auth_header or ""):
             return {"ok": False, "reason": "auth_header must be a plain header name."}
         try:
-            value = _resolve_secret(auth_ref, cfg)
+            value = _resolve_secret(auth_ref, cfg, auth_scope)
         except Exception as e:
             return {"ok": False, "reason": f"Could not resolve auth ref: {e}"}
         headers[auth_header] = f"{auth_scheme} {value}" if auth_scheme else value
@@ -206,7 +206,7 @@ def download(url: str, approve: Approver = None) -> dict[str, Any]:
         return gate
     cfg = policy.load_config()
     limit = int(cfg.get("max_download_bytes", 500_000_000))
-    qdir = policy.plugin_root() / cfg.get("download_dir", "quarantine")
+    qdir = policy.quarantine_dir(cfg)
     qdir.mkdir(parents=True, exist_ok=True)
     name = Path(policy.urlparse(url).path).name or "download.bin"
     dest = qdir / name
@@ -266,8 +266,12 @@ def port_check(target: str, ports: list[int] | None = None,
 
 
 def _allowed_hosts(ref: str, cfg: dict[str, Any] | None = None) -> list[str]:
-    """Hosts a vault secret may be sent to (set with /gate:secret allow)."""
-    s = vault.secret(ref)
+    """Hosts a vault secret or account token may be sent to (set with
+    /gate:update)."""
+    if vault.parse_account_ref(ref):
+        s = vault.account(ref)
+    else:
+        s = vault.secret(ref)
     return [h for h in (s or {}).get("hosts", []) if h and h != "*"]
 
 
@@ -283,16 +287,33 @@ def _ask_new_host(ref: str, host: str, method: str, url: str, bound: list[str],
 
 
 def _how_to_allow(ref: str, host: str) -> str:
-    return (f"If the task needs it, ask the user to run: "
-            f"/gate:secret allow {ref} {host} - then retry.")
+    return (f"If the task needs it, ask the user to type: /gate:update {ref} allow {host} "
+            "(you then guide the setup), and retry.")
 
 
-def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None) -> str:
-    """Resolve a vault secret NAME to its raw value. Never returned to Claude."""
+def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None,
+                    scope: str | None = None) -> str:
+    """Resolve a vault secret NAME, or an account's token (KIND:NAME), to its
+    raw value. Never returned to Claude. azure/mlcat accounts mint an Entra
+    access token for `scope` (default: ARM, or the catalog's API)."""
+    if vault.parse_account_ref(ref or ""):
+        a = vault.account(ref)
+        if a is not None and a.get("kind") in ("azure", "mlcat"):
+            from . import entra
+            if a["kind"] == "mlcat":
+                from . import mlcat
+                return mlcat.api_token(ref, a)
+            return entra.access_token(ref, scope or "arm")
+        token = (a or {}).get("secrets", {}).get("token")
+        if not token:
+            raise RuntimeError(f"the account {ref} has no token" if a else
+                               f"no account named {ref}; ask the user to type: "
+                               f"/gate:add {ref.split(':', 1)[0]}")
+        return token
     s = vault.secret(ref) if vault.NAME_RE.fullmatch(ref or "") else None
     if not s:
-        raise RuntimeError(f"no secret named {ref}; ask the user to run: "
-                           f"/gate:secret add {ref} <description>")
+        raise RuntimeError(f"no secret named {ref}; ask the user to type: "
+                           f"/gate:add secret (and suggest the name {ref})")
     return s["value"]
 
 
@@ -307,10 +328,11 @@ def secret_list(approve: Approver = None) -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "reason": f"vault unavailable: {e}"}
     return {"ok": True, "secrets": cat["secrets"], "sudo": cat["sudo"],
-            "note": "Names only, never values. Use a secret's NAME as auth_ref on "
-                    "http_request, only for its hosts. Missing one? Ask the user to "
-                    "run /gate:secret add NAME <description> (a browser form "
-                    "asks them for the value)."}
+            "accounts": cat["accounts"],
+            "note": "Names only, never values. Use a secret's NAME, or an account "
+                    "with a token (KIND:NAME), as auth_ref on http_request, only for "
+                    "its hosts. Missing one? Ask the user to type /gate:add secret or "
+                    "/gate:add account (a dialog asks them for the value)."}
 
 
 def secret_use_check(ref: str, approve: Approver = None) -> dict[str, Any]:
@@ -377,8 +399,8 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
         who = f"{user}@{host}" if user else host
         return _refuse("run_privileged", host, (
             f"No sudo password is stored for {who}, so nothing can run as root "
-            f"there. Ask the user to run: /gate:sudo add USER {host} "
-            "(a browser form asks them for the password)."))
+            f"there. Ask the user to type /gate:add sudo (for {who}; a dialog asks "
+            "them for the password)."))
     if len(entries) > 1:
         return _refuse("run_privileged", host, (
             "Several users have sudo passwords for this host; pass user= one of: "
@@ -396,7 +418,7 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
     # run_privileged_confirm, which settings.json puts on "ask", so Claude
     # Code's permission prompt asks the user every time.
     try:
-        # Claude Code tells each MCP server its session id; the /sudo command
+        # Claude Code tells each MCP server its session id; /gate:enable sudo
         # records the same id when it enables sudo for one session.
         enabled = vault.sudo_enabled(host, os.environ.get("CLAUDE_CODE_SESSION_ID"))
     except Exception as e:
@@ -408,12 +430,47 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
             f"sudo is disabled on {host}, so each root command needs the user's "
             "approval: call run_privileged_confirm with the same arguments (Claude "
             "Code asks the user). If the user wants root without asking there, "
-            f"they can run /gate:sudo enable {host}.")}
+            f"they can run /gate:enable sudo {host}.")}
     gate = _gate("run_privileged", host, f"AS ROOT on {target}: {cmdline}", approve,
                  pre_approved=True)  # a 'refuse' tier in policy.json still wins
     if gate is not None:
         return gate
     password = entry["password"]
+
+    via = None
+    if host != "localhost":
+        from . import sshops
+        try:
+            via = sshops.account_for_sudo(host, entry["user"], vault.load())
+        except Exception:
+            via = None
+    if via is not None:
+        # An ssh account for this target: its keys in a private agent, its
+        # pinned host key, the gateway's own ssh config (routes and all).
+        from . import sshops
+        ref, acct = via
+        try:
+            remote = shlex.join(["sh", "-c", _PRIV_SCRIPT, "sh", *argv])
+            r = sshops.run_remote(ref, remote, secrets=[password],
+                                  stdin=(password + "\n").encode(),
+                                  timeout=max(1, min(int(timeout), 600)))
+            result = {"ok": r["ok"], "host": host, "argv": argv, "exit_code": r["exit_code"],
+                      "stdout": r["stdout"], "stderr": r["stderr"], "via_account": ref,
+                      "route": r.get("route")}
+            for k in ("hint", "host_key_notes"):
+                if k in r:
+                    result[k] = r[k]
+            if r.get("timed_out"):
+                result["reason"] = "timed out"
+        except Exception as e:
+            result = {"ok": False, "host": host, "argv": argv, "reason": str(e)}
+        result = _hide(result, [password])
+        policy.audit("run_privileged", {
+            "host": target, "command": cmdline, "via_account": ref,
+            "approval": ("approved in Claude Code's prompt" if confirmed
+                         else "sudo enabled, no prompt"),
+            "exit_code": result.get("exit_code"), "ok": result.get("ok")})
+        return result
 
     if host == "localhost":
         cmd = ["/bin/sh", "-c", _PRIV_SCRIPT, "sh", *argv]

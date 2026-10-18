@@ -5,7 +5,8 @@ Subcommands (run as `pixi run --manifest-path …/pixi.toml <task>` or
   server                  Run the MCP stdio server.
   log [N]                 Show the last N audit entries (default 20).
   check <command>         Report whether a shell command would be redirected.
-  vault secret|sudo ...   Terminal fallback for the slash commands (hidden prompt).
+  gateway finish GRANT    Finish a setup, export or import Claude prepared where no
+                          dialog could open (hidden prompt).
 """
 from __future__ import annotations
 
@@ -27,8 +28,13 @@ def cmd_log(argv: list[str]) -> int:
             r = json.loads(line)
             d = r.get("detail", {})
             event = r.get("event", "")
-            if event.startswith("vault_") and "command" in d:
-                where = " ".join(x for x in (d.get("command"), d.get("target")) if x)
+            if event == "gate_command":
+                where = " ".join(x for x in ("/gate:" + str(d.get("command", "")),
+                                             d.get("target")) if x)
+                extra = d.get("outcome", "")
+            elif event == "gate_setup":
+                where = " ".join(str(x) for x in (d.get("op"), d.get("what"), d.get("target"))
+                                 if x) or str(d.get("grant", ""))
                 extra = d.get("outcome", "")
             elif event == "run_privileged":
                 where = f"{d.get('host', '')}: {d.get('command', '')}"
@@ -57,7 +63,7 @@ def cmd_log(argv: list[str]) -> int:
 
 def cmd_check(argv: list[str]) -> int:
     command = " ".join(argv)
-    hit = policy.match_blocked(command)
+    hit = policy.match_blocked(command) or policy.match_takeover(command)
     if hit:
         name, route = hit
         print(f"REDIRECT: '{name}' -> use {route}")
@@ -80,57 +86,40 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_log(rest)
     if sub == "check":
         return cmd_check(rest)
-    if sub == "vault":
-        return cmd_vault(rest)
+    if sub == "gateway" and rest[:1] == ["finish"]:
+        return cmd_finish(rest[1:])
     print(__doc__)
     return 0
 
 
-def cmd_vault(argv: list[str]) -> int:
-    """Terminal fallback for /gate:secret and /gate:sudo, for
-    machines with no browser (ssh, headless Linux). Same commands; values are
-    read at a hidden prompt. Session-only sudo enable isn't possible here (no
-    Claude session), so use `sudo enable HOST always`."""
+def cmd_finish(argv: list[str]) -> int:
+    """`gateway finish GRANT`: finish a setup Claude prepared on a machine where
+    no dialog could open. Shows the change, asks y/N, reads any secret hidden."""
     import getpass
 
-    from . import commands
-
-    if not argv or argv[0] not in ("secret", "sudo"):
-        print("usage: vault secret|sudo <command...>   (same as the slash commands)\n")
-        print(commands.SECRET_HELP + "\n\n" + commands.SUDO_HELP)
+    from . import setup
+    if len(argv) != 1:
+        print("usage: gateway finish GRANT   (the id Claude gave you, e.g. g-1a2b3c4d)")
         return 2
     if not sys.stdin.isatty():
-        print("vault: run this in an interactive terminal (values are read at a "
-              "hidden prompt).", file=sys.stderr)
+        print("gateway: run this in an interactive terminal.", file=sys.stderr)
         return 2
 
-    def prompt(title, details, label, optional):
-        print(title)
-        for k, v in details:
-            if v:
-                print(f"  {k}: {v}")
-        value = getpass.getpass(f"{label}{' (Enter to keep)' if optional else ''}: ")
-        if not optional and not value:
-            return None
-        if not optional and argv[0] == "sudo":
-            if getpass.getpass("Again: ") != value:
-                print("They don't match; nothing was saved.")
-                return None
-        return value
+    def confirm(summary: str) -> bool:
+        print(summary)
+        return input("Allow? [y/N] ").strip().lower() in ("y", "yes")
 
-    commands.VALUE_PROVIDER = prompt
-    kind, rest = argv[0], " ".join(argv[1:])
+    def secret(label: str) -> str | None:
+        v = getpass.getpass(f"{label}: ")
+        return v if v else None
+
+    from . import common
+    common.LOGIN_SHOW = lambda code, url: print(  # sign-ins: a device code here
+        f"Open {url} on any device, enter the code {code}, and approve.", flush=True)
+
     try:
-        if kind == "secret":
-            print(commands.run_secret(rest))
-        else:
-            print(commands.run_sudo(rest, session_id=""))
-    except (commands.CommandError, commands.LooksLikeValue) as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(setup.finish(argv[0], confirm, secret))
+        return 0
+    except setup.SetupError as e:
+        print(f"gateway: {e}", file=sys.stderr)
         return 1
-    policy.audit(f"vault_{kind}", commands._log_detail(kind, rest, "ok (terminal)"))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
