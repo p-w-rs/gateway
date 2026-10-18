@@ -4,9 +4,9 @@ route_main   -> PreToolUse(Bash): redirect blocked network/credential/cert CLIs.
 session_main -> SessionStart: inject the network policy and the vault catalog
                 (names, descriptions, hosts; never values) so Claude uses the
                 gateway on the first try.
-prompt_main  -> UserPromptSubmit (via hooks/prompt.sh): handle
-                /gate:secret, /gate:sudo and /gate:account, then let the prompt
-                through with the result (or block it if it may hold a value).
+prompt_main  -> UserPromptSubmit (via hooks/prompt.sh): handle the typed
+                /gate: commands, then let the prompt through with the result
+                (or block it if it may hold a value).
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-from . import commands, policy, vault
+from . import common, policy, vault
 
 SESSION_NOTE = (
     "Network policy for this session: do NOT run curl, wget, nmap, masscan, "
@@ -113,7 +113,7 @@ def _catalog_note(session_id: str = "") -> str:
     if cat["accounts"]:
         lines.append("Accounts in the gateway vault (KIND:NAME; never values):")
         for ref in cat["accounts"]:
-            lines.append("- " + commands._describe_account(ref, data["accounts"][ref], data))
+            lines.append("- " + common._describe_account(ref, data["accounts"][ref], data))
     if cat["sudo"]:
         lines.append("Stored sudo passwords:")
         for key in cat["sudo"]:
@@ -214,16 +214,14 @@ def session_main() -> int:
 
 
 def prompt_main() -> int:
-    """Output for a /secret or /sudo prompt. On an unexpected error it blocks,
+    """Output for a typed /gate: command. On an unexpected error it blocks,
     so a typed value can never fall through to Claude."""
     try:
         payload = json.load(sys.stdin)
         from . import setup
         out = setup.handle(payload)
-        if out is None:
-            out = commands.handle(payload)
     except Exception as e:  # noqa: BLE001
-        out = commands.block(
+        out = common.block(
             f"gateway: could not process the command ({type(e).__name__}); "
             "nothing was saved and it was not sent to Claude.")
     if out is not None:

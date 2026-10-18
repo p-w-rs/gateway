@@ -35,7 +35,6 @@ from . import policy, vault
 
 FORMAT = 1
 MAX_FILE = 5_000_000
-MIN_PASS = {True: 8, False: 12}  # by without_secrets
 AGE_TIMEOUT = 120
 
 
@@ -275,7 +274,7 @@ def _hosts(v: Any, what: str) -> list[str]:
 def validate(obj: Any) -> dict[str, Any]:
     """The file's content, checked as strictly as a setup. Raises
     TransferError for anything wrong (the whole import is refused)."""
-    from . import commands, sshconf
+    from . import common, sshconf
     if not isinstance(obj, dict) or obj.get("gateway_export") != FORMAT:
         raise TransferError("this isn't a gateway export (or it's from a newer version)")
     out: dict[str, Any] = {"without_secrets": bool(obj.get("without_secrets")),
@@ -316,8 +315,8 @@ def validate(obj: Any) -> dict[str, Any]:
             if not isinstance(v, str):
                 raise TransferError(f"{ref}: {f} must be text")
             try:
-                rec[f] = commands._clean_setting(kind, f, v)
-            except commands.CommandError as e:
+                rec[f] = common._clean_setting(kind, f, v)
+            except common.CommandError as e:
                 raise TransferError(f"{ref}: {e}")
         if "host" in a and "host" not in spec["fields"]:
             if not isinstance(a["host"], str) or not vault.HOST_RE.fullmatch(a["host"]):
@@ -326,8 +325,8 @@ def validate(obj: Any) -> dict[str, Any]:
         rec["hosts"] = _hosts(a.get("hosts", []), f"{ref} hosts")
         if spec["owners"]:
             try:
-                rec["owners"] = commands._owners(_str_list(a.get("owners", []), f"{ref} owners"))
-            except commands.CommandError as e:
+                rec["owners"] = common._owners(_str_list(a.get("owners", []), f"{ref} owners"))
+            except common.CommandError as e:
                 raise TransferError(f"{ref}: {e}")
         sec = a.get("secrets") or {}
         if not isinstance(sec, dict):
@@ -475,10 +474,6 @@ def run_export(plan: dict[str, Any], confirm: Callable[[str], bool],
                    "it (or to open it with age -d). It isn't stored anywhere.")
     if not first:
         raise Declined("No passphrase was entered; nothing was exported.")
-    least = MIN_PASS[plan["without_secrets"]]
-    if len(first) < least:
-        raise Declined(f"That passphrase is shorter than {least} characters; nothing was "
-                       "exported. Try again with a longer one.")
     if secret("Type the passphrase again.") != first:
         raise Declined("The two passphrases didn't match; nothing was exported.")
     data = vault.load()

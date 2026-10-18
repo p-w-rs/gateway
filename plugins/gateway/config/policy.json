@@ -20,7 +20,7 @@
     "file_hash": "auto",
     "run_privileged": "ask"
   },
-  "_vault_comment": "Secrets and sudo passwords live in the gateway's own vault, managed with /gate:secret and /gate:sudo.",
+  "_vault_comment": "Secrets and sudo passwords live in the gateway's own vault, managed with /gate:add, /gate:update and /gate:delete.",
   "max_response_bytes": 5000000,
   "download_dir": "quarantine",
   "max_download_bytes": 500000000

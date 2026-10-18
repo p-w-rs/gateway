@@ -1,6 +1,6 @@
 """Microsoft Entra ID (Azure AD) sign-in and tokens for azure and mlcat accounts.
 
-Sign-in happens only in the user's /gate:update (the hook):
+Sign-in happens only in a setup the user started (/gate:add, /gate:update):
 - browser: authorization code + PKCE with a one-time loopback redirect
   (http://localhost:PORT, which Entra allows for public clients), opened in
   the user's browser, where SSO, MFA and conditional access happen as usual;

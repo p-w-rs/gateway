@@ -1,4 +1,4 @@
-"""SSO sign-in for accounts, run only from the user's /gate:account login.
+"""SSO sign-in for accounts, run only from a setup the user started (/gate:add, /gate:update).
 
 GitHub: the plugin's own gh runs `gh auth login --web` in a throwaway
 GH_CONFIG_DIR with --insecure-storage, so it writes the OAuth token into

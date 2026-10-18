@@ -1,6 +1,7 @@
 ---
 name: accounts
 description: Use the user's separate gateway accounts (several GitHub, Hugging Face, Pijul, Azure, ASI ML Catalog, SSH, registry identities) for git, gh, mirrors and APIs, and set up or change repos mirrored between accounts (e.g. personal and work) when the user asks in plain words. Read before any git push/pull/clone, gh, hf, pijul or mirror work, or when the user mentions an account, a profile, "my work GitHub", "keep these in sync", or SSO.
+user-invocable: false
 ---
 
 # Working with gateway accounts

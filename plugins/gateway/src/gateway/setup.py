@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import commands, dialog, policy, vault
+from . import common, dialog, policy, vault
 
 GRANT_TTL = 15 * 60
 PREFIX = re.compile(r"^\s*/gate:(add|update|delete|enable|disable|block|list|export|import)(?=\s|$)(.*)$",
@@ -144,28 +144,24 @@ def _guided(gid: str, op: str, what: str, kind: str, target: str, extra: str) ->
 
 
 def _list(session_id: str) -> str:
-    out = []
-    for fn, arg in ((commands.run_secret, "list"), (commands.run_account, "list")):
-        out.append(fn(arg))
-    out.append(commands.run_sudo("list", session_id))
-    return "\n\n".join(out)
+    return common.list_all(session_id)
 
 
 def _delete(words: list[str], session_id: str) -> str:
     if not words:
-        raise commands.CommandError("Say what to delete, e.g. /gate:delete github:work, "
+        raise common.CommandError("Say what to delete, e.g. /gate:delete github:work, "
                                     "/gate:delete OPENCODE_API_KEY or /gate:delete joshua@powerslabs.")
     if words[0].lower() in ("secret", "account", "sudo"):
         words = words[1:]
     target = " ".join(words)
     if vault.parse_account_ref(target.lower()):
-        return commands.run_account(f"del {target.lower()}")
+        return common.delete_account(target.lower())
     if "@" in target and len(words) == 1:
         user, host = target.split("@", 1)
-        return commands.run_sudo(f"del {user} {host}", session_id)
+        return common.delete_sudo(user, host)
     if len(words) == 2 and vault.load()["sudo"].get(f"{words[0]}@{vault.norm_host(words[1])}"):
-        return commands.run_sudo(f"del {words[0]} {words[1]}", session_id)
-    return commands.run_secret(f"del {target}")
+        return common.delete_sudo(words[0], words[1])
+    return common.delete_secret(target)
 
 
 def _reuse(verb: str, words: list[str], session_id: str) -> str:
@@ -180,11 +176,11 @@ def _reuse(verb: str, words: list[str], session_id: str) -> str:
         data = vault.load()
         a = data["accounts"].get(ref)
         if a is None or a.get("kind") != "ssh":
-            raise commands.CommandError(f"{ref} is not an ssh account; see /gate:list.")
+            raise common.CommandError(f"{ref} is not an ssh account; see /gate:list.")
         reuse = data.setdefault("ssh_reuse", {})
         if verb == "enable":
             if not session_id:
-                raise commands.CommandError("This session has no id, so reuse can't be "
+                raise common.CommandError("This session has no id, so reuse can't be "
                                             "turned on for it.")
             ids = reuse.setdefault(ref, [])
             if session_id not in ids:
@@ -228,12 +224,12 @@ def _account_switch(verb: str, words: list[str], session_id: str) -> str:
         data = vault.load()
         a = data["accounts"].get(ref)
         if a is None:
-            raise commands.CommandError(f"No account named {ref}; see /gate:list.")
+            raise common.CommandError(f"No account named {ref}; see /gate:list.")
         prompts = a.setdefault("prompts", {})
         sess = a.setdefault("session_prompts", {})
         if verb == "enable" and not always:
             if not session_id:
-                raise commands.CommandError("This session has no id, so the switch can't be "
+                raise common.CommandError("This session has no id, so the switch can't be "
                                             "limited to it; add 'always' or try again.")
             ids = sess.setdefault(cls, [])
             if session_id not in ids:
@@ -275,9 +271,9 @@ def _transfer_command(verb: str, arg: str, session_id: str) -> str:
         if not path.is_absolute():
             path = Path.cwd() / path
         if not path.is_file():
-            raise commands.CommandError(f"{path} is not a file.")
+            raise common.CommandError(f"{path} is not a file.")
         if path.stat().st_size > transfer.MAX_FILE:
-            raise commands.CommandError(f"{path} is too big for a gateway export.")
+            raise common.CommandError(f"{path} is too big for a gateway export.")
         gid = open_grant("import", "import", str(path), session_id)
         return (f"Setup {gid} is open for: import {path}. Ask the user with one question "
                 "pop-up whether items that already exist here should be replaced by the "
@@ -290,7 +286,7 @@ def _transfer_command(verb: str, arg: str, session_id: str) -> str:
         try:
             target = str(transfer.check_export_path(arg))
         except transfer.TransferError as e:
-            raise commands.CommandError(str(e))
+            raise common.CommandError(str(e))
     gid = open_grant("export", "export", target, session_id)
     return (f"Setup {gid} is open for: export"
             + (f" to {target}" if target else f" (to {transfer.default_path()})") + ". Ask the "
@@ -346,9 +342,19 @@ def _run_transfer(plan: dict[str, Any], confirm, secret) -> str:
         raise SetupError(str(e))
 
 
+def _typed_password(words: list[str]) -> None:
+    """Words after `/gate:add sudo USER HOST` (or `/gate:update USER@HOST`) can
+    only be a password typed into the chat: block the prompt and scrub them."""
+    raise common.LooksLikeValue(
+        "That looks like a password typed after the command, so it was not sent to Claude "
+        "and nothing was saved. Type only /gate:add sudo (or /gate:add sudo USER HOST); "
+        "the password is typed in the gateway's own dialog. (Your typed text has been "
+        "scrubbed from the transcript.)", [" ".join(words)] + words)
+
+
 def run(verb: str, rest: str, session_id: str) -> str:
     words = rest.split()
-    commands._guard_text(words)
+    common._guard_text(words)
     if verb == "list":
         return _list(session_id)
     if verb in ("export", "import"):
@@ -363,7 +369,7 @@ def run(verb: str, rest: str, session_id: str) -> str:
             words = words[1:]
         if not words:
             return HELP
-        return commands.run_sudo(f"{verb} {' '.join(words)}", session_id)
+        return common.sudo_switch(verb, words, session_id)
     if verb == "delete":
         return _delete(words, session_id)
     if verb == "add":
@@ -376,6 +382,8 @@ def run(verb: str, rest: str, session_id: str) -> str:
                     "over SSH, Azure, the ML Catalog, a container registry, Pijul), a secret "
                     "(an API key or token for a web service) or sudo (a root password for a "
                     "machine), then follow the gate:setup skill with grant=\"" + gid + "\".")
+        if what == "sudo" and len(words) > 3:
+            _typed_password(words[3:])
         gid = open_grant("add", what, kind, session_id)
         return _guided(gid, "add", what, kind, "", extra)
     if verb == "update":
@@ -391,11 +399,13 @@ def run(verb: str, rest: str, session_id: str) -> str:
             what = "secret"
         elif target in data["sudo"]:
             what = "sudo"
+            if len(words) > 1:
+                _typed_password(words[1:])
         else:
-            raise commands.CommandError(f"Nothing named {target}; see /gate:list.")
+            raise common.CommandError(f"Nothing named {target}; see /gate:list.")
         gid = open_grant("update", what, target, session_id)
         return _guided(gid, "update", what, "", target, " ".join(words[1:]))
-    raise commands.CommandError(HELP)
+    raise common.CommandError(HELP)
 
 
 def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -407,15 +417,15 @@ def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
     try:
         result = run(verb, rest, payload.get("session_id") or "")
         outcome = "ok"
-    except commands.LooksLikeValue as e:
-        commands._spawn_scrubber(payload.get("transcript_path", ""), e.typed)
+    except common.LooksLikeValue as e:
+        common._spawn_scrubber(payload.get("transcript_path", ""), e.typed)
         policy.audit("gate_command", {"command": verb, "outcome": "blocked: looked like a value"})
-        return commands.block(f"gateway: {e}")
-    except (commands.CommandError, SetupError) as e:
+        return common.block(f"gateway: {e}")
+    except (common.CommandError, SetupError) as e:
         result, outcome = f"Error: {e}", "error"
     policy.audit("gate_command", {"command": verb, "target": " ".join(rest.split()[:2])[:80],
                                   "outcome": outcome})
-    return commands.passthrough(result)
+    return common.passthrough(result)
 
 
 # ---------------------------------------------------------------------------
@@ -448,8 +458,8 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
     if what == "secret":
         name = str(p.get("name") or g["target"] or "")
         try:
-            commands._name(name)
-        except commands.CommandError as e:
+            common._name(name)
+        except common.CommandError as e:
             raise SetupError(str(e))
         exists = name in data["secrets"]
         if op == "add" and exists:
@@ -473,8 +483,8 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         user, host = (target.split("@", 1) if target else
                       (str(p.get("user", "")), str(p.get("host", ""))))
         try:
-            user, host = commands._sudo_target(user, host)
-        except commands.CommandError as e:
+            user, host = common._sudo_target(user, host)
+        except common.CommandError as e:
             raise SetupError(str(e))
         key = f"{user}@{host}"
         if op == "add" and key in data["sudo"]:
@@ -519,13 +529,15 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
                   or "") for f in spec["fields"]}
     for f, v in got.items():
         try:
-            commands._clean_setting(kind, f, v)
-        except commands.CommandError as e:
+            common._clean_setting(kind, f, v)
+        except common.CommandError as e:
             raise SetupError(str(e))
         if f in ("host", "tenant") and not v.strip():
             raise SetupError(f"{f} is required for {kind} accounts")
     if kind == "ssh" and not got.get("user"):
         raise SetupError("user is required for ssh accounts")
+    if not spec["owners"] and p.get("owners"):
+        raise SetupError(f"{kind} accounts are scoped by host only, not owners")
     if spec["owners"]:
         owners = p.get("owners")
         if owners is None:
@@ -533,10 +545,13 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         if isinstance(owners, str):
             owners = owners.replace(",", " ").split()
         try:
-            commands._owners(list(owners))
-        except commands.CommandError as e:
+            common._owners(list(owners))
+        except common.CommandError as e:
             raise SetupError(str(e))
         got["owners"] = " ".join(owners)
+    extra_hosts = None
+    if "hosts" in p:  # hosts beyond the kind's own (e.g. a Databricks workspace)
+        extra_hosts = _hosts(p["hosts"] if isinstance(p["hosts"], list) else [p["hosts"]])
     desc = str(p.get("description") or (old or {}).get("description", "")).strip()
     if op == "add" and not desc:
         raise SetupError("add a short description, e.g. 'work GitHub (asirobots)'")
@@ -544,6 +559,17 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
     token = cred.get("token")  # "ask" | None
     key = cred.get("ssh_key")  # "generate" | "file" | None
     browser = bool(cred.get("browser"))
+    forget = cred.get("forget") or []
+    if isinstance(forget, str):
+        forget = [forget]
+    if forget:
+        if op != "update":
+            raise SetupError("credentials.forget is for /gate:update")
+        bad = [f for f in forget if f not in spec["secrets"]]
+        if bad or not isinstance(forget, list):
+            raise SetupError(f"credentials.forget: any of {', '.join(spec['secrets'])}")
+        if (token and "token" in forget) or (key and "ssh_key" in forget):
+            raise SetupError("don't add and forget the same credential at once")
     if token not in (None, "ask") or key not in (None, "generate", "file"):
         raise SetupError("credentials: token = 'ask', ssh_key = 'generate' or 'file', "
                          "browser = true/false")
@@ -564,7 +590,7 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
                          "with its own token, not both")
     plan.update(ref=ref, kind=kind, got=got, description=desc, old=old,
                 ask_secret=token == "ask", key=key, key_file=key_file, browser=browser,
-                ssh=ssh_opts)
+                ssh=ssh_opts, forget=list(forget), extra_hosts=extra_hosts)
     who = got.get("login") or got.get("user") or ""
     L.append(f"{'Add' if op == 'add' else 'Change'} the {spec['label']} account “{ref}”: {desc}."
              + (f" Login: {who}." if who else ""))
@@ -588,6 +614,13 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         L.append("A new SSH key is made for it; you'll get its public half to add on the site.")
     if key == "file":
         L.append(f"Its SSH key is read from {key_file} (Claude never reads the file).")
+    if extra_hosts is not None:
+        base = vault.default_hosts(kind, got.get("host") or spec["host"])
+        L.append("Its credentials may go to: " + ", ".join(dict.fromkeys(base + extra_hosts))
+                 + ".")
+    for f in forget:
+        L.append({"token": "Its token is removed.", "ssh_key": "Its SSH key is removed.",
+                  "refresh_token": "Its sign-in is removed (sign in again to use it)."}[f])
     L.extend(_ssh_lines(ssh_opts, old))
     return plan
 
@@ -741,7 +774,7 @@ def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> s
                 "updated": vault.now()}
             vault.save(data)
             s = data["secrets"][plan["name"]]
-        return (f"{'Stored' if op == 'add' else 'Updated'} {commands._describe(plan['name'], s)}.")
+        return (f"{'Stored' if op == 'add' else 'Updated'} {common._describe(plan['name'], s)}.")
     if what == "sudo":
         key = f"{plan['user']}@{plan['host']}"
         with vault.locked():
@@ -759,10 +792,19 @@ def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> s
     if plan["key"] == "file":
         got["ssh_key"] = Path(plan["key_file"]).read_text()
     try:
-        rec, note = commands._apply_form(plan["ref"], plan["kind"], got, plan["old"])
-    except commands.CommandError as e:
+        rec, note = common._apply_form(plan["ref"], plan["kind"], got, plan["old"])
+    except common.CommandError as e:
         raise SetupError(str(e))
     rec["description"] = plan["description"]
+    if plan.get("extra_hosts") is not None:
+        rec["hosts"] = list(dict.fromkeys(vault.default_hosts(plan["kind"], rec.get("host", ""))
+                                          + plan["extra_hosts"]))
+    for f in plan.get("forget", []):
+        rec["secrets"].pop(f, None)
+        if f == "ssh_key":
+            for k in ("public_key", "key_fingerprint", "old_public_keys"):
+                rec.pop(k, None)
+            rec["secrets"].pop("old_ssh_keys", None)
     if plan["kind"] == "ssh" and plan.get("ssh"):
         extra = _apply_ssh(rec, plan["ssh"], plan["old"])
         if extra:
@@ -773,13 +815,13 @@ def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> s
             raise SetupError(f"{plan['ref']} already exists")
         data["accounts"][plan["ref"]] = rec
         vault.save(data)
-        msg = f"{'Added' if op == 'add' else 'Updated'} {commands._describe_account(plan['ref'], rec, data)}."
+        msg = f"{'Added' if op == 'add' else 'Updated'} {common._describe_account(plan['ref'], rec, data)}."
     if note:
         msg += "\n" + note
     if plan["browser"]:
         try:
-            msg += "\n" + commands.run_account(f"login {plan['ref']}")
-        except commands.CommandError as e:
+            msg += "\n" + common.login(plan["ref"])
+        except common.CommandError as e:
             msg += f"\nThe account is saved, but sign-in didn't finish: {e} Run /gate:update {plan['ref']} to try again."
     return msg
 

@@ -6,59 +6,45 @@ slash commands) and one store outside it (the vault). They all share
 Python.
 
 ```
-                 ┌───────────────────────── Claude Code session ─────────────────────────┐
- user prompt ──▶ │ UserPromptSubmit hook ── /gate:secret|sudo ──▶ commands.py ─┐   │
-                 │   (prompt.sh pre-filter)                                          │   │
-                 │                              browser form (web_form.py) ◀─────────┤   │
-                 │                                                                   ▼   │
-                 │ SessionStart hook ── policy note + vault catalog ──▶ Claude     vault │
-                 │                                                                (age) │
- Claude's Bash ─▶│ PreToolUse(Bash) hook ── blocklist match ──▶ deny + "use X"        ▲   │
-                 │                                                                   │   │
- Claude's tools ▶│ MCP server "gw" (mcp_server.py → actions.py) ── reads secrets ────┘   │
-                 │     http_request / download / port_check / cert_inspect / file_hash   │
-                 │     secret_list / secret_use / run_privileged(_confirm)               │
-                 └───────────────────────────────────────────────────────────────────────┘
-                   everything above appends to logs/audit.jsonl (values redacted)
+                 ┌──────────────────────────── Claude Code session ─────────────────────────────┐
+ user prompt ──▶ │ UserPromptSubmit hook ── /gate:… ──▶ setup.py (+ common.py) ──────────────┐  │
+                 │   (prompt.sh pre-filter)      add/update open a grant ─▶ Claude asks,   │  │
+                 │                               calls gate_setup ─▶ native dialog ────────┤  │
+                 │ SessionStart hook ── policy note + vault catalog ──▶ Claude              ▼  │
+                 │                                                                     vault │
+ Claude's Bash ─▶│ PreToolUse(Bash) hook ── blocklist / take-over ──▶ deny + "use X"  (age)  │
+                 │                                                                       ▲   │
+ Claude's tools ▶│ MCP server "gw" (mcp_server.py) ── actions, git/gh/ssh/… as accounts ─┘   │
+                 └─────────────────────────────────────────────────────────────────────────────┘
+                   everything above appends to the audit log (values redacted)
 ```
 
 ## Hooks (`hooks/hooks.json`)
 
 | Event | Runs | Does |
 |---|---|---|
-| SessionStart | `run.py hook-session` | Injects the network policy plus a **catalog**: secret names, descriptions, allowed hosts, sudo targets and their state for *this* session. Never values. If sudo is enabled for the session, it also shows the user a `systemMessage` warning. |
-| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes ordinary prompts through without starting Python. For `/gate:secret`, `/gate:sudo` or `/gate:account` (or bare `/secret`, `/sudo`, `/account`) it calls `commands.handle`. |
-| PreToolUse(Bash) | `run.py hook-route` | `policy.match_blocked(command)`; on a hit, it returns `permissionDecision: deny` with the gateway equivalent. It fails open on its own errors. |
+| SessionStart | `run.py hook-session` | Injects the network policy plus a **catalog**: secret names, descriptions, allowed hosts, accounts, sudo targets and their state for *this* session. Never values. Writes `unset …` for the user's credential variables to `CLAUDE_ENV_FILE`. If sudo is enabled for the session, it also shows the user a `systemMessage` warning. |
+| UserPromptSubmit | `hooks/prompt.sh` → `run.py hook-prompt` | The shell pre-filter passes every prompt that isn't a `/gate:` command (add, update, delete, enable, disable, block, list, export, import) through without starting Python; those go to `setup.handle`. |
+| PreToolUse(Bash) | `run.py hook-route` | `policy.match_blocked(command)` and the take-over list; on a hit, it returns `permissionDecision: deny` with the gateway equivalent. It fails open on its own errors. |
+| PreToolUse(gateway tools, file tools) | `hooks/perm.sh` | `ask` for the `*_confirm` tools and `port_check`, `allow` for the other gateway tools; file tools that name a credential path go to `run.py hook-files`. |
 
-### The slash commands and the prompt hook
+### The typed commands and the prompt hook
 
-`commands.handle(payload)` returns hook JSON:
+`setup.handle(payload)` returns hook JSON:
 
-- **Normal case: pass through.** It runs the command (add, up, allow, enable,
-  …), then returns `additionalContext` holding a `<gateway-result>`
-  block. The prompt still reaches Claude, expanded from
-  `commands/secret.md`/`sudo.md`, whose body tells Claude to relay the result
-  in a line and call no tools. There's no "blocked by hook" popup, and the
-  input box isn't refilled.
-- **Values** (`secret add/up`, `sudo add/up`, `account add/up`) come from
-  `web_form.ask(…)` (one masked field) or `web_form.ask_form(…)` (an
-  account's settings plus masked token and key fields), a
-  one-time page on 127.0.0.1 the hook opens in the browser and waits on (up to
-  300 s; the hook timeout is 330 s). The typed command never contains a value.
-- **No browser** (`web_form.gui_available()` is false: Linux without
-  `DISPLAY`/`WAYLAND_DISPLAY`, or macOS over ssh): nothing is saved, and the
-  passed-through result gives the exact terminal fallback, `pixi run
-  --manifest-path …/pixi.toml vault secret|sudo …` (`cli.cmd_vault`). That runs
-  the same `run_secret`/`run_sudo` code with `commands.VALUE_PROVIDER` set to a
-  hidden `getpass` prompt, and refuses to read from a non-terminal. Python's
-  `webbrowser` is never used on a headless machine, because it can fall back to
-  console browsers (lynx) that would hang the hook.
+- **Normal case: pass through.** It runs the command, then returns
+  `additionalContext` holding a `<gateway-result>` block. The prompt still
+  reaches Claude, expanded from `commands/<verb>.md`, whose body tells Claude
+  to relay the result (or, for add/update/export/import, to guide the setup).
+- **Values are never typed in a command.** They're typed in the native
+  dialog that `gate_setup` opens (see "Short commands and guided setup").
 - **Safety net: block.** If the text looks like it holds a value
-  (`_TOKEN_LIKE`, or extra words after `sudo add USER HOST`), it returns
-  `decision: block` with `suppressOriginalPrompt`, saves nothing, and starts a
-  detached scrubber (`run.py scrub`). The scrubber overwrites the typed words
-  with `*` in the session transcript and prompt history for ~10 s, only on
-  lines containing a command marker, keeping the file the same length.
+  (`common._TOKEN_LIKE`, or extra words after `/gate:add sudo USER HOST` or
+  `/gate:update USER@HOST`), it returns `decision: block` with
+  `suppressOriginalPrompt`, saves nothing, and starts a detached scrubber
+  (`run.py scrub`). The scrubber overwrites the typed words with `*` in the
+  session transcript and prompt history for ~10 s, only on lines holding a
+  `gate:` command, keeping the file the same length.
 - Unexpected exception → block (fail closed). `prompt.sh` also blocks if
   Python can't run.
 
@@ -69,7 +55,7 @@ ping; it negotiates the client's protocol version). `dispatch` maps tools onto
 `actions.py`. Claude Code passes `CLAUDE_CODE_SESSION_ID` in the server's
 environment, and that's how per-session sudo works.
 
-| Tool | settings.json | Notes |
+| Tool | Permission (perm.sh) | Notes |
 |---|---|---|
 | http_request | allow | http(s) only; `auth_ref=NAME` puts the vault value in `auth_header` (default `Authorization: Bearer …`); refused unless the request's host is in the secret's `hosts`; the value is scrubbed from the response; credentials are dropped on cross-host or downgrade redirects; redirects must stay in `allow_domains` |
 | download | allow | to `quarantine/`, never overwrites, streams the sha256, `max_download_bytes` |
@@ -158,8 +144,8 @@ overwritten); a `path` in the proposal is refused.
 - **age without a terminal:** age reads passphrases only from a tty, so it
   runs under `pty.fork()` and the gateway answers its prompts; the
   plaintext moves through a FIFO in a 0700 temp dir, never a regular file.
-  The passphrase (twice, at least 12 characters for a full copy, 8 for a
-  shareable one) is typed in the native dialog or, headless, at
+  The passphrase (any length, typed twice; empty cancels, since age would
+  otherwise make one up) is typed in the native dialog or, headless, at
   `gateway finish GRANT`.
 - **Import:** passphrase -> decrypt -> validate the whole file as strictly
   as a setup (names, hosts, kinds, fields, owners, credentials, routes,
@@ -209,7 +195,7 @@ store.age   age-encrypted JSON, mode 600, replaced atomically; plaintext only vi
 
 A version 1 vault (no accounts) loads as-is and is written back as version 2.
 
-**Accounts** (`/gate:account`, `KINDS` in vault.py): `github`, `hf`, `pijul`,
+**Accounts** (`/gate:add account`, `KINDS` in vault.py): `github`, `hf`, `pijul`,
 `azure`, `mlcat`, `ssh`, `registry`.
 
 - **Values vs. catalog.** Everything under `secrets` is a value; the rest is
@@ -282,7 +268,7 @@ calls it yet, the `git` MCP tool comes next). Per call:
   - One that lists the owner wins over one with no owners (a catch-all).
   - Two candidates at the same level are ambiguous: pass `account=`.
   - A named account outside its owners is refused, with the
-    `/gate:account allow` command to fix it.
+    `/gate:update KIND:NAME allow OWNER` command to fix it.
   - No match: the command runs without credentials (public repos).
 - **Class and policy:**
   - Classes: `read` (fetch, pull, clone, ls-remote, lfs fetch) and `write`
@@ -301,8 +287,8 @@ calls it yet, the `git` MCP tool comes next). Per call:
   - gh refuses `auth`, extensions, alias, config, browse/`--web`,
     `--hostname`, repo clone/sync, pr checkout, and repo create/fork with clone/push/remote options. `gh api` only
     to the account's hosts.
-- **`/gate:account login github:NAME`** (`logins.py`):
-  - The hook runs the plugin's gh `auth login --web --insecure-storage` in
+- **GitHub browser sign-in** (`logins.py`, from a setup with `credentials.browser`):
+  - `gate_setup` runs the plugin's gh `auth login --web --insecure-storage` in
     a 0700 temp `GH_CONFIG_DIR` and shows gh's one-time code on a local
     page (`web_form.Notice`, with Cancel) or in the terminal.
   - When gh exits it reads `oauth_token` from that dir into the vault and
@@ -311,7 +297,7 @@ calls it yet, the `git` MCP tool comes next). Per call:
 
 ## Entra (`entra.py`) and the catalog (`mlcat.py`)
 
-- **Sign-in:** `/gate:account login` for azure and mlcat accounts runs
+- **Sign-in:** a setup with `credentials.browser` for azure and mlcat accounts runs
   auth code + PKCE with a one-time `http://localhost:PORT` redirect in your
   browser, or device code in the terminal. The refresh token goes into the
   vault.
@@ -372,8 +358,8 @@ on while the plugin is enabled.
 
 - **Typed commands:** `/gate:add|update|delete|enable|disable|list|export|import`
   go through the UserPromptSubmit hook (`prompt.sh` → `hooks.prompt_main` →
-  `setup.handle`, then `commands.handle` for the v0.5 commands). `delete`,
-  `enable`, `disable` and `list` act at once: the typed command is the consent.
+  `setup.handle`). `delete`, `enable`, `disable`, `block` and `list` act at
+  once: the typed command is the consent.
 - **Grants:** `add` and `update` open a **grant**
   `{op, what, target, session, expires (+15 min), used, pending}` in
   `vault["grants"]`, inside the encrypted vault, so Claude's Bash can't
@@ -389,15 +375,14 @@ on while the plugin is enabled.
      Claude can fix the proposal and retry.
   3. Shows `dialog.confirm` with a plain-language summary, then
      `dialog.secret` for a token or password, or opens a browser sign-in.
-  4. Saves through the same code as the v0.5 commands
-     (`commands._apply_form`, the sudo and secret records), and marks the
-     grant used.
+  4. Saves (`common._apply_form` for accounts, plus routes, extra hosts and
+     `credentials.forget`; the sudo and secret records), and marks the grant
+     used.
 - **No dialog:** the proposal is kept with the grant, and the user runs
   `pixi run … gateway finish GRANT` in a terminal. It shows the summary,
   asks y/N and reads the value at a hidden prompt.
-- **v0.5 commands:** `/gate:secret` and `/gate:sudo` take their value from
-  the same dialog; `/gate:account add|up` point to `/gate:add` and
-  `/gate:update`.
+- **Headless sign-in:** in `gateway finish`, `common.LOGIN_SHOW` prints the
+  device code (GitHub, Entra) instead of opening a page.
 
 ## Native dialogs (`dialog.py`)
 

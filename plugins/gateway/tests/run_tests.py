@@ -291,9 +291,10 @@ check("audit error text never holds the query secret",
 check("scrub leaves plain text", policy.scrub("git status --short", policy.load_config())
       == "git status --short")
 
-# --- Vault + /secret and /sudo chat commands (throwaway vault in TMP) --------
+# --- Vault + the typed /gate: commands (throwaway vault in TMP) ---------------
 print("vault commands:")
-from gateway import commands, vault  # noqa: E402
+from gateway import common, vault  # noqa: E402
+from gateway import setup as _st  # noqa: E402
 
 os.environ["GATEWAY_HOME"] = str(TMP / "vault")
 SID = "test-session-1"
@@ -302,8 +303,8 @@ TRANSCRIPT.write_text("")
 SUDO_PW = "pa$$ w0rd'\"=x"
 ME = __import__("getpass").getuser()
 
-# A fake "browser" for the value form: records the URL; then, per the plan
-# file, fills the form like a user would (save VALUE / cancel / nothing).
+# A fake "browser" for sign-in pages (GitHub, Entra): records the URL; then,
+# per the plan file, fills the page like a user would.
 FAKE_BROWSER = TMP / "fake_browser.py"
 FAKE_BROWSER.write_text(r'''
 import json, os, re, sys, urllib.parse, urllib.request
@@ -330,7 +331,7 @@ os.environ.update(GATEWAY_BROWSER=str(FAKE_BROWSER_SH), FAKE_URL_FILE=str(URL_FI
 
 
 # A fake native dialog (dialog.py): answers per the plan (save VALUE / cancel)
-# and records what it was shown. Values are typed only in a dialog now.
+# and records what it was shown. Values are typed only in a dialog.
 FAKE_DLG = TMP / "fake_dialog.py"
 DLG_PLAN, DLG_SEEN = TMP / "dialog.plan", TMP / "dialog.seen"
 FAKE_DLG.write_text(f"""#!{sys.executable}
@@ -357,152 +358,155 @@ def dialogs_seen():
 
 
 def say(prompt, sid=SID):
-    """Run a prompt through the UserPromptSubmit handler. Adds out["reason"]:
-    the text the user/Claude gets, whether passed through or blocked."""
-    out = commands._handle_legacy({"prompt": prompt, "session_id": sid,
-                           "transcript_path": str(TRANSCRIPT)})
+    """Run a typed prompt through the UserPromptSubmit handler. Adds
+    out["reason"]: the text the user/Claude gets, passed through or blocked."""
+    out = _st.handle({"prompt": prompt, "session_id": sid, "transcript_path": str(TRANSCRIPT)})
     if out is not None:
         out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
     return out
 
 
 def passed(out):
+    """A typed command passed through with a result, or a setup that finished."""
+    if out is not None and "ok" in out and "hookSpecificOutput" not in out:
+        return bool(out["ok"])
     return out is not None and "decision" not in out and \
         "<gateway-result>" in out["hookSpecificOutput"]["additionalContext"]
 
 
-def add_secret(name, value, desc):
-    form_plan({"action": "save", "value": value})
-    return say(f"/gate:secret add {name} {desc}")
+def run_setup(op, what, target, prop, value="", action="save", sid=SID):
+    """A typed /gate:add or /gate:update (the grant), Claude's proposal, and
+    the user's answer in the (fake) dialog. Adds r["reason"]: the text."""
+    gid = _st.open_grant(op, what, target, sid)
+    form_plan({"action": action, "value": value})
+    r = _st.gate_setup(gid, prop, sid)
+    r["reason"] = r.get("result") or r.get("reason", "")
+    return r
 
 
-def add_sudo(user, host, pw):
-    form_plan({"action": "save", "value": pw})
-    return say(f"/gate:sudo add {user} {host}")
+def add_secret(name, value, desc, hosts=(), action="save"):
+    return run_setup("add", "secret", "", {"what": "secret", "name": name, "description": desc,
+                                           "hosts": list(hosts)}, value, action)
+
+
+def allow_secret(name, *hosts):
+    cur = vault.secret(name)["hosts"]
+    return run_setup("update", "secret", name,
+                     {"what": "secret", "hosts": cur + [h for h in hosts if h not in cur]})
+
+
+def add_sudo(user, host, pw, action="save"):
+    return run_setup("add", "sudo", "", {"what": "sudo", "user": user, "host": host}, pw, action)
 
 
 out = add_secret("HF_TOKEN", "hf_abc123456789", "Hugging Face token for the Hub API")
-check("/secret add: passes through to Claude (no block, no pop-up)", passed(out))
-check("/secret add: value came from the browser form",
-      vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
-check("/secret add: result names it, never the value",
-      "Stored HF_TOKEN" in out["reason"] and "hf_abc123456789" not in out["reason"])
-check("the value is asked in a hidden dialog that names it and its description",
-      dialogs_seen()[-1][0] == "secret" and "HF_TOKEN" in dialogs_seen()[-1][2]
-      and "Hugging Face token" in dialogs_seen()[-1][2])
+check("add secret: the value comes from the dialog",
+      out.get("ok") and vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
+check("add secret: the result names it, never the value",
+      "Stored HF_TOKEN" in out["reason"] and "hf_abc123456789" not in json.dumps(out))
+check("the value is asked in a hidden dialog that names it",
+      dialogs_seen()[-1][0] == "secret" and "HF_TOKEN" in dialogs_seen()[-1][2])
 check("vault key is mode 600", oct(vault.key_path().stat().st_mode & 0o777) == "0o600")
 check("vault file is encrypted", b"hf_abc123456789" not in vault.store_path().read_bytes())
 check("ordinary prompt is not handled", say("please list my secrets") is None)
-check("short /secret form handled too", passed(say("  /secret list")))
 out = add_secret("HF_TOKEN", "other_value_123", "dup")
-check("add refuses an existing name (passed through as an error, no form)",
-      passed(out) and "already exists" in out["reason"] and not dialogs_seen()
+check("add refuses an existing name (no dialog)",
+      out.get("refused") and "already exists" in out["reason"] and not dialogs_seen()
       and vault.secret("HF_TOKEN")["value"] == "hf_abc123456789")
 check("bad name refused", "not a valid name" in add_secret("9BAD", "v12345", "x")["reason"])
-check("add needs a description", "Add a description" in say("/gate:secret add NODESC")["reason"]
+check("add needs a description", "description" in add_secret("NODESC", "v1", "")["reason"]
       and not vault.secret("NODESC"))
-form_plan({"action": "cancel"})
-out = say("/gate:secret add CANCELLED something")
-check("form cancelled: nothing stored", "Cancelled" in out["reason"] and not vault.secret("CANCELLED"))
-out = say("/gate:secret list")
-check("/secret list shows name, description, hosts",
-      "HF_TOKEN: Hugging Face token for the Hub API [hosts: none yet]" in out["reason"])
-out = say("/gate:secret allow HF_TOKEN huggingface.co")
-check("/secret allow", passed(out) and vault.secret("HF_TOKEN")["hosts"] == ["huggingface.co"])
-check("allow refuses '*'", "not a host" in say("/gate:secret allow HF_TOKEN *")["reason"])
-form_plan({"action": "save", "value": "hf_new_987654321"})
-say("/gate:secret up HF_TOKEN")
-check("/secret up: new value from form, description and hosts kept",
+out = add_secret("CANCELLED", "x", "something", action="cancel")
+check("dialog cancelled: nothing stored", out.get("declined") and not vault.secret("CANCELLED"))
+check("/gate:list shows name, description, hosts",
+      "HF_TOKEN: Hugging Face token for the Hub API [hosts: none yet]" in say("/gate:list")["reason"])
+check("update: allow a host", allow_secret("HF_TOKEN", "huggingface.co").get("ok")
+      and vault.secret("HF_TOKEN")["hosts"] == ["huggingface.co"])
+check("update refuses '*' as a host",
+      "not a host" in run_setup("update", "secret", "HF_TOKEN",
+                                {"what": "secret", "hosts": ["*"]})["reason"])
+run_setup("update", "secret", "HF_TOKEN", {"what": "secret", "new_value": True}, "hf_new_987654321")
+check("update: a new value from the dialog, description and hosts kept",
       vault.secret("HF_TOKEN")["value"] == "hf_new_987654321"
       and vault.secret("HF_TOKEN")["description"].startswith("Hugging Face token")
       and vault.secret("HF_TOKEN")["hosts"] == ["huggingface.co"])
-form_plan({"action": "save", "value": ""})
-say("/gate:secret up HF_TOKEN Hub token, renamed")
-check("/secret up: empty value keeps it, changes description",
+run_setup("update", "secret", "HF_TOKEN",
+          {"what": "secret", "description": "Hub token: write access to my models", "hosts": []})
+check("update: only the description and hosts change, the value stays",
       vault.secret("HF_TOKEN")["value"] == "hf_new_987654321"
-      and vault.secret("HF_TOKEN")["description"] == "Hub token, renamed")
-say("/gate:secret desc HF_TOKEN Hub token: write access to my models")
-check("/secret desc", vault.secret("HF_TOKEN")["description"] == "Hub token: write access to my models")
-say("/gate:secret disallow HF_TOKEN huggingface.co")
-check("/secret disallow", vault.secret("HF_TOKEN")["hosts"] == [])
+      and vault.secret("HF_TOKEN")["description"] == "Hub token: write access to my models"
+      and vault.secret("HF_TOKEN")["hosts"] == [])
 add_secret("TMP_X", "tmp_value_123", "temp")
-say("/gate:secret del TMP_X")
-check("/secret del", vault.secret("TMP_X") is None)
-check("unknown subcommand gives help", "Unknown command" in say("/gate:secret frob")["reason"])
+check("/gate:delete NAME", passed(say("/gate:delete TMP_X")) and vault.secret("TMP_X") is None)
 
 print("typed values are blocked, never passed through:")
-out = say("/gate:secret add LEAK hf_abcdefghij123456 my token")
-check("token-like word: blocked, not stored", out["decision"] == "block"
+out = say("/gate:add secret LEAK hf_abcdefghij123456 my token")
+check("token-like word: blocked, not stored", out.get("decision") == "block"
       and out["hookSpecificOutput"]["suppressOriginalPrompt"] is True and not vault.secret("LEAK"))
 check("block message never repeats it", "hf_abcdefghij123456" not in out["reason"])
-out = say("/gate:secret allow HF_TOKEN ghp_abcdefghijklmnop1234")
-check("token-like word anywhere: blocked", out["decision"] == "block")
+out = say("/gate:update HF_TOKEN ghp_abcdefghijklmnop1234")
+check("token-like word anywhere: blocked", out.get("decision") == "block")
+out = say(f"/gate:add sudo {ME} localhost {SUDO_PW}")
+check("a password after /gate:add sudo USER HOST: blocked, not passed to Claude",
+      out.get("decision") == "block" and SUDO_PW not in out["reason"]
+      and not vault.sudo_entries("localhost"))
 _log = Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
-check("blocked attempt is logged with name and reason",
-      '"secret add"' in _log and '"LEAK"' in _log and "looked like a typed value" in _log)
-check("blocked attempt's value is not logged",
-      "hf_abcdefghij123456" not in _log and "ghp_abcdefghijklmnop1234" not in _log)
-check("log names the secret command and target",
-      '"command": "secret allow", "target": "HF_TOKEN -> huggingface.co", "outcome": "ok"' in _log)
+check("blocked attempts are logged with the reason",
+      '"gate_command"' in _log and "looked like a value" in _log)
+check("blocked attempts' values are not logged",
+      all(v not in _log for v in ("hf_abcdefghij123456", "ghp_abcdefghijklmnop1234", SUDO_PW)))
 check("ordinary description words are fine",
-      passed(add_secret("DOCS_TOKEN", "docs_value_1", "Readme token for docs site")))
-out = say(f"/gate:sudo add {ME} localhost {SUDO_PW}")
-check("password after /sudo add USER HOST: blocked, not stored",
-      out["decision"] == "block" and not vault.sudo_entries("localhost")
-      and SUDO_PW not in out["reason"])
+      passed(say("/gate:add secret Readme token for docs site")))
 
-print("sudo commands:")
+print("sudo:")
 out = add_sudo(ME, "localhost", SUDO_PW)
-check("/sudo add: password from form (spaces/quotes kept), passes through",
-      passed(out) and vault.sudo_entries("localhost")[0]["password"] == SUDO_PW
-      and SUDO_PW not in out["reason"])
-check("sudo dialog names user and host",
-      ME in dialogs_seen()[-1][2] and "this machine" in dialogs_seen()[-1][2])
-out = add_sudo("someoneelse", "localhost", SUDO_PW)
-check("/sudo localhost must be the current user", "asks for the password of" in out["reason"])
+check("add sudo: password from the dialog (spaces/quotes kept)",
+      out.get("ok") and vault.sudo_entries("localhost")[0]["password"] == SUDO_PW
+      and SUDO_PW not in json.dumps(out))
+check("the sudo dialog names user and host",
+      ME in dialogs_seen()[-1][2] and "localhost" in dialogs_seen()[-1][2])
+check("sudo on this machine must be the current user",
+      "asks for the password of" in add_sudo("someoneelse", "localhost", SUDO_PW)["reason"])
 add_sudo("admin", "myserver", SUDO_PW)
 add_sudo("admin", "10.0.0.5", "not-the-password")
-out = say("/gate:sudo list")
-check("/sudo list shows user@host and state, never passwords",
-      out["reason"].count("@") == 3 and SUDO_PW not in out["reason"]
-      and "disabled" in out["reason"])
-check("/sudo host can't look like an ssh option",
+out = say("/gate:list")
+check("/gate:list shows user@host and state, never passwords",
+      all(k in out["reason"] for k in (f"{ME}@localhost", "admin@myserver", "admin@10.0.0.5"))
+      and SUDO_PW not in out["reason"] and "disabled" in out["reason"])
+check("sudo host can't look like an ssh option",
       "not a host" in add_sudo("admin", "-oProxyCommand=x", "pw123456")["reason"])
-form_plan({"action": "cancel"})
-out = say("/gate:sudo add admin box1")
-check("/sudo add cancelled: nothing stored", "Cancelled" in out["reason"]
-      and not vault.sudo_entries("box1"))
+out = add_sudo("admin", "box1", "x", action="cancel")
+check("add sudo cancelled: nothing stored", out.get("declined") and not vault.sudo_entries("box1"))
 
 print("sudo enable for one session vs always:")
 check("disabled by default", not vault.sudo_enabled("myserver", SID))
-out = say("/gate:sudo enable myserver")
-check("enable HOST: this session only", passed(out) and "THIS session only" in out["reason"]
+out = say("/gate:enable sudo myserver")
+check("enable sudo HOST: this session only", passed(out) and "THIS session only" in out["reason"]
       and vault.sudo_enabled("myserver", SID)
       and not vault.sudo_enabled("myserver", "another-session")
       and not vault.sudo_enabled("myserver"))
-check("/sudo list shows session state", "ENABLED for this session"
-      in say("/gate:sudo list")["reason"])
-check("other sessions still see it disabled", "admin@myserver  [disabled"
-      in say("/gate:sudo list", sid="another-session")["reason"])
-out = say("/gate:sudo enable myserver always")
-check("enable HOST always: every session", "EVERY session" in out["reason"]
+check("/gate:list shows session state", "ENABLED for this session" in say("/gate:list")["reason"])
+check("other sessions still see it disabled",
+      "admin@myserver  [disabled" in say("/gate:list", sid="another-session")["reason"])
+out = say("/gate:enable sudo myserver always")
+check("enable sudo HOST always: every session", "EVERY session" in out["reason"]
       and vault.sudo_enabled("myserver", "another-session") and vault.sudo_enabled("myserver"))
-say("/gate:sudo disable myserver")
+say("/gate:disable sudo myserver")
 check("disable clears both", not vault.sudo_enabled("myserver", SID)
       and not vault.sudo_enabled("myserver"))
 check("can't enable without a stored password",
-      "No sudo password stored" in say("/gate:sudo enable nowhere.example")["reason"])
-check("enable usage checked", "Usage" in say("/gate:sudo enable myserver forever")["reason"])
+      "No sudo password stored" in say("/gate:enable sudo nowhere.example")["reason"])
+check("enable usage checked", "Usage" in say("/gate:enable sudo myserver forever")["reason"])
 
 print("transcript scrubbing (only for blocked typed values):")
 line_cmd = json.dumps({"type": "queue-operation",
-                       "content": f"/sudo add {ME} localhost {SUDO_PW}"}) + "\n"
+                       "content": f"/gate:add sudo {ME} localhost {SUDO_PW}"}) + "\n"
 line_note = json.dumps({"type": "system", "content":
-                        "Original prompt: /secret add HF_TOKEN hf_abc123456789 x"}) + "\n"
+                        "Original prompt: /gate:add secret HF_TOKEN hf_abc123456789 x"}) + "\n"
 line_other = json.dumps({"type": "user", "content": "unrelated pa$$ hf_abc123456789"}) + "\n"
 TRANSCRIPT.write_text(line_cmd + line_note + line_other)
 size = TRANSCRIPT.stat().st_size
-n = commands.scrub_file(TRANSCRIPT, [SUDO_PW, "hf_abc123456789"])
+n = common.scrub_file(TRANSCRIPT, [SUDO_PW, "hf_abc123456789"])
 t = TRANSCRIPT.read_text()
 check("scrub removes values from command lines", SUDO_PW not in t.splitlines()[0]
       and "hf_abc123456789" not in t.splitlines()[1] and n == 2)
@@ -510,9 +514,9 @@ check("scrub keeps file size (safe while appending)", TRANSCRIPT.stat().st_size 
 check("scrub keeps every line valid JSON", all(json.loads(x) for x in t.splitlines()))
 check("scrub leaves non-command lines alone", t.splitlines()[2] == line_other.strip())
 TRANSCRIPT.write_text("")
-say("/gate:secret add LATE hf_latevalue123456789 written after the hook returns")
+say("/gate:add secret LATE hf_latevalue123456789 written after the hook returns")
 with TRANSCRIPT.open("a") as f:
-    f.write(json.dumps({"content": "/gate:secret add LATE hf_latevalue123456789 x"}) + "\n")
+    f.write(json.dumps({"content": "/gate:add secret LATE hf_latevalue123456789 x"}) + "\n")
 deadline = time.time() + 8
 while time.time() < deadline and "hf_latevalue123456789" in TRANSCRIPT.read_text():
     time.sleep(0.2)
@@ -534,13 +538,13 @@ def run_sh(prompt, root=ROOT):
 t0 = time.time()
 check("wrapper: normal prompt passes untouched", run_sh("hello there") == "")
 check("wrapper: normal prompt is fast (no Python)", time.time() - t0 < 0.5)
-out = json.loads(run_sh("/gate:secret desc HF_TOKEN via the wrapper"))
-check("wrapper: a retired /gate:secret is handled and points to the new commands",
-      "decision" not in out and "/gate:add secret" in out["hookSpecificOutput"]["additionalContext"]
-      and vault.secret("HF_TOKEN")["description"] != "via the wrapper")
-out = json.loads(run_sh("/gate:secret add X ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"))
-check("wrapper: a value typed into a retired command is still blocked", out.get("decision") == "block")
-out = json.loads(run_sh("/gate:secret list", root=TMP / "no-such-plugin"))
+out = json.loads(run_sh("/gate:list"))
+check("wrapper: a /gate: command is handled and passed through",
+      "decision" not in out and "HF_TOKEN" in out["hookSpecificOutput"]["additionalContext"])
+out = json.loads(run_sh("/gate:add secret X ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"))
+check("wrapper: a value typed into a command is blocked", out.get("decision") == "block")
+check("wrapper: other /gate: words aren't commands", run_sh("/gate:secret list") == "")
+out = json.loads(run_sh("/gate:list", root=TMP / "no-such-plugin"))
 check("wrapper: gateway failure blocks (fail closed)", out["decision"] == "block")
 
 print("vault-backed tools:")
@@ -548,8 +552,8 @@ use_config({})
 add_secret("API_KEY", "key_abcdef123456", "Test API on 127.0.0.1")
 r = actions.http_request("GET", A + "/x", auth_ref="API_KEY")
 check("not-yet-allowed secret refused with /secret allow hint",
-      r.get("refused") is True and "/gate:secret allow API_KEY 127.0.0.1" in r["reason"])
-say("/secret allow API_KEY 127.0.0.1")
+      r.get("refused") is True and "/gate:update API_KEY allow 127.0.0.1" in r["reason"])
+allow_secret("API_KEY", "127.0.0.1")
 r = actions.http_request("GET", A + "/x", auth_ref="API_KEY")
 check("allowed secret sent as Bearer", echoed(r).get("authorization") == "***REDACTED***"
       or "authorization" in echoed(r))
@@ -698,19 +702,19 @@ with _cl.redirect_stdout(_buf):
 _view = _buf.getvalue()
 check("/gate:log shows root runs with approval and exit code",
       "admin@myserver: printf" in _view and "[approved in Claude Code's prompt, exit 0]" in _view)
-check("/gate:log shows vault commands with target and outcome",
-      "secret add HF_TOKEN  [ok]" in _view and "blocked: looked like a typed value" in _view)
+check("/gate:log shows typed commands and setups with target and outcome",
+      "add secret HF_TOKEN  [ok]" in _view and "blocked: looked like a value" in _view)
 check("/gate:log never shows vault values",
       not any(v in _view for v in (SUDO_PW, "hf_abc123456789", "hf_new_987654321")))
 print("sudo enable/disable:")
-say("/sudo del other myserver")
+say("/gate:delete other@myserver")
 check("disabled by default", not vault.sudo_enabled("localhost")
       and not vault.sudo_enabled("myserver"))
 r = actions.run_privileged("localhost", ["echo", "x"])
 check("disabled: refused with confirm and enable hints", r.get("refused") is True
       and "run_privileged_confirm" in r["reason"]
       and "/gate:enable sudo localhost" in r["reason"])
-out = say("/sudo enable localhost always")
+out = say("/gate:enable sudo localhost always")
 check("/sudo enable localhost always", vault.sudo_enabled("localhost")
       and "WITHOUT asking" in out["reason"])
 check("/sudo 127.0.0.1 counts as localhost", vault.sudo_enabled("127.0.0.1"))
@@ -729,30 +733,30 @@ check("'refuse' in policy.json beats enabled", r.get("refused") is True)
 r = confirmed("localhost", ["echo", "x"])
 check("'refuse' in policy.json beats confirmed", r.get("refused") is True)
 use_config({})
-out = say("/sudo list")
+out = say("/gate:list")
 check("/sudo list shows enabled state", f"{ME}@localhost  [ENABLED" in out["reason"]
       and "admin@myserver  [disabled" in out["reason"] and SUDO_PW not in out["reason"])
 check("Claude's catalog shows enabled hosts",
       f"{ME}@localhost: sudo ENABLED in every session" in hooks._catalog_note(SID))
 check("user gets a session-start warning while enabled",
       "ENABLED" in (hooks._enabled_warning() or "") and "localhost" in hooks._enabled_warning())
-out = say("/sudo disable localhost")
+out = say("/gate:disable sudo localhost")
 check("/sudo disable HOST (either word order)", not vault.sudo_enabled("localhost"))
 r = actions.run_privileged("localhost", ["echo", "x"])
 check("disabled again: refused without confirm", r.get("refused") is True)
 check("no session warning when nothing is enabled", hooks._enabled_warning() is None)
-out = say("/sudo enable nowhere.example always")
+out = say("/gate:enable sudo nowhere.example always")
 check("can't enable a host without a stored password",
       "No sudo password stored" in out["reason"] and not vault.sudo_enabled("nowhere.example"))
-say("/sudo enable myserver always")
-say("/sudo del admin myserver")
+say("/gate:enable sudo myserver always")
+say("/gate:delete admin@myserver")
 check("/sudo del of the last entry also disables the host", not vault.sudo_enabled("myserver"))
 add_sudo("admin", "myserver", SUDO_PW)
 check("re-added host starts disabled", not vault.sudo_enabled("myserver"))
 
 # Session-only enable: run_privileged reads the session id Claude Code gives
 # each MCP server (CLAUDE_CODE_SESSION_ID).
-say("/sudo enable myserver", sid="sess-A")
+say("/gate:enable sudo myserver", sid="sess-A")
 os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-A"
 r = actions.run_privileged("myserver", ["echo", "sess"])
 check("session-enabled: runs in that session without asking", r.get("ok") is True)
@@ -765,20 +769,20 @@ check("...nor with no session id", r.get("refused") is True)
 check("session-start warning only for that session",
       "myserver" in (hooks._enabled_warning("sess-A") or "")
       and hooks._enabled_warning("sess-B") is None)
-say("/sudo disable myserver")
+say("/gate:disable sudo myserver")
 
 # Secrets: a new host is refused with a /secret allow hint; once allowed
 # (Claude Code's prompt gates that tool) it goes through without asking.
 add_secret("NEWHOST_KEY", "nh_value_123456", "test key")
-say("/secret allow NEWHOST_KEY localhost")
+allow_secret("NEWHOST_KEY", "localhost")
 n = len(HITS)
 r = actions.http_request("GET", A + "/x", auth_ref="NEWHOST_KEY", approve=approver(True))
 check("new host: refused, not sent, no gateway prompt",
       r.get("refused") is True and len(HITS) == n and not ASKED)
 check("new host: hint gives the exact /secret allow command",
-      "/gate:secret allow NEWHOST_KEY 127.0.0.1" in r["reason"])
+      "/gate:update NEWHOST_KEY allow 127.0.0.1" in r["reason"])
 check("refusal never shows the value", "nh_value_123456" not in json.dumps(r))
-say("/secret allow NEWHOST_KEY 127.0.0.1")
+allow_secret("NEWHOST_KEY", "127.0.0.1")
 check("/secret allow adds the host", True
       and vault.secret("NEWHOST_KEY")["hosts"] == ["localhost", "127.0.0.1"])
 r = actions.http_request("GET", A + "/x", auth_ref="NEWHOST_KEY")
@@ -894,18 +898,18 @@ check("mcp result hides secret", SECRET not in json.dumps(body))
 body, el = c.call("run_privileged_confirm", {"host": "localhost", "argv": ["echo", "hi"]})
 check("run_privileged_confirm runs (Claude Code's prompt gates it), no gateway form",
       el is None and body.get("ok") is True and body.get("stdout") == "hi\n")
-say("/sudo enable localhost always")
+say("/gate:enable sudo localhost always")
 body, el = c.call("run_privileged", {"host": "localhost", "argv": ["echo", "mcp"]})
 check("enabled sudo over MCP: run_privileged runs, no prompt",
       el is None and body.get("ok") is True)
-say("/sudo disable localhost")
+say("/gate:disable sudo localhost")
 body, el = c.call("run_privileged", {"host": "localhost", "argv": ["echo", "mcp"]})
 check("disabled again over MCP: refused", el is None and body.get("refused") is True)
 add_secret("MCP_KEY", "mcp_value_123456", "test")
 body, el = c.call("http_request", {"url": A + "/x", "auth_ref": "MCP_KEY"})
 check("secret to new host over MCP: refused with hint, no gateway form",
-      el is None and body.get("refused") is True and "/gate:secret allow" in body["reason"])
-say("/secret allow MCP_KEY 127.0.0.1")
+      el is None and body.get("refused") is True and "/gate:update" in body["reason"])
+allow_secret("MCP_KEY", "127.0.0.1")
 check("/secret allow, then MCP sees the host",
       el is None and vault.secret("MCP_KEY")["hosts"] == ["127.0.0.1"])
 body, el = c.call("http_request", {"url": A + "/x", "auth_ref": "MCP_KEY"})
@@ -1013,36 +1017,6 @@ finally:
         else:
             os.environ[k] = v
 
-os.environ["GATEWAY_DIALOG"] = "none"
-out = say("/gate:secret add HEADLESS_K a key added over ssh")
-check("no dialog: passes through an error with the exact terminal command",
-      passed(out) and "pixi run --manifest-path" in out["reason"]
-      and "gateway secret add HEADLESS_K a key added over ssh" in out["reason"]
-      and not vault.secret("HEADLESS_K"))
-os.environ["GATEWAY_DIALOG"] = str(FAKE_DLG)
-
-# The terminal fallback reuses the same command code with a hidden prompt.
-from gateway import commands as _cmds  # noqa: E402
-_cmds.VALUE_PROVIDER = lambda title, details, label, optional: "term_value_123456"
-try:
-    msg = _cmds.run_secret("add TERM_K added from a terminal")
-    check("terminal fallback: stores the value, reply has none",
-          vault.secret("TERM_K")["value"] == "term_value_123456"
-          and "term_value_123456" not in msg)
-    _cmds.run_sudo("add termuser box7", session_id="")
-    check("terminal fallback: sudo add works", vault.sudo_entries("box7")[0]["password"]
-          == "term_value_123456")
-    try:
-        _cmds.run_sudo("enable box7", session_id="")
-        check("terminal fallback: session-only enable needs 'always'", False)
-    except _cmds.CommandError as e:
-        check("terminal fallback: session-only enable needs 'always'", "always" in str(e))
-finally:
-    _cmds.VALUE_PROVIDER = None
-p = subprocess.run([sys.executable, str(ROOT / "run.py"), "vault", "secret", "add", "X", "d"],
-                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-check("the retired v0.5 terminal command says what to use instead (reads nothing)",
-      p.returncode == 2 and "retired" in p.stdout and "gateway finish" in p.stdout)
 check("/gate:help command exists, mentions the short commands and the terminal",
       "/gate:add" in (ROOT / "commands" / "help.md").read_text()
       and "gateway finish" in (ROOT / "commands" / "help.md").read_text())
@@ -1127,17 +1101,21 @@ def _setup_account(sub, rest):
 
 
 def acct(prompt):
+    """An account add or update the way the user and Claude would do it:
+    "/gate:account add KIND NAME desc" or "... up REF [desc]" is shorthand
+    for /gate:add or /gate:update plus Claude's proposal from acct_form."""
     m = re.match(r"^/gate:account (add|up|update) (.*)$", prompt, re.S)
-    if m and m.group(2).split() and not _TOKEN_IN.search(m.group(2)):
-        return _setup_account("add" if m.group(1) == "add" else "update", m.group(2))
-    out = commands._handle_legacy({"prompt": prompt, "session_id": SID,
-                           "transcript_path": str(TRANSCRIPT)})
-    if out is not None:
-        out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
-    return out
+    return _setup_account("add" if m.group(1) == "add" else "update", m.group(2))
 
 
-_TOKEN_IN = re.compile(r"\b(gho_|ghp_|hf_)\w{10,}")
+def acct_update(ref, **prop):
+    """/gate:update REF with a proposal (owners, hosts, credentials, ...)."""
+    return run_setup("update", "account", ref, {"what": "account", **prop})
+
+
+def login(ref):
+    """/gate:update REF, signing in again in the browser."""
+    return acct_update(ref, credentials={"browser": True})
 
 
 # v1 vault (no accounts) still reads, and is saved as v2.
@@ -1185,10 +1163,9 @@ check("account add: needs a description",
 check("account add: bad name refused",
       "name: a short lowercase name" in acct("/gate:account add github Bad/Name d")["reason"])
 check("host names with digits are not mistaken for tokens",
-      "decision" not in acct("/gate:account allow github:work adb-1234567890123456.7.azuredatabricks.net"))
-acct("/gate:account disallow github:work adb-1234567890123456.7.azuredatabricks.net")
+      "decision" not in say("/gate:update github:work allow adb-1234567890123456.7.azuredatabricks.net"))
 check("pasted token in the command is blocked, nothing saved",
-      acct(f"/gate:account add github leak {GH_TOKEN_V}").get("decision") == "block"
+      say(f"/gate:add github leak {GH_TOKEN_V}").get("decision") == "block"
       and vault.account("github:leak") is None)
 acct_form(action="cancel")
 check("account dialog cancelled: nothing stored",
@@ -1268,64 +1245,49 @@ acct_form({"host": "-oProxyCommand=x", "user": "deploy", "port": "",
            "ssh_key_mode": "none", "ssh_key": ""})
 check("host that looks like an ssh option refused",
       "not a valid host" in acct("/gate:account add ssh evil Bad host")["reason"])
-check("pubkey shows the public key",
-      vault.account("pijul:nest")["public_key"] in acct("/gate:account pubkey pijul:nest")["reason"])
+check("the public key (not secret) is in what Claude sees, to paste on a site",
+      vault.catalog()["accounts"]["pijul:nest"]["public_key"]
+      == vault.account("pijul:nest")["public_key"])
 
-# Scope: owners and hosts.
-acct("/gate:account allow github:work p-w-rs ghe.example.com")
+# Scope: owners and extra hosts, through /gate:update.
+acct_update("github:work", owners=["asirobots", "p-w-rs"], hosts=["ghe.example.com"])
 a = vault.account("github:work")
-check("allow: owner and host (dot = host)",
-      "p-w-rs" in a["owners"] and "ghe.example.com" in a["hosts"])
-acct("/gate:account disallow github:work p-w-rs ghe.example.com")
+check("update: owners and an extra host",
+      "p-w-rs" in a["owners"] and "ghe.example.com" in a["hosts"] and "github.com" in a["hosts"])
+acct_update("github:work", owners=["asirobots"], hosts=[])
 a = vault.account("github:work")
-check("disallow: owner and host removed",
-      "p-w-rs" not in a["owners"] and "ghe.example.com" not in a["hosts"])
+check("update: owner and extra host removed, the kind's own hosts stay",
+      "p-w-rs" not in a["owners"] and "ghe.example.com" not in a["hosts"]
+      and a["hosts"] == ["github.com", "api.github.com"])
 check("owners refused on a host-only kind",
-      "scoped by host only" in acct("/gate:account allow ssh:box someone")["reason"])
+      "scoped by host only" in acct_update("ssh:box", owners=["someone"])["reason"])
+check("an extra host must be a host name",
+      acct_update("github:work", hosts=["-oProxyCommand=x"]).get("refused"))
 
-# Prompt policy (stored in the vault, so Claude can't loosen it).
-check("prompts: defaults", "read=auto, write=auto, delete=ask, exec=ask"
-      in acct("/gate:account prompts github:work")["reason"])
-acct("/gate:account prompts github:work write=ask delete=refuse")
-check("prompts: per account", vault.effective_prompts(vault.account("github:work"), vault.load())
-      == {"read": "auto", "write": "ask", "delete": "refuse", "exec": "ask"})
-acct("/gate:account prompts * read=ask")
-check("prompts: '*' default applies to other accounts",
-      vault.effective_prompts(vault.account("pijul:nest"), vault.load())["read"] == "ask")
-check("prompts: bad value refused",
-      "should look like" in acct("/gate:account prompts github:work write=yes")["reason"])
-acct("/gate:account prompts * reset")
-acct("/gate:account prompts github:work reset")
-check("prompts: reset", vault.effective_prompts(vault.account("github:work"), vault.load())
-      == vault.DEFAULT_PROMPTS)
 
-# Import a /gate:secret value as a token; forget; azure default client.
-with vault.locked():
-    _d = vault.load()
-    _d["secrets"]["HF_IMPORT"] = {"value": "hf_importvalue123456", "description": "to import",
-                                  "hosts": [], "updated": ""}
-    vault.save(_d)
-acct_form({"login": "me", "owners": "", "token": "", "ssh_key_mode": "none", "ssh_key": ""})
+# Forget one credential; azure default client.
+acct_form({"login": "me", "owners": "", "token": "hf_metoken123456", "ssh_key_mode": "none",
+           "ssh_key": ""})
 acct("/gate:account add hf me My HF")
-acct("/gate:account import hf:me HF_IMPORT")
-check("import: secret value becomes the account token",
-      vault.account("hf:me")["secrets"]["token"] == "hf_importvalue123456")
-acct("/gate:account forget hf:me token")
-check("forget: token removed", "token" not in vault.account("hf:me")["secrets"])
+check("update credentials.forget: token removed",
+      acct_update("hf:me", credentials={"forget": ["token"]}).get("ok")
+      and "token" not in vault.account("hf:me")["secrets"])
+check("forget only on update, and only what the kind has",
+      acct_update("hf:me", credentials={"forget": ["refresh_token"]}).get("refused"))
 acct_form({"tenant": "contoso.onmicrosoft.com", "client_id": "", "login": ""})
 acct("/gate:account add azure work Work Azure")
 check("azure: default client id is the Azure CLI's public client",
       vault.account("azure:work")["client_id"] == vault.AZURE_CLI_CLIENT_ID)
-check("login: kinds without SSO say so",
-      "no SSO sign-in" in acct("/gate:account login ssh:box")["reason"])
+check("browser sign-in only where there is one",
+      "browser sign-in is for" in acct_update("ssh:box", credentials={"browser": True})["reason"])
 
 # http_request with an account as auth_ref: only to its hosts.
 n = len(HITS)
 r = actions.http_request("GET", A + "/x", auth_ref="github:work")
 check("account auth_ref refused for a host outside its scope, with the allow hint",
-      r.get("refused") is True and "/gate:account allow github:work 127.0.0.1" in r["reason"]
+      r.get("refused") is True and "/gate:update github:work allow 127.0.0.1" in r["reason"]
       and len(HITS) == n)
-acct("/gate:account allow github:work 127.0.0.1")
+acct_update("github:work", hosts=["127.0.0.1"])
 r = actions.http_request("GET", A + "/x", auth_ref="github:work")
 check("account auth_ref sent to an allowed host", r.get("ok") is True
       and "authorization" in echoed(r))
@@ -1346,18 +1308,10 @@ check("session note tells Claude the short commands", "/gate:add account" in _ho
 out = json.loads(run_sh("/gate:list"))
 check("wrapper routes /gate:list", "decision" not in out
       and "github:work" in out["hookSpecificOutput"]["additionalContext"])
-for _old, _new in (("/gate:sudo list", "/gate:enable sudo"), ("/gate:account list", "/gate:block")):
-    check(f"retired {_old.split()[0]} points to the v2 commands",
-          _new in commands.handle({"prompt": _old, "session_id": SID})
-          ["hookSpecificOutput"]["additionalContext"])
-check("old /gate:account add (typed in full) points to /gate:add",
-      "/gate:add account" in commands.handle({"prompt": "/gate:account add registry term From a terminal",
-                                              "session_id": SID})["hookSpecificOutput"]["additionalContext"])
 acct_form({"host": "registry.example.com", "login": "bot", "owners": "", "token": "tok_terminal_123456"})
 acct("/gate:account add registry term From a terminal")
-acct("/gate:account del registry:term")
-check("del", vault.account("registry:term") is None)
-check("account help lists the kinds", "github, hf, pijul" in acct("/gate:account help")["reason"])
+say("/gate:delete registry:term")
+check("/gate:delete KIND:NAME", vault.account("registry:term") is None)
 os.environ["GATEWAY_BROWSER"] = _old_browser
 
 # --- Runner core: credentials for one call, hardened git -----------------------
@@ -1861,7 +1815,7 @@ with vault.locked():
 acct_form(None)  # the fake browser only opens the page
 ACCT_PLAN.write_text("null")
 os.environ["GATEWAY_BROWSER"] = str(ACCT_BROWSER_SH)
-out = acct("/gate:account login github:sso")
+out = login("github:sso")
 a = vault.account("github:sso")
 check("login: token from gh's sign-in stored in the vault",
       a["secrets"].get("token") == "gho_fakeLOGINtoken123456" and a.get("token_source") == "gh-oauth")
@@ -1877,24 +1831,24 @@ with vault.locked():
     _d["accounts"]["github:sso"]["secrets"] = {}
     vault.save(_d)
 t0 = time.time()
-out = acct("/gate:account login github:sso")
+out = login("github:sso")
 os.environ.pop("FAKE_GH_SLEEP")
 check("login: Cancel on the page stops gh, nothing saved",
       "cancelled" in out["reason"] and not vault.account("github:sso")["secrets"].get("token")
       and time.time() - t0 < 15)
 _shown = []
-_cmds.LOGIN_SHOW = lambda code, url: _shown.append((code, url))
+common.LOGIN_SHOW = lambda code, url: _shown.append((code, url))
 try:
-    msg = _cmds.run_account("login github:sso")
+    msg = common.login("github:sso")
 finally:
-    _cmds.LOGIN_SHOW = None
+    common.LOGIN_SHOW = None
 check("login (terminal): prints the code instead of a page",
       _shown == [("ABCD-1234", "https://github.com/login/device")] and "Signed in" in msg)
 r = ghops.gh_tool(["issue", "list"], account="github:sso")
 check("gh: a github.com account gets GH_TOKEN", r["ok"] and "dotcom-token-present" in r["stdout"]
       and "gho_fakeLOGINtoken123456" not in json.dumps(r))
-check("login: kinds without SSO say so (hf)",
-      "no SSO sign-in" in acct("/gate:account login hf:me")["reason"])
+check("login: kinds without a browser sign-in say so (hf)",
+      "browser sign-in is for" in login("hf:me")["reason"])
 os.environ.pop("GATEWAY_BIN_GH")
 
 print("MCP + settings:")
@@ -2539,7 +2493,7 @@ FOLLOW_SH.chmod(0o755)
 _prev_browser = os.environ["GATEWAY_BROWSER"]
 os.environ["GATEWAY_BROWSER"] = str(FOLLOW_SH)
 try:
-    out = acct("/gate:account login azure:work")
+    out = login("azure:work")
 finally:
     os.environ["GATEWAY_BROWSER"] = _prev_browser
 a = vault.account("azure:work")
@@ -2553,7 +2507,7 @@ check("entra login: result holds no token", passed(out) and "rt-1" not in out["r
 n = len(HITS)
 r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="storage")
 check("azure token refused for a host outside the account", r.get("refused") is True and len(HITS) == n)
-acct("/gate:account allow azure:work 127.0.0.1")
+acct_update("azure:work", hosts=["127.0.0.1"])
 _hits = ENTRA["token_hits"]
 r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="storage")
 _auth = echoed(r).get("authorization", "")
@@ -2567,11 +2521,11 @@ check("azure: the access token is cached (no second refresh)", ENTRA["token_hits
 r = actions.http_request("GET", A + "/x", auth_ref="azure:work", auth_scope="graph")
 check("azure: another scope mints another token", ENTRA["token_hits"] == _hits + 2 and r.get("ok"))
 _shown2 = []
-_cmds.LOGIN_SHOW = lambda code, url: _shown2.append(code)
+common.LOGIN_SHOW = lambda code, url: _shown2.append(code)
 try:
-    msg = _cmds.run_account("login azure:work")
+    msg = common.login("azure:work")
 finally:
-    _cmds.LOGIN_SHOW = None
+    common.LOGIN_SHOW = None
 check("entra login (terminal): device code shown, then signed in",
       _shown2 == ["DEV-123"] and "Signed in" in msg)
 
@@ -2589,7 +2543,7 @@ try:
     WS = "adb-123.4.azuredatabricks.net"
     check("databricks: workspace outside the account refused",
           dbops.databricks_tool(["clusters", "list"], "azure:work", WS).get("refused") is True)
-    acct(f"/gate:account allow azure:work {WS}")
+    acct_update("azure:work", hosts=["127.0.0.1", WS])
     r = dbops.databricks_tool(["clusters", "list"], "azure:work", f"https://{WS}/")
     check("databricks: Entra token for the workspace, pat auth, no profiles",
           r["ok"] and f"host=https://{WS}" in r["stdout"] and "db-token-present" in r["stdout"]
@@ -2687,7 +2641,7 @@ check("mlcat account: default host is the catalog (host name, no port)",
       vault.account("mlcat:asi")["hosts"] == ["127.0.0.1"] and vault.account("mlcat:asi")["host"] == CHOST)
 os.environ["GATEWAY_BROWSER"] = str(FOLLOW_SH)
 try:
-    out = acct("/gate:account login mlcat:asi")
+    out = login("mlcat:asi")
 finally:
     os.environ["GATEWAY_BROWSER"] = _prev_browser
 a = vault.account("mlcat:asi")
@@ -2990,7 +2944,7 @@ finally:
 acct_form({"host": "ghcr.io", "login": "me", "via": "", "owners": "me", "token": "ghp_classicAAAA1111"})
 acct("/gate:account add registry gh2 ghcr own token")
 check("registry with its own token: summary lists the token method",
-      "methods: token" in acct("/gate:account list")["reason"])
+      "methods: token" in say("/gate:list")["reason"])
 acct_form({"host": "ghcr.io", "login": "me", "via": "github:pkgs", "owners": "me",
            "token": "ghp_otherBBBB2222"})
 out = acct("/gate:account up registry:gh2")
@@ -3003,11 +2957,6 @@ _a = vault.account("registry:gh2")
 check("form: choosing via drops the old token and says so",
       _a.get("via") == "github:pkgs" and not _a["secrets"].get("token") and "removed" in out["reason"])
 check("summary shows the via account", "signs in through github:pkgs" in out["reason"])
-_f = {f["name"]: f for f in commands._account_fields("github", None)}
-check("owners help explains repo-URL owners and spaces",
-      "github.com/OWNER" in _f["owners"]["help"] and "spaces" in _f["owners"]["help"])
-check("ssh host help says ~/.ssh/config aliases aren't read",
-      "~/.ssh/config" in {f["name"]: f for f in commands._account_fields("ssh", None)}["host"]["help"])
 
 # --- v2 phase 2: native dialogs, plugin data folder ---------------------------
 print("dialogs:")
@@ -3367,10 +3316,15 @@ gid = _gid(_st.run("export", f" {_e2e}", SID))
 check("/gate:export opens a setup", gid.startswith("g-"))
 r = _st.gate_setup(gid, {"what": "export", "without_secrets": False, "path": str(XF / "x.age")}, SID)
 check("export: Claude can't choose the path", r.get("refused") and "path" in r["reason"])
-form_plan({"action": "save", "value": "short"})
+form_plan({"action": "save", "value": ""})
 r = _st.gate_setup(gid, {"what": "export", "without_secrets": False}, SID)
-check("export: a short passphrase is refused, nothing written",
+check("export: an empty passphrase cancels (age would make one up), nothing written",
       r.get("declined") and not _e2e.exists())
+_one = XF / "one-char.age"
+transfer.run_export({"what": "export", "path": _one, "without_secrets": True, "lines": ["x"]},
+                    lambda m: True, lambda l: "z")
+check("export: a passphrase of any length works (one character here)",
+      _one.is_file() and json.loads(transfer.decrypt(_one, "z"))["gateway_export"] == 1)
 form_plan({"action": "save", "value": _PASS5})
 r = _st.gate_setup(gid, {"what": "export", "without_secrets": False}, SID)
 check("export: through the dialogs, file written, the result names the path",
@@ -3538,5 +3492,31 @@ check("/gate:block can't be run by Claude itself",
       "disable-model-invocation: true" in (ROOT / "commands" / "block.md").read_text())
 check("prompt.sh sends /gate:block to the gateway",
       "block" in (ROOT / "hooks" / "prompt.sh").read_text().split("gate:(")[1].split(")")[0])
+print("only the v2 commands exist:")
+check("no old command files", not any((ROOT / "commands" / f"{n}.md").exists()
+                                      for n in ("secret", "sudo", "account")))
+check("no old command module", not (ROOT / "src" / "gateway" / "commands.py").exists())
+check("prompt.sh routes only the /gate: commands",
+      "secret|sudo|account" not in (ROOT / "hooks" / "prompt.sh").read_text())
+check("an old command is just a prompt (not handled)", say("/gate:secret list") is None
+      and say("/secret add X y") is None)
+for _sk in ("accounts", "setup"):
+    check(f"skill gate:{_sk} is for Claude only (not in the slash menu)",
+          "\nuser-invocable: false\n" in (ROOT / "skills" / _sk / "SKILL.md").read_text())
+out = say(f"/gate:update admin@myserver {SUDO_PW}")
+check("a password after /gate:update USER@HOST is blocked too",
+      out and out.get("decision") == "block" and SUDO_PW not in json.dumps(out))
+_npriv, _npub = vault.generate_ssh_key("forget test")
+with vault.locked():
+    _d = vault.load()
+    _d["accounts"]["ssh:forget"] = {"kind": "ssh", "description": "f", "host": "f.example.com",
+                                    "user": "u", "hosts": ["f.example.com"], "public_key": _npub,
+                                    "key_fingerprint": "SHA256:x",
+                                    "secrets": {"ssh_key": _npriv}, "prompts": {}}
+    vault.save(_d)
+acct_update("ssh:forget", credentials={"forget": ["ssh_key"]})
+_a = vault.account("ssh:forget")
+check("forget ssh_key: the key and its public half are gone",
+      "ssh_key" not in _a["secrets"] and "public_key" not in _a and "key_fingerprint" not in _a)
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

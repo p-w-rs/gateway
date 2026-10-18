@@ -287,9 +287,8 @@ def _ask_new_host(ref: str, host: str, method: str, url: str, bound: list[str],
 
 
 def _how_to_allow(ref: str, host: str) -> str:
-    cmd = "account" if vault.parse_account_ref(ref) else "secret"
-    return (f"If the task needs it, ask the user to run: "
-            f"/gate:{cmd} allow {ref} {host} - then retry.")
+    return (f"If the task needs it, ask the user to type: /gate:update {ref} allow {host} "
+            "(you then guide the setup), and retry.")
 
 
 def _resolve_secret(ref: str, cfg: dict[str, Any] | None = None,
@@ -419,7 +418,7 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
     # run_privileged_confirm, which settings.json puts on "ask", so Claude
     # Code's permission prompt asks the user every time.
     try:
-        # Claude Code tells each MCP server its session id; the /sudo command
+        # Claude Code tells each MCP server its session id; /gate:enable sudo
         # records the same id when it enables sudo for one session.
         enabled = vault.sudo_enabled(host, os.environ.get("CLAUDE_CODE_SESSION_ID"))
     except Exception as e:

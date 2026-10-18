@@ -79,7 +79,7 @@ VERSION = 2
 
 
 def _empty() -> dict[str, Any]:
-    # sudo_enabled: hosts enabled in every session (`/sudo enable HOST always`).
+    # sudo_enabled: hosts enabled in every session (`/gate:enable sudo HOST always`).
     # sudo_session: {host: [session ids]} enabled for those sessions only.
     # run_privileged runs without asking there; elsewhere it needs approval.
     # accounts / account_prompts: see the module docstring and KINDS.
@@ -283,7 +283,7 @@ PINNED_KINDS = ("pijul", "ssh")
 
 def keyscan(host: str, port: str = "") -> str:
     """The host's SSH keys as known_hosts lines (ssh-keyscan), or "".
-    Used only from the user's /gate:account add/up (their trust decision);
+    Used only from a setup the user started (/gate:add, /gate:update: their trust decision);
     GATEWAY_KEYSCAN=none turns it off (tests)."""
     if host == "nest.pijul.com" and port in ("", "22"):
         return NEST_KNOWN_HOSTS
@@ -449,6 +449,7 @@ def account_view(ref: str, acct: dict[str, Any], data: dict[str, Any]) -> dict[s
     view["methods"] = methods(acct)
     if acct.get("public_key"):
         view["key_fingerprint"] = acct.get("key_fingerprint", "")
+        view["public_key"] = acct["public_key"]  # the half to paste on a site; not a secret
     if kind in PINNED_KINDS:
         view["host_keys"] = host_key_fingerprints(acct.get("known_hosts", ""))
     view["prompts"] = effective_prompts(acct, data)

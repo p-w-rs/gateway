@@ -28,8 +28,13 @@ def cmd_log(argv: list[str]) -> int:
             r = json.loads(line)
             d = r.get("detail", {})
             event = r.get("event", "")
-            if event.startswith("vault_") and "command" in d:
-                where = " ".join(x for x in (d.get("command"), d.get("target")) if x)
+            if event == "gate_command":
+                where = " ".join(x for x in ("/gate:" + str(d.get("command", "")),
+                                             d.get("target")) if x)
+                extra = d.get("outcome", "")
+            elif event == "gate_setup":
+                where = " ".join(str(x) for x in (d.get("op"), d.get("what"), d.get("target"))
+                                 if x) or str(d.get("grant", ""))
                 extra = d.get("outcome", "")
             elif event == "run_privileged":
                 where = f"{d.get('host', '')}: {d.get('command', '')}"
@@ -83,12 +88,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check(rest)
     if sub == "gateway" and rest[:1] == ["finish"]:
         return cmd_finish(rest[1:])
-    if sub in ("vault", "gateway"):
-        print("The v0.5 terminal commands (vault secret|sudo|account) are retired. Add or "
-              "change things by typing /gate:add, /gate:update, /gate:delete, /gate:enable or "
-              "/gate:disable in Claude Code; where no dialog can open, Claude gives you a "
-              "`gateway finish GRANT` command to run here.")
-        return 2
     print(__doc__)
     return 0
 
@@ -113,6 +112,10 @@ def cmd_finish(argv: list[str]) -> int:
     def secret(label: str) -> str | None:
         v = getpass.getpass(f"{label}: ")
         return v if v else None
+
+    from . import common
+    common.LOGIN_SHOW = lambda code, url: print(  # sign-ins: a device code here
+        f"Open {url} on any device, enter the code {code}, and approve.", flush=True)
 
     try:
         print(setup.finish(argv[0], confirm, secret))

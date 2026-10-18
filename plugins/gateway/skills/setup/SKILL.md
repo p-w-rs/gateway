@@ -1,6 +1,7 @@
 ---
 name: setup
 description: Guide the user through adding or changing something in the gateway (an account, a secret, a sudo password, an SSH server) after they typed /gate:add or /gate:update. Use when a gateway note says "Setup g-… is open". Ask a few plain-language questions with question pop-ups, then call gate_setup.
+user-invocable: false
 ---
 
 # Guiding a gateway setup
@@ -118,7 +119,10 @@ Then ask, per kind:
   ```
 - **Azure:** the tenant (directory id or domain) and browser sign-in.
   Fields: `tenant`, optional `client_id`, `login`. Databricks workspace hosts
-  are allowed later with `/gate:update azure:NAME`.
+  are allowed later with `/gate:update azure:NAME` and
+  `{"hosts": ["adb-….azuredatabricks.net"]}`: `hosts` is the full list of
+  extra hosts beyond the kind's own (send the ones already there too; see
+  `account_list`).
 - **ML Catalog:** browser sign-in; `host` keeps its default.
 - **Container registry:** the host (`ghcr.io`, `docker.io`, an ACR); either
   sign in **through** another account (`via: "github:personal"` for ghcr.io,
@@ -159,7 +163,13 @@ Ask what to change, then send only that. Examples:
 - for an account: `{"fields": {"email": "…"}}`, `{"owners": [...]}`, or
   `{"credentials": {"token": "ask"}}` / `{"credentials": {"browser": true}}`
   to sign in again
+- to remove a credential from an account (e.g. stop using its token and keep
+  only SSH): `{"credentials": {"forget": ["token"]}}` (also `ssh_key`,
+  `refresh_token`)
 - for sudo: `{}`, which asks for the new password
+
+If the user asks for an account's public SSH key (to paste on a site),
+`account_list` shows it; it isn't secret.
 
 ## After gate_setup
 

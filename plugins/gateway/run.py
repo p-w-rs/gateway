@@ -6,7 +6,7 @@ Claude Code launches the MCP server, a hook, or the CLI. Invoked as:
     python run.py server        # MCP stdio server (.mcp.json)
     python run.py hook-route     # PreToolUse(Bash) hook
     python run.py hook-session   # SessionStart hook
-    python run.py hook-prompt    # UserPromptSubmit hook (/secret, /sudo)
+    python run.py hook-prompt    # UserPromptSubmit hook (the /gate: commands)
     python run.py scrub PATH...  # internal: scrub typed values from transcripts
     python run.py log [N]        # show recent audit entries
     python run.py check <cmd>    # test whether a command would redirect
@@ -36,8 +36,8 @@ def main() -> int:
         from gateway import hooks
         return hooks.prompt_main()
     if mode == "scrub":
-        from gateway import commands
-        return commands.scrub_main(sys.argv[2:])
+        from gateway import common
+        return common.scrub_main(sys.argv[2:])
     from gateway import cli
     return cli.main(sys.argv[1:])
 

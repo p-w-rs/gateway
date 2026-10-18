@@ -30,7 +30,7 @@ plugins/gateway/
   install.py                      dev only: register this checkout + remove v0.5's settings.json entries (legacy-settings.json)
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
-  run.py                          single entry: server | hook-* | log | check | scrub | vault
+  run.py                          single entry: server | hook-* | log | check | scrub | gateway finish
   src/gateway/
     policy.py      config, allowlists, redaction/scrubbing, audit log, Bash blocklist
     actions.py     the MCP tools' logic (http, download, port, certs, hash, sudo)
@@ -38,7 +38,7 @@ plugins/gateway/
                    credential helper, hardened git config, scrubbed output
     gitops.py      the git / git_confirm / git_identity tools (account by remote URL)
     ghops.py       the gh / gh_confirm tools (the plugin's own gh)
-    logins.py      /gate:account login (GitHub via gh's web flow)
+    logins.py      GitHub browser sign-in (gh's web flow), from a setup
     entra.py       Entra sign-in (PKCE / device code) and per-scope tokens
     mirrors.py     git_mirror
     hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
@@ -49,13 +49,14 @@ plugins/gateway/
   skills/setup/SKILL.md           how Claude guides /gate:add and /gate:update (gate:setup)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
-    commands.py    v0.5 /gate:secret|sudo|account, shared validation, transcript scrubber
+    common.py      shared by the commands and gate_setup: validation, account records,
+                   list/delete, sudo switches, sign-in, hook output, transcript scrubber
     vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches, accounts (KINDS)
     setup.py       /gate:add|update|delete|enable|disable|list, setup grants, gate_setup, `gateway finish`
     web_form.py    browser opener + pages for GitHub/Entra sign-ins (no value form any more)
     dialog.py      native dialogs (osascript / zenity / kdialog): confirm a change, type a secret hidden
-    cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
-                   fallback for /secret, /sudo and /account when no browser can open)
+    cli.py         `run.py log` (the /gate:log viewer), `check`, and `gateway finish GRANT`
+                   (a setup, export or import where no dialog can open)
   tests/run_tests.py              single offline test script (no pytest)
 ```
 
@@ -105,8 +106,8 @@ your change (mutation-check it).
    afterwards; commands the Bash blocklist matches are refused here too;
    `run_privileged` runs only where sudo is enabled (persistently, or for this
    session via `CLAUDE_CODE_SESSION_ID`).
-6. **The prompt hook fails closed.** If it can't run, a /secret or /sudo
-   prompt is blocked, never passed through (`prompt.sh`).
+6. **The prompt hook fails closed.** If it can't run, a typed /gate: command
+   is blocked, never passed through (`prompt.sh`).
 7. **Stdlib only** in `src/`. The only external binaries are `age`/`age-keygen`
    and OpenSSH's `ssh-keygen` (from pixi), the system `sudo`/`ssh`, and the browser.
 
@@ -147,80 +148,19 @@ your change (mutation-check it).
 
 v2 (plan and trackers in `.work/v2/`, local): one strict mode always on,
 standard plugin install (rules in the plugin's hooks), short typed commands
-with guided setup and native dialogs (the web form and the v0.5
-`/gate:secret|sudo|account` commands are retired), the gateway's own SSH
+(`/gate:add|update|delete|enable|disable|block|list|export|import`, plus
+help and log) with guided setup and native dialogs, the gateway's own SSH
 config (routes, host-key policy, key rotation, opt-in connection reuse),
-export / import, per-account switches (`/gate:enable|disable|block CLASS
-KIND:NAME`). About 800 tests pass; each phase's security properties are
-mutation-checked. Live-tried on macOS: phases 1 to 4. Not yet live: export /
-import, ssh routes, the switches, Linux end to end. plugin.json still says
-0.5.0.
+export / import, per-account switches. The skills are for Claude only
+(`user-invocable: false`). About 790 tests pass; each phase's security
+properties are mutation-checked.
 
-### v0.5.0
+Live-tried on macOS (desktop app): every account kind, push/PR/mirror,
+setup through dialogs, ssh exec/copy/sudo and reuse, export / import, the
+switches. Not yet live: ssh routes (no LAN route here), Linux end to end,
+the ACR exchange. plugin.json still says 0.5.0.
 
-v0.5.0 completes the accounts plan in code:
-- mirrors and the accounts skill;
-- Hugging Face, Pijul (the Nest and self-hosted), SSH hosts, Entra/Azure
-  and Databricks, the ASI ML Catalog, container registries;
-- take-over (off by default) and strict mode.
-
-About 680 tests pass, and every security property has a mutation check.
-
-Verified live (2026-10-17, macOS desktop app; notes in
-`.work/accounts/LIVE-RESULTS.md`, local): all seven kinds. That covers:
-- GitHub personal (PAT + SSH) and work (SSO via gh's login), with push,
-  PR, the confirm prompt and the force-push refusal, plus a personal↔work
-  mirror;
-- Hugging Face Xet upload and download;
-- an SSH host, with exec, copy and sudo through the account;
-- Azure ARM, Databricks, the ML Catalog clone, a ghcr.io push and pull, and
-  the Pijul Nest;
-- strict mode: take-over refusals, blanked tokens, Read denies, and the
-  ssh-agent unset per command.
-
-Still unverified: Linux end-to-end, and the ACR exchange.
-
-### v0.4.0
-
-v0.4.0 adds accounts (`/gate:account`, vault v2). This is phase 1 of the
-accounts plan:
-
-- kinds, scope and the prompt policy;
-- the kind-aware form, with SSH key paste or generate;
-- the terminal fallback;
-- accounts as `auth_ref`.
-
-Covered by tests (6 mutation-checked); not yet tried live.
-
-Phase 2 adds `runner.py`, the credentialed runner. Nothing calls it yet;
-the `git` tool comes next. It's tested against a local git-http-backend
-behind Basic auth, a user-level sshd, and a hostile repo config (hooks,
-fsmonitor, sshCommand, askpass, credential helper, proxy, pack programs).
-8 properties are mutation-checked.
-
-Phase 3 adds the `git` (all of git), `git_confirm`, `git_identity`, `gh`,
-`gh_confirm` and `account_list` tools, and `/gate:account login` for GitHub.
-423 tests pass, and 10 more properties are mutation-checked. Tool changes need
-`pixi run install` (new permission rules) and a new session.
-
-### v0.3.0 (2026-10-15)
-
-Verified live (macOS, desktop app): Bash redirect; vault add/up/allow/del/list
-through the browser form with no popup; secret use to allowed hosts and refusal
-elsewhere; sudo on a remote Linux host with approve, decline, session enable and
-disable; the safety-net block with transcript scrub; the vault read denial; the
-/gate:log view.
-
-Linux: the test suite covers headless detection (no `DISPLAY` means no
-browser and the terminal fallback) and the installer's path handling, and the
-pixi lock includes linux-64 and linux-aarch64. Not yet run end-to-end on a
-Linux desktop.
-
-Not yet verified live: the session-start "sudo enabled" warning; per-session
-isolation in two real sessions (covered by tests); `pixi run install` on a fresh
-machine; Windows (sudo can't work there; the rest should).
-
-Known limitations / ideas:
+Known limitations:
 - The audit log and quarantine live in the plugin data folder
   (`CLAUDE_PLUGIN_DATA`, `~/.claude/plugins/data/gate-gateway`): Claude may
   read them, not edit them. Tests set `GATEWAY_DATA` and `GATEWAY_DIALOG=none`.
@@ -230,6 +170,6 @@ Known limitations / ideas:
 - Plain `sudo` in Bash isn't redirected. It can't prompt for a password
   from Claude's Bash, so it only works for NOPASSWD rules; password-based root
   goes through run_privileged.
-- The `/gate:` prefix is required (plugin commands can't register a
-  bare name). The hook also accepts bare `/secret` and `/sudo`, but the app
-  shows "isn't a command" above the input for those.
+- The `/gate:` prefix is required (plugin commands can't register a bare
+  name).
+- Windows isn't supported (no sudo; export needs a pty).
