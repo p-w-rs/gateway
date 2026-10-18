@@ -1,6 +1,6 @@
 {
   "_comment": "Tune the gateway here; values override the built-in defaults in src/gateway/policy.py. Reload Claude Code after editing.",
-  "_takeover_comment": "true = git, gh, hf, pijul, asiml/dvc, az, databricks, ssh/scp/rsync-to-host, docker/podman registry commands, skopeo, oras and crane in Bash are redirected to the gateway's account tools. Off until the live test passes; `pixi run install --strict` turns it on.",
+  "_takeover_comment": "true = git, gh, hf, pijul, asiml/dvc, az, databricks, ssh/scp/rsync-to-host, docker/podman registry commands, skopeo, oras and crane in Bash are redirected to the gateway's account tools. Keep false here: `pixi run install --strict` turns it on in config/local.json (gitignored), which wins.",
   "takeover": false,
   "_approvals_comment": "auto = run, refuse = never run, ask = needs approval. Real approvals come from Claude Code's permission prompt ('ask' rules in settings.json, e.g. port_check, run_privileged_confirm), so tools gated there are 'auto' here to avoid a second prompt. An 'ask' tier here uses an MCP form, which the desktop app auto-cancels, so in practice it means refuse. run_privileged is decided by the per-host sudo switch; 'refuse' turns it off entirely.",
   "allow_domains": [
