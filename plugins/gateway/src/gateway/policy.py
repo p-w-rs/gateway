@@ -337,6 +337,10 @@ TAKEOVER = [
     (_CMD + r"(?:docker|podman)\s+(?:\S+\s+)*?(?:login|push|pull|logout)\b",
      "docker/podman registry", "the registry tool (crane as a registry account, no daemon)"),
     (_CMD + r"(?:skopeo|oras|crane)(?=\s|$)", "skopeo/oras/crane", "the registry tool"),
+    # Ways back to the user's ssh-agent after the hook unsets SSH_AUTH_SOCK.
+    (_CMD + r"ssh-add(?=\s|$)", "ssh-add", "an ssh account's key (ssh_exec / ssh_copy / git)"),
+    (r"\blaunchctl\s+getenv\s+SSH_AUTH_SOCK\b|com\.apple\.launchd\.[^/\s]*/Listeners",
+     "the user's ssh-agent", "an ssh account's key (ssh_exec / ssh_copy / git)"),
 ]
 _TAKEOVER_COMPILED = [(re.compile(p), name, route) for p, name, route in TAKEOVER]
 

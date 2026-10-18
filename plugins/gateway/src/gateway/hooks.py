@@ -62,6 +62,24 @@ ACCOUNTS_NOTE = (
 )
 
 
+# With take-over on, every Bash command runs without the user's ssh-agent:
+# the desktop app hands Claude Code SSH_AUTH_SOCK and settings `env` can't
+# override it (seen live). The hook rewrites the command with no permission
+# decision, so the user's rules still apply; `install --strict` adds an exact
+# allow rule for this prefix (STRICT_ALLOW) so it never adds a prompt.
+AGENT_UNSET = "unset SSH_AUTH_SOCK SSH_AGENT_PID"
+
+
+def _strip_agent(tool_input: dict, command: str) -> int:
+    if not policy.load_config().get("takeover") or command.startswith(AGENT_UNSET + ";"):
+        return 0
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "updatedInput": {**tool_input, "command": f"{AGENT_UNSET}; {command}"},
+    }}))
+    return 0
+
+
 def route_main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -76,7 +94,7 @@ def route_main() -> int:
 
     hit = policy.match_blocked(command) or policy.match_takeover(command)
     if not hit:
-        return 0
+        return _strip_agent(payload["tool_input"], command)
 
     name, route = hit
     policy.audit("hook_redirect", {"tool": name, "command": command[:500]})

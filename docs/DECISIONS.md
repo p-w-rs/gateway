@@ -159,6 +159,18 @@ git). The parts that shape the code:
   steer Claude; blanking `SSH_AUTH_SOCK`, `GITHUB_TOKEN` and the like for
   Claude Code's processes means a Bash call that slips past the regex has
   nothing to use. The user's own terminal is unaffected.
+- **The ssh-agent is unset per command, not through `env`.** Live, the
+  desktop app's `SSH_AUTH_SOCK` survived both `""` and `/dev/null` in
+  settings `env`, while `GITHUB_TOKEN` was blanked. The PreToolUse hook's
+  `updatedInput` (checked headless: it applies without a permission decision
+  and the user's rules still decide) prefixes `unset SSH_AUTH_SOCK
+  SSH_AGENT_PID;`. Rules are checked against the rewritten command, so the
+  prefix alone needed approval until strict added `Bash(unset SSH_AUTH_SOCK
+  SSH_AGENT_PID)` as an exact allow rule. Returning `allow` instead would
+  have auto-approved every command, so the hook never sets a decision.
+- **Take-over lives in config/local.json.** Writing it into the tracked
+  policy.json left the checkout dirty while strict was on. local.json is
+  gitignored, wins over policy.json, and may set only `takeover`.
 - **Host names aren't tokens.** The paste guard exempts host names
   (`adb-1234567890.7.azuredatabricks.net`) unless they start with a known
   token prefix.

@@ -93,14 +93,19 @@ def merge_strict(settings: dict, strict: dict, undo: bool = False) -> tuple[dict
         elif env.get(k) != v:
             env[k] = v
             changes.append(f"+ env: {k}=\"{v}\" (blanked for Claude Code only)")
-    for rule in strict.get("deny", []):
-        if undo:
-            if rule in deny:
-                deny.remove(rule)
-                changes.append(f"- deny: {rule}")
-        elif rule not in deny:
-            deny.append(rule)
-            changes.append(f"+ deny: {rule}")
+    allow = out["permissions"].setdefault("allow", [])
+    for kind, rules, have in (("deny", strict.get("deny", []), deny),
+                              ("allow", strict.get("allow", []), allow)):
+        for rule in rules:
+            if undo:
+                if rule in have:
+                    have.remove(rule)
+                    changes.append(f"- {kind}: {rule}")
+            elif rule not in have:
+                have.append(rule)
+                changes.append(f"+ {kind}: {rule}")
+    if not allow:
+        out["permissions"].pop("allow")
     if not env:
         out.pop("env")
     return out, changes

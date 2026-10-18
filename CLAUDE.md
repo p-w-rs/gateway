@@ -140,9 +140,21 @@ v0.5.0 completes the accounts plan in code:
   and Databricks, the ASI ML Catalog, container registries;
 - take-over (off by default) and strict mode.
 
-About 650 tests pass, and every security property has a mutation check. None
-of it has been tried live yet: see `.work/accounts/LIVE-TEST.md` (local, not
-in git).
+About 680 tests pass, and every security property has a mutation check.
+
+Verified live (2026-10-17, macOS desktop app; notes in
+`.work/accounts/LIVE-RESULTS.md`, local): all seven kinds. That covers:
+- GitHub personal (PAT + SSH) and work (SSO via gh's login), with push,
+  PR, the confirm prompt and the force-push refusal, plus a personal↔work
+  mirror;
+- Hugging Face Xet upload and download;
+- an SSH host, with exec, copy and sudo through the account;
+- Azure ARM, Databricks, the ML Catalog clone, a ghcr.io push and pull, and
+  the Pijul Nest;
+- strict mode: take-over refusals, blanked tokens, Read denies, and the
+  ssh-agent unset per command.
+
+Still unverified: Linux end-to-end, and the ACR exchange.
 
 ### v0.4.0
 

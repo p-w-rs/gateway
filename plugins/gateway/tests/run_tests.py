@@ -2701,7 +2701,8 @@ try:
     _h = _hook("git push origin main")
     check("hook: takeover on denies git with the git tool route",
           '"deny"' in _h and "git tool" in _h)
-    check("hook: takeover on leaves plain commands", _hook("ls -la") == "")
+    check("hook: takeover on lets plain commands run (only the agent is unset)",
+          '"deny"' not in _hook("ls -la") and "unset SSH_AUTH_SOCK" in _hook("ls -la"))
     check("hook: blocklist still wins with takeover on", "http_request" in _hook("cu" + "rl https://x"))
     check("session note: says take-over is ON", "Take-over is ON" in _session())
     _c = io.StringIO()
@@ -2856,6 +2857,63 @@ check("owners help explains repo-URL owners and spaces",
       "github.com/OWNER" in _f["owners"]["help"] and "spaces" in _f["owners"]["help"])
 check("ssh host help says ~/.ssh/config aliases aren't read",
       "~/.ssh/config" in {f["name"]: f for f in commands._account_fields("ssh", None)}["host"]["help"])
+
+# --- Strict: the user's ssh-agent is unset in every Bash command ------------
+print("strict: ssh-agent stripped from Bash:")
+
+
+def _hook_out(cmd, extra=None):
+    old = sys.stdin
+    sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash",
+                                        "tool_input": {"command": cmd, **(extra or {})}}))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            hooks.route_main()
+    finally:
+        sys.stdin = old
+    s = buf.getvalue().strip()
+    return json.loads(s) if s else None
+
+
+_saved_cfg3 = os.environ.get("GATEWAY_CONFIG")
+try:
+    use_config({"takeover": False})
+    check("agent strip: off without take-over", _hook_out("ls -la") is None)
+    use_config({"takeover": True})
+    _o = _hook_out("ls -la", {"description": "list", "timeout": 5000})
+    _hs = (_o or {}).get("hookSpecificOutput", {})
+    check("agent strip: take-over on prefixes the unset",
+          _hs.get("updatedInput", {}).get("command") == hooks.AGENT_UNSET + "; ls -la")
+    check("agent strip: other input fields kept",
+          _hs.get("updatedInput", {}).get("description") == "list"
+          and _hs.get("updatedInput", {}).get("timeout") == 5000)
+    check("agent strip: no permission decision (the user's rules still apply)",
+          "permissionDecision" not in _hs)
+    check("agent strip: not prefixed twice",
+          _hook_out(hooks.AGENT_UNSET + "; ls") is None)
+    _d = _hook_out("git push")
+    check("agent strip: a refused command stays refused",
+          _d["hookSpecificOutput"].get("permissionDecision") == "deny"
+          and "updatedInput" not in _d["hookSpecificOutput"])
+    for _c in ("ssh-add -L", "launchctl getenv SSH_AUTH_SOCK",
+               "SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.AbC123/Listeners ls"):
+        check(f"take-over refuses: {_c[:40]}", policy.match_takeover(_c) is not None)
+    check("take-over still allows ssh-keygen", policy.match_takeover("ssh-keygen -l -f k.pub") is None)
+finally:
+    if _saved_cfg3 is None:
+        os.environ.pop("GATEWAY_CONFIG", None)
+    else:
+        os.environ["GATEWAY_CONFIG"] = _saved_cfg3
+
+_st = install.load_strict()
+check("strict allows exactly the hook's prefix",
+      _st.get("allow") == [f"Bash({hooks.AGENT_UNSET})"])
+_sa, _ = install.merge_strict({"permissions": {"allow": ["Bash(ls:*)"]}}, _st)
+check("strict merge adds the allow rule, keeps the user's",
+      _sa["permissions"]["allow"] == ["Bash(ls:*)", f"Bash({hooks.AGENT_UNSET})"])
+_ua, _ = install.merge_strict(_sa, _st, undo=True)
+check("unstrict removes only that allow rule", _ua["permissions"]["allow"] == ["Bash(ls:*)"])
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

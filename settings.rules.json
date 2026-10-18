@@ -53,8 +53,10 @@
       "Edit({PLUGIN_DIR}/config/**)"
     ]
   },
-  "_strict_comment": "Merged only by `pixi run install --strict` (undo: --unstrict). env: your own credentials are blanked for Claude Code's processes only (your terminal is unaffected), so nothing Claude runs can fall back to them; the gateway's account tools bring their own. SSH_AUTH_SOCK is /dev/null, not empty: Claude Code does not apply an empty value over one the app already has (macOS sets it from launchd), and /dev/null is no agent. deny: the usual places tools keep credentials. Strict also sets takeover=true in config/local.json (gitignored).",
+  "_strict_comment": "Merged only by `pixi run install --strict` (undo: --unstrict). env: your own credentials are blanked for Claude Code's processes only (your terminal is unaffected), so nothing Claude runs can fall back to them; the gateway's account tools bring their own. SSH_AUTH_SOCK=/dev/null works where Claude Code applies settings env to it; the desktop app keeps its own value, so with take-over on the Bash hook also unsets it in every command (see allow). deny: the usual places tools keep credentials. Strict also sets takeover=true in config/local.json (gitignored).",
   "strict": {
+    "_allow_comment": "With take-over on, the gateway's Bash hook prefixes every command with this (the desktop app's SSH_AUTH_SOCK can't be removed through env); the exact rule keeps the prefix from adding a prompt.",
+    "allow": ["Bash(unset SSH_AUTH_SOCK SSH_AGENT_PID)"],
     "env": {
       "SSH_AUTH_SOCK": "/dev/null",
       "SSH_ASKPASS": "",

@@ -260,10 +260,17 @@ calls it yet, the `git` MCP tool comes next). Per call:
   them when `takeover` is true: in config/local.json (gitignored, written by
   the installer) or policy.json; local.json wins and can set nothing else.
 - **Strict mode:** `pixi run install --strict` sets `takeover`, blanks the
-  user's credential variables in Claude Code's settings `env` (`SSH_AUTH_SOCK`
-  becomes `/dev/null`: Claude Code keeps an inherited value over an empty one), and adds Read
+  user's credential variables in Claude Code's settings `env`, and adds Read
   denies for the usual credential files, so a Bash call that gets past the
-  regex finds no credentials.
+  regex finds no credentials. `SSH_AUTH_SOCK` is the exception: the desktop
+  app starts Claude Code with it and settings `env` doesn't override it (seen
+  live with both "" and /dev/null). So with take-over on, the PreToolUse hook
+  rewrites every Bash command to `unset SSH_AUTH_SOCK SSH_AGENT_PID; …`
+  (`updatedInput`, no permission decision, so the user's rules still apply),
+  strict adds an exact allow rule for that prefix so it adds no prompt, and
+  take-over refuses `ssh-add`, `launchctl getenv SSH_AUTH_SOCK` and the
+  launchd socket path. A determined command can still find the socket; this
+  closes the accidental path, like the rest of take-over.
 
 ## Policy and logging (`policy.py`)
 
