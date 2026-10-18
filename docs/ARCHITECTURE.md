@@ -257,9 +257,11 @@ calls it yet, the `git` MCP tool comes next). Per call:
   pijul, asiml/dvc, az, databricks/mlflow, ssh/scp/sftp, rsync to a host,
   docker/podman login/push/pull, skopeo, oras and crane, at a command
   position only (not `echo git` or `ssh-keygen`). The Bash hook redirects
-  them when `takeover` is true in policy.json.
+  them when `takeover` is true: in config/local.json (gitignored, written by
+  the installer) or policy.json; local.json wins and can set nothing else.
 - **Strict mode:** `pixi run install --strict` sets `takeover`, blanks the
-  user's credential variables in Claude Code's settings `env`, and adds Read
+  user's credential variables in Claude Code's settings `env` (`SSH_AUTH_SOCK`
+  becomes `/dev/null`: Claude Code keeps an inherited value over an empty one), and adds Read
   denies for the usual credential files, so a Bash call that gets past the
   regex finds no credentials.
 

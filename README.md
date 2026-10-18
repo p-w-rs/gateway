@@ -132,11 +132,11 @@ commands when sudo is disabled, and for the `_confirm` tools, so keep them.
 Options: `--dry-run`, `--yes`, `--skip-plugin`, and:
 
 - **`--strict`** (undo with `--unstrict`): full take-over. It blanks your own
-  credential variables (`SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `HF_TOKEN`, …) for
-  Claude Code's processes only; your terminal is unaffected. It denies
+  credential variables (`GITHUB_TOKEN`, `HF_TOKEN`, …; `SSH_AUTH_SOCK` points
+  at `/dev/null`) for Claude Code's processes only; your terminal is unaffected. It denies
   Claude's reads of the usual credential files (`~/.ssh/id_*`, gh's
   `hosts.yml`, `~/.docker/config.json`, …). And it turns on `takeover` in
-  `config/policy.json`, so git, gh, hf, pijul, ssh, scp, docker
+  `config/local.json` (gitignored, so your checkout stays clean), so git, gh, hf, pijul, ssh, scp, docker
   login/push/pull, az and the like in Bash are redirected to the account
   tools. With strict on, sudo on remote hosts needs an ssh account for that
   host (your ssh agent is blanked).

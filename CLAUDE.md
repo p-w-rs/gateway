@@ -109,8 +109,8 @@ your change (mutation-check it).
   includes heredocs, commit messages, `grep` patterns and scripts written
   inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
   use `git commit -F file`. Check with `run.py check '…'`.
-- **Take-over** (`"takeover": true` in config/policy.json, set by
-  `pixi run install --strict`) makes the hook refuse git, gh, hf, pijul, ssh,
+- **Take-over** (`"takeover": true` in config/local.json, gitignored, set
+  by `pixi run install --strict`; policy.json keeps the default false) makes the hook refuse git, gh, hf, pijul, ssh,
   dvc, … in Bash in every session, including yours. Use the `git` tool then,
   even for local commits (`git commit -F` works through it too). In a session
   whose MCP server predates a tool change, turn takeover off before you need

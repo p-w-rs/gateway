@@ -128,6 +128,16 @@ def load_config() -> dict[str, Any]:
                     cfg[k] = v
         except Exception as e:
             sys.stderr.write(f"gateway: ignoring unreadable {p}: {e}\n")
+    # Machine-local switches next to it (gitignored, so `install --strict`
+    # leaves the checkout clean). Only "takeover" is read from there.
+    lp = p.with_name("local.json")
+    if lp.exists():
+        try:
+            local = json.loads(lp.read_text())
+            if isinstance(local.get("takeover"), bool):
+                cfg["takeover"] = local["takeover"]
+        except Exception as e:
+            sys.stderr.write(f"gateway: ignoring unreadable {lp}: {e}\n")
     return cfg
 
 

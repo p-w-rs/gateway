@@ -10,7 +10,7 @@
 
 3. With --strict (undo with --unstrict): blanks your own credential variables
    for Claude Code's processes, denies reads of the usual credential files,
-   and turns on takeover in config/policy.json (git, gh, hf, pijul, ssh, ...
+   and turns on takeover in config/local.json (gitignored; git, gh, hf, pijul, ssh, ...
    in Bash are redirected to the gateway's account tools).
 
 Options: --yes (don't ask), --dry-run (show only), --skip-plugin (settings only),
@@ -106,14 +106,31 @@ def merge_strict(settings: dict, strict: dict, undo: bool = False) -> tuple[dict
     return out, changes
 
 
+def takeover_now(plugin_dir: Path = PLUGIN_DIR) -> bool:
+    """Take-over as the gateway sees it: config/local.json, else policy.json."""
+    for name in ("local.json", "policy.json"):
+        p = plugin_dir / "config" / name
+        try:
+            v = json.loads(p.read_text()).get("takeover")
+        except (OSError, ValueError):
+            continue
+        if isinstance(v, bool):
+            return v
+    return False
+
+
 def set_takeover(on: bool, plugin_dir: Path = PLUGIN_DIR) -> bool:
-    """Set config/policy.json "takeover"; True if it changed."""
-    p = plugin_dir / "config" / "policy.json"
-    cfg = json.loads(p.read_text())
-    if cfg.get("takeover") is on:
+    """Set "takeover" in config/local.json (gitignored, so the checkout
+    stays clean); True if it changed."""
+    if takeover_now(plugin_dir) is on:
         return False
+    p = plugin_dir / "config" / "local.json"
+    try:
+        cfg = json.loads(p.read_text())
+    except (OSError, ValueError):
+        cfg = {}
     cfg["takeover"] = on
-    tmp = p.with_name("policy.json.tmp")
+    tmp = p.with_name("local.json.tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.replace(tmp, p)
     return True
@@ -155,9 +172,8 @@ def main(argv: list[str]) -> int:
     if strict or unstrict:
         new, more = merge_strict(new, load_strict(), undo=unstrict)
         changes += more
-        cur = json.loads((PLUGIN_DIR / "config" / "policy.json").read_text()).get("takeover")
-        if cur is not strict:
-            changes.append(f"~ config/policy.json: takeover = {str(strict).lower()}")
+        if takeover_now() is not strict:
+            changes.append(f"~ config/local.json: takeover = {str(strict).lower()}")
     print(f"\n== Permission rules for {path}")
     if not changes:
         print("✓ already up to date")

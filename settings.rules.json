@@ -53,10 +53,10 @@
       "Edit({PLUGIN_DIR}/config/**)"
     ]
   },
-  "_strict_comment": "Merged only by `pixi run install --strict` (undo: --unstrict). env: your own credentials are blanked for Claude Code's processes only (your terminal is unaffected), so nothing Claude runs can fall back to them; the gateway's account tools bring their own. deny: the usual places tools keep credentials. Strict also sets takeover=true in config/policy.json.",
+  "_strict_comment": "Merged only by `pixi run install --strict` (undo: --unstrict). env: your own credentials are blanked for Claude Code's processes only (your terminal is unaffected), so nothing Claude runs can fall back to them; the gateway's account tools bring their own. SSH_AUTH_SOCK is /dev/null, not empty: Claude Code does not apply an empty value over one the app already has (macOS sets it from launchd), and /dev/null is no agent. deny: the usual places tools keep credentials. Strict also sets takeover=true in config/local.json (gitignored).",
   "strict": {
     "env": {
-      "SSH_AUTH_SOCK": "",
+      "SSH_AUTH_SOCK": "/dev/null",
       "SSH_ASKPASS": "",
       "GIT_ASKPASS": "",
       "GITHUB_TOKEN": "",

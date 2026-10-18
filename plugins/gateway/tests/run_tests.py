@@ -2716,8 +2716,11 @@ finally:
 
 _strict = install.load_strict()
 check("strict template: blanks credential env vars, denies credential files",
-      _strict["env"].get("SSH_AUTH_SOCK") == "" and _strict["env"].get("GITHUB_TOKEN") == ""
-      and all(v == "" for v in _strict["env"].values())
+      _strict["env"].get("GITHUB_TOKEN") == ""
+      and all(v == "" for k, v in _strict["env"].items() if k != "SSH_AUTH_SOCK")
+      # Claude Code keeps an inherited SSH_AUTH_SOCK over an empty value (seen live on
+      # macOS), so strict points it at something that is no agent instead.
+      and _strict["env"].get("SSH_AUTH_SOCK") == "/dev/null"
       and "Read(~/.config/gh/hosts.yml)" in _strict["deny"] and "Read(~/.ssh/id_*)" in _strict["deny"])
 check("strict template: not part of the default rules",
       "Read(~/.ssh/id_*)" not in rules["deny"])
@@ -2725,7 +2728,7 @@ _b = {"env": {"KEEP": "1", "GITHUB_TOKEN": "mine"}, "permissions": {"deny": ["Ba
 _s1, _c1 = install.merge_strict(_b, _strict)
 check("strict: blanks env, adds denies, keeps the rest",
       _s1["env"]["KEEP"] == "1" and _s1["env"]["GITHUB_TOKEN"] == ""
-      and _s1["env"]["SSH_AUTH_SOCK"] == "" and "Bash(rm:*)" in _s1["permissions"]["deny"]
+      and _s1["env"]["SSH_AUTH_SOCK"] == "/dev/null" and "Bash(rm:*)" in _s1["permissions"]["deny"]
       and "Read(~/.azure/**)" in _s1["permissions"]["deny"] and bool(_c1))
 check("strict: input not mutated", _b["env"]["GITHUB_TOKEN"] == "mine")
 _s2, _c2 = install.merge_strict(_s1, _strict)
@@ -2738,11 +2741,32 @@ check("unstrict on clean settings: no empty env left", "env" not in _u2)
 _pd = TMP / "fakeplugin"
 (_pd / "config").mkdir(parents=True)
 (_pd / "config" / "policy.json").write_text(json.dumps({"x": 1, "takeover": False}))
-check("set_takeover: turns on", install.set_takeover(True, _pd)
-      and json.loads((_pd / "config" / "policy.json").read_text()) == {"x": 1, "takeover": True})
+check("set_takeover: turns on in config/local.json, policy.json untouched",
+      install.set_takeover(True, _pd)
+      and json.loads((_pd / "config" / "local.json").read_text()) == {"takeover": True}
+      and json.loads((_pd / "config" / "policy.json").read_text()) == {"x": 1, "takeover": False})
 check("set_takeover: no change when already on", install.set_takeover(True, _pd) is False)
 check("set_takeover: turns off", install.set_takeover(False, _pd)
-      and json.loads((_pd / "config" / "policy.json").read_text())["takeover"] is False)
+      and json.loads((_pd / "config" / "local.json").read_text())["takeover"] is False)
+check("config/local.json is gitignored",
+      "**/config/local.json" in (ROOT.parents[1] / ".gitignore").read_text())
+_saved_cfg2 = os.environ.get("GATEWAY_CONFIG")
+try:
+    os.environ["GATEWAY_CONFIG"] = str(_pd / "config" / "policy.json")
+    (_pd / "config" / "local.json").write_text(json.dumps({"takeover": True, "allow_domains": ["x"]}))
+    _lc = policy.load_config()
+    check("load_config: local.json turns take-over on", _lc["takeover"] is True)
+    check("load_config: local.json can't change anything but takeover",
+          _lc["allow_domains"] != ["x"] and _lc.get("x") == 1)
+    (_pd / "config" / "local.json").write_text(json.dumps({"takeover": False}))
+    (_pd / "config" / "policy.json").write_text(json.dumps({"x": 1, "takeover": True}))
+    check("load_config: local.json wins over policy.json", policy.load_config()["takeover"] is False
+          and install.takeover_now(_pd) is False)
+finally:
+    if _saved_cfg2 is None:
+        os.environ.pop("GATEWAY_CONFIG", None)
+    else:
+        os.environ["GATEWAY_CONFIG"] = _saved_cfg2
 check("version is 0.5.0 everywhere", __import__("gateway").__version__ == "0.5.0"
       and json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"] == "0.5.0")
 
