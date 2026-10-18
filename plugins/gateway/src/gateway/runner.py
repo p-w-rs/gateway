@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import policy
+from . import policy, vault
 
 # Environment variables a child may inherit. Everything else is dropped.
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
@@ -158,7 +158,7 @@ class _Agent:
             time.sleep(0.02)
         for key in [private_key] if isinstance(private_key, str) else private_key:
             add = subprocess.run([_which("ssh-add"), "-q", "-"],
-                                 input=key.strip().encode() + b"\n",
+                                 input=vault.normalize_key(key).encode(),
                                  env=child_env({"SSH_AUTH_SOCK": str(self.sock)}),
                                  capture_output=True, timeout=15)
             if add.returncode != 0:

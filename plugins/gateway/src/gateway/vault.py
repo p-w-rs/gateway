@@ -355,6 +355,12 @@ def _ssh_string(buf: bytes, pos: int) -> tuple[bytes, int]:
     return buf[pos + 4:pos + 4 + n], pos + 4 + n
 
 
+def normalize_key(private_key: str) -> str:
+    """A pasted key as ssh-add wants it: LF line endings (browsers submit
+    textareas with CRLF), no stray spaces, one trailing newline."""
+    return "\n".join(line.strip() for line in private_key.strip().splitlines()) + "\n"
+
+
 def public_key_of(private_key: str) -> str:
     """The OpenSSH public key line for an OpenSSH private key, parsed here
     (stdlib only; nothing written to disk). Keys with a passphrase are

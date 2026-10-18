@@ -1239,6 +1239,24 @@ acct_form({"host": "box3.example.com", "user": "deploy", "port": "",
            "ssh_key_mode": "paste", "ssh_key": "not a key"})
 check("garbage key refused", "not an OpenSSH private key" in
       acct("/gate:account add ssh box3 Bad key")["reason"])
+# Browsers submit textareas with CRLF; ssh-add refuses a key with \r in it.
+acct_form({"host": "box4.example.com", "user": "deploy", "port": "",
+           "ssh_key_mode": "paste", "ssh_key": (_kd / "plain").read_text().replace("\n", "\r\n")})
+acct("/gate:account add ssh box4 CRLF paste")
+a = vault.account("ssh:box4")
+check("ssh key pasted with CRLF: stored with LF only",
+      a and "\r" not in a["secrets"]["ssh_key"]
+      and a["secrets"]["ssh_key"] == (_kd / "plain").read_text())
+from gateway import runner as _rn  # noqa: E402
+_crlf_tmp = Path(tempfile.mkdtemp(prefix="gw-crlf-"))
+try:
+    _rn._Agent(_crlf_tmp, (_kd / "plain").read_text().replace("\n", "\r\n")).close()
+    check("runner loads a key saved with CRLF (older vaults)", True)
+except _rn.RunnerError as e:
+    check(f"runner loads a key saved with CRLF (older vaults): {e}", False)
+finally:
+    import shutil as _sh  # noqa: E402
+    _sh.rmtree(_crlf_tmp, ignore_errors=True)
 acct_form({"host": "-oProxyCommand=x", "user": "deploy", "port": "",
            "ssh_key_mode": "none", "ssh_key": ""})
 check("host that looks like an ssh option refused",

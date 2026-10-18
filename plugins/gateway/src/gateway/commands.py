@@ -546,6 +546,8 @@ def _apply_form(ref: str, kind: str, got: dict[str, str],
         note = f"New SSH public key (add it on {host}):\n{pub}"
     elif mode == "paste":
         priv = got.get("ssh_key", "").strip()
+        if priv:
+            priv = vault.normalize_key(priv).rstrip("\n")
         if not priv:
             raise CommandError("'Use a private key I paste' was chosen but no key was pasted; "
                                "nothing was saved.")
