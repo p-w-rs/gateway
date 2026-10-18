@@ -3283,5 +3283,205 @@ for _f in ("add", "update", "delete", "enable", "disable", "list", "export", "im
 check("gate:setup skill exists and says secrets go only in the dialog",
       "never in the chat" in (ROOT / "skills" / "setup" / "SKILL.md").read_text())
 
+print("export / import:")
+from gateway import transfer  # noqa: E402
+
+XF = TMP / "xfer"
+XF.mkdir()
+_PASS5 = "a long enough passphrase"
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"]["XF_SECRET"] = {"value": "xf-secret-value-1234", "description": "xf",
+                                  "hosts": ["api.example.com"], "updated": ""}
+    _d["sudo"]["root@xfhost"] = {"user": "root", "host": "xfhost", "password": "xf-sudo-pass-5678",
+                                 "updated": ""}
+    _d["accounts"]["github:xf"] = {"kind": "github", "description": "xf", "host": "github.com",
+                                   "login": "xfuser", "name": "", "email": "", "owners": ["xforg"],
+                                   "hosts": ["github.com", "api.github.com"],
+                                   "secrets": {"token": "xf-token-abcdef"}, "prompts": {},
+                                   "token_source": "gh"}
+    _d["sudo_enabled"] = sorted(set(_d.get("sudo_enabled", [])) | {"xfhost"})
+    _d["sudo_session"]["xfhost"] = ["s1"]
+    _d.setdefault("ssh_reuse", {})["ssh:lab"] = ["s1"]
+    vault.save(_d)
+_data = vault.load()
+_full = transfer.export_data(_data, False)
+_share = transfer.export_data(_data, True)
+check("export: a full copy carries the values",
+      _full["secrets"]["XF_SECRET"]["value"] == "xf-secret-value-1234"
+      and _full["accounts"]["github:xf"]["secrets"]["token"] == "xf-token-abcdef")
+_sj = json.dumps(_share)
+check("export: a shareable copy has no secret value, password, token or private key",
+      all(v not in _sj for v in ("xf-secret-value-1234", "xf-sudo-pass-5678", "xf-token-abcdef",
+                                 "PRIVATE KEY"))
+      and _share["accounts"]["github:xf"]["owners"] == ["xforg"])
+check("export: no grants, sudo switches or connection reuse in the file",
+      not ({"grants", "sudo_session", "sudo_enabled", "ssh_reuse"} & set(_full)))
+
+_f1 = XF / "full.age"
+transfer.encrypt(json.dumps(_full).encode(), _PASS5, _f1)
+check("export: an age file, readable only by the user",
+      _f1.read_bytes().startswith(b"age-encryption.org/v1") and (_f1.stat().st_mode & 0o777) == 0o600
+      and b"xf-secret-value-1234" not in _f1.read_bytes())
+check("export: age round trip through the private terminal",
+      json.loads(transfer.decrypt(_f1, _PASS5))["secrets"]["XF_SECRET"]["value"] == "xf-secret-value-1234")
+try:
+    transfer.decrypt(_f1, "not the passphrase")
+    _ok = False
+except transfer.Declined:
+    _ok = True
+check("import: a wrong passphrase is refused", _ok)
+check("no temp folders or FIFOs left behind",
+      not list(Path(tempfile.gettempdir()).glob("gw-xfer-*")))
+
+_home_was = os.environ["HOME"]
+os.environ["HOME"] = str(XF)
+try:
+    (XF / "Downloads").mkdir()
+    import datetime as _dt  # noqa: E402
+    _day = _dt.date(2026, 10, 17)
+    _p1 = transfer.default_path(_day)
+    _p1.write_text("x")
+    check("export: default path in Downloads, never overwrites",
+          _p1 == XF / "Downloads" / "gateway-20261017.age"
+          and transfer.default_path(_day).name == "gateway-20261017-2.age")
+finally:
+    os.environ["HOME"] = _home_was
+
+
+def _gid(text):
+    m = re.search(r"g-[0-9a-f]{8}", text)
+    return m.group(0) if m else ""
+
+
+# Export end to end: typed command -> grant -> gate_setup -> dialogs.
+_e2e = XF / "e2e.age"
+gid = _gid(_st.run("export", f" {_e2e}", SID))
+check("/gate:export opens a setup", gid.startswith("g-"))
+r = _st.gate_setup(gid, {"what": "export", "without_secrets": False, "path": str(XF / "x.age")}, SID)
+check("export: Claude can't choose the path", r.get("refused") and "path" in r["reason"])
+form_plan({"action": "save", "value": "short"})
+r = _st.gate_setup(gid, {"what": "export", "without_secrets": False}, SID)
+check("export: a short passphrase is refused, nothing written",
+      r.get("declined") and not _e2e.exists())
+form_plan({"action": "save", "value": _PASS5})
+r = _st.gate_setup(gid, {"what": "export", "without_secrets": False}, SID)
+check("export: through the dialogs, file written, the result names the path",
+      r.get("ok") and _e2e.is_file() and str(_e2e) in r["result"])
+check("export: neither the passphrase nor a value is in the result or the audit log",
+      _PASS5 not in json.dumps(r) and "xf-secret-value-1234" not in json.dumps(r)
+      and _PASS5 not in Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text()
+      and "xf-secret-value-1234" not in Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text())
+check("export: the setup can't be used twice",
+      _st.gate_setup(gid, {"what": "export", "without_secrets": False}, SID).get("refused"))
+_g_add = _st.open_grant("add", "", "", SID)
+check("export can't ride on an /gate:add setup",
+      _st.gate_setup(_g_add, {"what": "export", "without_secrets": False}, SID).get("refused"))
+_answers = iter([_PASS5, _PASS5 + "x"])
+_plan5 = {"what": "export", "path": XF / "mismatch.age", "without_secrets": False, "lines": ["x"]}
+try:
+    transfer.run_export(_plan5, lambda s: True, lambda l: next(_answers))
+    _ok = False
+except transfer.Declined:
+    _ok = True
+check("export: passphrases that don't match: nothing written",
+      _ok and not (XF / "mismatch.age").exists())
+check("/gate:export refuses a path that exists or isn't .age",
+      "Error" in json.dumps(_st.handle({"prompt": f"/gate:export {_e2e}", "session_id": SID}))
+      and "Error" in json.dumps(_st.handle({"prompt": f"/gate:export {XF / 'x.txt'}",
+                                            "session_id": SID})))
+
+# Import.
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"].pop("XF_SECRET")
+    _d["accounts"].pop("github:xf")
+    _d["sudo_enabled"] = [h for h in _d["sudo_enabled"] if h != "xfhost"]
+    vault.save(_d)
+gid = _gid(_st.run("import", f" {_e2e}", SID))
+check("/gate:import opens a setup", gid.startswith("g-"))
+form_plan({"action": "save", "value": "not the passphrase"})
+r = _st.gate_setup(gid, {"what": "import", "keep_existing": False}, SID)
+check("import: a wrong passphrase changes nothing",
+      r.get("declined") and not vault.secret("XF_SECRET"))
+form_plan({"action": "save", "value": _PASS5})
+r = _st.gate_setup(gid, {"what": "import", "keep_existing": False}, SID)
+_v = vault.load()
+check("import: adds what's missing, with values",
+      r.get("ok") and _v["secrets"]["XF_SECRET"]["value"] == "xf-secret-value-1234"
+      and _v["accounts"]["github:xf"]["secrets"]["token"] == "xf-token-abcdef"
+      and "secret XF_SECRET" in r["result"])
+check("import: the summary dialog showed what changes",
+      any("Adds" in json.dumps(x) for x in dialogs_seen()))
+check("import: no value in the result", "xf-secret-value-1234" not in json.dumps(r))
+check("import: sudo isn't switched on by an import", "xfhost" not in _v["sudo_enabled"])
+
+
+def _import(path, keep, pw=_PASS5, ok=True):
+    plan = {"what": "import", "path": path, "keep_existing": keep}
+    return transfer.run_import(plan, lambda s: ok, lambda l: pw)
+
+
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"]["XF_SECRET"]["value"] = "local-value"
+    vault.save(_d)
+_import(_e2e, True)
+check("import keep_existing: what's here stays", vault.secret("XF_SECRET")["value"] == "local-value")
+try:
+    _import(_e2e, False, ok=False)
+except transfer.Declined:
+    pass
+check("import: Cancel at the summary changes nothing",
+      vault.secret("XF_SECRET")["value"] == "local-value")
+_import(_e2e, False)
+check("import: otherwise the file's version wins",
+      vault.secret("XF_SECRET")["value"] == "xf-secret-value-1234")
+_f2 = XF / "share.age"
+_share["secrets"]["XF_SECRET"]["description"] = "from the shareable copy"
+transfer.encrypt(json.dumps(_share).encode(), _PASS5, _f2)
+with vault.locked():
+    _d = vault.load()
+    _d["secrets"]["XF_SECRET"]["value"] = "local-value"
+    _d["sudo"].pop("root@xfhost")
+    vault.save(_d)
+_res = _import(_f2, False)
+_v = vault.load()
+check("import of a shareable copy keeps local values, takes the settings",
+      _v["secrets"]["XF_SECRET"]["value"] == "local-value"
+      and _v["secrets"]["XF_SECRET"]["description"] == "from the shareable copy"
+      and _v["accounts"]["github:xf"]["secrets"].get("token") == "xf-token-abcdef")
+check("import of a shareable copy skips a sudo with no password here",
+      "root@xfhost" not in _v["sudo"] and "sudo root@xfhost" in _res)
+for _label, _mut in (("a host that isn't a host name",
+                      lambda o: o["secrets"]["XF_SECRET"].update(hosts=["-oProxyCommand=x"])),
+                     ("an unknown kind", lambda o: o["accounts"].update(
+                         {"evil:x": {"kind": "evil"}})),
+                     ("a bad owner", lambda o: o["accounts"]["github:xf"].update(owners=["a b"])),
+                     ("an unknown credential", lambda o: o["accounts"]["github:xf"]["secrets"]
+                      .update(cookie="x"))):
+    _bad = json.loads(json.dumps(_full))
+    _mut(_bad)
+    _fb = XF / f"bad-{abs(hash(_label))}.age"
+    transfer.encrypt(json.dumps(_bad).encode(), _PASS5, _fb)
+    _before = json.dumps(vault.load(), sort_keys=True)
+    try:
+        _import(_fb, False)
+        _ok = False
+    except transfer.TransferError:
+        _ok = True
+    check(f"import: a file with {_label} is refused whole",
+          _ok and json.dumps(vault.load(), sort_keys=True) == _before)
+_star = json.loads(json.dumps(_full))
+_star["secrets"]["XF_SECRET"]["hosts"] = ["*", "api.example.com"]
+_fs = XF / "star.age"
+transfer.encrypt(json.dumps(_star).encode(), _PASS5, _fs)
+_import(_fs, False)
+check("import: a legacy '*' host is dropped, never imported",
+      vault.secret("XF_SECRET")["hosts"] == ["api.example.com"])
+check("/gate:import needs a file that exists",
+      "Error" in json.dumps(_st.handle({"prompt": f"/gate:import {XF / 'nope.age'}",
+                                        "session_id": SID})))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

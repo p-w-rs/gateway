@@ -11,7 +11,8 @@ place a secret is typed or a change is approved.
     /gate:enable reuse ssh:NAME                        keep ssh connections open (this session)
     /gate:disable reuse ssh:NAME                       close them; every call connects anew
     /gate:list                                         what the gateway holds
-    /gate:export / /gate:import                        (phase 5)
+    /gate:export [PATH]                                everything, encrypted with a passphrase
+    /gate:import FILE                                  merge an export (summary dialog first)
 
 How the guided part stays safe: a typed /gate:add or /gate:update opens a
 **setup grant**. It is stored inside the encrypted vault, so Claude's Bash
@@ -54,7 +55,9 @@ HELP = (
     "/gate:disable sudo HOST             every root command there asks again\n"
     "/gate:enable reuse ssh:NAME         keep that server's connection open (this session)\n"
     "/gate:disable reuse ssh:NAME        close it; every call connects anew\n"
-    "/gate:list                          what the gateway holds (never values)"
+    "/gate:list                          what the gateway holds (never values)\n"
+    "/gate:export [PATH]                 save it all to a passphrase-encrypted file\n"
+    "/gate:import FILE                   bring an export in (shows what changes first)"
 )
 
 
@@ -194,13 +197,95 @@ def _reuse(verb: str, words: list[str], session_id: str) -> str:
             + (f"; closed {n} open connection{'s' if n != 1 else ''}." if n else "."))
 
 
+def _transfer_command(verb: str, arg: str, session_id: str) -> str:
+    """/gate:export [PATH] and /gate:import FILE open a grant; the path is
+    only ever what the user typed (or the default export path)."""
+    from . import transfer
+    if verb == "import":
+        if not arg:
+            return "Usage: /gate:import FILE (a .age file made by /gate:export)"
+        path = Path(os.path.expanduser(arg))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise commands.CommandError(f"{path} is not a file.")
+        if path.stat().st_size > transfer.MAX_FILE:
+            raise commands.CommandError(f"{path} is too big for a gateway export.")
+        gid = open_grant("import", "import", str(path), session_id)
+        return (f"Setup {gid} is open for: import {path}. Ask the user with one question "
+                "pop-up whether items that already exist here should be replaced by the "
+                "file's versions or kept (only new items added); then call gate_setup with "
+                f"grant=\"{gid}\" and {{\"what\": \"import\", \"keep_existing\": true|false}}. "
+                "The gateway asks for the file's passphrase and shows what changes in its "
+                "own dialog; never ask for the passphrase in the chat.")
+    target = ""
+    if arg:
+        try:
+            target = str(transfer.check_export_path(arg))
+        except transfer.TransferError as e:
+            raise commands.CommandError(str(e))
+    gid = open_grant("export", "export", target, session_id)
+    return (f"Setup {gid} is open for: export"
+            + (f" to {target}" if target else f" (to {transfer.default_path()})") + ". Ask the "
+            "user with one question pop-up: a full copy (with the secret values, to move to "
+            "another machine of theirs) or a shareable copy (accounts, hosts and settings "
+            "without any token, key or password)? Then call gate_setup with "
+            f"grant=\"{gid}\" and {{\"what\": \"export\", \"without_secrets\": true|false}}. "
+            "The gateway asks for a passphrase in its own dialog; never ask for it in the chat.")
+
+
+def _transfer_plan(g: dict[str, Any], p: dict[str, Any]) -> dict[str, Any]:
+    from . import transfer
+    what = g["op"]
+    if g["what"] != what or str(p.get("what", what)).lower() != what:
+        raise SetupError(f"this setup is for {g['op']} {g['what']}, not {p.get('what')}")
+    extra = set(p) - {"what", "without_secrets", "keep_existing"}
+    if extra:
+        raise SetupError(f"{what} takes no {', '.join(sorted(extra))} (the file path is "
+                         "what the user typed)")
+    if what == "export":
+        ws = p.get("without_secrets")
+        if not isinstance(ws, bool):
+            raise SetupError("without_secrets: true (shareable copy) or false (full copy)")
+        try:
+            path = (transfer.check_export_path(g["target"]) if g["target"]
+                    else transfer.default_path())
+        except transfer.TransferError as e:
+            raise SetupError(str(e))
+        data = vault.load()
+        line = (f"Export the gateway to {path}: {len(data['accounts'])} accounts, "
+                f"{len(data['secrets'])} secrets, {len(data['sudo'])} sudo passwords, "
+                + ("WITHOUT any secret value (a shareable copy)." if ws else
+                   "WITH their secret values, encrypted with a passphrase you choose next."))
+        return {"op": "export", "what": "export", "path": path, "without_secrets": ws,
+                "lines": [line]}
+    keep = p.get("keep_existing")
+    if not isinstance(keep, bool):
+        raise SetupError("keep_existing: true (only add new items) or false (the file wins)")
+    path = Path(g["target"])
+    if not path.is_file():
+        raise SetupError(f"{path} is gone; ask the user to type /gate:import again")
+    return {"op": "import", "what": "import", "path": path, "keep_existing": keep,
+            "lines": [f"Import {path}" + (" (keeping what's already here)." if keep else ".")]}
+
+
+def _run_transfer(plan: dict[str, Any], confirm, secret) -> str:
+    from . import transfer
+    try:
+        if plan["what"] == "export":
+            return transfer.run_export(plan, confirm, secret)
+        return transfer.run_import(plan, confirm, secret)
+    except transfer.TransferError as e:
+        raise SetupError(str(e))
+
+
 def run(verb: str, rest: str, session_id: str) -> str:
     words = rest.split()
     commands._guard_text(words)
     if verb == "list":
         return _list(session_id)
     if verb in ("export", "import"):
-        return f"/gate:{verb} is coming in a later version of the gateway."
+        return _transfer_command(verb, rest.strip(), session_id)
     if verb in ("enable", "disable"):
         if words and words[0].lower() == "reuse":
             return _reuse(verb, words[1:], session_id)
@@ -280,6 +365,10 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
     """Validate a proposal against its grant; return a normalized plan with a
     plain-language summary. Raises SetupError so Claude can fix and retry."""
     op, what = g["op"], g["what"] or str(p.get("what", "")).lower()
+    if op in ("export", "import") or what in ("export", "import"):
+        if op not in ("export", "import"):
+            raise SetupError("export and import start only from /gate:export or /gate:import")
+        return _transfer_plan(g, p)
     if g["what"] and p.get("what") and str(p["what"]).lower() != g["what"]:
         raise SetupError(f"this setup is for {g['what']}, not {p['what']}")
     if what not in WHATS:
@@ -627,6 +716,26 @@ def gate_setup(grant: str, proposal: dict[str, Any], session_id: str | None = No
         policy.audit("gate_setup", {"grant": str(grant)[:16], "outcome": f"refused: {e}"[:200]})
         return {"ok": False, "refused": True, "reason": str(e)}
     summary = "\n".join(plan["lines"])
+    if plan["what"] in ("export", "import") and dialog.available():
+        from . import transfer
+        try:
+            result = _run_transfer(plan, dialog.confirm, dialog.secret)
+        except transfer.Declined as e:
+            policy.audit("gate_setup", {"grant": grant, "what": plan["what"],
+                                        "outcome": "declined"})
+            return {"ok": False, "declined": True, "reason": str(e)}
+        except SetupError as e:
+            policy.audit("gate_setup", {"grant": grant, "what": plan["what"],
+                                        "outcome": f"refused: {e}"[:200]})
+            return {"ok": False, "refused": True, "reason": str(e)}
+        except dialog.Unavailable:
+            _use(grant, pending=proposal)
+            return {"ok": False, "needs_terminal": True, "summary": summary,
+                    "reason": "The dialog couldn't open. Ask the user to finish in a terminal:\n  "
+                              + terminal_command(f"finish {grant}")}
+        _use(grant)
+        policy.audit("gate_setup", {"grant": grant, "what": plan["what"], "outcome": "ok"})
+        return {"ok": True, "result": result}
     if not dialog.available():
         _use(grant, pending=proposal)
         policy.audit("gate_setup", {"grant": grant, "outcome": "needs terminal"})
@@ -672,6 +781,14 @@ def finish(gid: str, ask_confirm, ask_secret) -> str:
     if not g.get("pending"):
         raise SetupError(f"setup {gid} has nothing to finish yet")
     plan = _plan(g, g["pending"], data)
+    if plan["what"] in ("export", "import"):
+        from . import transfer
+        try:
+            result = _run_transfer(plan, ask_confirm, ask_secret)
+        except transfer.Declined as e:
+            return str(e)
+        _use(gid)
+        return result
     if not ask_confirm("\n".join(plan["lines"])):
         return "Cancelled; nothing was saved."
     value = None

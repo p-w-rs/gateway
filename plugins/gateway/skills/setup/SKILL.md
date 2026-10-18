@@ -138,6 +138,19 @@ Account proposal, for example:
  "credentials": {"browser": true}}
 ```
 
+### Export and import (`/gate:export`, `/gate:import FILE`)
+One question each, then `gate_setup`:
+- Export: a **full copy** (with secret values, to move to another machine
+  of theirs; recommended for that) or a **shareable copy** (accounts, hosts
+  and settings, no token, key or password).
+  `{"what": "export", "without_secrets": false}`.
+- Import: **keep what's here** and only add new items, or let **the file
+  win** for items that exist in both. `{"what": "import", "keep_existing": true}`.
+Never put a path in the proposal: the file is what the user typed. The
+gateway asks for the passphrase in its own dialog and shows a summary before
+anything changes. Afterwards, relay the result; mention that sudo stays off
+on the new machine until they type `/gate:enable sudo HOST`.
+
 ### Updates (`/gate:update NAME`)
 Ask what to change, then send only that. Examples:
 - `{"description": "…"}`

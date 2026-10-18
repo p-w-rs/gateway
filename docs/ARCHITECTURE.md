@@ -141,6 +141,34 @@ Each ssh_exec / ssh_copy / run_privileged-over-ssh call writes a private
 - Pijul uses its own SSH client, and git over ssh uses the runner's
   `GIT_SSH_COMMAND` (below); neither goes through this config.
 
+### Export and import (`transfer.py`)
+
+`/gate:export [PATH]` and `/gate:import FILE` open a setup grant like
+`/gate:add`. Claude asks one question (full or shareable copy; replace or
+keep existing items) and calls `gate_setup`. The file path is only ever what
+the user typed (default `~/Downloads/gateway-YYYYMMDD.age`, never
+overwritten); a `path` in the proposal is refused.
+
+- **File:** age passphrase encryption (scrypt), mode 0600. The plaintext is
+  `{"gateway_export": 1, created, from_host, without_secrets, secrets, sudo,
+  accounts, account_prompts}`. Grants, sudo session and "always" switches
+  and ssh reuse are never exported. A shareable copy drops every secret
+  value, sudo password and account credential. Opens by hand with
+  `age -d FILE`.
+- **age without a terminal:** age reads passphrases only from a tty, so it
+  runs under `pty.fork()` and the gateway answers its prompts; the
+  plaintext moves through a FIFO in a 0700 temp dir, never a regular file.
+  The passphrase (twice, at least 12 characters for a full copy, 8 for a
+  shareable one) is typed in the native dialog or, headless, at
+  `gateway finish GRANT`.
+- **Import:** passphrase -> decrypt -> validate the whole file as strictly
+  as a setup (names, hosts, kinds, fields, owners, credentials, routes,
+  policies; anything wrong refuses the whole file; a legacy `*` host is
+  dropped) -> summary dialog (adds, replaces, keeps, skips, host keys that
+  differ) -> merge under the vault lock. Values a shareable copy lacks keep
+  the local ones; an item with no value here or there is skipped. sudo
+  stays off for imported hosts until a typed `/gate:enable`.
+
 ### Root commands
 
 `run_privileged` runs, locally or as `ssh -o BatchMode=yes -T -- user@host`:

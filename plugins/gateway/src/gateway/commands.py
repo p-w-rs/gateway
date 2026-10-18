@@ -138,8 +138,10 @@ _HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-
 def _guard_text(words: list[str]) -> None:
     # A host name (adb-1234567890.7.azuredatabricks.net) is long and mixes
     # letters and digits too; only a known token prefix flags one.
+    # So is a file path (/gate:import ~/Downloads/gateway-20261017.age).
     hits = [w for w in words if _TOKEN_LIKE.match(w)
-            and (_KNOWN_PREFIX.match(w) or not _HOSTNAME.match(w.lower()))]
+            and (_KNOWN_PREFIX.match(w) or not (_HOSTNAME.match(w.lower())
+                                                or w.startswith(("/", "~/", "./", "../"))))]
     if hits:
         raise LooksLikeValue(
             "That looks like it contains a secret value, so it was not sent to "

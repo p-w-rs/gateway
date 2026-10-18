@@ -44,6 +44,7 @@ plugins/gateway/
     hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
                    the hf, pijul, ssh_exec/ssh_copy/ssh_hosts, databricks, mlcat*, registry tools
     sshconf.py     the gateway's own ssh_config per call: routes, host-key policy, keys, reuse
+    transfer.py    /gate:export and /gate:import: age -p under a private pty, validate, merge
   skills/accounts/SKILL.md        how Claude uses accounts and mirrors (gate:accounts)
   skills/setup/SKILL.md           how Claude guides /gate:add and /gate:update (gate:setup)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
