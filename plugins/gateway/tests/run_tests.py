@@ -998,36 +998,70 @@ print("tool list and settings:")
 names = {t["name"] for t in c.rpc("tools/list", {})["result"]["tools"]}
 check("no vault_* tools any more", not any(n.startswith("vault_") for n in names))
 c.close()
-_proposed = json.loads((ROOT.parents[1] / "settings.rules.json").read_text())["permissions"]
 _gw = "mcp__plugin_gate_gw__"
-check("rules template: run_privileged_confirm and port_check on 'ask', not 'allow'",
-      all(_gw + t in _proposed["ask"] and _gw + t not in _proposed["allow"]
-          for t in ("run_privileged_confirm", "port_check")))
-check("rules template: no vault_* rules, no personal paths",
-      not any("vault_" in r for k in ("allow", "ask") for r in _proposed[k])
-      and "/Users/" not in json.dumps(_proposed) and "/home/" not in json.dumps(_proposed))
-
-print("installer (merge logic, no real settings touched):")
+print("installer (dev helper: legacy cleanup, no real settings touched):")
 sys.path.insert(0, str(ROOT))
 import install  # noqa: E402
-rules = install.load_rules(Path.home() / "x" / "plugins" / "gateway")
-check("installer: {PLUGIN_DIR} under home becomes ~/...",
-      "Edit(~/x/plugins/gateway/config/**)" in rules["deny"])
-check("installer: path outside home becomes //abs",
-      install.rule_path(Path("/opt/ng")) == "//opt/ng")
-before = {"theme": "dark",
-          "permissions": {"allow": ["Bash(ls:*)", _gw + "port_check"], "deny": ["Bash(rm:*)"]}}
-after, changes = install.merge(before, rules)
-check("installer: keeps unrelated settings and rules",
-      after["theme"] == "dark" and "Bash(ls:*)" in after["permissions"]["allow"]
-      and "Bash(rm:*)" in after["permissions"]["deny"])
-check("installer: a stray 'allow' for an ask-tool is moved to 'ask'",
-      _gw + "port_check" not in after["permissions"]["allow"]
-      and _gw + "port_check" in after["permissions"]["ask"]
-      and f"- allow: {_gw}port_check" in changes)
-again, changes2 = install.merge(after, rules)
-check("installer: idempotent", again == after and changes2 == [])
-check("installer: input not mutated", before["permissions"]["allow"] == ["Bash(ls:*)", _gw + "port_check"])
+_leg = install.legacy(Path.home() / "x" / "plugins" / "gateway")
+check("legacy: {PLUGIN_DIR} under home becomes ~/...",
+      "Edit(~/x/plugins/gateway/config/**)" in _leg["rules"]["deny"])
+check("legacy: path outside home becomes //abs", install.rule_path(Path("/opt/ng")) == "//opt/ng")
+check("legacy: covers v0.5's rules, strict rules and env",
+      _gw + "git" in _leg["rules"]["allow"] and _gw + "git_confirm" in _leg["rules"]["ask"]
+      and "Read(~/.ssh/id_*)" in _leg["rules"]["deny"]
+      and "Bash(unset SSH_AUTH_SOCK SSH_AGENT_PID)" in _leg["rules"]["allow"]
+      and "SSH_AUTH_SOCK" in _leg["env"] and "GITHUB_TOKEN" in _leg["env"])
+_before = {"theme": "dark", "env": {"GITHUB_TOKEN": "", "SSH_AUTH_SOCK": "/dev/null", "MINE": "1",
+                                    "HF_TOKEN": "users-own-value"},
+           "permissions": {"allow": ["Bash(ls:*)", _gw + "git", "Bash(unset SSH_AUTH_SOCK SSH_AGENT_PID)"],
+                           "ask": [_gw + "git_confirm"],
+                           "deny": ["Bash(rm:*)", "Read(~/.ssh/id_*)", "Bash(curl:*)"]}}
+_after, _ch = install.cleanup(_before, _leg)
+check("cleanup: removes v0.5's rules and env blanks",
+      _after["permissions"] == {"allow": ["Bash(ls:*)"], "deny": ["Bash(rm:*)"]}
+      and "GITHUB_TOKEN" not in _after["env"] and "SSH_AUTH_SOCK" not in _after["env"] and _ch)
+check("cleanup: keeps unrelated settings and the user's own env values",
+      _after["theme"] == "dark" and _after["env"] == {"MINE": "1", "HF_TOKEN": "users-own-value"})
+check("cleanup: idempotent", install.cleanup(_after, _leg) == (_after, []))
+check("cleanup: input not mutated", _before["env"]["GITHUB_TOKEN"] == ""
+      and _gw + "git" in _before["permissions"]["allow"])
+check("cleanup: an emptied settings file loses empty sections",
+      install.cleanup({"permissions": {"ask": [_gw + "port_check"]}, "env": {"GH_TOKEN": ""}}, _leg)[0] == {})
+
+print("permission hook (perm.sh: the plugin's own rules):")
+PERM_SH = ROOT / "hooks" / "perm.sh"
+
+
+def perm(tool, tool_input=None):
+    r = subprocess.run(["sh", str(PERM_SH), str(ROOT)], capture_output=True, text=True,
+                       input=json.dumps({"tool_name": tool, "tool_input": tool_input or {}}),
+                       env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(ROOT)})
+    out = r.stdout.strip()
+    return json.loads(out)["hookSpecificOutput"]["permissionDecision"] if out else None
+
+
+for _t in ("git", "gh", "account_list", "http_request", "run_privileged", "ssh_exec", "registry"):
+    check(f"perm: gateway tool {_t} allowed", perm(_gw + _t) == "allow")
+for _t in ("git_confirm", "gh_confirm", "run_privileged_confirm", "port_check", "registry_confirm"):
+    check(f"perm: {_t} asks", perm(_gw + _t) == "ask")
+_H = str(Path.home())
+for _tool, _ti in (("Read", {"file_path": _H + "/.ssh/id_ed25519"}), ("Read", {"file_path": "~/.ssh/powerslabs"}),
+                   ("Read", {"file_path": _H + "/.config/gh/hosts.yml"}),
+                   ("Read", {"file_path": _H + "/.config/gateway/vault.age"}),
+                   ("Grep", {"pattern": "PRIVATE", "path": _H + "/.ssh"}),
+                   ("Read", {"file_path": _H + "/.docker/config.json"}),
+                   ("Edit", {"file_path": str(ROOT / "config" / "policy.json")}),
+                   ("Write", {"file_path": str(ROOT / "config" / "x.json")})):
+    check(f"perm: {_tool} {str(list(_ti.values())[-1])[-38:]} denied", perm(_tool, _ti) == "deny")
+for _tool, _ti in (("Read", {"file_path": _H + "/.ssh/config"}), ("Read", {"file_path": _H + "/.ssh/powerslabs.pub"}),
+                   ("Glob", {"pattern": "*", "path": _H + "/.ssh"}),
+                   ("Read", {"file_path": str(ROOT / "config" / "policy.json")}),
+                   ("Read", {"file_path": "/tmp/notes.txt"}), ("Edit", {"file_path": str(ROOT / "README.md")})):
+    check(f"perm: {_tool} {str(list(_ti.values())[-1])[-38:]} allowed", perm(_tool, _ti) is None)
+_r = subprocess.run(["sh", str(PERM_SH), str(TMP / "no-such-plugin")], capture_output=True, text=True,
+                    input=json.dumps({"tool_name": "Read", "tool_input": {"file_path": _H + "/.ssh/id_rsa"}}))
+check("perm: if the gateway can't run, a credential path is denied (fails closed)",
+      '"deny"' in _r.stdout)
 
 print("linux / headless value entry:")
 _saved_env = {k: os.environ.get(k) for k in ("GATEWAY_BROWSER", "DISPLAY", "WAYLAND_DISPLAY",
@@ -1898,10 +1932,6 @@ check("MCP dispatch: git", r["ok"] is True)
 r = mcp_server.dispatch("account_list", {})
 check("MCP account_list: never values", r["ok"] and RUN_TOKEN not in json.dumps(r)
       and "github:acme" in r["accounts"])
-_rules = json.loads((ROOT.parents[1] / "settings.rules.json").read_text())["permissions"]
-check("settings rules: git/gh allowed, the _confirm tools ask",
-      all(f"mcp__plugin_gate_gw__{t}" in _rules["allow"] for t in ("git", "gh", "git_identity", "account_list"))
-      and all(f"mcp__plugin_gate_gw__{t}" in _rules["ask"] for t in ("git_confirm", "gh_confirm")))
 _gsrv2.shutdown()
 
 print("mirrors:")
@@ -2631,9 +2661,8 @@ finally:
 check("MCP lists registry (+confirm)", {"registry", "registry_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
 _asrv.shutdown()
 
-# --- Phase 9: take-over, strict mode, session note ------------------------
-print("take-over / strict:")
-_ON, _OFF = {"takeover": True}, {"takeover": False}
+# --- One mode: take-over always on, credentials out of Bash ----------------
+print("take-over (always on):")
 TAKE = [
     "git status", "git push origin main", "cd repo && git pull", "/usr/bin/git log",
     "GIT_TRACE=1 git fetch", "sudo -E git clone x", "env FOO=1 git log", "echo $(git rev-parse HEAD)",
@@ -2642,7 +2671,8 @@ TAKE = [
     "ssh host uptime", "scp a host:b", "sftp host", "rsync -a dir/ me@host:dir/",
     "rsync -av src host:/tmp", "docker login ghcr.io", "docker push x/y:1", "podman pull x",
     "docker image pull x", "skopeo copy a b", "oras push x", "crane ls x",
-    "ls; gh auth status", "true | git log",
+    "ls; gh auth status", "true | git log", "ssh-add -L", "launchctl getenv SSH_AUTH_SOCK",
+    "SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.AbC123/Listeners ls",
 ]
 NOTAKE = [
     "ls -la", "echo git", "cat .gitignore", "ssh-keygen -l -f k.pub", "grep -r ghost .",
@@ -2650,16 +2680,14 @@ NOTAKE = [
     "vim .github/x.yml", "azure-thing", "echo 'use the git tool'",
 ]
 for c in TAKE:
-    check(f"takeover on redirects: {c[:40]}", policy.match_takeover(c, _ON) is not None)
-    check(f"takeover off allows:  {c[:40]}", policy.match_takeover(c, _OFF) is None)
+    check(f"take-over redirects: {c[:40]}", policy.match_takeover(c) is not None)
 for c in NOTAKE:
-    check(f"takeover on allows:   {c[:40]}", policy.match_takeover(c, _ON) is None)
-check("takeover is off by default", policy.DEFAULT_CONFIG["takeover"] is False
-      and json.loads((ROOT / "config" / "policy.json").read_text()).get("takeover") is False)
-check("takeover routes name the account tool",
-      "git tool" in policy.match_takeover("git push", _ON)[1]
-      and "ssh_exec" in policy.match_takeover("ssh h", _ON)[1]
-      and "registry" in policy.match_takeover("docker push x", _ON)[1])
+    check(f"take-over allows:    {c[:40]}", policy.match_takeover(c) is None)
+check("no take-over switch any more", "takeover" not in policy.DEFAULT_CONFIG)
+check("take-over routes name the account tool",
+      "git tool" in policy.match_takeover("git push")[1]
+      and "ssh_exec" in policy.match_takeover("ssh h")[1]
+      and "registry" in policy.match_takeover("docker push x")[1])
 
 
 def _hook(cmd):
@@ -2674,100 +2702,64 @@ def _hook(cmd):
     return buf.getvalue().strip()
 
 
-def _session():
+def _session(env_file=None):
     old = sys.stdin
     sys.stdin = io.StringIO(json.dumps({"session_id": SID}))
     buf = io.StringIO()
+    saved = os.environ.get("CLAUDE_ENV_FILE")
+    if env_file:
+        os.environ["CLAUDE_ENV_FILE"] = str(env_file)
+    else:
+        os.environ.pop("CLAUDE_ENV_FILE", None)
     try:
         with contextlib.redirect_stdout(buf):
             hooks.session_main()
     finally:
         sys.stdin = old
+        if saved is None:
+            os.environ.pop("CLAUDE_ENV_FILE", None)
+        else:
+            os.environ["CLAUDE_ENV_FILE"] = saved
     return json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
 
 
-_saved_cfg = os.environ.get("GATEWAY_CONFIG")
-try:
-    use_config(_OFF)
-    check("hook: takeover off lets git through", _hook("git push origin main") == "")
-    _n = _session()
-    check("session note: account tools listed, take-over not claimed",
-          "git_mirror" in _n and "gate:accounts" in _n and "Take-over is ON" not in _n)
-    _c = io.StringIO()
-    with contextlib.redirect_stdout(_c):
-        cli.cmd_check(["git", "push"])
-    check("run.py check: git allowed with takeover off", "REDIRECT" not in _c.getvalue())
-    use_config(_ON)
-    _h = _hook("git push origin main")
-    check("hook: takeover on denies git with the git tool route",
-          '"deny"' in _h and "git tool" in _h)
-    check("hook: takeover on lets plain commands run (only the agent is unset)",
-          '"deny"' not in _hook("ls -la") and "unset SSH_AUTH_SOCK" in _hook("ls -la"))
-    check("hook: blocklist still wins with takeover on", "http_request" in _hook("cu" + "rl https://x"))
-    check("session note: says take-over is ON", "Take-over is ON" in _session())
-    _c = io.StringIO()
-    with contextlib.redirect_stdout(_c):
-        cli.cmd_check(["gh", "pr", "list"])
-    check("run.py check: gh redirected with takeover on", "REDIRECT: 'gh'" in _c.getvalue())
-finally:
-    if _saved_cfg is None:
-        os.environ.pop("GATEWAY_CONFIG", None)
-    else:
-        os.environ["GATEWAY_CONFIG"] = _saved_cfg
-
-_strict = install.load_strict()
-check("strict template: blanks credential env vars, denies credential files",
-      _strict["env"].get("GITHUB_TOKEN") == ""
-      and all(v == "" for k, v in _strict["env"].items() if k != "SSH_AUTH_SOCK")
-      # Claude Code keeps an inherited SSH_AUTH_SOCK over an empty value (seen live on
-      # macOS), so strict points it at something that is no agent instead.
-      and _strict["env"].get("SSH_AUTH_SOCK") == "/dev/null"
-      and "Read(~/.config/gh/hosts.yml)" in _strict["deny"] and "Read(~/.ssh/id_*)" in _strict["deny"])
-check("strict template: not part of the default rules",
-      "Read(~/.ssh/id_*)" not in rules["deny"])
-_b = {"env": {"KEEP": "1", "GITHUB_TOKEN": "mine"}, "permissions": {"deny": ["Bash(rm:*)"]}}
-_s1, _c1 = install.merge_strict(_b, _strict)
-check("strict: blanks env, adds denies, keeps the rest",
-      _s1["env"]["KEEP"] == "1" and _s1["env"]["GITHUB_TOKEN"] == ""
-      and _s1["env"]["SSH_AUTH_SOCK"] == "/dev/null" and "Bash(rm:*)" in _s1["permissions"]["deny"]
-      and "Read(~/.azure/**)" in _s1["permissions"]["deny"] and bool(_c1))
-check("strict: input not mutated", _b["env"]["GITHUB_TOKEN"] == "mine")
-_s2, _c2 = install.merge_strict(_s1, _strict)
-check("strict: idempotent", _s2 == _s1 and _c2 == [])
-_u, _cu = install.merge_strict(_s1, _strict, undo=True)
-check("unstrict: removes only what strict added",
-      _u["env"] == {"KEEP": "1"} and _u["permissions"]["deny"] == ["Bash(rm:*)"] and bool(_cu))
-_u2, _ = install.merge_strict({"permissions": {}}, _strict, undo=True)
-check("unstrict on clean settings: no empty env left", "env" not in _u2)
-_pd = TMP / "fakeplugin"
-(_pd / "config").mkdir(parents=True)
-(_pd / "config" / "policy.json").write_text(json.dumps({"x": 1, "takeover": False}))
-check("set_takeover: turns on in config/local.json, policy.json untouched",
-      install.set_takeover(True, _pd)
-      and json.loads((_pd / "config" / "local.json").read_text()) == {"takeover": True}
-      and json.loads((_pd / "config" / "policy.json").read_text()) == {"x": 1, "takeover": False})
-check("set_takeover: no change when already on", install.set_takeover(True, _pd) is False)
-check("set_takeover: turns off", install.set_takeover(False, _pd)
-      and json.loads((_pd / "config" / "local.json").read_text())["takeover"] is False)
-check("config/local.json is gitignored",
-      "**/config/local.json" in (ROOT.parents[1] / ".gitignore").read_text())
-_saved_cfg2 = os.environ.get("GATEWAY_CONFIG")
-try:
-    os.environ["GATEWAY_CONFIG"] = str(_pd / "config" / "policy.json")
-    (_pd / "config" / "local.json").write_text(json.dumps({"takeover": True, "allow_domains": ["x"]}))
-    _lc = policy.load_config()
-    check("load_config: local.json turns take-over on", _lc["takeover"] is True)
-    check("load_config: local.json can't change anything but takeover",
-          _lc["allow_domains"] != ["x"] and _lc.get("x") == 1)
-    (_pd / "config" / "local.json").write_text(json.dumps({"takeover": False}))
-    (_pd / "config" / "policy.json").write_text(json.dumps({"x": 1, "takeover": True}))
-    check("load_config: local.json wins over policy.json", policy.load_config()["takeover"] is False
-          and install.takeover_now(_pd) is False)
-finally:
-    if _saved_cfg2 is None:
-        os.environ.pop("GATEWAY_CONFIG", None)
-    else:
-        os.environ["GATEWAY_CONFIG"] = _saved_cfg2
+_h = _hook("git push origin main")
+check("hook: git in Bash is denied with the git tool route", '"deny"' in _h and "git tool" in _h)
+check("hook: plain commands pass untouched", _hook("ls -la") == "")
+check("hook: blocklist still wins", "http_request" in _hook("cu" + "rl https://x"))
+_ef = TMP / "claude-env-file"
+_n = _session(_ef)
+check("session note: account tools listed and take-over stated",
+      "git_mirror" in _n and "gate:accounts" in _n and "only way" in _n)
+_envtxt = _ef.read_text() if _ef.exists() else ""
+check("session start unsets the credential variables for Bash (CLAUDE_ENV_FILE)",
+      _envtxt.startswith("unset ") and all(v in _envtxt.split() for v in
+                                         ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GITHUB_TOKEN", "GH_TOKEN",
+                                          "HF_TOKEN", "DATABRICKS_TOKEN", "GIT_ASKPASS")))
+_r = subprocess.run(["sh", "-c", f". {_ef}; printf '%s|%s' \"${{SSH_AUTH_SOCK-gone}}\" \"${{GITHUB_TOKEN-gone}}\""],
+                    capture_output=True, text=True,
+                    env={**os.environ, "SSH_AUTH_SOCK": "/tmp/agent", "GITHUB_TOKEN": "ghp_x"})
+check("sourcing the env file really removes them", _r.stdout == "gone|gone")
+check("no CLAUDE_ENV_FILE: session start still works", "only way" in _session(None))
+_c = io.StringIO()
+with contextlib.redirect_stdout(_c):
+    cli.cmd_check(["gh", "pr", "list"])
+check("run.py check: gh redirected", "REDIRECT: 'gh'" in _c.getvalue())
+check("python -c with only an import passes; a real call is redirected",
+      policy.match_blocked('python -c "import requests; print(requests.__version__)"') is None
+      and policy.match_blocked("python3 -c 'import urllib.request as u; u.urlopen(1)'") is not None
+      and policy.match_blocked("python -c 'import requests; requests.get(1)'") is not None)
+for _argv, _ok in ((["add", "-u"], True), (["push", "-u", "origin", "main"], True),
+                   (["cherry-pick", "-x", "abc"], True), (["commit", "-q", "-m", "x"], True),
+                   (["clone", "-u", "x", "y"], False), (["clone", "-u/bin/sh", "y"], False),
+                   (["ls-remote", "-u", "x", "y"], False), (["rebase", "-x", "make"], False),
+                   (["rebase", "-ix", "make"], False), (["fetch", "--upload-pack=x"], False)):
+    try:
+        runner.check_git_argv(_argv)
+        _got = True
+    except runner.RunnerError:
+        _got = False
+    check(f"git {' '.join(_argv)}: {'allowed' if _ok else 'refused'}", _got is _ok)
 check("version is 0.5.0 everywhere", __import__("gateway").__version__ == "0.5.0"
       and json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"] == "0.5.0")
 
@@ -2857,63 +2849,6 @@ check("owners help explains repo-URL owners and spaces",
       "github.com/OWNER" in _f["owners"]["help"] and "spaces" in _f["owners"]["help"])
 check("ssh host help says ~/.ssh/config aliases aren't read",
       "~/.ssh/config" in {f["name"]: f for f in commands._account_fields("ssh", None)}["host"]["help"])
-
-# --- Strict: the user's ssh-agent is unset in every Bash command ------------
-print("strict: ssh-agent stripped from Bash:")
-
-
-def _hook_out(cmd, extra=None):
-    old = sys.stdin
-    sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash",
-                                        "tool_input": {"command": cmd, **(extra or {})}}))
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            hooks.route_main()
-    finally:
-        sys.stdin = old
-    s = buf.getvalue().strip()
-    return json.loads(s) if s else None
-
-
-_saved_cfg3 = os.environ.get("GATEWAY_CONFIG")
-try:
-    use_config({"takeover": False})
-    check("agent strip: off without take-over", _hook_out("ls -la") is None)
-    use_config({"takeover": True})
-    _o = _hook_out("ls -la", {"description": "list", "timeout": 5000})
-    _hs = (_o or {}).get("hookSpecificOutput", {})
-    check("agent strip: take-over on prefixes the unset",
-          _hs.get("updatedInput", {}).get("command") == hooks.AGENT_UNSET + "; ls -la")
-    check("agent strip: other input fields kept",
-          _hs.get("updatedInput", {}).get("description") == "list"
-          and _hs.get("updatedInput", {}).get("timeout") == 5000)
-    check("agent strip: no permission decision (the user's rules still apply)",
-          "permissionDecision" not in _hs)
-    check("agent strip: not prefixed twice",
-          _hook_out(hooks.AGENT_UNSET + "; ls") is None)
-    _d = _hook_out("git push")
-    check("agent strip: a refused command stays refused",
-          _d["hookSpecificOutput"].get("permissionDecision") == "deny"
-          and "updatedInput" not in _d["hookSpecificOutput"])
-    for _c in ("ssh-add -L", "launchctl getenv SSH_AUTH_SOCK",
-               "SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.AbC123/Listeners ls"):
-        check(f"take-over refuses: {_c[:40]}", policy.match_takeover(_c) is not None)
-    check("take-over still allows ssh-keygen", policy.match_takeover("ssh-keygen -l -f k.pub") is None)
-finally:
-    if _saved_cfg3 is None:
-        os.environ.pop("GATEWAY_CONFIG", None)
-    else:
-        os.environ["GATEWAY_CONFIG"] = _saved_cfg3
-
-_st = install.load_strict()
-check("strict allows exactly the hook's prefix",
-      _st.get("allow") == [f"Bash({hooks.AGENT_UNSET})"])
-_sa, _ = install.merge_strict({"permissions": {"allow": ["Bash(ls:*)"]}}, _st)
-check("strict merge adds the allow rule, keeps the user's",
-      _sa["permissions"]["allow"] == ["Bash(ls:*)", f"Bash({hooks.AGENT_UNSET})"])
-_ua, _ = install.merge_strict(_sa, _st, undo=True)
-check("unstrict removes only that allow rule", _ua["permissions"]["allow"] == ["Bash(ls:*)"])
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

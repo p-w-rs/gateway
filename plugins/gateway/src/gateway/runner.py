@@ -245,8 +245,12 @@ GIT_REFUSED = {"credential", "credential-cache", "credential-store", "daemon",
 GIT_REFUSED_GLOBAL = ("-c", "--config-env", "--exec-path", "-C", "--git-dir",
                       "--work-tree", "--namespace", "--super-prefix", "--list-cmds")
 # Per-call flags that point git at another program.
-GIT_REFUSED_FLAGS = ("--upload-pack", "--receive-pack", "-u", "--exec", "-x",
+GIT_REFUSED_FLAGS = ("--upload-pack", "--receive-pack", "--exec",
                      "--extcmd", "--tool", "--config", "--template", "--separate-git-dir")
+# Short flags that run a program only in some subcommands (`clone -u` is
+# --upload-pack, `rebase -x` is --exec; `add -u`, `push -u` and
+# `cherry-pick -x` are harmless). Attached and grouped forms count too.
+GIT_REFUSED_SHORT = {"u": ("clone", "ls-remote"), "x": ("rebase",)}
 
 
 def check_git_argv(argv: list[str]) -> str:
@@ -263,8 +267,12 @@ def check_git_argv(argv: list[str]) -> str:
         raise RunnerError(f"'git {sub}' is not run through the gateway")
     for a in argv[1:]:
         flag = a.split("=", 1)[0]
-        if flag in GIT_REFUSED_FLAGS and not (sub == "push" and flag == "-u"):
+        if flag in GIT_REFUSED_FLAGS:
             raise RunnerError(f"git flag {flag} is not allowed here")
+        if a.startswith("-") and not a.startswith("--"):
+            for letter, subs in GIT_REFUSED_SHORT.items():
+                if sub in subs and letter in a[1:]:
+                    raise RunnerError(f"git {sub} -{letter} runs a program; not allowed here")
     if sub == "submodule" and "foreach" in argv[1:]:
         raise RunnerError("'git submodule foreach' runs shell commands; not allowed here")
     if sub == "bisect" and "run" in argv[1:]:

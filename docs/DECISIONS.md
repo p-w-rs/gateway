@@ -151,26 +151,40 @@ git). The parts that shape the code:
 - **Refresh-token rotation is the server's one vault write.** Entra rotates
   refresh tokens; keeping the spent one would break the next sign-in. This
   replaces a value the user already put there and grants nothing new.
-- **Take-over is a switch, off by default.** The Bash hook reads the
-  checkout live, so turning it on blocks git in Bash in every open session,
-  including ones whose MCP server predates the git tool. It goes on (via
-  `--strict`) after the live test.
-- **Strict mode blanks credentials through settings `env`.** Redirects only
-  steer Claude; blanking `SSH_AUTH_SOCK`, `GITHUB_TOKEN` and the like for
-  Claude Code's processes means a Bash call that slips past the regex has
-  nothing to use. The user's own terminal is unaffected.
-- **The ssh-agent is unset per command, not through `env`.** Live, the
-  desktop app's `SSH_AUTH_SOCK` survived both `""` and `/dev/null` in
-  settings `env`, while `GITHUB_TOKEN` was blanked. The PreToolUse hook's
-  `updatedInput` (checked headless: it applies without a permission decision
-  and the user's rules still decide) prefixes `unset SSH_AUTH_SOCK
-  SSH_AGENT_PID;`. Rules are checked against the rewritten command, so the
-  prefix alone needed approval until strict added `Bash(unset SSH_AUTH_SOCK
-  SSH_AGENT_PID)` as an exact allow rule. Returning `allow` instead would
-  have auto-approved every command, so the hook never sets a decision.
-- **Take-over lives in config/local.json.** Writing it into the tracked
-  policy.json left the checkout dirty while strict was on. local.json is
-  gitignored, wins over policy.json, and may set only `takeover`.
+- *(v0.5, superseded in v0.6 below: take-over as a switch, strict mode
+  through settings `env` and installer-merged rules, a per-command `unset`
+  prefix with its allow rule, `config/local.json`.)*
 - **Host names aren't tokens.** The paste guard exempts host names
   (`adb-1234567890.7.azuredatabricks.net`) unless they start with a known
   token prefix.
+
+## One mode, rules in the plugin (v0.6)
+
+- **No modes.** The user wants the gateway to be the only way Claude uses
+  what it manages. Take-over and the lockdown are always on while the plugin
+  is enabled; disabling the plugin is the off switch.
+- **Rules are hook decisions, not settings.** Plugins can't ship permission
+  rules or `env`: from a plugin's settings, only `agent` and
+  `subagentStatusLine` are honored (Claude Code docs, plugin components). So
+  the `ask` and `deny` rules became PreToolUse decisions in `hooks/perm.sh`
+  and `hooks.files_main`. The installer no longer edits settings.json, and
+  install is the standard `/plugin install`.
+- **Credential variables are unset through `CLAUDE_ENV_FILE`.** A
+  SessionStart hook may append shell lines to it, and Claude Code sources it
+  before every Bash command. An `unset` there removed `SSH_AUTH_SOCK` and
+  `GITHUB_TOKEN` with no prompt, probed headless with a fake value in the
+  parent env. This replaces both settings `env` and the per-command prefix.
+- **A sh prefilter keeps file tools fast.** Every Read/Grep/Glob/Edit now
+  passes through the hook. `perm.sh` decides gateway tools by name and sends
+  only calls that mention a credential location to Python. If Python can't
+  run, those calls are denied (fail closed).
+- **`~/.ssh/config`, `known_hosts` and `*.pub` stay readable.** Claude needs
+  them to help import hosts; private keys, agent sockets and Grep over the
+  folder don't.
+- **`python -c "import requests"` is fine.** The inline-python rule now looks
+  for a call (`requests.get(`, `urlopen(`, `socket.create_connection(`, …),
+  not an import.
+- **`-u`/`-x` are refused only where they run a program** (`clone`/`ls-remote
+  -u`, `rebase -x`), including attached and grouped forms. `add -u`, `push
+  -u` and `cherry-pick -x` work.
+

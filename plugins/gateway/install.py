@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Install gateway for the current user (run via `pixi run install`).
+"""Developer helper (`pixi run install`). Users don't need it: the standard
+plugin install (/plugin marketplace add p-w-rs/gateway, /plugin install
+gate@gateway) is all there is, because the gateway's rules live in its own
+hooks.
 
-1. Registers this repo as the local plugin marketplace "gateway" and
-   installs gateway from it (`claude plugin ...`).
-2. Merges the plugin's permission rules (settings.rules.json at the repo
-   root) into your user settings.json, after showing what changes and asking.
-   A backup is written first. Re-running is safe: rules already there are
-   left alone.
+1. Registers this checkout as the local plugin marketplace "gateway" and
+   installs the plugin from it (`claude plugin ...`), so edits here are live.
+2. Removes what gateway v0.5 wrote into your settings.json (permission rules
+   and the strict-mode `env` entries, listed in legacy-settings.json), after
+   showing it and asking. A backup is written first. Settings the gateway
+   didn't add are left alone.
 
-3. With --strict (undo with --unstrict): blanks your own credential variables
-   for Claude Code's processes, denies reads of the usual credential files,
-   and turns on takeover in config/local.json (gitignored; git, gh, hf, pijul, ssh, ...
-   in Bash are redirected to the gateway's account tools).
-
-Options: --yes (don't ask), --dry-run (show only), --skip-plugin (settings only),
---strict / --unstrict. Only Claude Code and pixi are needed.
+Options: --yes (don't ask), --dry-run (show only), --skip-plugin (cleanup only).
+Only Claude Code and pixi are needed.
 """
 from __future__ import annotations
 
@@ -28,7 +26,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PLUGIN_DIR.parents[1]
-RULES_FILE = REPO_ROOT / "settings.rules.json"
+LEGACY_FILE = PLUGIN_DIR / "legacy-settings.json"
 KINDS = ("allow", "ask", "deny")
 
 
@@ -39,8 +37,7 @@ def settings_path() -> Path:
 
 def rule_path(p: Path) -> str:
     """A path as Claude Code permission rules spell it: `~/…` under home,
-    `//abs/…` otherwise (a single leading `/` would mean relative to the
-    settings file)."""
+    `//abs/…` otherwise."""
     p = p.resolve()
     try:
         return "~/" + p.relative_to(Path.home().resolve()).as_posix()
@@ -48,97 +45,47 @@ def rule_path(p: Path) -> str:
         return "/" + p.as_posix()
 
 
-def load_rules(plugin_dir: Path = PLUGIN_DIR) -> dict[str, list[str]]:
-    raw = json.loads(RULES_FILE.read_text())["permissions"]
+def legacy(plugin_dir: Path = PLUGIN_DIR) -> dict:
+    """Everything v0.5's installer could have added: rules per kind (with
+    {PLUGIN_DIR} filled in) and env entries with the value it set."""
+    raw = json.loads(LEGACY_FILE.read_text())
     where = rule_path(plugin_dir)
-    return {k: [r.replace("{PLUGIN_DIR}", where) for r in raw.get(k, [])] for k in KINDS}
+    rules = {k: [r.replace("{PLUGIN_DIR}", where) for r in raw["permissions"].get(k, [])]
+             for k in KINDS}
+    strict = raw.get("strict", {})
+    for k in ("allow", "deny"):
+        rules[k] += strict.get(k, [])
+    env = dict(strict.get("env", {}))
+    return {"rules": rules, "env": env}
 
 
-def merge(settings: dict, rules: dict[str, list[str]]) -> tuple[dict, list[str]]:
-    """Add the plugin's rules to a settings dict. A rule the plugin puts on
-    'ask' or 'deny' is removed from a weaker list ('allow', or 'allow'/'ask'),
-    so a stray allow can't silence a prompt. Returns (new settings, changes)."""
+def cleanup(settings: dict, old: dict) -> tuple[dict, list[str]]:
+    """Remove v0.5's rules and env entries. An env entry goes only if it still
+    has a value v0.5 set ("" or the template's), so the user's own stays."""
     out = json.loads(json.dumps(settings))
-    perm = out.setdefault("permissions", {})
+    perm = out.get("permissions", {})
     changes = []
-    weaker = {"ask": ["allow"], "deny": ["allow", "ask"], "allow": []}
     for kind in KINDS:
-        for rule in rules[kind]:
-            for w in weaker[kind]:
-                if rule in perm.get(w, []):
-                    perm[w].remove(rule)
-                    changes.append(f"- {w}: {rule}")
-            cur = perm.setdefault(kind, [])
-            if rule not in cur:
-                cur.append(rule)
-                changes.append(f"+ {kind}: {rule}")
-    return out, changes
-
-
-def load_strict() -> dict:
-    return json.loads(RULES_FILE.read_text()).get("strict", {"env": {}, "deny": []})
-
-
-def merge_strict(settings: dict, strict: dict, undo: bool = False) -> tuple[dict, list[str]]:
-    """Add (or with undo, remove) strict mode's env blanks and deny rules."""
-    out = json.loads(json.dumps(settings))
-    env = out.setdefault("env", {})
-    deny = out.setdefault("permissions", {}).setdefault("deny", [])
-    changes = []
-    for k, v in strict.get("env", {}).items():
-        if undo:
-            if k in env and env[k] == v:
+        have = perm.get(kind)
+        if not isinstance(have, list):
+            continue
+        for rule in old["rules"][kind]:
+            while rule in have:
+                have.remove(rule)
+                changes.append(f"- {kind}: {rule}")
+        if not have:
+            perm.pop(kind)
+    if "permissions" in out and not out["permissions"]:
+        out.pop("permissions")
+    env = out.get("env")
+    if isinstance(env, dict):
+        for k, v in old["env"].items():
+            if k in env and env[k] in ("", v):
                 del env[k]
                 changes.append(f"- env: {k}")
-        elif env.get(k) != v:
-            env[k] = v
-            changes.append(f"+ env: {k}=\"{v}\" (blanked for Claude Code only)")
-    allow = out["permissions"].setdefault("allow", [])
-    for kind, rules, have in (("deny", strict.get("deny", []), deny),
-                              ("allow", strict.get("allow", []), allow)):
-        for rule in rules:
-            if undo:
-                if rule in have:
-                    have.remove(rule)
-                    changes.append(f"- {kind}: {rule}")
-            elif rule not in have:
-                have.append(rule)
-                changes.append(f"+ {kind}: {rule}")
-    if not allow:
-        out["permissions"].pop("allow")
-    if not env:
-        out.pop("env")
+        if not env:
+            out.pop("env")
     return out, changes
-
-
-def takeover_now(plugin_dir: Path = PLUGIN_DIR) -> bool:
-    """Take-over as the gateway sees it: config/local.json, else policy.json."""
-    for name in ("local.json", "policy.json"):
-        p = plugin_dir / "config" / name
-        try:
-            v = json.loads(p.read_text()).get("takeover")
-        except (OSError, ValueError):
-            continue
-        if isinstance(v, bool):
-            return v
-    return False
-
-
-def set_takeover(on: bool, plugin_dir: Path = PLUGIN_DIR) -> bool:
-    """Set "takeover" in config/local.json (gitignored, so the checkout
-    stays clean); True if it changed."""
-    if takeover_now(plugin_dir) is on:
-        return False
-    p = plugin_dir / "config" / "local.json"
-    try:
-        cfg = json.loads(p.read_text())
-    except (OSError, ValueError):
-        cfg = {}
-    cfg["takeover"] = on
-    tmp = p.with_name("local.json.tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-    os.replace(tmp, p)
-    return True
 
 
 def _claude(*args: str) -> subprocess.CompletedProcess:
@@ -166,22 +113,16 @@ def install_plugin() -> bool:
 def main(argv: list[str]) -> int:
     yes, dry = "--yes" in argv, "--dry-run" in argv
     if not dry and "--skip-plugin" not in argv:
-        print("== Registering the plugin")
+        print("== Registering the plugin from this checkout")
         if not install_plugin():
             return 1
 
     path = settings_path()
     current = json.loads(path.read_text()) if path.exists() else {}
-    new, changes = merge(current, load_rules())
-    strict, unstrict = "--strict" in argv, "--unstrict" in argv
-    if strict or unstrict:
-        new, more = merge_strict(new, load_strict(), undo=unstrict)
-        changes += more
-        if takeover_now() is not strict:
-            changes.append(f"~ config/local.json: takeover = {str(strict).lower()}")
-    print(f"\n== Permission rules for {path}")
+    new, changes = cleanup(current, legacy())
+    print(f"\n== Old gateway entries in {path}")
     if not changes:
-        print("✓ already up to date")
+        print("✓ none (the gateway keeps its rules in its own hooks)")
     else:
         print("\n".join(changes))
         if dry:
@@ -191,25 +132,24 @@ def main(argv: list[str]) -> int:
             if not sys.stdin.isatty():
                 print("\nNot a terminal; re-run with --yes to apply.", file=sys.stderr)
                 return 1
-            if input("\nApply these changes? [y/N] ").strip().lower() not in ("y", "yes"):
+            if input("\nRemove these? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("Nothing changed.")
                 return 0
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            backup = path.with_name(f"settings.json.bak.{time.strftime('%Y%m%d%H%M%S')}")
-            shutil.copy2(path, backup)
-            print(f"backup: {backup}")
-        mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+        backup = path.with_name(f"settings.json.bak.{time.strftime('%Y%m%d%H%M%S')}")
+        shutil.copy2(path, backup)
+        print(f"backup: {backup}")
+        mode = path.stat().st_mode & 0o777
         tmp = path.with_name("settings.json.tmp")
         tmp.write_text(json.dumps(new, indent=2) + "\n")
         os.chmod(tmp, mode)
         os.replace(tmp, path)
-        print("✓ settings updated")
-        if strict or unstrict:
-            set_takeover(strict)
-            print(f"✓ takeover {'on' if strict else 'off'}")
+        print("✓ settings cleaned")
+    stale = PLUGIN_DIR / "config" / "local.json"
+    if stale.exists() and not dry:
+        stale.unlink()
+        print("✓ removed config/local.json (take-over is always on now)")
 
-    print("\nDone. Restart Claude Code (or /reload-plugins), then try /gate:help")
+    print("\nDone. Start a new Claude Code session, then try /gate:help")
     return 0
 
 

@@ -26,6 +26,9 @@ def main() -> int:
     if mode == "hook-route":
         from gateway import hooks
         return hooks.route_main()
+    if mode == "hook-files":
+        from gateway import hooks
+        return hooks.files_main()
     if mode == "hook-session":
         from gateway import hooks
         return hooks.session_main()

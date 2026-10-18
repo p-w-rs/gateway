@@ -251,26 +251,36 @@ calls it yet, the `git` MCP tool comes next). Per call:
   the catalog's `/api/config`. Storage passes come from
   `/api/transfers/{push,pull,complete}` and live only in dvc's environment.
 
-## Take-over and strict mode
+## One mode: the plugin's own rules
 
-- **Redirects:** `policy.TAKEOVER` matches git, gh, hf/huggingface-cli,
-  pijul, asiml/dvc, az, databricks/mlflow, ssh/scp/sftp, rsync to a host,
-  docker/podman login/push/pull, skopeo, oras and crane, at a command
-  position only (not `echo git` or `ssh-keygen`). The Bash hook redirects
-  them when `takeover` is true: in config/local.json (gitignored, written by
-  the installer) or policy.json; local.json wins and can set nothing else.
-- **Strict mode:** `pixi run install --strict` sets `takeover`, blanks the
-  user's credential variables in Claude Code's settings `env`, and adds Read
-  denies for the usual credential files, so a Bash call that gets past the
-  regex finds no credentials. `SSH_AUTH_SOCK` is the exception: the desktop
-  app starts Claude Code with it and settings `env` doesn't override it (seen
-  live with both "" and /dev/null). So with take-over on, the PreToolUse hook
-  rewrites every Bash command to `unset SSH_AUTH_SOCK SSH_AGENT_PID; …`
-  (`updatedInput`, no permission decision, so the user's rules still apply),
-  strict adds an exact allow rule for that prefix so it adds no prompt, and
-  take-over refuses `ssh-add`, `launchctl getenv SSH_AUTH_SOCK` and the
-  launchd socket path. A determined command can still find the socket; this
-  closes the accidental path, like the rest of take-over.
+Plugins can't ship permission rules or `env` (only `agent` settings are
+honored), so everything the plugin enforces is a hook decision. It's always
+on while the plugin is enabled.
+
+- **Redirects (Bash, `hooks.route_main`):** `policy.TAKEOVER` matches git,
+  gh, hf/huggingface-cli, pijul, asiml/dvc, az, databricks/mlflow,
+  ssh/scp/sftp, rsync to a host, docker/podman login/push/pull, skopeo, oras,
+  crane, `ssh-add`, `launchctl getenv SSH_AUTH_SOCK` and the launchd agent
+  socket path, at a command position only (not `echo git` or `ssh-keygen`).
+  `_BLOCKED` adds curl, wget, nmap, the keychain tool, inline python/node
+  network calls and the vault path.
+- **Credentials out of Bash (SessionStart):** `hooks.write_env_file` appends
+  `unset SSH_AUTH_SOCK SSH_AGENT_PID GITHUB_TOKEN …` (`policy.ENV_UNSET`) to
+  `CLAUDE_ENV_FILE`, which Claude Code sources before every Bash command.
+  Settings `env` couldn't do this: plugins can't ship it, and the desktop
+  app's `SSH_AUTH_SOCK` survived both `""` and `/dev/null` there.
+- **Gateway tools (`hooks/perm.sh`):** `*_confirm` and `port_check` return
+  `ask`, so Claude Code shows its prompt with the exact arguments. Every other
+  gateway tool returns `allow`, because each enforces its own accounts and
+  policy.
+- **File tools (`perm.sh` → `hooks.files_main`):** Read/Grep/Glob/Edit/Write
+  calls that mention a credential location get a precise check
+  (`policy.protected_path`): the vault, age and secret stores, credential
+  files (gh `hosts.yml`, docker, HF, Azure, Databricks, pijul identities,
+  asiml), private keys in `~/.ssh` (`config`, `known_hosts` and `*.pub` stay
+  readable; Glob may list names; Grep over `~/.ssh` is refused), the plugin's
+  data dir, and writes to the plugin's `config/`. Everything else passes
+  without starting Python.
 
 ## Policy and logging (`policy.py`)
 
@@ -286,17 +296,15 @@ calls it yet, the `git` MCP tool comes next). Per call:
 - `_BLOCKED` is the Bash blocklist used by the PreToolUse hook and by
   run_privileged.
 
-## Install (`install.py`, `pixi run install`)
+## Install
 
-1. `claude plugin marketplace add <repo>` (skipped if `gateway` is
-   already registered), then `claude plugin install gate@gateway`.
-2. Reads `settings.rules.json`, replaces `{PLUGIN_DIR}` with a rule path (`~/…`
-   under home, `//abs/…` otherwise; a single `/` would be relative to the
-   settings file), and merges into `$CLAUDE_CONFIG_DIR/settings.json` or
-   `~/.claude/settings.json`. It removes a rule from a weaker list when the
-   plugin needs it stricter, so a stray `allow` can't silence an `ask`. It
-   shows the changes, asks, backs up, and writes atomically. Re-running is
-   idempotent.
+Users install with `/plugin marketplace add p-w-rs/gateway` and
+`/plugin install gate@gateway`; nothing else. `install.py` (`pixi run
+install`) is a developer helper: it registers a local checkout as the
+`gateway` marketplace and removes what gateway 0.5 wrote into settings.json
+(rules and strict-mode env, listed in `legacy-settings.json`). An env entry
+goes only while it still has a value 0.5 set. It shows the changes, asks,
+backs up, and writes atomically.
 
 ## Threat model, briefly
 

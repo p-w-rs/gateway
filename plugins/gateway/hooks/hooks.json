@@ -31,6 +31,16 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_gate_gw__.*|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/perm.sh\" \"${CLAUDE_PLUGIN_ROOT}\"",
+            "timeout": 15
+          }
+        ]
       }
     ]
   }

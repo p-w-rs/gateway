@@ -58,10 +58,6 @@ def audit_log_path() -> Path:
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    # Take-over: redirect git, gh, hf, pijul, asiml, dvc, az, databricks, ssh,
-    # scp, rsync-to-host, docker/podman login|push|pull, skopeo, oras and
-    # crane in Bash to the gateway's account tools (TAKEOVER below).
-    "takeover": False,
     # Domains Claude may reach without asking. "*" means all hosts are in
     # scope (the user chose this), but writes still follow approval tiers.
     "allow_domains": ["*"],
@@ -128,16 +124,6 @@ def load_config() -> dict[str, Any]:
                     cfg[k] = v
         except Exception as e:
             sys.stderr.write(f"gateway: ignoring unreadable {p}: {e}\n")
-    # Machine-local switches next to it (gitignored, so `install --strict`
-    # leaves the checkout clean). Only "takeover" is read from there.
-    lp = p.with_name("local.json")
-    if lp.exists():
-        try:
-            local = json.loads(lp.read_text())
-            if isinstance(local.get("takeover"), bool):
-                cfg["takeover"] = local["takeover"]
-        except Exception as e:
-            sys.stderr.write(f"gateway: ignoring unreadable {lp}: {e}\n")
     return cfg
 
 
@@ -293,7 +279,10 @@ _BLOCKED = [
     # Common evasions: absolute paths, env/exec wrappers.
     (r"/(usr/bin|bin|opt/\S+?/bin)/(curl|wget)\b", "curl/wget (full path)",
      "WebFetch or the http_request / download tools"),
-    (r"(?i)\bpython3?\b.*-c.*\b(requests|urllib|http\.client|socket)\b",
+    # Inline python that actually makes a call (an import alone is fine).
+    (r"(?i)\bpython3?\b.*\s-c\s.*\b(requests\.(get|post|put|patch|delete|head|request|"
+     r"Session)|urlopen|urlretrieve|http\.client\.HTTPS?Connection|"
+     r"socket\.create_connection|\.connect\s*\(\s*\()",
      "python inline network call", "the http_request tool"),
     (r"(?i)\bnode\b.*-e.*\bfetch\s*\(", "node inline fetch", "the http_request tool"),
     # Secret stores: values must stay inside the gateway. The gateway's own
@@ -345,14 +334,84 @@ TAKEOVER = [
 _TAKEOVER_COMPILED = [(re.compile(p), name, route) for p, name, route in TAKEOVER]
 
 
-def match_takeover(command: str, cfg: dict[str, Any] | None = None) -> tuple[str, str] | None:
-    """With takeover on, (tool_name, route) for a Bash command an account tool replaces."""
-    cfg = cfg if cfg is not None else load_config()
-    if not cfg.get("takeover"):
-        return None
+def match_takeover(command: str) -> tuple[str, str] | None:
+    """(tool_name, route) for a Bash command an account tool replaces. Always
+    on while the plugin is enabled: the gateway is the only way to these."""
     for rx, name, route in _TAKEOVER_COMPILED:
         if rx.search(command):
             return name, route
+    return None
+
+
+# Credential variables removed from every Bash command (SessionStart writes
+# `unset ...` to CLAUDE_ENV_FILE). Settings `env` can't do it: plugins can't
+# ship it, and the desktop app's SSH_AUTH_SOCK survives it anyway.
+ENV_UNSET = (
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS",
+    "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN",
+    "AZURE_STORAGE_KEY", "AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_CLIENT_SECRET", "ARM_CLIENT_SECRET", "ARM_ACCESS_KEY",
+    "DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DOCKER_AUTH_CONFIG",
+    "REGISTRY_AUTH_FILE",
+)
+
+
+# Files Claude's own file tools may not touch (hook-files). Read-type tools
+# are refused on secrets; write-type tools also on the gateway's config.
+# Paths are relative to $HOME; a trailing "/" means everything under it.
+PROTECTED_READ = (
+    ".config/gateway/", ".config/age/", ".config/secrets/",
+    ".git-credentials", ".config/git/credentials", ".config/gh/hosts.yml",
+    ".docker/config.json", ".cache/huggingface/token", ".cache/huggingface/stored_tokens",
+    ".huggingface/token", ".azure/", ".databrickscfg", ".databricks/",
+    ".config/pijul/identities/", ".local/share/ASI/asiml/",
+)
+# In ~/.ssh only these are readable (so Claude can help import hosts);
+# private keys and agent sockets are not.
+SSH_READABLE = ("config", "known_hosts", "known_hosts.old", "authorized_keys")
+
+
+def protected_path(path: str, write: bool = False, plugin_root: str = "",
+                   contents: bool = False) -> str | None:
+    """Why `path` is off limits to Claude's file tools, or None. `contents`:
+    the tool reads everything under a folder (Grep), so ~/.ssh itself counts."""
+    if not path:
+        return None
+    try:
+        p = Path(os.path.expanduser(path)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return "unreadable path"
+    home = Path.home().resolve()
+    vault_home = Path(os.environ.get("GATEWAY_HOME") or
+                      Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "gateway").resolve()
+    if p == vault_home or vault_home in p.parents:
+        return "the gateway's vault"
+    try:
+        rel = p.relative_to(home).as_posix()
+    except ValueError:
+        rel = None
+    if rel is not None:
+        if rel == ".ssh":
+            return ("SSH private keys (the gateway keeps its own keys)" if contents
+                    else None)  # the folder itself (listing names) is fine
+        if rel.startswith(".ssh/"):
+            name = rel[len(".ssh/"):]
+            if "/" not in name and (name in SSH_READABLE or name.endswith(".pub")):
+                return None
+            return "an SSH private key or agent (the gateway keeps its own keys)"
+        for prot in PROTECTED_READ:
+            if rel == prot.rstrip("/") or (prot.endswith("/") and rel.startswith(prot)):
+                return "a credential file (the gateway holds credentials itself)"
+        if rel.endswith(".pem") and ("/.ssh/" in "/" + rel or rel.startswith(".ssh")):
+            return "a private key"
+    data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
+    if data and (p == Path(data).resolve() or Path(data).resolve() in p.parents):
+        return "the gateway's own data"
+    if write and plugin_root:
+        cfg = (Path(plugin_root) / "config").resolve()
+        if p == cfg or cfg in p.parents:
+            return "the gateway's configuration (change it with /gate: commands)"
     return None
 
 

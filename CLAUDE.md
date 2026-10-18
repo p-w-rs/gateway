@@ -18,16 +18,15 @@ that way, and keep it working on macOS and Linux (desktop and headless).
 
 ```
 .claude-plugin/marketplace.json   marketplace "gateway" -> ./plugins/gateway
-settings.rules.json               permission rules the plugin expects (template; install.py merges it)
-settings.snippet.json             deny-only backstop for if the plugin is disabled
 docs/                             ARCHITECTURE, DECISIONS, history/
 plugins/gateway/
   .claude-plugin/plugin.json      name, version
   .mcp.json                       MCP server "gw" (stdio, via pixi)
-  hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse(Bash)
+  hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse (Bash; gateway tools + file tools)
+  hooks/perm.sh                   the plugin's permission rules: allow/ask gateway tools, credential-path prefilter
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
   commands/{help,secret,sudo,account,log}.md   slash commands
-  install.py                      `pixi run install`: register plugin + merge settings.rules.json
+  install.py                      dev only: register this checkout + remove v0.5's settings.json entries (legacy-settings.json)
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
   run.py                          single entry: server | hook-* | log | check | scrub | vault
@@ -109,12 +108,14 @@ your change (mutation-check it).
   includes heredocs, commit messages, `grep` patterns and scripts written
   inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
   use `git commit -F file`. Check with `run.py check '…'`.
-- **Take-over** (`"takeover": true` in config/local.json, gitignored, set
-  by `pixi run install --strict`; policy.json keeps the default false) makes the hook refuse git, gh, hf, pijul, ssh,
-  dvc, … in Bash in every session, including yours. Use the `git` tool then,
+- **Take-over is always on** while the plugin is enabled: the hook refuses git, gh, hf, pijul, ssh,
+  dvc, … in Bash in every session, including yours, and your Bash has no SSH_AUTH_SOCK or
+  token variables (SessionStart writes `unset …` to CLAUDE_ENV_FILE). Use the `git` tool then,
   even for local commits (`git commit -F` works through it too). In a session
-  whose MCP server predates a tool change, turn takeover off before you need
-  git in Bash.
+  whose MCP server predates a tool change, use `git -C` from your own terminal.
+- **Plugins can't ship permission rules or env** (only `agent` settings are
+  honored); every rule is a hook decision (perm.sh, hooks.py). Hook config
+  (hooks.json) loads at session start; the Python behind it runs fresh each call.
 - **pixi-guard** (another plugin) refuses `python3` outside pixi here: use
   `pixi run python …`.
 - **You can't read the vault** (`Read(~/.config/gateway/**)` is denied) and

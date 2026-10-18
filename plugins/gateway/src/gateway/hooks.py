@@ -11,6 +11,8 @@ prompt_main  -> UserPromptSubmit (via hooks/prompt.sh): handle
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 
 from . import commands, policy, vault
@@ -62,24 +64,6 @@ ACCOUNTS_NOTE = (
 )
 
 
-# With take-over on, every Bash command runs without the user's ssh-agent:
-# the desktop app hands Claude Code SSH_AUTH_SOCK and settings `env` can't
-# override it (seen live). The hook rewrites the command with no permission
-# decision, so the user's rules still apply; `install --strict` adds an exact
-# allow rule for this prefix (STRICT_ALLOW) so it never adds a prompt.
-AGENT_UNSET = "unset SSH_AUTH_SOCK SSH_AGENT_PID"
-
-
-def _strip_agent(tool_input: dict, command: str) -> int:
-    if not policy.load_config().get("takeover") or command.startswith(AGENT_UNSET + ";"):
-        return 0
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "updatedInput": {**tool_input, "command": f"{AGENT_UNSET}; {command}"},
-    }}))
-    return 0
-
-
 def route_main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -94,7 +78,7 @@ def route_main() -> int:
 
     hit = policy.match_blocked(command) or policy.match_takeover(command)
     if not hit:
-        return _strip_agent(payload["tool_input"], command)
+        return 0
 
     name, route = hit
     policy.audit("hook_redirect", {"tool": name, "command": command[:500]})
@@ -138,11 +122,61 @@ def _catalog_note(session_id: str = "") -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
-def _takeover_note() -> str:
-    if policy.load_config().get("takeover"):
-        return ("\nTake-over is ON: git, gh, hf, pijul, asiml/dvc, az, databricks, ssh/scp/"
-                "rsync-to-host and registry commands in Bash are refused; use the tools above.")
-    return ""
+TAKEOVER_NOTE = (
+    "\nThe gateway is the only way to these: git, gh, hf, pijul, asiml/dvc, az, "
+    "databricks, ssh/scp/rsync-to-host and registry commands in Bash are refused; use "
+    "the tools above. The user's own credential variables and ssh-agent are not "
+    "available in Bash, and credential files can't be read."
+)
+
+
+def write_env_file() -> bool:
+    """Unset the user's credential variables for every Bash command this
+    session (Claude Code sources CLAUDE_ENV_FILE before each one)."""
+    path = os.environ.get("CLAUDE_ENV_FILE")
+    if not path:
+        return False
+    try:
+        with open(path, "a") as f:
+            f.write("unset " + " ".join(policy.ENV_UNSET) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def files_main() -> int:
+    """PreToolUse for file tools (perm.sh sends only calls that mention a
+    credential location). Denies reads of secrets and keys, and writes to the
+    gateway's own config; says nothing otherwise."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    tool = payload.get("tool_name", "")
+    ti = payload.get("tool_input") or {}
+    write = tool in ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    paths = [ti.get(k) for k in ("file_path", "path", "notebook_path") if isinstance(ti.get(k), str)]
+    if tool == "Glob" and isinstance(ti.get("pattern"), str):
+        base = ti.get("path") or ""
+        paths.append(os.path.join(base, ti["pattern"]) if base else ti["pattern"])
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    for path in paths:
+        # A glob pattern: check its fixed leading part and the whole thing.
+        cands = [path]
+        if any(c in path for c in "*?["):
+            cands.append(re.split(r"[*?\[]", path, maxsplit=1)[0])
+        for c in cands:
+            why = policy.protected_path(c, write=write, plugin_root=root,
+                                        contents=(tool == "Grep"))
+            if why and tool == "Glob" and why.startswith("an SSH"):
+                continue  # Glob only lists names; listing ~/.ssh is fine
+            if why:
+                policy.audit("hook_file_denied", {"tool": tool, "path": str(path)[:300], "why": why})
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": f"gateway: {path} is {why}; Claude doesn't need it."}}))
+                return 0
+    return 0
 
 
 def _enabled_warning(session_id: str = "") -> str | None:
@@ -164,10 +198,11 @@ def session_main() -> int:
         session_id = json.load(sys.stdin).get("session_id") or ""
     except Exception:
         session_id = ""
+    write_env_file()
     out: dict = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SESSION_NOTE + ACCOUNTS_NOTE + _takeover_note()
+            "additionalContext": SESSION_NOTE + ACCOUNTS_NOTE + TAKEOVER_NOTE
                                  + _catalog_note(session_id),
         }
     }

@@ -99,7 +99,7 @@ the `gate:accounts` skill tells it how.
 
 | Silent | Asks you (Claude Code's prompt) | Blocked |
 |---|---|---|
-| web requests, downloads, cert checks, file hashes, listing secret names | `port_check` | `curl`, `wget`, `nmap`, `security`, … in Bash (redirected to the gateway) |
+| web requests, downloads, cert checks, file hashes, listing secret names | `port_check`, and the `_confirm` tools (the plugin's own hook asks) | `curl`, `wget`, `nmap`, `security`, … in Bash (redirected to the gateway) |
 | a secret going to one of its allowed hosts | root commands on a host where sudo is **disabled** (`run_privileged_confirm`) | a secret going to any other host (Claude tells you the `/secret allow` command) |
 | root commands where sudo is **enabled** for this session or always | | reading the vault or your personal age store; `file://` URLs |
 
@@ -111,41 +111,32 @@ You need only **[Claude Code](https://code.claude.com)** and
 **[pixi](https://pixi.sh)** (`curl -fsSL https://pixi.sh/install.sh | sh`).
 pixi supplies Python 3.12 and `age` (for the vault) from `pixi.lock` for macOS
 (Intel and Apple Silicon), Linux (x86-64 and arm64) and Windows. All gateway
-code is Python standard library. Put the clone somewhere permanent, because
-Claude Code loads the plugin from it.
+code is Python standard library.
 
-```bash
-git clone https://github.com/p-w-rs/gateway.git ~/gateway
-cd ~/gateway/plugins/gateway
-pixi run install
+In Claude Code:
+
+```
+/plugin marketplace add p-w-rs/gateway
+/plugin install gate@gateway
 ```
 
-`pixi run install`:
-- registers the repo as the local marketplace `gateway` and installs the
-  plugin;
-- shows the permission rules from [settings.rules.json](settings.rules.json) it
-  will add to your user `settings.json` (in `$CLAUDE_CONFIG_DIR` or
-  `~/.claude`), and asks before writing. It makes a backup first.
+Then start a new session and run **`/gate:help`**. That's all: nothing is
+added to your settings. The gateway's rules live in its own hooks and are
+active whenever the plugin is enabled:
+- git, gh, hf, pijul, ssh, scp, docker login/push/pull, az and the like in
+  Claude's Bash are redirected to the gateway's account tools;
+- your own credential variables (`GITHUB_TOKEN`, `HF_TOKEN`, …) and your
+  ssh-agent are removed from every command Claude runs (your terminal is
+  unaffected);
+- Claude can't read your credential files (`~/.ssh` private keys, gh's
+  `hosts.yml`, `~/.docker/config.json`, …) or the vault.
 
-The `ask` rules are what make Claude Code prompt for `port_check`, for root
-commands when sudo is disabled, and for the `_confirm` tools, so keep them.
-Options: `--dry-run`, `--yes`, `--skip-plugin`, and:
+To turn all of it off, disable the plugin (`/plugin`).
 
-- **`--strict`** (undo with `--unstrict`): full take-over. It blanks your own
-  credential variables (`GITHUB_TOKEN`, `HF_TOKEN`, …) for Claude Code's
-  processes only; your terminal is unaffected. Your ssh-agent is removed from
-  every command Claude runs in Bash (the desktop app passes `SSH_AUTH_SOCK` in
-  a way settings can't override, so the gateway's hook unsets it per command). It denies
-  Claude's reads of the usual credential files (`~/.ssh/id_*`, gh's
-  `hosts.yml`, `~/.docker/config.json`, …). And it turns on `takeover` in
-  `config/local.json` (gitignored, so your checkout stays clean), so git, gh, hf, pijul, ssh, scp, docker
-  login/push/pull, az and the like in Bash are redirected to the account
-  tools. With strict on, sudo on remote hosts needs an ssh account for that
-  host (your ssh agent is blanked).
-
-Then restart Claude Code and run **`/gate:help`**.
-
-Updating later: `git pull` in the clone, then start a new Claude Code session.
+**From a local checkout** (to work on the gateway): clone it, then in
+`plugins/gateway` run `pixi run install`. That registers the clone as the
+`gateway` marketplace, and also removes rules that gateway 0.5 wrote into
+`settings.json` (it shows them and asks first).
 
 ### Linux and headless machines
 
