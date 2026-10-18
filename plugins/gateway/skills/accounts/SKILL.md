@@ -80,3 +80,17 @@ It's normal to use two accounts in one task, e.g. open a PR on the work repo
 (`git_mirror`). Say which account each step used. If the user's words
 ("my work GitHub", "the asirobots one") map to an account, use it; if not,
 ask.
+
+## Servers over SSH
+
+`ssh_exec` runs a command (argv list) and `ssh_copy` copies files as an
+`ssh:NAME` account; root goes through `run_privileged`. The gateway writes
+its own ssh config for each call, so the user's `~/.ssh/config` aliases
+don't apply: use the account name. An account can have several routes (for
+example home LAN, then a forwarded port); the gateway picks one and the
+result says which (`route`, `route_why`). `ssh_hosts` shows the routes,
+host-key policy and fingerprints, and, with `probe=true`, which route it
+would use now. If a host key changed, say so plainly and don't work around
+it; the user decides with `/gate:update ssh:NAME`. For many quick calls in
+a row, the user can type `/gate:enable reuse ssh:NAME` to keep the
+connection open for this session. Suggest it; never assume it's on.

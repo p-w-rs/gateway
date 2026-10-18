@@ -1,6 +1,6 @@
 ---
-description: Make every root command on a host ask again
-argument-hint: sudo HOST
+description: Make every root command on a host ask again, or stop ssh connection reuse
+argument-hint: sudo HOST | reuse ssh:NAME
 disable-model-invocation: true
 ---
 

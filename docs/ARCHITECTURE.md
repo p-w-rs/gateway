@@ -87,7 +87,8 @@ environment, and that's how per-session sudo works.
 | git_mirror | allow | `mirrors.py`: status/sync/add/remove of a remote set (repo config `gateway.mirror`); fetch and push through the git tool, fast-forward only |
 | hf / hf_confirm | allow / **ask** | `hfops.py`: the `hf` CLI (pixi env hf) with HF_TOKEN, HF_ENDPOINT pinned, token files in the temp dir |
 | pijul / pijul_confirm | allow / **ask** | `pijulops.py`: temp PIJUL_CONFIG_DIR + identity.toml, temp HOME with the pinned known_hosts, the key in a private agent, `--config signing_key=` |
-| ssh_exec(+_confirm), ssh_copy(+_confirm) | allow / **ask** | `sshops.py`: private agent, `-F /dev/null`, pinned host keys, ProxyCommand for jump hosts, argv joined once; exec asks by default |
+| ssh_exec(+_confirm), ssh_copy(+_confirm) | allow / **ask** | `sshops.py` + `sshconf.py`: private agent, `-F` the gateway's own per-call ssh_config, routes, pinned host keys under one alias, jump hosts, argv joined once; exec asks by default (see "SSH hosts") |
+| ssh_hosts | allow | read-only: routes, the route it would use (probe), host-key policy and fingerprints, key fingerprints, reuse state |
 | databricks / databricks_confirm | allow / **ask** | `dbops.py`: an Entra token for the workspace as DATABRICKS_TOKEN, auth type pat, empty config file |
 | mlcat, mlcat_workspace(+_confirm) | allow / **ask** | `mlcat.py`: the catalog API; asiml's workspace commands natively, dvc with the one-hour pass only in its env |
 | registry / registry_confirm | allow / **ask** | `regops.py`: crane with a throwaway DOCKER_CONFIG; ghcr via a GitHub account, ACR via token exchange |
@@ -96,6 +97,49 @@ environment, and that's how per-session sudo works.
 elicitation (`Server.approve`/`form`), but the desktop app auto-cancels those,
 so the real prompts are the settings.json `ask` rules. `refuse` is a hard
 off-switch, including for run_privileged.
+
+### SSH hosts (`sshconf.py`)
+
+Each ssh_exec / ssh_copy / run_privileged-over-ssh call writes a private
+`ssh_config` and `known_hosts` in the call's 0700 temp dir and runs
+`ssh -F <that file> gw-NAME`; `~/.ssh` is never read at runtime.
+
+- **Blocks:** one `Host gw-NAME` per account in the chain (target, then its
+  jump hosts, at most 3, no loops): HostName/Port from the chosen route,
+  `HostKeyAlias gw-NAME`, `StrictHostKeyChecking yes`, `CheckHostIP no`,
+  `UpdateHostKeys no`, BatchMode, no password or keyboard-interactive,
+  `IdentitiesOnly` with one `IdentityFile <pub>` per key and the private
+  agent, no agent/X11/port forwarding, no LocalCommand or tunnel. A jump is
+  `ProxyCommand ssh -F <same file> -W [%h]:%p gw-JUMP`. A final `Host *`
+  gives any other name no agent, no key and an empty known_hosts.
+- **Routes:** an ordered list `{name, host, port, when}`; none means one
+  route from host/port. Python picks: a route with `when` (CIDR) applies only
+  if the local source address toward it is in that network (UDP connect, no
+  packet); a non-last route must answer an `SSH-` banner within 2 s; the
+  last route is the fallback. Cached 5 minutes per account. If the chosen
+  route is unreachable or shows another host key, the next route is tried
+  (a LAN address elsewhere may be someone else's machine).
+- **Host keys:** stored known_hosts lines are rewritten under the alias, so
+  every route checks the same keys. Policy per account: `pinned` (default;
+  a mismatch is refused with a hint to `/gate:update`), `accept-new`
+  (rescan, store, audit `host_key`, report `host_key_notes`; also pins on
+  first use) or `ask` (the native dialog shows both fingerprints; Cancel
+  keeps the pin). ssh itself always runs strict; replacing is the gateway's
+  decision, made only after every route failed. At setup, every route must
+  show the same host key, or the proposal is refused.
+- **Keys:** `secrets.ssh_key` (newest) plus `secrets.old_ssh_keys` /
+  `old_public_keys` (at most 3) during a rotation; all are loaded into the
+  private agent and offered newest first.
+- **Reuse:** off unless the user typed `/gate:enable reuse ssh:NAME` in this
+  session (`ssh_reuse` in the vault: account to session ids). Then the
+  target block gets `ControlMaster auto`, `ControlPersist <reuse_minutes>m`
+  and a socket `<data>/ssh-mux/NAME-<hash of route and chain>` (or
+  `/tmp/gw-mux-UID` when the data path is too long for a socket). While a
+  master is open, any process running as the user could use that socket:
+  that is why it's opt-in per session. `/gate:disable reuse` sends
+  `-O exit` and removes the sockets.
+- Pijul uses its own SSH client, and git over ssh uses the runner's
+  `GIT_SSH_COMMAND` (below); neither goes through this config.
 
 ### Root commands
 

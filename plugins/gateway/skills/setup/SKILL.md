@@ -84,6 +84,38 @@ Then ask, per kind:
   they then add to the server). Fields: `host`, `user`, `port`, `jump`.
   Name it after the server: `powerslabs`. If they also use sudo there, use
   the same name, so it links up.
+  - **Several ways in** (e.g. a LAN address at home, a forwarded port when
+    away): send `ssh.routes`, tried in order, the last one being the
+    fallback. Each route is `{name, host, port, when}`, where `when` is an
+    optional network like `192.168.0.0/24`: the route is tried only when this
+    computer is on it. In `~/.ssh/config`, look for two `Host` entries for
+    the same machine, or `Match exec` / `Match host` blocks, and offer them as
+    routes. Every route must reach the same machine (same host key), or the
+    gateway refuses.
+  - **Host key** (the server's fingerprint): `ssh.host_key_policy` is
+    `pinned` (the default and the right choice almost always: a changed key
+    is refused), `ask` (a dialog asks you when it changes), or `accept-new`
+    (a changed key is trusted and logged; only for test boxes that get
+    reinstalled often). Ask only if they mention reinstalling a machine.
+  - **Comfort** (only if they ask): `ssh.connect_timeout` (seconds),
+    `ssh.keepalive` (seconds), `ssh.compression` (true/false),
+    `ssh.reuse_minutes` (how long a reused connection stays open).
+    Connection reuse itself is never set here: the user types
+    `/gate:enable reuse ssh:NAME` for a session.
+  - **Changing the key** (`/gate:update ssh:NAME`): a new key with
+    `credentials: {ssh_key: "generate", keep_old_key: true}` keeps the old
+    one working until the new one is on the server. Later,
+    `credentials: {remove_old_keys: true}` drops the old one.
+
+  ```json
+  {"what": "account", "kind": "ssh", "name": "powerslabs",
+   "description": "Powers Labs server",
+   "fields": {"user": "joshua"},
+   "ssh": {"routes": [
+       {"name": "home", "host": "192.168.0.80", "port": "22", "when": "192.168.0.0/24"},
+       {"name": "away", "host": "ssh.powerslabs.org", "port": "49222"}]},
+   "credentials": {"ssh_key": "file", "ssh_key_file": "~/.ssh/id_ed25519"}}
+  ```
 - **Azure:** the tenant (directory id or domain) and browser sign-in.
   Fields: `tenant`, optional `client_id`, `login`. Databricks workspace hosts
   are allowed later with `/gate:update azure:NAME`.

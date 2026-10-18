@@ -397,6 +397,17 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _COPY_SCHEMA,
     },
     {
+        "name": "ssh_hosts",
+        "description": ("The gateway's ssh accounts (read-only): routes (ways in, tried in "
+                        "order), jump host, host-key policy and pinned fingerprints, key "
+                        "fingerprints, whether connection reuse is on for this session. With "
+                        "probe=true, also which route it would use right now and why. Use it "
+                        "to explain or troubleshoot ssh; never shows a key or password."),
+        "inputSchema": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "ssh:NAME (default: all)"},
+            "probe": {"type": "boolean", "default": False}}},
+    },
+    {
         "name": "databricks",
         "description": ("Run the Databricks CLI as a gateway azure account (use INSTEAD OF "
                         "databricks in Bash): workspace is the workspace host (e.g. "
@@ -640,6 +651,8 @@ def dispatch(name: str, args: dict[str, Any],
         return sshops.ssh_exec(args.get("account", ""), args.get("argv"),
                                confirmed=name == "ssh_exec_confirm",
                                timeout=min(int(args.get("timeout", 300)), 3600))
+    if name == "ssh_hosts":
+        return sshops.ssh_hosts(args.get("account") or "", bool(args.get("probe")))
     if name in ("ssh_copy", "ssh_copy_confirm"):
         return sshops.ssh_copy(args.get("account", ""), args.get("direction", ""),
                                args.get("local", ""), args.get("remote", ""),

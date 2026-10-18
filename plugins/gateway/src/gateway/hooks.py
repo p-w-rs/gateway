@@ -57,7 +57,7 @@ SESSION_NOTE = (
 ACCOUNTS_NOTE = (
     "\nAccount tools (the user's own credentials are never used for these; read the "
     "gate:accounts skill before git/gh/hf/pijul/mirror work): git (EVERY git command, "
-    "local ones too), git_mirror, git_identity, gh, hf, pijul, ssh_exec, ssh_copy, "
+    "local ones too), git_mirror, git_identity, gh, hf, pijul, ssh_exec, ssh_copy, ssh_hosts, "
     "databricks, mlcat, mlcat_workspace, registry, account_list. When a tool answers "
     "use: <tool>_confirm, call that tool with the same arguments (Claude Code asks the "
     "user)."

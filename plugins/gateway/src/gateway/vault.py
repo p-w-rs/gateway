@@ -86,7 +86,10 @@ def _empty() -> dict[str, Any]:
     return {"version": VERSION, "secrets": {}, "sudo": {}, "sudo_enabled": [],
             "sudo_session": {}, "accounts": {}, "account_prompts": {},
             # grants: open guided setups (setup.py), by id; never hold a value.
-            "grants": {}}
+            "grants": {},
+            # ssh_reuse: {ssh account: [session ids]} where the user typed
+            # /gate:enable reuse ACCOUNT (connection reuse, sshconf.py).
+            "ssh_reuse": {}}
 
 
 MAX_SESSIONS_PER_HOST = 20  # oldest session grants are dropped beyond this

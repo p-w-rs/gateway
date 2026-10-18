@@ -2093,6 +2093,12 @@ def _start_sshd(d: Path, client_pub: str) -> tuple[int, str] | None:
         f"AuthorizedKeysFile {d / 'authorized_keys'}\nPasswordAuthentication no\n"
         "KbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n"
         "Subsystem sftp internal-sftp\n")
+    # OpenSSH 9.8+ penalizes a source after failed connections; the host-key
+    # tests fail on purpose, so turn that off where sshd knows the option.
+    _cfg = (d / "sshd_config").read_text()
+    (d / "sshd_config").write_text(_cfg + "PerSourcePenalties no\n")
+    if subprocess.run([sshd, "-t", "-f", str(d / "sshd_config")], capture_output=True).returncode:
+        (d / "sshd_config").write_text(_cfg)
     subprocess.run([sshd, "-f", str(d / "sshd_config"), "-E", str(d / "log")])
     for _ in range(100):
         try:
@@ -2250,6 +2256,185 @@ else:
               TKNOWN.split()[2] in _kh and "Host key pinned" in out["reason"])
     finally:
         os.environ["GATEWAY_KEYSCAN"] = "none"
+    # v2 phase 4: the gateway's own ssh config (routes, policy, keys, reuse).
+    from gateway import setup as _gsetup  # noqa: E402
+    from gateway import sshconf  # noqa: E402
+
+    def _free_port():
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def _set(ref, **kw):
+        with vault.locked():
+            d = vault.load()
+            base = d["accounts"].get(ref) or dict(d["accounts"]["ssh:lab"])
+            base.update(kw)
+            for k in [k for k, v in kw.items() if v is None]:
+                base.pop(k)
+            d["accounts"][ref] = base
+            vault.save(d)
+
+    _DEAD = _free_port()
+    _WRONG = JKNOWN.replace(str(JPORT), str(TPORT))  # the jump box's key, claimed for target
+    _set("ssh:lab", known_hosts=TKNOWN, host_key_policy=None)
+    _cd = RT / "p4cfg"
+    _cd.mkdir()
+    _c = sshops.Conn("ssh:via", vault.load())
+    _opts = _c.options(_cd)
+    _cfg = Path(_opts[1]).read_text()
+    check("ssh config: run with -F the gateway's own file only", _opts[0] == "-F" and len(_opts) == 2)
+    check("ssh config: a block per account in the chain, strict keys, no forwarding, no reuse",
+          "Host gw-via" in _cfg and "Host gw-jump" in _cfg and "ForwardAgent no" in _cfg
+          and "StrictHostKeyChecking yes" in _cfg and "ControlMaster no" in _cfg
+          and "Include" not in _cfg and "ProxyCommand" in _cfg.split("Host gw-jump")[0])
+    check("ssh config: any other host name gets no key and no agent",
+          "IdentityAgent none" in _cfg.split("Host *")[1]
+          and "UserKnownHostsFile /dev/null" in _cfg.split("Host *")[1])
+    check("ssh config: pinned keys written under one alias per account",
+          (_cd / "known_hosts").read_text().splitlines()[0].startswith("gw-via ssh-ed25519 "))
+
+    _set("ssh:routed", known_hosts=TKNOWN, routes=[
+        {"name": "home", "host": "127.0.0.1", "port": str(_DEAD), "when": "127.0.0.0/8"},
+        {"name": "lan2", "host": "127.0.0.1", "port": str(TPORT), "when": "203.0.113.0/24"},
+        {"name": "away", "host": "127.0.0.1", "port": str(TPORT), "when": ""}])
+    _r, _why = sshconf.pick("ssh:routed", vault.account("ssh:routed"), use_cache=False)
+    check("routes: a closed route and an off-network route are skipped, the last one is used",
+          _r["name"] == "away" and "home: no answer" in _why and "lan2: not on" in _why)
+    r = sshops.ssh_exec("ssh:routed", ["echo", "routed"], confirmed=True)
+    check("ssh_exec goes over the chosen route", r["ok"] and r["route"] == "away"
+          and "routed" in r["stdout"] and "route_why" in r)
+    _set("ssh:routed", routes=[
+        {"name": "home", "host": "127.0.0.1", "port": str(TPORT), "when": "127.0.0.0/8"},
+        {"name": "away", "host": "127.0.0.1", "port": str(_DEAD), "when": ""}])
+    r = sshops.ssh_exec("ssh:routed", ["echo", "home"], confirmed=True)
+    check("routes: the first route that answers wins", r["ok"] and r["route"] == "home")
+    _set("ssh:routed", routes=[
+        {"name": "home", "host": "127.0.0.1", "port": str(JPORT), "when": ""},
+        {"name": "away", "host": "127.0.0.1", "port": str(TPORT), "when": ""}])
+    r = sshops.ssh_exec("ssh:routed", ["echo", "the right box"], confirmed=True)
+    check("routes: a route that answers with another machine's host key falls over to the next",
+          r["ok"] and r["route"] == "away" and "the right box" in r["stdout"])
+
+    os.environ.pop("GATEWAY_KEYSCAN", None)
+    try:
+        _set("ssh:lab", known_hosts=_WRONG, host_key_policy=None)
+        r = sshops.ssh_exec("ssh:lab", ["true"], confirmed=True)
+        check("host key pinned (default): a changed key is refused and never replaced",
+              not r["ok"] and "pinned" in r.get("hint", "")
+              and vault.account("ssh:lab")["known_hosts"] == _WRONG)
+        _set("ssh:lab", known_hosts=_WRONG, host_key_policy="accept-new")
+        r = sshops.ssh_exec("ssh:lab", ["echo", "reflashed"], confirmed=True)
+        check("host key accept-new: a changed key is read again, stored and reported",
+              r["ok"] and "reflashed" in r["stdout"] and r.get("host_key_notes")
+              and TKNOWN.split()[2] in vault.account("ssh:lab")["known_hosts"])
+        check("host key accept-new: the replacement is in the audit log",
+              '"host_key"' in Path(os.environ["GATEWAY_AUDIT_LOG"]).read_text())
+        _set("ssh:lab", known_hosts="", host_key_policy="accept-new")
+        r = sshops.ssh_exec("ssh:lab", ["true"], confirmed=True)
+        check("host key accept-new: no key yet is read on first use",
+              r["ok"] and TKNOWN.split()[2] in vault.account("ssh:lab")["known_hosts"])
+        _dlg_was = os.environ["GATEWAY_DIALOG"]
+        os.environ["GATEWAY_DIALOG"] = str(FAKE_DLG)
+        try:
+            _set("ssh:lab", known_hosts=_WRONG, host_key_policy="ask")
+            form_plan({"action": "cancel"})
+            r = sshops.ssh_exec("ssh:lab", ["true"], confirmed=True)
+            check("host key ask: Cancel in the dialog keeps the pinned key, no connection",
+                  not r["ok"] and vault.account("ssh:lab")["known_hosts"] == _WRONG)
+            form_plan({"action": "save"})
+            r = sshops.ssh_exec("ssh:lab", ["true"], confirmed=True)
+            check("host key ask: Allow stores the new key and connects",
+                  r["ok"] and TKNOWN.split()[2] in vault.account("ssh:lab")["known_hosts"])
+            check("host key ask: the dialog showed both fingerprints",
+                  "Pinned:" in DLG_SEEN.read_text() and "Now:" in DLG_SEEN.read_text())
+        finally:
+            os.environ["GATEWAY_DIALOG"] = _dlg_was
+        # Setup: every route must reach the same machine.
+        _rec = {"kind": "ssh", "known_hosts": TKNOWN, "secrets": {}}
+        try:
+            _gsetup._apply_ssh(_rec, {"routes": [
+                {"name": "a", "host": "127.0.0.1", "port": str(TPORT), "when": ""},
+                {"name": "b", "host": "127.0.0.1", "port": str(JPORT), "when": ""}]}, {})
+            _diff = False
+        except _gsetup.SetupError as e:
+            _diff = "different machine" in str(e)
+        check("setup: routes that show different host keys are refused", _diff)
+    finally:
+        os.environ["GATEWAY_KEYSCAN"] = "none"
+    _set("ssh:lab", known_hosts=TKNOWN, host_key_policy=None)
+
+    _npriv, _npub = vault.generate_ssh_key("rotation test")
+    _set("ssh:rot", known_hosts=TKNOWN, public_key=_npub, old_public_keys=[_pub],
+         secrets={"ssh_key": _npriv, "old_ssh_keys": [_key]})
+    r = sshops.ssh_exec("ssh:rot", ["echo", "old key"], confirmed=True)
+    check("keys: an older key kept during a rotation still signs in", r["ok"])
+    _set("ssh:rot", old_public_keys=None, secrets={"ssh_key": _npriv})
+    check("keys: once removed, the old key is gone (the new one isn't on the server yet)",
+          not sshops.ssh_exec("ssh:rot", ["true"], confirmed=True)["ok"])
+    _rec = {"kind": "ssh", "secrets": {"ssh_key": "NEW"}, "public_key": "pubNEW"}
+    _gsetup._apply_ssh(_rec, {"keep_old_key": True},
+                       {"secrets": {"ssh_key": "OLD"}, "public_key": "pubOLD"})
+    check("setup: keep_old_key moves the current key to the older keys",
+          _rec["secrets"]["old_ssh_keys"] == ["OLD"] and _rec["old_public_keys"] == ["pubOLD"])
+    _gsetup._apply_ssh(_rec, {"remove_old_keys": True}, {})
+    check("setup: remove_old_keys drops them", "old_ssh_keys" not in _rec["secrets"]
+          and "old_public_keys" not in _rec)
+    for _bad, _why in (({"routes": [{"name": "x", "host": "bad host"}]}, "host"),
+                       ({"routes": [{"name": "x", "host": "a.b", "when": "nope"}]}, "network"),
+                       ({"host_key_policy": "trust-all"}, "pinned"),
+                       ({"reuse_minutes": 100000}, "reuse_minutes"),
+                       ({"forward_agent": True}, "no forward_agent")):
+        try:
+            _gsetup._ssh_opts("ssh", _bad, {}, None)
+            _ok = False
+        except _gsetup.SetupError as e:
+            _ok = _why in str(e)
+        check(f"setup: bad ssh settings refused ({_why})", _ok)
+    try:
+        _gsetup._ssh_opts("github", {"routes": []}, {}, None)
+        _ok = False
+    except _gsetup.SetupError:
+        _ok = True
+    check("setup: routes are only for ssh accounts", _ok)
+
+    _set("ssh:loop1", jump="ssh:loop2")
+    _set("ssh:loop2", jump="ssh:loop1")
+    r = sshops.ssh_exec("ssh:loop1", ["true"], confirmed=True)
+    check("jump hosts that loop are refused", r.get("refused") and "loop" in r["reason"])
+
+    h = sshops.ssh_hosts(probe=True)
+    _hj = json.dumps(h)
+    check("ssh_hosts: lists routes and the route it would use, never a key",
+          h["ok"] and any(x["account"] == "ssh:routed" and x.get("would_use") for x in h["hosts"])
+          and "PRIVATE KEY" not in _hj and _key.strip().splitlines()[1] not in _hj)
+    check("MCP lists ssh_hosts", "ssh_hosts" in {t["name"] for t in mcp_server.TOOLS})
+
+    # Reuse: only in a session where the user typed /gate:enable reuse.
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-reuse"
+    try:
+        out = _gsetup.run("enable", " reuse ssh:lab", "sess-reuse")
+        check("/gate:enable reuse turns it on for this session", "on for ssh:lab" in out)
+        r = sshops.ssh_exec("ssh:lab", ["echo", "one"], confirmed=True, timeout=30)
+        _socks = list(sshconf.mux_dir().glob("lab-*"))
+        check("reuse: the first call leaves a master open (and returns)",
+              r["ok"] and r.get("reuse") and len(_socks) == 1)
+        r = sshops.ssh_exec("ssh:lab", ["echo", "two"], confirmed=True, timeout=30)
+        check("reuse: the next call works through it", r["ok"] and "two" in r["stdout"])
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "another-session"
+        _c = sshops.Conn("ssh:lab", vault.load())
+        check("reuse: another session doesn't get it",
+              not _c.reuse and "ControlMaster no" in Path(_c.options(_cd)[1]).read_text())
+        out = _gsetup.run("disable", " reuse ssh:lab", "sess-reuse")
+        check("/gate:disable reuse closes the open connection",
+              "closed 1" in out and not list(sshconf.mux_dir().glob("lab-*")))
+        check("/gate:enable reuse refuses a non-ssh account",
+              "Error" in json.dumps(_gsetup.handle({"prompt": "/gate:enable reuse github:nope",
+                                                     "session_id": "s"})))
+    finally:
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     for _sd in ("target", "jump"):
         try:
             os.kill(int((SH / _sd / "pid").read_text()), 15)

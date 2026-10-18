@@ -8,6 +8,8 @@ place a secret is typed or a change is approved.
     /gate:delete NAME                                  delete it (now)
     /gate:enable [sudo] HOST [always]                  root commands without asking
     /gate:disable [sudo] HOST                          every root command asks again
+    /gate:enable reuse ssh:NAME                        keep ssh connections open (this session)
+    /gate:disable reuse ssh:NAME                       close them; every call connects anew
     /gate:list                                         what the gateway holds
     /gate:export / /gate:import                        (phase 5)
 
@@ -50,6 +52,8 @@ HELP = (
     "/gate:enable sudo HOST [always]     root commands there run without asking\n"
     "                                    (this session, or always)\n"
     "/gate:disable sudo HOST             every root command there asks again\n"
+    "/gate:enable reuse ssh:NAME         keep that server's connection open (this session)\n"
+    "/gate:disable reuse ssh:NAME        close it; every call connects anew\n"
     "/gate:list                          what the gateway holds (never values)"
 )
 
@@ -154,6 +158,42 @@ def _delete(words: list[str], session_id: str) -> str:
     return commands.run_secret(f"del {target}")
 
 
+def _reuse(verb: str, words: list[str], session_id: str) -> str:
+    """/gate:enable reuse ssh:NAME (this session only) and /gate:disable reuse
+    ssh:NAME (every session; open connections are closed)."""
+    from . import sshconf
+    if len(words) != 1:
+        return ("Usage: /gate:enable reuse ssh:NAME (keeps the connection open for this "
+                "session) or /gate:disable reuse ssh:NAME")
+    ref = words[0].lower()
+    with vault.locked():
+        data = vault.load()
+        a = data["accounts"].get(ref)
+        if a is None or a.get("kind") != "ssh":
+            raise commands.CommandError(f"{ref} is not an ssh account; see /gate:list.")
+        reuse = data.setdefault("ssh_reuse", {})
+        if verb == "enable":
+            if not session_id:
+                raise commands.CommandError("This session has no id, so reuse can't be "
+                                            "turned on for it.")
+            ids = reuse.setdefault(ref, [])
+            if session_id not in ids:
+                ids.append(session_id)
+            del ids[:-vault.MAX_SESSIONS_PER_HOST]
+        else:
+            reuse.pop(ref, None)
+        vault.save(data)
+    if verb == "enable":
+        mins = int({**sshconf.COMFORT, **(a.get("comfort") or {})}["reuse_minutes"])
+        return (f"Connection reuse is on for {ref} in this session: after a call, the "
+                f"connection stays open for {mins} minutes so the next one is quicker. "
+                f"While it's open, anything on this computer running as you could use it. "
+                f"/gate:disable reuse {ref} turns it off and closes it.")
+    n = sshconf.close_masters(ref)
+    return (f"Connection reuse is off for {ref} in every session"
+            + (f"; closed {n} open connection{'s' if n != 1 else ''}." if n else "."))
+
+
 def run(verb: str, rest: str, session_id: str) -> str:
     words = rest.split()
     commands._guard_text(words)
@@ -162,6 +202,8 @@ def run(verb: str, rest: str, session_id: str) -> str:
     if verb in ("export", "import"):
         return f"/gate:{verb} is coming in a later version of the gateway."
     if verb in ("enable", "disable"):
+        if words and words[0].lower() == "reuse":
+            return _reuse(verb, words[1:], session_id)
         if words and words[0].lower() == "sudo":
             words = words[1:]
         if not words:
@@ -305,6 +347,11 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         kind, old = data["accounts"][ref]["kind"], data["accounts"][ref]
     spec = vault.KINDS[kind]
     fields = dict(p.get("fields") or {})
+    ssh_opts = _ssh_opts(kind, p.get("ssh"), p.get("credentials") or {}, old)
+    if ssh_opts.get("routes"):
+        # The last route is the default one (host/port); the others come first.
+        fields["host"] = ssh_opts["routes"][-1]["host"]
+        fields["port"] = ssh_opts["routes"][-1]["port"]
     for f in fields:
         if f not in spec["fields"]:
             raise SetupError(f"{kind} accounts have no field {f!r} (fields: "
@@ -357,7 +404,8 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         raise SetupError("a registry signs in either through another account (via) or "
                          "with its own token, not both")
     plan.update(ref=ref, kind=kind, got=got, description=desc, old=old,
-                ask_secret=token == "ask", key=key, key_file=key_file, browser=browser)
+                ask_secret=token == "ask", key=key, key_file=key_file, browser=browser,
+                ssh=ssh_opts)
     who = got.get("login") or got.get("user") or ""
     L.append(f"{'Add' if op == 'add' else 'Change'} the {spec['label']} account “{ref}”: {desc}."
              + (f" Login: {who}." if who else ""))
@@ -374,7 +422,128 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         L.append("A new SSH key is made for it; you'll get its public half to add on the site.")
     if key == "file":
         L.append(f"Its SSH key is read from {key_file} (Claude never reads the file).")
+    L.extend(_ssh_lines(ssh_opts, old))
     return plan
+
+
+SSH_COMFORT_LIMITS = {"connect_timeout": (1, 120), "keepalive": (0, 600),
+                      "reuse_minutes": (1, 240)}
+
+
+def _ssh_opts(kind: str, raw: Any, cred: dict[str, Any], old: dict[str, Any] | None) -> dict[str, Any]:
+    """The ssh-only part of a proposal: {"ssh": {routes, host_key_policy,
+    connect_timeout, keepalive, compression, reuse_minutes}} and the key
+    rotation flags in credentials (keep_old_key, remove_old_keys)."""
+    from . import sshconf
+    out: dict[str, Any] = {}
+    rot = {k: cred.get(k) for k in ("keep_old_key", "remove_old_keys") if cred.get(k) is not None}
+    if kind != "ssh":
+        if raw is not None or rot:
+            raise SetupError("routes, host-key policy and key rotation are for ssh accounts")
+        return out
+    for k, v in rot.items():
+        if not isinstance(v, bool):
+            raise SetupError(f"credentials.{k} is true or false")
+    if rot.get("keep_old_key") and cred.get("ssh_key") not in ("generate", "file"):
+        raise SetupError("keep_old_key goes with a new key (ssh_key: generate or file)")
+    if rot.get("keep_old_key") and not (old or {}).get("secrets", {}).get("ssh_key"):
+        raise SetupError("keep_old_key: there's no current key to keep")
+    out.update({k: v for k, v in rot.items() if v})
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        raise SetupError("ssh: {routes, host_key_policy, connect_timeout, keepalive, "
+                         "compression, reuse_minutes}")
+    unknown = set(raw) - {"routes", "host_key_policy", "compression", *SSH_COMFORT_LIMITS}
+    if unknown:
+        raise SetupError(f"ssh settings have no {', '.join(sorted(unknown))}")
+    if "routes" in raw:
+        try:
+            out["routes"] = sshconf.check_routes(raw["routes"])
+        except ValueError as e:
+            raise SetupError(str(e))
+    if "host_key_policy" in raw:
+        if raw["host_key_policy"] not in sshconf.POLICIES:
+            raise SetupError("host_key_policy: pinned, accept-new or ask")
+        out["host_key_policy"] = raw["host_key_policy"]
+    comfort = {}
+    for k, (lo, hi) in SSH_COMFORT_LIMITS.items():
+        if k in raw:
+            v = raw[k]
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise SetupError(f"{k}: a whole number from {lo} to {hi}")
+            comfort[k] = v
+    if "compression" in raw:
+        if not isinstance(raw["compression"], bool):
+            raise SetupError("compression is true or false")
+        comfort["compression"] = raw["compression"]
+    if comfort:
+        out["comfort"] = comfort
+    return out
+
+
+def _ssh_lines(o: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
+    L = []
+    if o.get("routes"):
+        L.append("Ways in, tried in this order: " + "; ".join(
+            f"{r['name']}: {r['host']}" + (f" port {r['port']}" if r["port"] else "")
+            + (f" (only on {r['when']})" if r["when"] else "") for r in o["routes"]) + ".")
+    pol = o.get("host_key_policy")
+    if pol:
+        L.append({"pinned": "Host key: pinned; a changed key is refused.",
+                  "accept-new": "Host key: if it changes (e.g. after a reinstall), the new key is "
+                                "trusted and logged. Only for test machines.",
+                  "ask": "Host key: if it changes, a dialog like this one asks you."}[pol])
+    if o.get("comfort"):
+        L.append("Connection settings: " + ", ".join(f"{k} {v}" for k, v in o["comfort"].items())
+                 + ".")
+    if o.get("keep_old_key"):
+        L.append("The current key is kept as an older key, so both work until you remove it.")
+    if o.get("remove_old_keys"):
+        n = len((old or {}).get("old_public_keys", []))
+        L.append(f"Older keys are removed ({n}).")
+    return L
+
+
+def _apply_ssh(rec: dict[str, Any], o: dict[str, Any], old: dict[str, Any] | None) -> str:
+    """Routes, policy, comfort and key rotation onto an ssh account record.
+    Every route must show the same host key (one machine)."""
+    from . import sshconf
+    old = old or {}
+    note = []
+    if o.get("keep_old_key"):
+        prev = old.get("secrets", {}).get("ssh_key")
+        if prev and prev != rec["secrets"].get("ssh_key"):
+            rec["secrets"]["old_ssh_keys"] = ([prev] + list(old.get("secrets", {})
+                                              .get("old_ssh_keys", [])))[:3]
+            rec["old_public_keys"] = ([old.get("public_key", "")]
+                                      + list(old.get("old_public_keys", [])))[:3]
+    if o.get("remove_old_keys"):
+        rec["secrets"].pop("old_ssh_keys", None)
+        rec.pop("old_public_keys", None)
+    if "host_key_policy" in o:
+        rec["host_key_policy"] = o["host_key_policy"]
+    if o.get("comfort"):
+        rec["comfort"] = {**(old.get("comfort") or {}), **o["comfort"]}
+    if o.get("routes"):
+        rec["routes"] = o["routes"]
+        rec["hosts"] = list(dict.fromkeys(r["host"] for r in o["routes"]))
+        pinned = sshconf._key_set(rec.get("known_hosts", ""))
+        for r in o["routes"]:
+            got = vault.keyscan(r["host"], r["port"])
+            if not got:
+                note.append(f"route {r['name']} didn't answer now; its host key will be "
+                            "checked against the pinned one when used")
+                continue
+            if not pinned:
+                rec["known_hosts"], pinned = got, sshconf._key_set(got)
+                note.append(f"Host key pinned from route {r['name']}: "
+                            + "; ".join(vault.host_key_fingerprints(got)))
+            elif sshconf._key_set(got) != pinned:
+                raise SetupError(f"route {r['name']} ({r['host']}) shows a different host key "
+                                 "than the others, so it is a different machine; check the "
+                                 "routes. Nothing was saved.")
+    return "\n".join(note)
 
 
 def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> str:
@@ -411,6 +580,10 @@ def _apply(plan: dict[str, Any], secret_value: str | None, session_id: str) -> s
     except commands.CommandError as e:
         raise SetupError(str(e))
     rec["description"] = plan["description"]
+    if plan["kind"] == "ssh" and plan.get("ssh"):
+        extra = _apply_ssh(rec, plan["ssh"], plan["old"])
+        if extra:
+            note = (note + "\n" if note else "") + extra
     with vault.locked():
         data = vault.load()
         if op == "add" and plan["ref"] in data["accounts"]:

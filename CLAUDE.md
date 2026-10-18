@@ -42,7 +42,8 @@ plugins/gateway/
     entra.py       Entra sign-in (PKCE / device code) and per-scope tokens
     mirrors.py     git_mirror
     hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
-                   the hf, pijul, ssh_exec/ssh_copy, databricks, mlcat*, registry tools
+                   the hf, pijul, ssh_exec/ssh_copy/ssh_hosts, databricks, mlcat*, registry tools
+    sshconf.py     the gateway's own ssh_config per call: routes, host-key policy, keys, reuse
   skills/accounts/SKILL.md        how Claude uses accounts and mirrors (gate:accounts)
   skills/setup/SKILL.md           how Claude guides /gate:add and /gate:update (gate:setup)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas

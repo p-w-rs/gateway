@@ -449,6 +449,13 @@ def _describe_account(ref: str, a: dict[str, Any], data: dict[str, Any]) -> str:
         bits.append("methods: " + (", ".join(v["methods"]) or "none yet"))
     if v.get("key_fingerprint"):
         bits.append(f"key {v['key_fingerprint']}")
+    if a.get("kind") == "ssh":
+        if a.get("routes"):
+            bits.append("routes: " + ", ".join(r.get("name", "?") for r in a["routes"]))
+        if a.get("old_public_keys"):
+            bits.append(f"{len(a['old_public_keys'])} older key(s) kept")
+        if a.get("host_key_policy") in ("accept-new", "ask"):
+            bits.append(f"host key: {a['host_key_policy']}")
     p = v["prompts"]
     asks = [k for k in vault.PROMPT_CLASSES if p[k] != "auto"]
     bits.append("prompts: " + (", ".join(f"{k}={p[k]}" for k in asks) or "never ask"))

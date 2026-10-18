@@ -446,22 +446,22 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
         except Exception:
             via = None
     if via is not None:
-        # An ssh account for this target: its key in a private agent, its
-        # pinned host key, no user ssh config.
-        from . import runner, sshops
+        # An ssh account for this target: its keys in a private agent, its
+        # pinned host key, the gateway's own ssh config (routes and all).
+        from . import sshops
         ref, acct = via
         try:
-            acct, jump = sshops.resolve(ref, vault.load())
             remote = shlex.join(["sh", "-c", _PRIV_SCRIPT, "sh", *argv])
-            r = runner.run_cli(
-                "ssh", [], cwd=None, secrets=[password], ssh_key=sshops.keys_of(acct, jump),
-                account=ref, stdin=(password + "\n").encode(),
-                timeout=max(1, min(int(timeout), 600)),
-                argv_fn=lambda tmp: [*sshops.ssh_args(tmp, acct, jump), "-T", "--",
-                                     f"{acct['user']}@{acct['host']}", remote])
-            result = {"ok": r.ok, "host": host, "argv": argv, "exit_code": r.exit_code,
-                      "stdout": r.stdout, "stderr": r.stderr, "via_account": ref}
-            if r.timed_out:
+            r = sshops.run_remote(ref, remote, secrets=[password],
+                                  stdin=(password + "\n").encode(),
+                                  timeout=max(1, min(int(timeout), 600)))
+            result = {"ok": r["ok"], "host": host, "argv": argv, "exit_code": r["exit_code"],
+                      "stdout": r["stdout"], "stderr": r["stderr"], "via_account": ref,
+                      "route": r.get("route")}
+            for k in ("hint", "host_key_notes"):
+                if k in r:
+                    result[k] = r[k]
+            if r.get("timed_out"):
                 result["reason"] = "timed out"
         except Exception as e:
             result = {"ok": False, "host": host, "argv": argv, "reason": str(e)}

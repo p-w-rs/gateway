@@ -1,6 +1,6 @@
 ---
-description: Let root commands on a host run without asking (this session, or always)
-argument-hint: sudo HOST [always]
+description: Let root commands on a host run without asking, or keep an ssh connection open (reuse)
+argument-hint: sudo HOST [always] | reuse ssh:NAME
 disable-model-invocation: true
 ---
 
