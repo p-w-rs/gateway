@@ -2611,5 +2611,120 @@ finally:
 check("MCP lists registry (+confirm)", {"registry", "registry_confirm"} <= {t["name"] for t in mcp_server.TOOLS})
 _asrv.shutdown()
 
+# --- Phase 9: take-over, strict mode, session note ------------------------
+print("take-over / strict:")
+_ON, _OFF = {"takeover": True}, {"takeover": False}
+TAKE = [
+    "git status", "git push origin main", "cd repo && git pull", "/usr/bin/git log",
+    "GIT_TRACE=1 git fetch", "sudo -E git clone x", "env FOO=1 git log", "echo $(git rev-parse HEAD)",
+    "git-lfs pull", "gh pr list", "hf download x", "huggingface-cli login", "pijul push",
+    "asiml pull", "dvc push", "az account show", "databricks fs ls", "mlflow runs list",
+    "ssh host uptime", "scp a host:b", "sftp host", "rsync -a dir/ me@host:dir/",
+    "rsync -av src host:/tmp", "docker login ghcr.io", "docker push x/y:1", "podman pull x",
+    "docker image pull x", "skopeo copy a b", "oras push x", "crane ls x",
+    "ls; gh auth status", "true | git log",
+]
+NOTAKE = [
+    "ls -la", "echo git", "cat .gitignore", "ssh-keygen -l -f k.pub", "grep -r ghost .",
+    "rsync -a dir/ other/", "docker build .", "docker run --rm x", "python3 hf_utils.py",
+    "vim .github/x.yml", "azure-thing", "echo 'use the git tool'",
+]
+for c in TAKE:
+    check(f"takeover on redirects: {c[:40]}", policy.match_takeover(c, _ON) is not None)
+    check(f"takeover off allows:  {c[:40]}", policy.match_takeover(c, _OFF) is None)
+for c in NOTAKE:
+    check(f"takeover on allows:   {c[:40]}", policy.match_takeover(c, _ON) is None)
+check("takeover is off by default", policy.DEFAULT_CONFIG["takeover"] is False
+      and json.loads((ROOT / "config" / "policy.json").read_text()).get("takeover") is False)
+check("takeover routes name the account tool",
+      "git tool" in policy.match_takeover("git push", _ON)[1]
+      and "ssh_exec" in policy.match_takeover("ssh h", _ON)[1]
+      and "registry" in policy.match_takeover("docker push x", _ON)[1])
+
+
+def _hook(cmd):
+    old = sys.stdin
+    sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}}))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            hooks.route_main()
+    finally:
+        sys.stdin = old
+    return buf.getvalue().strip()
+
+
+def _session():
+    old = sys.stdin
+    sys.stdin = io.StringIO(json.dumps({"session_id": SID}))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            hooks.session_main()
+    finally:
+        sys.stdin = old
+    return json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+
+
+_saved_cfg = os.environ.get("GATEWAY_CONFIG")
+try:
+    use_config(_OFF)
+    check("hook: takeover off lets git through", _hook("git push origin main") == "")
+    _n = _session()
+    check("session note: account tools listed, take-over not claimed",
+          "git_mirror" in _n and "gate:accounts" in _n and "Take-over is ON" not in _n)
+    _c = io.StringIO()
+    with contextlib.redirect_stdout(_c):
+        cli.cmd_check(["git", "push"])
+    check("run.py check: git allowed with takeover off", "REDIRECT" not in _c.getvalue())
+    use_config(_ON)
+    _h = _hook("git push origin main")
+    check("hook: takeover on denies git with the git tool route",
+          '"deny"' in _h and "git tool" in _h)
+    check("hook: takeover on leaves plain commands", _hook("ls -la") == "")
+    check("hook: blocklist still wins with takeover on", "http_request" in _hook("cu" + "rl https://x"))
+    check("session note: says take-over is ON", "Take-over is ON" in _session())
+    _c = io.StringIO()
+    with contextlib.redirect_stdout(_c):
+        cli.cmd_check(["gh", "pr", "list"])
+    check("run.py check: gh redirected with takeover on", "REDIRECT: 'gh'" in _c.getvalue())
+finally:
+    if _saved_cfg is None:
+        os.environ.pop("GATEWAY_CONFIG", None)
+    else:
+        os.environ["GATEWAY_CONFIG"] = _saved_cfg
+
+_strict = install.load_strict()
+check("strict template: blanks credential env vars, denies credential files",
+      _strict["env"].get("SSH_AUTH_SOCK") == "" and _strict["env"].get("GITHUB_TOKEN") == ""
+      and all(v == "" for v in _strict["env"].values())
+      and "Read(~/.config/gh/hosts.yml)" in _strict["deny"] and "Read(~/.ssh/id_*)" in _strict["deny"])
+check("strict template: not part of the default rules",
+      "Read(~/.ssh/id_*)" not in rules["deny"])
+_b = {"env": {"KEEP": "1", "GITHUB_TOKEN": "mine"}, "permissions": {"deny": ["Bash(rm:*)"]}}
+_s1, _c1 = install.merge_strict(_b, _strict)
+check("strict: blanks env, adds denies, keeps the rest",
+      _s1["env"]["KEEP"] == "1" and _s1["env"]["GITHUB_TOKEN"] == ""
+      and _s1["env"]["SSH_AUTH_SOCK"] == "" and "Bash(rm:*)" in _s1["permissions"]["deny"]
+      and "Read(~/.azure/**)" in _s1["permissions"]["deny"] and bool(_c1))
+check("strict: input not mutated", _b["env"]["GITHUB_TOKEN"] == "mine")
+_s2, _c2 = install.merge_strict(_s1, _strict)
+check("strict: idempotent", _s2 == _s1 and _c2 == [])
+_u, _cu = install.merge_strict(_s1, _strict, undo=True)
+check("unstrict: removes only what strict added",
+      _u["env"] == {"KEEP": "1"} and _u["permissions"]["deny"] == ["Bash(rm:*)"] and bool(_cu))
+_u2, _ = install.merge_strict({"permissions": {}}, _strict, undo=True)
+check("unstrict on clean settings: no empty env left", "env" not in _u2)
+_pd = TMP / "fakeplugin"
+(_pd / "config").mkdir(parents=True)
+(_pd / "config" / "policy.json").write_text(json.dumps({"x": 1, "takeover": False}))
+check("set_takeover: turns on", install.set_takeover(True, _pd)
+      and json.loads((_pd / "config" / "policy.json").read_text()) == {"x": 1, "takeover": True})
+check("set_takeover: no change when already on", install.set_takeover(True, _pd) is False)
+check("set_takeover: turns off", install.set_takeover(False, _pd)
+      and json.loads((_pd / "config" / "policy.json").read_text())["takeover"] is False)
+check("version is 0.5.0 everywhere", __import__("gateway").__version__ == "0.5.0"
+      and json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())["version"] == "0.5.0")
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

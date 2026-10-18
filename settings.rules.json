@@ -52,5 +52,46 @@
       "Edit(~/.config/gateway/**)",
       "Edit({PLUGIN_DIR}/config/**)"
     ]
+  },
+  "_strict_comment": "Merged only by `pixi run install --strict` (undo: --unstrict). env: your own credentials are blanked for Claude Code's processes only (your terminal is unaffected), so nothing Claude runs can fall back to them; the gateway's account tools bring their own. deny: the usual places tools keep credentials. Strict also sets takeover=true in config/policy.json.",
+  "strict": {
+    "env": {
+      "SSH_AUTH_SOCK": "",
+      "SSH_ASKPASS": "",
+      "GIT_ASKPASS": "",
+      "GITHUB_TOKEN": "",
+      "GH_TOKEN": "",
+      "GH_ENTERPRISE_TOKEN": "",
+      "GITHUB_ENTERPRISE_TOKEN": "",
+      "HF_TOKEN": "",
+      "HUGGING_FACE_HUB_TOKEN": "",
+      "AZURE_STORAGE_KEY": "",
+      "AZURE_STORAGE_SAS_TOKEN": "",
+      "AZURE_STORAGE_CONNECTION_STRING": "",
+      "AZURE_CLIENT_SECRET": "",
+      "ARM_CLIENT_SECRET": "",
+      "DATABRICKS_TOKEN": "",
+      "DOCKER_AUTH_CONFIG": ""
+    },
+    "deny": [
+      "Read(~/.ssh/id_*)",
+      "Read(~/.ssh/*.pem)",
+      "Read(~/.git-credentials)",
+      "Read(~/.config/git/credentials)",
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.cache/huggingface/token)",
+      "Read(~/.cache/huggingface/stored_tokens)",
+      "Read(~/.huggingface/token)",
+      "Read(~/.azure/**)",
+      "Read(~/.databrickscfg)",
+      "Read(~/.databricks/**)",
+      "Read(~/.config/pijul/identities/**)",
+      "Read(~/.local/share/ASI/asiml/**)",
+      "Bash(git credential:*)",
+      "Bash(gh auth token:*)",
+      "Bash(hf auth token:*)",
+      "Bash(az account get-access-token:*)"
+    ]
   }
 }

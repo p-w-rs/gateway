@@ -52,6 +52,15 @@ SESSION_NOTE = (
     "Every gateway call is logged; run /gate:log to review this session."
 )
 
+ACCOUNTS_NOTE = (
+    "\nAccount tools (the user's own credentials are never used for these; read the "
+    "gate:accounts skill before git/gh/hf/pijul/mirror work): git (EVERY git command, "
+    "local ones too), git_mirror, git_identity, gh, hf, pijul, ssh_exec, ssh_copy, "
+    "databricks, mlcat, mlcat_workspace, registry, account_list. When a tool answers "
+    "use: <tool>_confirm, call that tool with the same arguments (Claude Code asks the "
+    "user)."
+)
+
 
 def route_main() -> int:
     try:
@@ -65,7 +74,7 @@ def route_main() -> int:
     if not command:
         return 0
 
-    hit = policy.match_blocked(command)
+    hit = policy.match_blocked(command) or policy.match_takeover(command)
     if not hit:
         return 0
 
@@ -111,6 +120,13 @@ def _catalog_note(session_id: str = "") -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
+def _takeover_note() -> str:
+    if policy.load_config().get("takeover"):
+        return ("\nTake-over is ON: git, gh, hf, pijul, asiml/dvc, az, databricks, ssh/scp/"
+                "rsync-to-host and registry commands in Bash are refused; use the tools above.")
+    return ""
+
+
 def _enabled_warning(session_id: str = "") -> str | None:
     """Shown to the USER at session start while any host runs sudo unasked."""
     try:
@@ -133,7 +149,8 @@ def session_main() -> int:
     out: dict = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SESSION_NOTE + _catalog_note(session_id),
+            "additionalContext": SESSION_NOTE + ACCOUNTS_NOTE + _takeover_note()
+                                 + _catalog_note(session_id),
         }
     }
     warning = _enabled_warning(session_id)

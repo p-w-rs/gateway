@@ -58,7 +58,7 @@ def cmd_log(argv: list[str]) -> int:
 
 def cmd_check(argv: list[str]) -> int:
     command = " ".join(argv)
-    hit = policy.match_blocked(command)
+    hit = policy.match_blocked(command) or policy.match_takeover(command)
     if hit:
         name, route = hit
         print(f"REDIRECT: '{name}' -> use {route}")

@@ -45,7 +45,14 @@ Reference:
     for SSO-only orgs); a page shows the one-time code.
   - Claude runs git and gh through the gateway's `git` and `gh` tools as the
     right account; an account with a token also works as `auth_ref` on
-    `http_request`. hf/pijul/Azure tools come later.
+    `http_request`. Tools: git (all of git), git_mirror, git_identity, gh, hf,
+    pijul, ssh_exec/ssh_copy, databricks, mlcat/mlcat_workspace, registry; each
+    has a `_confirm` twin for calls the account's policy asks about.
+  - `/gate:account login azure:NAME` / `mlcat:NAME`: Microsoft sign-in in the
+    browser (device code in a terminal).
+- **Strict mode** (`pixi run install --strict`): your own credentials are blanked
+  for Claude Code and git/gh/hf/pijul/ssh/docker… in Bash are redirected to the
+  account tools. `--unstrict` undoes it.
 - **No browser here** (ssh, headless Linux)? Run the same command in a
   terminal, which asks at a hidden prompt:
   `pixi run --manifest-path <plugin dir>/pixi.toml vault secret add NAME description`

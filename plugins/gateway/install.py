@@ -8,8 +8,13 @@
    A backup is written first. Re-running is safe: rules already there are
    left alone.
 
-Options: --yes (don't ask), --dry-run (show only), --skip-plugin (settings only).
-Only Claude Code and pixi are needed.
+3. With --strict (undo with --unstrict): blanks your own credential variables
+   for Claude Code's processes, denies reads of the usual credential files,
+   and turns on takeover in config/policy.json (git, gh, hf, pijul, ssh, ...
+   in Bash are redirected to the gateway's account tools).
+
+Options: --yes (don't ask), --dry-run (show only), --skip-plugin (settings only),
+--strict / --unstrict. Only Claude Code and pixi are needed.
 """
 from __future__ import annotations
 
@@ -70,6 +75,50 @@ def merge(settings: dict, rules: dict[str, list[str]]) -> tuple[dict, list[str]]
     return out, changes
 
 
+def load_strict() -> dict:
+    return json.loads(RULES_FILE.read_text()).get("strict", {"env": {}, "deny": []})
+
+
+def merge_strict(settings: dict, strict: dict, undo: bool = False) -> tuple[dict, list[str]]:
+    """Add (or with undo, remove) strict mode's env blanks and deny rules."""
+    out = json.loads(json.dumps(settings))
+    env = out.setdefault("env", {})
+    deny = out.setdefault("permissions", {}).setdefault("deny", [])
+    changes = []
+    for k, v in strict.get("env", {}).items():
+        if undo:
+            if k in env and env[k] == v:
+                del env[k]
+                changes.append(f"- env: {k}")
+        elif env.get(k) != v:
+            env[k] = v
+            changes.append(f"+ env: {k}=\"{v}\" (blanked for Claude Code only)")
+    for rule in strict.get("deny", []):
+        if undo:
+            if rule in deny:
+                deny.remove(rule)
+                changes.append(f"- deny: {rule}")
+        elif rule not in deny:
+            deny.append(rule)
+            changes.append(f"+ deny: {rule}")
+    if not env:
+        out.pop("env")
+    return out, changes
+
+
+def set_takeover(on: bool, plugin_dir: Path = PLUGIN_DIR) -> bool:
+    """Set config/policy.json "takeover"; True if it changed."""
+    p = plugin_dir / "config" / "policy.json"
+    cfg = json.loads(p.read_text())
+    if cfg.get("takeover") is on:
+        return False
+    cfg["takeover"] = on
+    tmp = p.with_name("policy.json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, p)
+    return True
+
+
 def _claude(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["claude", *args], capture_output=True, text=True)
 
@@ -102,6 +151,13 @@ def main(argv: list[str]) -> int:
     path = settings_path()
     current = json.loads(path.read_text()) if path.exists() else {}
     new, changes = merge(current, load_rules())
+    strict, unstrict = "--strict" in argv, "--unstrict" in argv
+    if strict or unstrict:
+        new, more = merge_strict(new, load_strict(), undo=unstrict)
+        changes += more
+        cur = json.loads((PLUGIN_DIR / "config" / "policy.json").read_text()).get("takeover")
+        if cur is not strict:
+            changes.append(f"~ config/policy.json: takeover = {str(strict).lower()}")
     print(f"\n== Permission rules for {path}")
     if not changes:
         print("✓ already up to date")
@@ -128,6 +184,9 @@ def main(argv: list[str]) -> int:
         os.chmod(tmp, mode)
         os.replace(tmp, path)
         print("✓ settings updated")
+        if strict or unstrict:
+            set_takeover(strict)
+            print(f"✓ takeover {'on' if strict else 'off'}")
 
     print("\nDone. Restart Claude Code (or /reload-plugins), then try /gate:help")
     return 0

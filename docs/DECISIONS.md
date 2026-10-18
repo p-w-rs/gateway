@@ -127,3 +127,38 @@ git). The parts that shape the code:
 - **Not yet:** pinned host keys per account (ssh accepts new keys per call
   and reports them), commit signing, submodules with credentials, and the
   Bash redirect (phase 9).
+
+## The rest of the accounts plan (v0.5)
+
+- **Optional tools in their own pixi environments** (hf, databricks, dvc,
+  registry, pijul), installed on first use. The default environment stays
+  small. pijul isn't packaged, so the `pijul` environment builds it with
+  conda-forge's Rust (on macOS it links the SDK's iconv).
+- **Pijul needs pinned host keys and PIJUL_CONFIG_DIR.** It can't ask about
+  a new host key without a terminal, and it ignores HOME/XDG for its config.
+  So ssh and pijul accounts pin keys when the user adds them (ssh-keyscan
+  in their own command, fingerprints shown; the Nest's key is built in), and
+  each call gets a temp config dir with a generated identity.toml. That file
+  needs `last_modified`, or pijul skips it silently.
+- **No `az` CLI (D3 a).** az can't take an injected token and keeps its own
+  plaintext login, so Azure work goes through REST with tokens the gateway
+  mints. Databricks takes an Entra token as DATABRICKS_TOKEN.
+- **The ML Catalog natively, in asiml's format (D1 c).** asiml keeps its
+  login in the keychain and can't be given a token, and has no macOS build.
+  The gateway does what asiml does (same `.asiml/workspace.json`), so asiml
+  still works on those folders. An upstream PR for `--token-stdin` and
+  macOS builds is still to do.
+- **Refresh-token rotation is the server's one vault write.** Entra rotates
+  refresh tokens; keeping the spent one would break the next sign-in. This
+  replaces a value the user already put there and grants nothing new.
+- **Take-over is a switch, off by default.** The Bash hook reads the
+  checkout live, so turning it on blocks git in Bash in every open session,
+  including ones whose MCP server predates the git tool. It goes on (via
+  `--strict`) after the live test.
+- **Strict mode blanks credentials through settings `env`.** Redirects only
+  steer Claude; blanking `SSH_AUTH_SOCK`, `GITHUB_TOKEN` and the like for
+  Claude Code's processes means a Bash call that slips past the regex has
+  nothing to use. The user's own terminal is unaffected.
+- **Host names aren't tokens.** The paste guard exempts host names
+  (`adb-1234567890.7.azuredatabricks.net`) unless they start with a known
+  token prefix.

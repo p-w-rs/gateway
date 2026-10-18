@@ -84,6 +84,13 @@ environment, and that's how per-session sudo works.
 | git_identity | allow | the repo's own user.name/user.email (and gateway.account) from an account |
 | gh | allow | the plugin's own gh as an account (`ghops.py`): GH_TOKEN or GH_ENTERPRISE_TOKEN, GH_HOST, a temp GH_CONFIG_DIR |
 | gh_confirm | **ask** | the same, when the policy asks |
+| git_mirror | allow | `mirrors.py`: status/sync/add/remove of a remote set (repo config `gateway.mirror`); fetch and push through the git tool, fast-forward only |
+| hf / hf_confirm | allow / **ask** | `hfops.py`: the `hf` CLI (pixi env hf) with HF_TOKEN, HF_ENDPOINT pinned, token files in the temp dir |
+| pijul / pijul_confirm | allow / **ask** | `pijulops.py`: temp PIJUL_CONFIG_DIR + identity.toml, temp HOME with the pinned known_hosts, the key in a private agent, `--config signing_key=` |
+| ssh_exec(+_confirm), ssh_copy(+_confirm) | allow / **ask** | `sshops.py`: private agent, `-F /dev/null`, pinned host keys, ProxyCommand for jump hosts, argv joined once; exec asks by default |
+| databricks / databricks_confirm | allow / **ask** | `dbops.py`: an Entra token for the workspace as DATABRICKS_TOKEN, auth type pat, empty config file |
+| mlcat, mlcat_workspace(+_confirm) | allow / **ask** | `mlcat.py`: the catalog API; asiml's workspace commands natively, dvc with the one-hour pass only in its env |
+| registry / registry_confirm | allow / **ask** | `regops.py`: crane with a throwaway DOCKER_CONFIG; ghcr via a GitHub account, ACR via token exchange |
 
 `_gate` applies the `policy.json` tiers. An `ask` tier there would use MCP
 elicitation (`Server.approve`/`form`), but the desktop app auto-cancels those,
@@ -230,6 +237,32 @@ calls it yet, the `git` MCP tool comes next). Per call:
     removes the dir.
   - Scopes: gh's defaults plus workflow, read:packages and write:packages.
 
+## Entra (`entra.py`) and the catalog (`mlcat.py`)
+
+- **Sign-in:** `/gate:account login` for azure and mlcat accounts runs
+  auth code + PKCE with a one-time `http://localhost:PORT` redirect in your
+  browser, or device code in the terminal. The refresh token goes into the
+  vault.
+- **Tokens:** the MCP server mints access tokens per scope (`arm`,
+  `storage`, `graph`, `databricks`, `api://…`), caches them in memory, and
+  stores Entra's rotated refresh token in place of the old one. That is the
+  only vault write the server makes, and it grants nothing new.
+- **The catalog:** mlcat accounts take the tenant, API app and CLI app from
+  the catalog's `/api/config`. Storage passes come from
+  `/api/transfers/{push,pull,complete}` and live only in dvc's environment.
+
+## Take-over and strict mode
+
+- **Redirects:** `policy.TAKEOVER` matches git, gh, hf/huggingface-cli,
+  pijul, asiml/dvc, az, databricks/mlflow, ssh/scp/sftp, rsync to a host,
+  docker/podman login/push/pull, skopeo, oras and crane, at a command
+  position only (not `echo git` or `ssh-keygen`). The Bash hook redirects
+  them when `takeover` is true in policy.json.
+- **Strict mode:** `pixi run install --strict` sets `takeover`, blanks the
+  user's credential variables in Claude Code's settings `env`, and adds Read
+  denies for the usual credential files, so a Bash call that gets past the
+  regex finds no credentials.
+
 ## Policy and logging (`policy.py`)
 
 - `load_config()` merges `config/policy.json` over `DEFAULT_CONFIG`. An
@@ -264,6 +297,17 @@ and secrets ending up in transcripts or logs.
 
 Not a sandbox: Claude still has Bash, so a determined bypass of the regex
 blocklist is possible (`c''url`, `nc`, a written script), and Bash can edit
-`policy.json`. The Read/Edit deny rules protect the vault files from Claude's
+`policy.json`.
+
+Accounts add one more limit. `http_request` enforces a secret's hosts
+itself, but once a token is inside a CLI's environment (`gh`, `hf`, `dvc`,
+`databricks`, `crane`), the CLI could send it anywhere. The gateway narrows
+this:
+- endpoints are pinned (`GH_HOST`, `HF_ENDPOINT`, `DATABRICKS_HOST`);
+- subcommands that print tokens, sign in or run other programs are refused;
+- proxies and endpoint variables are blanked;
+- exact-value scrubbing catches echoes.
+
+It is a guardrail, not a guarantee. The Read/Edit deny rules protect the vault files from Claude's
 file tools; the vault key itself is the user's file. Enabling sudo with
 `always` deliberately trades the prompt away.

@@ -58,6 +58,10 @@ def audit_log_path() -> Path:
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    # Take-over: redirect git, gh, hf, pijul, asiml, dvc, az, databricks, ssh,
+    # scp, rsync-to-host, docker/podman login|push|pull, skopeo, oras and
+    # crane in Bash to the gateway's account tools (TAKEOVER below).
+    "takeover": False,
     # Domains Claude may reach without asking. "*" means all hosts are in
     # scope (the user chose this), but writes still follow approval tiers.
     "allow_domains": ["*"],
@@ -293,6 +297,47 @@ _BLOCKED = [
 ]
 
 _BLOCKED_COMPILED = [(re.compile(p), name, route) for p, name, route in _BLOCKED]
+
+
+# A command word at a command position: the start, after ; & | ( ` $( or a
+# newline, after sudo/env/exec/time/nohup/xargs/then/do/else (with their
+# options), and after VAR=value assignments. So `echo git`, `ssh-keygen` or
+# `cat .gitignore` don't match.
+_CMD = (r"(?:^|[;&|(`\n]\s*|\$\(\s*|\b(?:sudo|env|command|exec|time|nohup|xargs|then|do|"
+        r"else)\s+(?:-\S+\s+)*)(?:\w+=\S*\s+)*(?:\S*/)?")
+TAKEOVER = [
+    (_CMD + r"git(?:-lfs|-xet)?(?=\s|$)", "git",
+     "the git tool (every git command; remote ones run as the right account), "
+     "git_mirror for mirrors"),
+    (_CMD + r"gh(?=\s|$)", "gh", "the gh tool (GitHub CLI as an account)"),
+    (_CMD + r"(?:hf|huggingface-cli)(?=\s|$)", "hf", "the hf tool (Hugging Face as an account)"),
+    (_CMD + r"pijul(?=\s|$)", "pijul", "the pijul tool (Pijul as an account)"),
+    (_CMD + r"(?:asiml|dvc)(?=\s|$)", "asiml/dvc",
+     "mlcat (catalog search) and mlcat_workspace (init/clone/pull/push/status)"),
+    (_CMD + r"az(?=\s|$)", "az",
+     "http_request with auth_ref=azure:NAME and auth_scope (arm, storage, graph, ...); "
+     "the Azure CLI isn't used"),
+    (_CMD + r"(?:databricks|mlflow)(?=\s|$)", "databricks", "the databricks tool"),
+    (_CMD + r"(?:ssh|scp|sftp|sshpass)(?=\s|$)", "ssh/scp/sftp",
+     "ssh_exec / ssh_copy (an ssh account), or run_privileged for root"),
+    (_CMD + r"rsync\b[^;&|\n]*\s(?:\S+@)?[A-Za-z0-9.\-\[\]]+:", "rsync to a host",
+     "ssh_copy (an ssh account)"),
+    (_CMD + r"(?:docker|podman)\s+(?:\S+\s+)*?(?:login|push|pull|logout)\b",
+     "docker/podman registry", "the registry tool (crane as a registry account, no daemon)"),
+    (_CMD + r"(?:skopeo|oras|crane)(?=\s|$)", "skopeo/oras/crane", "the registry tool"),
+]
+_TAKEOVER_COMPILED = [(re.compile(p), name, route) for p, name, route in TAKEOVER]
+
+
+def match_takeover(command: str, cfg: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    """With takeover on, (tool_name, route) for a Bash command an account tool replaces."""
+    cfg = cfg if cfg is not None else load_config()
+    if not cfg.get("takeover"):
+        return None
+    for rx, name, route in _TAKEOVER_COMPILED:
+        if rx.search(command):
+            return name, route
+    return None
 
 
 def match_blocked(command: str) -> tuple[str, str] | None:

@@ -55,12 +55,34 @@ several GitHub accounts side by side, Hugging Face, Pijul (the Nest or your own
 server), Azure, the ASI ML Catalog, SSH hosts and container registries
 (`KIND:NAME`, e.g. `github:work`). Each is scoped to its hosts and owners, and
 its prompt policy (`read`, `write`, `delete`, `exec` = `auto`, `ask` or
-`refuse`) lives in the vault, so Claude can't loosen it. Claude uses them through the gateway's
-`git` tool (every git command; the account is picked from the remote's host
-and owner) and `gh` tool (the plugin's own GitHub CLI), and an account with
-a token works as `auth_ref` on `http_request`. `/gate:account login
-github:NAME` signs in with GitHub's web flow, including SSO-only orgs. hf,
-pijul, Azure and the rest come in later versions.
+`refuse`) lives in the vault, so Claude can't loosen it. 
+
+`/gate:account login KIND:NAME` signs in with SSO:
+- GitHub: through the plugin's own gh web flow, including SSO-only orgs.
+- Azure and the ASI ML Catalog: through Microsoft Entra, in your browser,
+  or with a device code in a terminal.
+
+Claude then works through the gateway's tools, each picking the right account:
+
+| Tool | For |
+|---|---|
+| `git` | every git command (local ones without credentials; remote ones as the account for that remote's host and owner) |
+| `git_mirror` | keep one repo's branches and tags the same on several remotes, e.g. personal and work (fast-forward only, never forced) |
+| `git_identity` | commit as an account in a repo |
+| `gh` | GitHub's CLI (the plugin's own copy) |
+| `hf` | Hugging Face uploads, downloads, repos (Xet) |
+| `pijul` | Pijul, with the Nest or your own server (signs with the account's key) |
+| `ssh_exec`, `ssh_copy` | servers as ssh accounts, with jump hosts; `run_privileged` uses them too |
+| `databricks` | the Databricks CLI with an Entra token |
+| `mlcat`, `mlcat_workspace` | the ASI ML Catalog: search, and asiml's init/clone/pull/push/status |
+| `registry` | container images (ghcr.io via GitHub, ACR via Azure, others by token), no Docker needed |
+| `http_request` | any API, with `auth_ref=KIND:NAME` (Azure: plus `auth_scope`) |
+
+When an account's policy says `ask`, the tool's `_confirm` twin runs the call
+after Claude Code asks you. The optional tools install on first use (the tool
+tells Claude the exact `pixi install -e …` command). Ask Claude in plain words
+to set up a mirror ("keep this repo in sync on my personal and work GitHub");
+the `gate:accounts` skill tells it how.
 
 - **Values never go in the chat.** A one-time page opens in your browser on
   `127.0.0.1` with a masked field; you paste and Save. Claude never sees the
@@ -105,9 +127,21 @@ pixi run install
   will add to your user `settings.json` (in `$CLAUDE_CONFIG_DIR` or
   `~/.claude`), and asks before writing. It makes a backup first.
 
-The `ask` rules are what make Claude Code prompt for `port_check` and for root
-commands when sudo is disabled, so keep them. Options: `--dry-run`, `--yes`,
-`--skip-plugin`. Then restart Claude Code and run **`/gate:help`**.
+The `ask` rules are what make Claude Code prompt for `port_check`, for root
+commands when sudo is disabled, and for the `_confirm` tools, so keep them.
+Options: `--dry-run`, `--yes`, `--skip-plugin`, and:
+
+- **`--strict`** (undo with `--unstrict`): full take-over. It blanks your own
+  credential variables (`SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `HF_TOKEN`, …) for
+  Claude Code's processes only; your terminal is unaffected. It denies
+  Claude's reads of the usual credential files (`~/.ssh/id_*`, gh's
+  `hosts.yml`, `~/.docker/config.json`, …). And it turns on `takeover` in
+  `config/policy.json`, so git, gh, hf, pijul, ssh, scp, docker
+  login/push/pull, az and the like in Bash are redirected to the account
+  tools. With strict on, sudo on remote hosts needs an ssh account for that
+  host (your ssh agent is blanked).
+
+Then restart Claude Code and run **`/gate:help`**.
 
 Updating later: `git pull` in the clone, then start a new Claude Code session.
 

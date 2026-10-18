@@ -39,6 +39,11 @@ plugins/gateway/
     gitops.py      the git / git_confirm / git_identity tools (account by remote URL)
     ghops.py       the gh / gh_confirm tools (the plugin's own gh)
     logins.py      /gate:account login (GitHub via gh's web flow)
+    entra.py       Entra sign-in (PKCE / device code) and per-scope tokens
+    mirrors.py     git_mirror
+    hfops.py, pijulops.py, sshops.py, dbops.py, mlcat.py, regops.py
+                   the hf, pijul, ssh_exec/ssh_copy, databricks, mlcat*, registry tools
+  skills/accounts/SKILL.md        how Claude uses accounts and mirrors (gate:accounts)
     mcp_server.py  hand-rolled stdio JSON-RPC MCP server + tool schemas
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
     commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
@@ -104,6 +109,14 @@ your change (mutation-check it).
   includes heredocs, commit messages, `grep` patterns and scripts written
   inline (even `run.py check '…curl…'` gets blocked). Write the content to a file (in your scratchpad) and run that, or
   use `git commit -F file`. Check with `run.py check '…'`.
+- **Take-over** (`"takeover": true` in config/policy.json, set by
+  `pixi run install --strict`) makes the hook refuse git, gh, hf, pijul, ssh,
+  dvc, … in Bash in every session, including yours. Use the `git` tool then,
+  even for local commits (`git commit -F` works through it too). In a session
+  whose MCP server predates a tool change, turn takeover off before you need
+  git in Bash.
+- **pixi-guard** (another plugin) refuses `python3` outside pixi here: use
+  `pixi run python …`.
 - **You can't read the vault** (`Read(~/.config/gateway/**)` is denied) and
   must not try. Use the `secret_list` tool for names.
 - **Tool and hook changes need a new session** to be picked up (the MCP server
@@ -119,7 +132,19 @@ your change (mutation-check it).
 - The audit log is shared by all sessions on the machine; entries from other
   sessions are normal.
 
-## Status (2026-10-17, v0.4.0)
+## Status (2026-10-17, v0.5.0)
+
+v0.5.0 completes the accounts plan in code:
+- mirrors and the accounts skill;
+- Hugging Face, Pijul (the Nest and self-hosted), SSH hosts, Entra/Azure
+  and Databricks, the ASI ML Catalog, container registries;
+- take-over (off by default) and strict mode.
+
+About 650 tests pass, and every security property has a mutation check. None
+of it has been tried live yet: see `.work/accounts/LIVE-TEST.md` (local, not
+in git).
+
+### v0.4.0
 
 v0.4.0 adds accounts (`/gate:account`, vault v2). This is phase 1 of the
 accounts plan:
