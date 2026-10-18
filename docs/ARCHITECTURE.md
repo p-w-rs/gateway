@@ -296,6 +296,29 @@ on while the plugin is enabled.
 - `_BLOCKED` is the Bash blocklist used by the PreToolUse hook and by
   run_privileged.
 
+## Native dialogs (`dialog.py`)
+
+The one place a person types a secret or approves a change. The dialog is
+opened by the gateway's own process, and the answer comes straight back to
+it; Claude Code's question pop-ups aren't used for values, because their
+answers go to the model.
+- **macOS:** `osascript` (`display dialog`, `with hidden answer` for
+  secrets, giving up after 5 minutes).
+- **Linux desktop:** `zenity`, else `kdialog`.
+- **Elsewhere (ssh, headless):** `Unavailable`, so the caller points to the
+  terminal.
+
+Text is passed as arguments to a fixed script, never spliced into it.
+AppleScript variables carry a `gw` prefix: `kind` is a reserved word and
+broke the first live run.
+
+## Plugin data folder
+
+`policy.data_dir()`: `CLAUDE_PLUGIN_DATA`, or `<config dir>/plugins/data/gate-gateway`
+outside Claude Code. It holds the audit log (moved there once from the v0.5
+`logs/`) and `quarantine/` (a relative `download_dir`). It survives plugin
+updates. Claude's file tools may read it but not write to it.
+
 ## Install
 
 Users install with `/plugin marketplace add p-w-rs/gateway` and

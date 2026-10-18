@@ -206,7 +206,7 @@ def download(url: str, approve: Approver = None) -> dict[str, Any]:
         return gate
     cfg = policy.load_config()
     limit = int(cfg.get("max_download_bytes", 500_000_000))
-    qdir = policy.plugin_root() / cfg.get("download_dir", "quarantine")
+    qdir = policy.quarantine_dir(cfg)
     qdir.mkdir(parents=True, exist_ok=True)
     name = Path(policy.urlparse(url).path).name or "download.bin"
     dest = qdir / name

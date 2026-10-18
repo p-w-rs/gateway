@@ -47,7 +47,8 @@ plugins/gateway/
     hooks.py       SessionStart note + vault catalog, PreToolUse redirect, prompt hook
     commands.py    /gate:secret, /gate:sudo and /gate:account handling, transcript scrubber
     vault.py       age-encrypted JSON vault (~/.config/gateway), sudo switches, accounts (KINDS)
-    web_form.py    one-time 127.0.0.1 browser form for entering values
+    web_form.py    one-time 127.0.0.1 browser form (v0.5 commands; replaced by dialog.py in phase 3)
+    dialog.py      native dialogs (osascript / zenity / kdialog): confirm a change, type a secret hidden
     cli.py         `run.py log` (the /gate:log viewer), `check`, and `vault` (terminal
                    fallback for /secret, /sudo and /account when no browser can open)
   tests/run_tests.py              single offline test script (no pytest)
@@ -198,8 +199,9 @@ isolation in two real sessions (covered by tests); `pixi run install` on a fresh
 machine; Windows (sudo can't work there; the rest should).
 
 Known limitations / ideas:
-- Logs and the quarantine folder live inside the plugin folder (gitignored).
-  Could move to `CLAUDE_PLUGIN_DATA`.
+- The audit log and quarantine live in the plugin data folder
+  (`CLAUDE_PLUGIN_DATA`, `~/.claude/plugins/data/gate-gateway`): Claude may
+  read them, not edit them. Tests set `GATEWAY_DATA` and `GATEWAY_DIALOG=none`.
 - The Bash blocklist is regex-based: false positives (e.g. `git commit -m
   "...curl..."`) and easy bypasses (`c''url`, base64, `nc`). It steers a
   cooperative model; it isn't a sandbox.

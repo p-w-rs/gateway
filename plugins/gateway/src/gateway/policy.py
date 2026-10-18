@@ -46,11 +46,36 @@ def config_path() -> Path:
     return plugin_root() / "config" / "policy.json"
 
 
+def data_dir() -> Path:
+    """The plugin's own data folder (audit log, quarantine): Claude Code's
+    CLAUDE_PLUGIN_DATA, which survives plugin updates. Outside a hook or the
+    MCP server (e.g. `run.py log` from a terminal) it is worked out the same
+    way Claude Code does: <config dir>/plugins/data/gate-gateway."""
+    override = os.environ.get("GATEWAY_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
+    if override:
+        return Path(override)
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return Path(base) / "plugins" / "data" / "gate-gateway"
+
+
 def audit_log_path() -> Path:
     override = os.environ.get("GATEWAY_AUDIT_LOG")
     if override:
         return Path(override)
-    return plugin_root() / "logs" / "audit.jsonl"
+    new = data_dir() / "audit.jsonl"
+    old = plugin_root() / "logs" / "audit.jsonl"
+    if old.exists() and not new.exists():  # v0.5 kept it inside the plugin folder
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.replace(new)
+        except OSError:
+            return old
+    return new
+
+
+def quarantine_dir(cfg: dict[str, Any]) -> Path:
+    d = Path(os.path.expanduser(str(cfg.get("download_dir", "quarantine"))))
+    return d if d.is_absolute() else data_dir() / d
 
 
 # ---------------------------------------------------------------------------
@@ -405,9 +430,10 @@ def protected_path(path: str, write: bool = False, plugin_root: str = "",
                 return "a credential file (the gateway holds credentials itself)"
         if rel.endswith(".pem") and ("/.ssh/" in "/" + rel or rel.startswith(".ssh")):
             return "a private key"
-    data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
-    if data and (p == Path(data).resolve() or Path(data).resolve() in p.parents):
-        return "the gateway's own data"
+    if write:
+        data = data_dir().resolve()
+        if p == data or data in p.parents:
+            return "the gateway's own data (its log and downloads; read them, don't edit them)"
     if write and plugin_root:
         cfg = (Path(plugin_root) / "config").resolve()
         if p == cfg or cfg in p.parents:

@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # Never write test activity into the real audit log.
 TMP = Path(tempfile.mkdtemp(prefix="gateway-test-"))
 os.environ["GATEWAY_AUDIT_LOG"] = str(TMP / "audit.jsonl")
+os.environ["GATEWAY_DATA"] = str(TMP / "plugins" / "data" / "gate-gateway")
 # ...nor touch the real vault, nor ever open a real pop-up on screen.
 os.environ["GATEWAY_HOME"] = str(TMP / "vault")
 os.environ["GATEWAY_DIALOG"] = "none"
@@ -2849,6 +2850,137 @@ check("owners help explains repo-URL owners and spaces",
       "github.com/OWNER" in _f["owners"]["help"] and "spaces" in _f["owners"]["help"])
 check("ssh host help says ~/.ssh/config aliases aren't read",
       "~/.ssh/config" in {f["name"]: f for f in commands._account_fields("ssh", None)}["host"]["help"])
+
+# --- v2 phase 2: native dialogs, plugin data folder ---------------------------
+print("dialogs:")
+from gateway import dialog  # noqa: E402
+
+check("dialog: GATEWAY_DIALOG=none means no dialogs (tests never pop up)", not dialog.available())
+try:
+    dialog.secret("x")
+    check("dialog: unavailable raises", False)
+except dialog.Unavailable:
+    check("dialog: unavailable raises", True)
+FAKE_DIALOG = TMP / "fake-dialog.sh"
+DIALOG_LOG = TMP / "dialog-args.jsonl"
+FAKE_DIALOG.write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(DIALOG_LOG)!r}, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+answer = os.environ.get("GW_DIALOG_ANSWER", "")
+if answer == "cancel":
+    sys.exit(1)
+print(answer)
+""")
+FAKE_DIALOG.chmod(0o755)
+_saved_dlg = os.environ["GATEWAY_DIALOG"]
+os.environ["GATEWAY_DIALOG"] = str(FAKE_DIALOG)
+try:
+    os.environ["GW_DIALOG_ANSWER"] = "s3cret value with spaces"
+    _tricky = 'Save "work" token? $(touch /tmp/pwned) `id` \\" & end'
+    check("dialog: secret returns what was typed", dialog.secret(_tricky) == "s3cret value with spaces")
+    _args = json.loads(DIALOG_LOG.read_text().splitlines()[-1])
+    check("dialog: message arrives as one argument, verbatim (no injection)",
+          _args[0] == "secret" and _args[2] == _tricky)
+    os.environ["GW_DIALOG_ANSWER"] = "cancel"
+    check("dialog: Cancel gives None / False", dialog.secret("x") is None and dialog.confirm("x") is False)
+    os.environ["GW_DIALOG_ANSWER"] = "yes"
+    check("dialog: Allow gives True", dialog.confirm("Add account?") is True)
+finally:
+    os.environ["GATEWAY_DIALOG"] = _saved_dlg
+    os.environ.pop("GW_DIALOG_ANSWER", None)
+
+_real_backend, _real_run = dialog._backend, dialog.subprocess.run
+_seen = {}
+
+
+class _R:
+    returncode, stdout = 0, "typed\n"
+
+
+def _cap(argv, **k):
+    _seen["argv"] = argv
+    return _R()
+
+
+try:
+    dialog.subprocess.run = _cap
+    for _be in ("osascript", "zenity", "kdialog"):
+        dialog._backend = lambda _be=_be: _be
+        _msg = 'Token for "work" `x` $(y)'
+        check(f"dialog {_be}: answer returned", dialog.secret(_msg) == "typed")
+        _a = _seen["argv"]
+        check(f"dialog {_be}: message passed as data, not code",
+              (_msg in _a or any(_msg in x for x in _a))
+              and not any(_msg in x and ("display dialog" in x) for x in _a))
+    dialog._backend = lambda: "osascript"
+    dialog.secret("m")
+    check("dialog osascript: hidden answer for secrets", "with hidden answer" in _seen["argv"][2])
+finally:
+    dialog._backend, dialog.subprocess.run = _real_backend, _real_run
+_sv = {k: os.environ.get(k) for k in ("SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY")}
+_plat = sys.platform
+try:
+    os.environ["GATEWAY_DIALOG"] = ""
+    os.environ["SSH_CONNECTION"] = "1.2.3.4 5 6.7.8.9 22"
+    sys.platform = "darwin"
+    check("dialog: over ssh on a Mac, unavailable", not dialog.available())
+    sys.platform = "linux"
+    os.environ.pop("SSH_CONNECTION")
+    os.environ.pop("DISPLAY", None)
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    check("dialog: Linux without a display, unavailable", not dialog.available())
+finally:
+    sys.platform = _plat
+    os.environ["GATEWAY_DIALOG"] = _saved_dlg
+    for k, v in _sv.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+print("plugin data folder:")
+check("data dir: GATEWAY_DATA in tests", policy.data_dir() == Path(os.environ["GATEWAY_DATA"]))
+_svd = {k: os.environ.get(k) for k in ("GATEWAY_DATA", "CLAUDE_PLUGIN_DATA", "CLAUDE_CONFIG_DIR",
+                                       "GATEWAY_AUDIT_LOG")}
+try:
+    for k in _svd:
+        os.environ.pop(k, None)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(TMP / "cc")
+    check("data dir: outside Claude Code, <config dir>/plugins/data/gate-gateway",
+          policy.data_dir() == TMP / "cc" / "plugins" / "data" / "gate-gateway")
+    os.environ["CLAUDE_PLUGIN_DATA"] = str(TMP / "pd")
+    check("data dir: CLAUDE_PLUGIN_DATA wins", policy.data_dir() == TMP / "pd")
+    _fr = TMP / "fakeroot"
+    (_fr / "logs").mkdir(parents=True)
+    (_fr / "logs" / "audit.jsonl").write_text('{"old": 1}\n')
+    _svr = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    os.environ["CLAUDE_PLUGIN_ROOT"] = str(_fr)
+    try:
+        check("audit log lives in the data dir; a v0.5 log is moved there once",
+              policy.audit_log_path() == TMP / "pd" / "audit.jsonl"
+              and (TMP / "pd" / "audit.jsonl").read_text() == '{"old": 1}\n'
+              and not (_fr / "logs" / "audit.jsonl").exists())
+    finally:
+        if _svr is None:
+            os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+        else:
+            os.environ["CLAUDE_PLUGIN_ROOT"] = _svr
+    check("quarantine: relative download_dir is under the data dir",
+          policy.quarantine_dir({"download_dir": "quarantine"}) == TMP / "pd" / "quarantine"
+          and policy.quarantine_dir({"download_dir": str(TMP / "q")}) == TMP / "q")
+finally:
+    for k, v in _svd.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+_D = os.environ["GATEWAY_DATA"]
+check("perm: Claude may read its downloads in the data dir",
+      perm("Read", {"file_path": _D + "/quarantine/file.json"}) is None)
+check("perm: Claude may not edit the data dir (audit log)",
+      perm("Edit", {"file_path": _D + "/audit.jsonl"}) == "deny"
+      and perm("Write", {"file_path": _D + "/quarantine/x"}) == "deny")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
