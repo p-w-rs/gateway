@@ -2,7 +2,7 @@
 mlcat accounts.
 
 Sign-in: the catalog publishes its Entra tenant, API app and CLI app at
-GET /api/config. /gate:account login mlcat:NAME signs in with the CLI app
+GET /api/config. /gate:update mlcat:NAME signs in with the CLI app
 (entra.py), and the API token is minted for api://<API app>/access_as_user.
 
 Tools:
@@ -77,8 +77,7 @@ def _account(account: str | None, data: dict[str, Any]) -> tuple[str, dict[str, 
     if len(cats) == 1:
         return cats[0]
     raise gitops.GitRefused("pass account= (one of: " + (", ".join(r for r, _ in cats) or
-                            "none yet; ask the user to run /gate:account add mlcat NAME "
-                            "<description> and /gate:account login mlcat:NAME") + ")")
+                            "none yet; ask the user to type /gate:add catalog") + ")")
 
 
 def _api(ref: str, acct: dict[str, Any], method: str, path: str,
@@ -94,7 +93,7 @@ def _api(ref: str, acct: dict[str, Any], method: str, path: str,
             raw = r.read().decode()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
-        detail = {401: "the sign-in was rejected; ask the user to run /gate:account login " + ref,
+        detail = {401: "the sign-in was rejected; ask the user to run /gate:update " + ref,
                   403: "the user's catalog role does not allow this (publishing needs "
                        "Catalog.Writer)"}.get(e.code)
         if detail is None:

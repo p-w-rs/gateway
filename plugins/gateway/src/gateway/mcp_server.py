@@ -144,7 +144,7 @@ TOOLS: list[dict[str, Any]] = [
             "simply reading a web page, prefer the built-in WebFetch tool. "
             "Only http:// and https:// URLs. If policy requires approval, the "
             "user is prompted directly. Authenticate with auth_ref = the NAME of "
-            "a secret the user stored with /secret (see secret_list or the "
+            "a secret the user stored with /gate:add secret (see secret_list or the "
             "session's vault catalog); it is sent only to hosts the user allowed "
             "and its value is never shown to you."),
         "inputSchema": {

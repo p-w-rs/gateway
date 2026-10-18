@@ -58,14 +58,14 @@ def credential(ref: str, acct: dict[str, Any], data: dict[str, Any]) -> tuple[st
     if via.startswith("github:"):
         g = data["accounts"].get(via)
         if g is None or not g.get("secrets", {}).get("token"):
-            raise gitops.GitRefused(f"{via} has no token; ask the user to run /gate:account login {via}")
+            raise gitops.GitRefused(f"{via} has no token; ask the user to run /gate:update {via}")
         return g.get("login") or "x-access-token", g["secrets"]["token"]
     if via.startswith("azure:"):
         return ACR_USER, _acr_token(host, via, data)
     tok = acct.get("secrets", {}).get("token")
     if not tok:
         raise gitops.GitRefused(f"{ref} has no token and no via account; ask the user to run "
-                                f"/gate:account up {ref}")
+                                f"/gate:update {ref}")
     return acct.get("login") or "user", tok
 
 
@@ -88,7 +88,7 @@ def registry_tool(args: list[str], account: str, confirmed: bool = False,
                 owner = a[len(host) + 1:].split("/", 1)[0].lower()
                 if owners and owner not in owners:
                     raise gitops.GitRefused(f"{account} is not for {host}/{owner}; ask the user to "
-                                            f"run /gate:account allow {account} {owner}")
+                                            f"run /gate:update {account} {owner}")
         cls = classify(args)
         decision = vault.effective_prompts(acct, data)[cls]
         if decision == "refuse":
@@ -125,5 +125,5 @@ def registry_tool(args: list[str], account: str, confirmed: bool = False,
         elif "DENIED" in err or "expected scopes" in err:
             res["hint"] = ("ghcr.io needs a classic token with read:packages / write:packages "
                            "(delete:packages to delete); fine-grained tokens can't use it. Ask "
-                           f"the user to set one with /gate:account up {account} (Via empty).")
+                           f"the user to set one with /gate:update {account} (Via empty).")
     return res

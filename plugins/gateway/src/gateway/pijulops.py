@@ -61,11 +61,11 @@ def choose(remote: dict[str, Any] | None, explicit: str | None,
             raise gitops.GitRefused(f"{explicit} is not a Pijul account; see account_list")
         if remote and not policy.host_allowed(remote["host"], a.get("hosts", [])):
             raise gitops.GitRefused(f"{explicit} is not for {remote['host']}; ask the user to run "
-                                    f"/gate:account allow {explicit} {remote['host']}")
+                                    f"/gate:update {explicit} {remote['host']}")
         owners = [o.lower() for o in a.get("owners", [])]
         if remote and owners and remote["owner"].lower() not in owners:
             raise gitops.GitRefused(f"{explicit} is not for {remote['owner']}; ask the user to "
-                                    f"run /gate:account allow {explicit} {remote['owner']}")
+                                    f"run /gate:update {explicit} {remote['owner']}")
         return explicit, a
     if remote:
         fit = [(r, a) for r, a in accts if policy.host_allowed(remote["host"], a.get("hosts", []))
@@ -130,10 +130,10 @@ def pijul_tool(args: list[str], cwd: str, account: str | None = None,
         key = (acct or {}).get("secrets", {}).get("ssh_key", "") if needs_acct else ""
         if needs_acct and acct is not None and not key:
             raise gitops.GitRefused(f"{ref} has no SSH key; ask the user to add one with "
-                                    f"/gate:account up {ref}")
+                                    f"/gate:update {ref}")
         if remote and acct is not None and not acct.get("known_hosts"):
             raise gitops.GitRefused(f"{ref} has no pinned host key for {remote['host']}; ask the "
-                                    f"user to run /gate:account up {ref} (it reads the key)")
+                                    f"user to run /gate:update {ref} (it reads the key)")
     except (gitops.GitRefused, runner.RunnerError) as e:
         policy.audit("refused", {"action": "pijul", "reason": str(e)[:200]})
         return {"ok": False, "refused": True, "reason": str(e)}
@@ -179,5 +179,5 @@ def pijul_tool(args: list[str], cwd: str, account: str | None = None,
         res["account"] = ref
     if not res["ok"] and "Unknown key" in res.get("stdout", "") + res.get("stderr", ""):
         res["hint"] = (f"The server's host key isn't the pinned one. If it changed on purpose, "
-                       f"ask the user to run /gate:account up {ref} to read it again.")
+                       f"ask the user to run /gate:update {ref} to read it again.")
     return res

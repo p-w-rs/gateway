@@ -34,12 +34,12 @@ and hosts it's for, its methods (token, ssh_key) and its prompt policy.
   helpers.
 - **Missing or not allowed?** Tell the user the exact command. You can't run
   these yourself:
-  - `/gate:account add github NAME <description>` (a browser form asks the
-    login, owners, token or SSH key);
-  - `/gate:account login github:NAME` (SSO / web sign-in, needed for
-    SSO-only orgs like asirobots);
-  - `/gate:account allow github:NAME OWNER`;
-  - `/gate:account prompts github:NAME write=ask|auto delete=ask|refuse`.
+  - `/gate:add github` (a new account; you then guide the setup);
+  - `/gate:update github:NAME` (sign in again, a new token or key, more
+    owners; e.g. `/gate:update github:work allow asirobots`);
+  - `/gate:enable exec|delete|write|read KIND:NAME [always]` (no prompt for
+    that kind of call), `/gate:disable …` (back to asking),
+    `/gate:block write KIND:NAME` (refuse).
 - **Plain force pushes are refused.** If the user really wants to overwrite
   a remote, use `--force-with-lease` through `git_confirm`.
 

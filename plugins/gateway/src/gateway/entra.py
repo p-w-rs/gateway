@@ -1,6 +1,6 @@
 """Microsoft Entra ID (Azure AD) sign-in and tokens for azure and mlcat accounts.
 
-Sign-in happens only in the user's /gate:account login (the hook):
+Sign-in happens only in the user's /gate:update (the hook):
 - browser: authorization code + PKCE with a one-time loopback redirect
   (http://localhost:PORT, which Entra allows for public clients), opened in
   the user's browser, where SSO, MFA and conditional access happen as usual;
@@ -185,7 +185,7 @@ def access_token(ref: str, scope: str) -> str:
             rt = a.get("secrets", {}).get("refresh_token")
             if not rt:
                 raise EntraError(f"{ref} is not signed in; ask the user to run "
-                                 f"/gate:account login {ref}")
+                                 f"/gate:update {ref}")
             tok = _post(_token_url(a.get("tenant_id") or a.get("tenant")), {
                 "client_id": a["client_id"], "grant_type": "refresh_token",
                 "refresh_token": rt, "scope": f"{scope} offline_access"})

@@ -108,7 +108,7 @@ def _catalog_note(session_id: str = "") -> str:
         lines.append("Secrets in the gateway vault (use the NAME as auth_ref):")
         for n, s in cat["secrets"].items():
             hosts = (", ".join(s["hosts"])
-                     or f"none yet: ask the user to run /gate:secret allow {n} HOST")
+                     or f"none yet: ask the user to run /gate:update {n} HOST")
             lines.append(f"- {n}: {s['description'] or '(no description)'} [hosts: {hosts}]")
     if cat["accounts"]:
         lines.append("Accounts in the gateway vault (KIND:NAME; never values):")
@@ -190,7 +190,7 @@ def _enabled_warning(session_id: str = "") -> str | None:
     if not hosts:
         return None
     return ("gateway: sudo is ENABLED (root commands run without asking) on: "
-            + ", ".join(hosts) + ". Turn off with /gate:sudo disable HOST.")
+            + ", ".join(hosts) + ". Turn off with /gate:disable sudo HOST.")
 
 
 def session_main() -> int:

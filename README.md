@@ -1,180 +1,108 @@
 # gateway
 
-A Claude Code plugin that gives Claude **one audited path** for network,
-credential and root work, instead of letting it run `curl`, `wget`, `nmap`,
-`certutil`, `cmdkey`, the macOS `security` tool, PowerShell web cmdlets, or
-`sudo` with a password directly.
-
-Claude still gets the work done. It just does it through gateway tools that
-keep secret values out of the conversation, only send a credential to the
-hosts you allowed, ask before root commands (unless you switch that off for a
-host), and log everything.
+A Claude Code plugin that holds your passwords, tokens, SSH keys and sign-ins,
+and is **the only way Claude uses them**. Claude never sees a value: the
+gateway puts it into each request or command itself, sends it only where you
+allowed, and logs every use.
 
 > Developing on this repo, or an agent picking it up? Start with
 > [CLAUDE.md](CLAUDE.md), then [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## What you get
+## Install
 
-| Instead of | Claude uses |
-|---|---|
-| `curl`/`wget` to read a page | the built-in **WebFetch** |
-| `curl`/`Invoke-RestMethod` to an API | **http_request** (any method, headers, body; auth by secret NAME) |
-| `curl -O` / `wget` a file | **download** (to a quarantine folder, never executed, size-capped) |
-| `nmap` / `masscan` up-or-down checks | **port_check** (plain TCP connect; asks you first) |
-| `certutil` / `openssl s_client` | **cert_inspect** (also reports self-signed/expired certs) |
-| `certutil -hashfile` | **file_hash** |
-| `sudo` with a typed password | **run_privileged** / **run_privileged_confirm** |
-| keychain / env tokens | secrets in the gateway's own vault, used by NAME |
-
-## Adding accounts, secrets and sudo (you type a short command)
-
-```
-/gate:add account        GitHub, Hugging Face, a server over SSH, Azure/Databricks,
-                         the ASI ML Catalog, a container registry, Pijul
-                         (or say it directly: /gate:add github, /gate:add ssh, ...)
-/gate:add secret         an API key or token for a website
-/gate:add sudo           a computer's administrator password
-/gate:update NAME        change one (e.g. /gate:update github:work)
-/gate:delete NAME        remove one
-/gate:enable sudo HOST [always]   admin commands there run without asking
-/gate:disable sudo HOST           every admin command asks again
-/gate:list               what the gateway holds (never values)
-```
-
-After a `/gate:add` or `/gate:update`, Claude asks you a few questions in its
-pop-ups, in plain words (which service, which org, how to sign in), and
-suggests answers it can look up. Then a small **dialog from your system**
-shows exactly what will be added. The token or password is typed only
-there, hidden. For GitHub, Azure and the ML Catalog the recommended choice
-is to sign in in your browser, which works with company single sign-on and
-needs no copying.
-
-**Accounts** are separate identities, kept apart from your own environment:
-several GitHub accounts side by side, Hugging Face, Pijul (the Nest or your own
-server), Azure, the ASI ML Catalog, SSH hosts and container registries
-(`KIND:NAME`, e.g. `github:work`). Each is scoped to its hosts and owners, and
-its prompt policy (`read`, `write`, `delete`, `exec` = `auto`, `ask` or
-`refuse`) lives in the vault, so Claude can't loosen it. 
-
-`/gate:account login KIND:NAME` signs in with SSO:
-- GitHub: through the plugin's own gh web flow, including SSO-only orgs.
-- Azure and the ASI ML Catalog: through Microsoft Entra, in your browser,
-  or with a device code in a terminal.
-
-Claude then works through the gateway's tools, each picking the right account:
-
-| Tool | For |
-|---|---|
-| `git` | every git command (local ones without credentials; remote ones as the account for that remote's host and owner) |
-| `git_mirror` | keep one repo's branches and tags the same on several remotes, e.g. personal and work (fast-forward only, never forced) |
-| `git_identity` | commit as an account in a repo |
-| `gh` | GitHub's CLI (the plugin's own copy) |
-| `hf` | Hugging Face uploads, downloads, repos (Xet) |
-| `pijul` | Pijul, with the Nest or your own server (signs with the account's key) |
-| `ssh_exec`, `ssh_copy` | servers as ssh accounts, with jump hosts; `run_privileged` uses them too |
-| `databricks` | the Databricks CLI with an Entra token |
-| `mlcat`, `mlcat_workspace` | the ASI ML Catalog: search, and asiml's init/clone/pull/push/status |
-| `registry` | container images (ghcr.io via GitHub, ACR via Azure, others by token), no Docker needed |
-| `http_request` | any API, with `auth_ref=KIND:NAME` (Azure: plus `auth_scope`) |
-
-When an account's policy says `ask`, the tool's `_confirm` twin runs the call
-after Claude Code asks you. The optional tools install on first use (the tool
-tells Claude the exact `pixi install -e …` command). Ask Claude in plain words
-to set up a mirror ("keep this repo in sync on my personal and work GitHub");
-the `gate:accounts` skill tells it how.
-
-- **Values never go in the chat.** They're typed in the system dialog (macOS,
-  or zenity/kdialog on a Linux desktop), straight into the gateway's vault.
-  Without a screen (over ssh), Claude gives you a `gateway finish …` command
-  to run in a terminal there, which asks at a hidden prompt.
-- **Only your typed command starts a change.** It opens a one-time setup that
-  lasts 15 minutes, for that change and this session only. It's kept in the
-  encrypted vault, so Claude can't make one up.
-- **Safety net.** If you type something that looks like a token into a
-  command anyway, it's blocked, nothing is saved, and your text is scrubbed
-  from the transcript.
-- The v0.5 commands (`/gate:secret`, `/gate:sudo`, `/gate:account …`) still
-  work for now, but adding or changing an account goes through `/gate:add`
-  and `/gate:update`.
-
-## How it behaves in auto mode
-
-| Silent | Asks you (Claude Code's prompt) | Blocked |
-|---|---|---|
-| web requests, downloads, cert checks, file hashes, listing secret names | `port_check`, and the `_confirm` tools (the plugin's own hook asks) | `curl`, `wget`, `nmap`, `security`, … in Bash (redirected to the gateway) |
-| a secret going to one of its allowed hosts | root commands on a host where sudo is **disabled** (`run_privileged_confirm`) | a secret going to any other host (Claude tells you the `/secret allow` command) |
-| root commands where sudo is **enabled** for this session or always | | reading the vault or your personal age store; `file://` URLs |
-
-A new session warns you while sudo is enabled for it.
-
-## Requirements and install
-
-You need only **[Claude Code](https://code.claude.com)** and
-**[pixi](https://pixi.sh)** (`curl -fsSL https://pixi.sh/install.sh | sh`).
-pixi supplies Python 3.12 and `age` (for the vault) from `pixi.lock` for macOS
-(Intel and Apple Silicon), Linux (x86-64 and arm64) and Windows. All gateway
-code is Python standard library.
-
-In Claude Code:
+You need **[Claude Code](https://code.claude.com)** and
+**[pixi](https://pixi.sh)**. In Claude Code:
 
 ```
 /plugin marketplace add p-w-rs/gateway
 /plugin install gate@gateway
 ```
 
-Then start a new session and run **`/gate:help`**. That's all: nothing is
-added to your settings. The gateway's rules live in its own hooks and are
-active whenever the plugin is enabled:
-- git, gh, hf, pijul, ssh, scp, docker login/push/pull, az and the like in
-  Claude's Bash are redirected to the gateway's account tools;
-- your own credential variables (`GITHUB_TOKEN`, `HF_TOKEN`, …) and your
-  ssh-agent are removed from every command Claude runs (your terminal is
-  unaffected);
-- Claude can't read your credential files (`~/.ssh` private keys, gh's
-  `hosts.yml`, `~/.docker/config.json`, …) or the vault.
+Start a new session and type **`/gate:help`**. Nothing is added to your
+settings; to turn it all off, disable the plugin.
 
-To turn all of it off, disable the plugin (`/plugin`).
+## Add your first account
 
-**From a local checkout** (to work on the gateway): clone it, then in
-`plugins/gateway` run `pixi run install`. That registers the clone as the
-`gateway` marketplace, and also removes rules that gateway 0.5 wrote into
-`settings.json` (it shows them and asks first).
+Type a short command; Claude asks a few questions in its pop-ups and suggests
+answers. Then a small **dialog from your system** shows exactly what will
+change. A token or password is typed only there, hidden.
 
-### Linux and headless machines
+```
+/gate:add github         (or hf, ssh, azure, catalog, registry, pijul, or just "account")
+/gate:add secret         an API key or token for a website
+/gate:add sudo           a computer's administrator password
+```
 
-- **Desktop Linux:** the value form opens in your browser (needs `DISPLAY` or
-  `WAYLAND_DISPLAY`).
-- **No desktop (ssh, servers):** the slash command can't open a browser, so it
-  tells you the exact terminal command, which asks at a hidden prompt:
+For GitHub, Azure and the ML Catalog, the easy choice is to sign in in your
+browser; it works with company single sign-on and needs no copying.
 
-  ```bash
-  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault secret add NAME description
-  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault account add KIND NAME description
-  pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml vault sudo add USER HOST
-  ```
+## Everyday commands
 
-  Sudo enable from the terminal needs `always`, because a terminal has no
-  Claude session.
-- **Remote sudo** uses your normal ssh keys or agent (`BatchMode`; no
-  password prompts). The remote login shell must be a POSIX `sh`, such as bash
-  or dash, not fish.
+```
+/gate:list                           what the gateway holds (never values)
+/gate:update NAME                    change one (sign in again, new token, more orgs, ...)
+/gate:delete NAME                    remove one
+/gate:enable sudo HOST [always]      admin commands there run without asking
+/gate:enable exec ssh:NAME [always]  commands on that server run without asking
+                                     (also delete / write / read, for any account)
+/gate:disable ...                    back to asking
+/gate:block write github:work        make an account read-only for Claude
+/gate:enable reuse ssh:NAME          keep a server's connection open (this session)
+/gate:export [FILE.age]              everything in one file locked with a passphrase
+/gate:import FILE                    bring it in on another computer
+/gate:log                            what the gateway did
+```
 
-## Configure
+`[always]` keeps a switch on in every session; without it, it ends with this
+session.
 
-`plugins/gateway/config/policy.json`: allowed domains, port-check scope,
-approval tiers, response and download size limits. Credentials and their hosts
-are **not** configured here; use `/gate:secret`.
+## What Claude can and can't do
 
-## Review what happened
+- It works with git, GitHub (`gh`), Hugging Face, Pijul, your servers over
+  SSH, Azure / Databricks, the ASI ML Catalog and container registries
+  **through the gateway's tools**, each time as the right account. Several
+  accounts of one kind (personal and work GitHub) sit side by side.
+- Reading and writing (clone, pull, push a branch, open a PR, upload) just
+  run. **Deleting and running commands on servers ask you first** in Claude
+  Code's permission prompt, unless you switched that off. A plain force-push
+  is always refused.
+- **Admin (root) commands ask you**, unless you enabled sudo for that machine.
+- A secret goes **only to the hosts you allowed**; anywhere else is refused.
+- In Claude's own terminal, `curl`, `git`, `gh`, `ssh`, `docker push`, `az`
+  and the like are redirected to the gateway. Your own tokens, your
+  ssh-agent and your credential files are off limits to Claude. Your own
+  terminal is unaffected.
+- Claude **can't add or change anything** in the gateway by itself: every
+  change starts with a command you type, and you approve it in the dialog.
+- If you type something that looks like a token into a command by mistake,
+  it's blocked and scrubbed from the transcript.
 
-`/gate:log` summarizes the audit log (`plugins/gateway/logs/`):
-hosts contacted, credentials used (by name), root commands and how each was
-approved, vault changes, refusals. It never shows values.
+## No screen? (over ssh, servers)
 
-## Develop / test
+When a dialog can't open, Claude gives you one command to run in a terminal
+on that machine:
+
+```bash
+pixi run --manifest-path ~/gateway/plugins/gateway/pixi.toml gateway finish g-1a2b3c4d
+```
+
+It shows the same change and asks at a hidden prompt.
+
+## Platforms
+
+macOS and Linux (desktop or headless). The dialogs use macOS's own, or
+zenity / kdialog on Linux. pixi supplies Python and `age`; all gateway code is
+Python's standard library. Windows isn't supported (no sudo, no pty for the
+export passphrase).
+
+## Develop
 
 ```bash
 cd plugins/gateway
-pixi run test          # ~240 checks, offline, uses throwaway vaults and fakes
+pixi run test            # offline: throwaway vaults, fake dialogs, local servers
 claude plugin validate .
 ```
+
+From a local checkout, `pixi run install` (in `plugins/gateway`) registers the
+clone as the `gateway` marketplace. How it works inside:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); why: [docs/DECISIONS.md](docs/DECISIONS.md).

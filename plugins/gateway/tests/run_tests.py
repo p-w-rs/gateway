@@ -359,7 +359,7 @@ def dialogs_seen():
 def say(prompt, sid=SID):
     """Run a prompt through the UserPromptSubmit handler. Adds out["reason"]:
     the text the user/Claude gets, whether passed through or blocked."""
-    out = commands.handle({"prompt": prompt, "session_id": sid,
+    out = commands._handle_legacy({"prompt": prompt, "session_id": sid,
                            "transcript_path": str(TRANSCRIPT)})
     if out is not None:
         out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
@@ -535,8 +535,11 @@ t0 = time.time()
 check("wrapper: normal prompt passes untouched", run_sh("hello there") == "")
 check("wrapper: normal prompt is fast (no Python)", time.time() - t0 < 0.5)
 out = json.loads(run_sh("/gate:secret desc HF_TOKEN via the wrapper"))
-check("wrapper: command handled and passed through", "decision" not in out
-      and vault.secret("HF_TOKEN")["description"] == "via the wrapper")
+check("wrapper: a retired /gate:secret is handled and points to the new commands",
+      "decision" not in out and "/gate:add secret" in out["hookSpecificOutput"]["additionalContext"]
+      and vault.secret("HF_TOKEN")["description"] != "via the wrapper")
+out = json.loads(run_sh("/gate:secret add X ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"))
+check("wrapper: a value typed into a retired command is still blocked", out.get("decision") == "block")
 out = json.loads(run_sh("/gate:secret list", root=TMP / "no-such-plugin"))
 check("wrapper: gateway failure blocks (fail closed)", out["decision"] == "block")
 
@@ -628,8 +631,8 @@ def confirmed(*a, **k):
 
 
 r = confirmed("elsewhere", touch)
-check("host without stored password refused with /sudo add hint",
-      r.get("refused") is True and "/gate:sudo add USER elsewhere" in r["reason"])
+check("host without stored password refused with a /gate:add sudo hint",
+      r.get("refused") is True and "/gate:add sudo (for elsewhere" in r["reason"])
 r = confirmed("-oProxyCommand=x", touch)
 check("option-like host refused", r.get("refused") is True)
 r = confirmed("localhost", "rm -rf /")
@@ -706,7 +709,7 @@ check("disabled by default", not vault.sudo_enabled("localhost")
 r = actions.run_privileged("localhost", ["echo", "x"])
 check("disabled: refused with confirm and enable hints", r.get("refused") is True
       and "run_privileged_confirm" in r["reason"]
-      and "/gate:sudo enable localhost" in r["reason"])
+      and "/gate:enable sudo localhost" in r["reason"])
 out = say("/sudo enable localhost always")
 check("/sudo enable localhost always", vault.sudo_enabled("localhost")
       and "WITHOUT asking" in out["reason"])
@@ -1038,8 +1041,8 @@ finally:
     _cmds.VALUE_PROVIDER = None
 p = subprocess.run([sys.executable, str(ROOT / "run.py"), "vault", "secret", "add", "X", "d"],
                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-check("terminal fallback refuses without a real terminal (never reads a piped value)",
-      p.returncode == 2 and "interactive terminal" in p.stderr)
+check("the retired v0.5 terminal command says what to use instead (reads nothing)",
+      p.returncode == 2 and "retired" in p.stdout and "gateway finish" in p.stdout)
 check("/gate:help command exists, mentions the short commands and the terminal",
       "/gate:add" in (ROOT / "commands" / "help.md").read_text()
       and "gateway finish" in (ROOT / "commands" / "help.md").read_text())
@@ -1127,7 +1130,7 @@ def acct(prompt):
     m = re.match(r"^/gate:account (add|up|update) (.*)$", prompt, re.S)
     if m and m.group(2).split() and not _TOKEN_IN.search(m.group(2)):
         return _setup_account("add" if m.group(1) == "add" else "update", m.group(2))
-    out = commands.handle({"prompt": prompt, "session_id": SID,
+    out = commands._handle_legacy({"prompt": prompt, "session_id": SID,
                            "transcript_path": str(TRANSCRIPT)})
     if out is not None:
         out["reason"] = out.get("reason") or out["hookSpecificOutput"]["additionalContext"]
@@ -1340,9 +1343,13 @@ check("session note lists accounts, never values",
       "github:work" in _note and "pijul:nest" in _note and GH_TOKEN_V not in _note
       and "PRIVATE KEY" not in _note)
 check("session note tells Claude the short commands", "/gate:add account" in _hooks.SESSION_NOTE and "gate:setup" in _hooks.SESSION_NOTE)
-out = json.loads(run_sh("/gate:account list"))
-check("wrapper routes /gate:account", "decision" not in out
+out = json.loads(run_sh("/gate:list"))
+check("wrapper routes /gate:list", "decision" not in out
       and "github:work" in out["hookSpecificOutput"]["additionalContext"])
+for _old, _new in (("/gate:sudo list", "/gate:enable sudo"), ("/gate:account list", "/gate:block")):
+    check(f"retired {_old.split()[0]} points to the v2 commands",
+          _new in commands.handle({"prompt": _old, "session_id": SID})
+          ["hookSpecificOutput"]["additionalContext"])
 check("old /gate:account add (typed in full) points to /gate:add",
       "/gate:add account" in commands.handle({"prompt": "/gate:account add registry term From a terminal",
                                               "session_id": SID})["hookSpecificOutput"]["additionalContext"])
@@ -1692,7 +1699,7 @@ try:
     check("choose: a named account outside its owners is refused, with the allow hint", False)
 except gitops.GitRefused as e:
     check("choose: a named account outside its owners is refused, with the allow hint",
-          "/gate:account allow github:acme someone" in str(e))
+          "/gate:update github:acme someone" in str(e))
 _D2 = {"accounts": {"github:a": {"kind": "github", "hosts": ["github.com"], "owners": []},
                     "github:b": {"kind": "github", "hosts": ["github.com"], "owners": []}}}
 try:
@@ -1967,7 +1974,7 @@ check("MCP lists git_mirror", "git_mirror" in {t["name"] for t in mcp_server.TOO
 _skill = (ROOT / "skills" / "accounts" / "SKILL.md").read_text()
 check("accounts skill: frontmatter + mirrors + confirm guidance",
       _skill.startswith("---\nname: accounts\n") and "git_mirror" in _skill
-      and "git_confirm" in _skill and "/gate:account login" in _skill)
+      and "git_confirm" in _skill and "/gate:update github:NAME" in _skill)
 
 print("hugging face:")
 from gateway import hfops  # noqa: E402
@@ -3483,5 +3490,53 @@ check("/gate:import needs a file that exists",
       "Error" in json.dumps(_st.handle({"prompt": f"/gate:import {XF / 'nope.age'}",
                                         "session_id": SID})))
 
+_ov = {"accounts": {"github:personal": {"kind": "github", "host": "github.com", "owners": ["p-w-rs"]},
+                    "github:work": {"kind": "github", "host": "github.com", "owners": ["asirobots"]},
+                    "github:ghe": {"kind": "github", "host": "acme.ghe.com", "owners": []}}}
+check("setup: an account whose owners overlap another is called out",
+      _st.overlapping("github:test", "github", "github.com", ["P-W-RS"], _ov) == ["github:personal"]
+      and _st.overlapping("github:all", "github", "github.com", [], _ov)
+      == ["github:personal", "github:work"]
+      and _st.overlapping("github:new", "github", "github.com", ["other"], _ov) == [])
+print("account switches:")
+
+
+def _eff(ref, sid):
+    return vault.effective_prompts(vault.account(ref), vault.load(), sid)["exec"]
+
+
+out = _st.handle({"prompt": "/gate:enable exec github:xf", "session_id": "sw-1"})
+_txt = out["hookSpecificOutput"]["additionalContext"]
+check("/gate:enable CLASS ACCOUNT: this session only",
+      "in this session" in _txt and _eff("github:xf", "sw-1") == "auto"
+      and _eff("github:xf", "sw-2") == "ask" and _eff("github:xf", "") == "ask")
+_st.handle({"prompt": "/gate:disable exec github:xf", "session_id": "sw-1"})
+check("/gate:disable CLASS ACCOUNT: back to the default", _eff("github:xf", "sw-1") == "ask"
+      and "session_prompts" not in vault.account("github:xf"))
+_st.handle({"prompt": "/gate:enable github:xf delete always", "session_id": "sw-1"})
+check("/gate:enable ... always: every session, either word order",
+      vault.effective_prompts(vault.account("github:xf"), vault.load(), "sw-9")["delete"] == "auto")
+_st.handle({"prompt": "/gate:block write github:xf", "session_id": "sw-1"})
+_p = vault.effective_prompts(vault.account("github:xf"), vault.load(), "sw-1")
+check("/gate:block CLASS ACCOUNT: refused", _p["write"] == "refuse")
+_st.handle({"prompt": "/gate:enable write github:xf", "session_id": "sw-1"})
+check("a typed session enable lifts a block for that session only",
+      vault.effective_prompts(vault.account("github:xf"), vault.load(), "sw-1")["write"] == "auto"
+      and vault.effective_prompts(vault.account("github:xf"), vault.load(), "sw-2")["write"] == "refuse")
+_bad = json.dumps(_st.handle({"prompt": "/gate:enable exec github:nope", "session_id": "sw-1"}))
+check("switches: unknown account and bad usage refused",
+      "No account named" in _bad and "Usage" in json.dumps(
+          _st.handle({"prompt": "/gate:block exec github:xf always", "session_id": "sw-1"})))
+os.environ["CLAUDE_CODE_SESSION_ID"] = "sw-1"
+try:
+    _st.handle({"prompt": "/gate:enable exec github:xf", "session_id": "sw-1"})
+    check("the MCP server's session id picks up the switch",
+          vault.effective_prompts(vault.account("github:xf"), vault.load())["exec"] == "auto")
+finally:
+    os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+check("/gate:block can't be run by Claude itself",
+      "disable-model-invocation: true" in (ROOT / "commands" / "block.md").read_text())
+check("prompt.sh sends /gate:block to the gateway",
+      "block" in (ROOT / "hooks" / "prompt.sh").read_text().split("gate:(")[1].split(")")[0])
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

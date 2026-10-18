@@ -44,7 +44,7 @@ def databricks_tool(args: list[str], account: str, workspace: str, cwd: str | No
             raise gitops.GitRefused(f"{account} is not an azure account; see account_list")
         if not host or not policy.host_allowed(host, a.get("hosts", [])):
             raise gitops.GitRefused(f"{account} may not be used for {host or 'that workspace'}; "
-                                    f"ask the user to run /gate:account allow {account} {host}")
+                                    f"ask the user to run /gate:update {account} {host}")
         if args[0] in REFUSED_TOP or args[0].startswith("-"):
             raise gitops.GitRefused(f"'databricks {args[0]}' is not run through the gateway "
                                     "(it manages sign-in, profiles or local sync)")

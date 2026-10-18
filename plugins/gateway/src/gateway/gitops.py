@@ -158,7 +158,7 @@ def choose_account(remote: dict[str, Any], explicit: str | None,
         if not (in_scope(a) and owner_ok(a)):
             raise GitRefused(
                 f"{explicit} is not for {host}/{remote['owner']}. If it should be, ask the "
-                f"user to run: /gate:account allow {explicit} "
+                f"user to run: /gate:update {explicit} "
                 f"{remote['owner'] if in_scope(a) else host}")
         return explicit, a
     cands = [(r, a) for r, a in sorted(data["accounts"].items()) if in_scope(a) and owner_ok(a)]
@@ -227,7 +227,7 @@ def _hint(stderr: str, ref: str | None) -> str:
     low = stderr.lower()
     if "saml" in low or "sso" in low:
         return (f"The organization requires SSO for this token. Ask the user to run "
-                f"/gate:account login {ref or 'github:NAME'} (SSO sign-in) and retry.")
+                f"/gate:update {ref or 'github:NAME'} (SSO sign-in) and retry.")
     if "author identity unknown" in low or "please tell me who you are" in low:
         return ("git doesn't see the user's global identity here (on purpose). Call "
                 "git_identity once with this repo and the account to commit as, then retry.")
@@ -236,7 +236,7 @@ def _hint(stderr: str, ref: str | None) -> str:
     if ("authentication failed" in low or "could not read username" in low
             or "permission denied (publickey)" in low):
         return (f"The remote refused {ref or 'the call (no account matched)'}. Check the "
-                "account has access, or ask the user to add or update it with /gate:account.")
+                "account has access, or ask the user to add it with /gate:add github or change it with /gate:update.")
     return ""
 
 
@@ -271,7 +271,7 @@ def git_tool(args: list[str], cwd: str, account: str | None = None,
                                                                 else cls]
                 if decision == "refuse":
                     return _refuse(ref, cls, f"{ref} is set to refuse {cls} calls "
-                                   f"(/gate:account prompts {ref} {cls}=ask|auto to change).")
+                                   f"(the user can type /gate:disable {cls} {ref} to change that).")
                 if decision == "ask" and not confirmed:
                     return _refuse(ref, cls, f"{ref} asks before {cls} calls: run the same "
                                    "command with git_confirm (Claude Code asks the user).",
@@ -342,7 +342,7 @@ def _creds(ref: str, acct: dict[str, Any], remote: dict[str, Any]) -> runner.Cre
     if remote["scheme"] in ("https", "http"):
         if not secrets.get("token"):
             raise GitRefused(f"{ref} has no token for https; ask the user to run "
-                             f"/gate:account login {ref} or /gate:account up {ref}, or use "
+                             f"/gate:update {ref} or /gate:update {ref}, or use "
                              "the ssh URL if it has an SSH key")
         return runner.Creds(host=remote["cred_host"], token=secrets["token"],
                             username="x-access-token" if acct["kind"] == "github"
@@ -350,7 +350,7 @@ def _creds(ref: str, acct: dict[str, Any], remote: dict[str, Any]) -> runner.Cre
                             protocols=(remote["scheme"],))
     if not secrets.get("ssh_key"):
         raise GitRefused(f"{ref} has no SSH key; use the https URL, or ask the user to add "
-                         f"one with /gate:account up {ref}")
+                         f"one with /gate:update {ref}")
     known = acct.get("known_hosts", "")
     if not known and remote["cred_host"] == "github.com":
         known = GITHUB_KNOWN_HOSTS
@@ -383,7 +383,7 @@ def git_identity(cwd: str, account: str) -> dict[str, Any]:
         return {"ok": False, "reason": f"no account named {account}; see account_list"}
     if not (a.get("name") or a.get("email")):
         return {"ok": False, "reason": f"{account} has no commit name or email; ask the user "
-                                       f"to set them with /gate:account up {account}"}
+                                       f"to set them with /gate:update {account}"}
     try:
         _check_paths(cwdp, [])
     except GitRefused as e:

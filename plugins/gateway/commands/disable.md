@@ -1,6 +1,6 @@
 ---
-description: Make every root command on a host ask again, or stop ssh connection reuse
-argument-hint: sudo HOST | reuse ssh:NAME
+description: Put an account's calls or a host's root commands back to the default (asking), or stop ssh connection reuse
+argument-hint: CLASS KIND:NAME | sudo HOST | reuse ssh:NAME
 disable-model-invocation: true
 ---
 

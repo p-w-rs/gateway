@@ -155,7 +155,7 @@ def gh_tool(args: list[str], cwd: str | None = None, account: str | None = None,
         token = acct.get("secrets", {}).get("token")
         if not token:
             raise gitops.GitRefused(f"{ref} has no token; ask the user to run "
-                                    f"/gate:account login {ref}")
+                                    f"/gate:update {ref}")
         cls = classify(args)
         decision = vault.effective_prompts(acct, data)[cls]
         if decision == "refuse":

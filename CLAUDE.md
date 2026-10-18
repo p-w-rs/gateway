@@ -25,8 +25,8 @@ plugins/gateway/
   hooks/hooks.json                SessionStart, UserPromptSubmit, PreToolUse (Bash; gateway tools + file tools)
   hooks/perm.sh                   the plugin's permission rules: allow/ask gateway tools, credential-path prefilter
   hooks/prompt.sh                 fast pre-filter for UserPromptSubmit
-  commands/*.md                   slash commands: add, update, delete, enable, disable, list,
-                                  export, import, help, log (+ v0.5 secret, sudo, account)
+  commands/*.md                   slash commands: add, update, delete, enable, disable, block,
+                                  list, export, import, help, log
   install.py                      dev only: register this checkout + remove v0.5's settings.json entries (legacy-settings.json)
   config/policy.json              tunables (domains, tiers, size limits)
   pixi.toml / pixi.lock           Python 3.12 + age, all platforms
@@ -68,7 +68,7 @@ claude plugin validate .         # plugin manifest
 claude plugin validate ../..     # marketplace manifest
 pixi run --frozen python run.py check 'some bash command'   # would the hook redirect it?
 pixi run --frozen python run.py log 40                      # audit log viewer
-pixi run install --dry-run       # what the installer would add to settings.json
+pixi run install --dry-run       # what the dev installer would register / remove
 ```
 
 The tests are hermetic. They set `GATEWAY_HOME`, `GATEWAY_CONFIG` and
@@ -94,8 +94,10 @@ your change (mutation-check it).
    on a live grant and only after the user approves the native dialog, where
    any value is typed. No MCP tool opens a grant, enables sudo, or adds a
    secret or host without one.
-4. **Approvals come from Claude Code's permission prompt**, i.e. `ask` rules in
-   settings.json (`port_check`, `run_privileged_confirm`). Never rely on MCP
+4. **Approvals come from Claude Code's permission prompt**, i.e. the plugin's
+   own PreToolUse hook answering `ask` (`hooks/perm.sh`: the `*_confirm` tools,
+   `port_check`). Switches that skip a prompt (`/gate:enable sudo|reuse|CLASS`)
+   exist only as typed commands, stored in the vault. Never rely on MCP
    elicitation forms: the desktop app auto-cancels them without showing them
    (see DECISIONS). Never add a model-settable "approved" parameter.
 5. **Root commands**: argv lists only (no shell strings); the password goes
@@ -141,7 +143,20 @@ your change (mutation-check it).
 - The audit log is shared by all sessions on the machine; entries from other
   sessions are normal.
 
-## Status (2026-10-17, v0.5.0)
+## Status (2026-10-17, v2 on branch accounts-phase1, not released)
+
+v2 (plan and trackers in `.work/v2/`, local): one strict mode always on,
+standard plugin install (rules in the plugin's hooks), short typed commands
+with guided setup and native dialogs (the web form and the v0.5
+`/gate:secret|sudo|account` commands are retired), the gateway's own SSH
+config (routes, host-key policy, key rotation, opt-in connection reuse),
+export / import, per-account switches (`/gate:enable|disable|block CLASS
+KIND:NAME`). About 800 tests pass; each phase's security properties are
+mutation-checked. Live-tried on macOS: phases 1 to 4. Not yet live: export /
+import, ssh routes, the switches, Linux end to end. plugin.json still says
+0.5.0.
+
+### v0.5.0
 
 v0.5.0 completes the accounts plan in code:
 - mirrors and the accounts skill;

@@ -8,6 +8,9 @@ place a secret is typed or a change is approved.
     /gate:delete NAME                                  delete it (now)
     /gate:enable [sudo] HOST [always]                  root commands without asking
     /gate:disable [sudo] HOST                          every root command asks again
+    /gate:enable CLASS KIND:NAME [always]              no prompt for read|write|delete|exec there
+    /gate:disable CLASS KIND:NAME                      back to the default
+    /gate:block CLASS KIND:NAME                        refuse that class of calls
     /gate:enable reuse ssh:NAME                        keep ssh connections open (this session)
     /gate:disable reuse ssh:NAME                       close them; every call connects anew
     /gate:list                                         what the gateway holds
@@ -37,7 +40,7 @@ from typing import Any
 from . import commands, dialog, policy, vault
 
 GRANT_TTL = 15 * 60
-PREFIX = re.compile(r"^\s*/gate:(add|update|delete|enable|disable|list|export|import)(?=\s|$)(.*)$",
+PREFIX = re.compile(r"^\s*/gate:(add|update|delete|enable|disable|block|list|export|import)(?=\s|$)(.*)$",
                     re.S)
 WHATS = ("secret", "sudo", "account")
 ACCOUNT_WORDS = {"ssh": "ssh", "github": "github", "gh": "github", "huggingface": "hf",
@@ -53,6 +56,10 @@ HELP = (
     "/gate:enable sudo HOST [always]     root commands there run without asking\n"
     "                                    (this session, or always)\n"
     "/gate:disable sudo HOST             every root command there asks again\n"
+    "/gate:enable CLASS KIND:NAME [always]  no prompt for read|write|delete|exec calls of\n"
+    "                                    that account (this session, or always)\n"
+    "/gate:disable CLASS KIND:NAME       back to the default\n"
+    "/gate:block CLASS KIND:NAME         refuse those calls (e.g. block write github:work)\n"
     "/gate:enable reuse ssh:NAME         keep that server's connection open (this session)\n"
     "/gate:disable reuse ssh:NAME        close it; every call connects anew\n"
     "/gate:list                          what the gateway holds (never values)\n"
@@ -197,6 +204,66 @@ def _reuse(verb: str, words: list[str], session_id: str) -> str:
             + (f"; closed {n} open connection{'s' if n != 1 else ''}." if n else "."))
 
 
+CLASS_WORDS = {"read": "reading (clone, fetch, pull, download)",
+               "write": "writing (push a branch, open a PR, upload)",
+               "delete": "deleting (branches, tags, releases, force-with-lease)",
+               "exec": "running commands (ssh_exec, workflow runs, jobs)"}
+
+
+def _account_switch(verb: str, words: list[str], session_id: str) -> str:
+    """/gate:enable CLASS ACCOUNT [always]: no prompt for that kind of call
+    (this session, or always); /gate:disable CLASS ACCOUNT: back to the
+    default; /gate:block CLASS ACCOUNT: refused."""
+    usage = ("Usage: /gate:enable CLASS KIND:NAME [always], /gate:disable CLASS KIND:NAME, "
+             "/gate:block CLASS KIND:NAME, where CLASS is read, write, delete or exec.")
+    low = [w.lower() for w in words]
+    always = "always" in low
+    rest = [w for w in low if w != "always"]
+    cls = [w for w in rest if w in vault.PROMPT_CLASSES]
+    refs = [w for w in rest if vault.parse_account_ref(w)]
+    if len(cls) != 1 or len(refs) != 1 or len(rest) != 2 or (always and verb != "enable"):
+        return usage
+    cls, ref = cls[0], refs[0]
+    with vault.locked():
+        data = vault.load()
+        a = data["accounts"].get(ref)
+        if a is None:
+            raise commands.CommandError(f"No account named {ref}; see /gate:list.")
+        prompts = a.setdefault("prompts", {})
+        sess = a.setdefault("session_prompts", {})
+        if verb == "enable" and not always:
+            if not session_id:
+                raise commands.CommandError("This session has no id, so the switch can't be "
+                                            "limited to it; add 'always' or try again.")
+            ids = sess.setdefault(cls, [])
+            if session_id not in ids:
+                ids.append(session_id)
+            del ids[:-vault.MAX_SESSIONS_PER_HOST]
+        else:
+            sess.pop(cls, None)
+            if verb == "enable":
+                prompts[cls] = "auto"
+            elif verb == "block":
+                prompts[cls] = "refuse"
+            else:
+                prompts.pop(cls, None)
+        if not sess:
+            a.pop("session_prompts")
+        vault.save(data)
+        now = vault.effective_prompts(a, data, "")[cls]
+    what = CLASS_WORDS[cls]
+    if verb == "enable":
+        return (f"{ref}: {what} now runs without asking "
+                + ("in every session." if always else "in this session.")
+                + f" /gate:disable {cls} {ref} turns the prompt back on.")
+    if verb == "block":
+        return (f"{ref}: {what} is now refused in every session. /gate:disable {cls} {ref} "
+                "goes back to the default.")
+    return (f"{ref}: {what} is back to the default ("
+            + {"auto": "runs without asking", "ask": "asks each time",
+               "refuse": "refused"}[now] + ") in every session.")
+
+
 def _transfer_command(verb: str, arg: str, session_id: str) -> str:
     """/gate:export [PATH] and /gate:import FILE open a grant; the path is
     only ever what the user typed (or the default export path)."""
@@ -286,6 +353,9 @@ def run(verb: str, rest: str, session_id: str) -> str:
         return _list(session_id)
     if verb in ("export", "import"):
         return _transfer_command(verb, rest.strip(), session_id)
+    if verb == "block" or (verb in ("enable", "disable") and any(
+            w.lower() in vault.PROMPT_CLASSES for w in words[:2])):
+        return _account_switch(verb, words, session_id)
     if verb in ("enable", "disable"):
         if words and words[0].lower() == "reuse":
             return _reuse(verb, words[1:], session_id)
@@ -501,6 +571,13 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
     if spec["owners"]:
         L.append("Used for: " + (", ".join(got["owners"].split()) or "anything") + " on "
                  + (got.get("host") or spec["host"]) + ".")
+        clash = overlapping(ref, kind, got.get("host") or spec["host"], got["owners"].split(),
+                            data)
+        if clash:
+            L.append("Note: " + ", ".join(clash) + (" is" if len(clash) == 1 else " are")
+                     + " also used for some of these. For repos both cover, Claude will have to "
+                     "say which account to use each time; giving each account its own owners "
+                     "avoids that.")
     elif got.get("host"):
         L.append(f"Host: {got['host']}" + (f", port {got['port']}" if got.get("port") else "") + ".")
     if browser:
@@ -513,6 +590,23 @@ def _plan(g: dict[str, Any], p: dict[str, Any], data: dict[str, Any]) -> dict[st
         L.append(f"Its SSH key is read from {key_file} (Claude never reads the file).")
     L.extend(_ssh_lines(ssh_opts, old))
     return plan
+
+
+def overlapping(ref: str, kind: str, host: str, owners: list[str],
+                data: dict[str, Any]) -> list[str]:
+    """Other accounts of the same kind and host whose owners meet these
+    (no owners means any): the git/gh tools can't choose between them."""
+    mine = {o.lower() for o in owners}
+    out = []
+    for r, a in sorted(data["accounts"].items()):
+        if r == ref or a.get("kind") != kind:
+            continue
+        if (a.get("host") or vault.KINDS[kind]["host"]) != host:
+            continue
+        theirs = {o.lower() for o in a.get("owners", [])}
+        if not mine or not theirs or mine & theirs:
+            out.append(r)
+    return out
 
 
 SSH_COMFORT_LIMITS = {"connect_timeout": (1, 120), "keepalive": (0, 600),

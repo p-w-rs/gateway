@@ -145,8 +145,8 @@ def _guard_text(words: list[str]) -> None:
     if hits:
         raise LooksLikeValue(
             "That looks like it contains a secret value, so it was not sent to "
-            "Claude and nothing was saved. Values go in the browser form: type only "
-            "/gate:secret add NAME description. (Your typed text has been "
+            "Claude and nothing was saved. Values are typed only in the gateway's own "
+            "dialog: type /gate:add secret or /gate:update NAME. (Your typed text has been "
             "scrubbed from the transcript.)", hits)
 
 
@@ -862,8 +862,40 @@ def passthrough(result: str) -> dict[str, Any]:
                               + "\n</gateway-result>")}}
 
 
+RETIRED = {
+    "secret": ("/gate:secret is retired. Use /gate:add secret, /gate:update NAME, "
+               "/gate:delete NAME and /gate:list."),
+    "sudo": ("/gate:sudo is retired. Use /gate:add sudo, /gate:enable sudo HOST [always], "
+             "/gate:disable sudo HOST, /gate:delete USER@HOST and /gate:list."),
+    "account": ("/gate:account is retired. Use /gate:add account (or /gate:add github, hf, "
+                "ssh, azure, catalog, registry, pijul), /gate:update KIND:NAME (also to sign "
+                "in again), /gate:delete KIND:NAME, /gate:enable | /gate:disable | /gate:block "
+                "CLASS KIND:NAME and /gate:list."),
+}
+
+
 def handle(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Hook output for a /secret or /sudo prompt, or None for other prompts."""
+    """Hook output for a v0.5 /gate:secret, /gate:sudo or /gate:account
+    prompt (retired): a value typed into one is still blocked and scrubbed;
+    otherwise it says which v2 command to use. None for other prompts."""
+    prompt = payload.get("prompt") or ""
+    m = PREFIX.match(prompt)
+    if not m:
+        return None
+    kind, rest = m.group(1), m.group(2)
+    try:
+        _guard_text(rest.split())
+    except LooksLikeValue as e:
+        _spawn_scrubber(payload.get("transcript_path", ""), e.typed)
+        policy.audit(f"vault_{kind}", {"outcome": "blocked: looked like a typed value"})
+        return block(f"gateway: {e}")
+    policy.audit(f"vault_{kind}", {"outcome": "retired command"})
+    return passthrough(RETIRED[kind])
+
+
+def _handle_legacy(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The v0.5 command handler, kept for the tests of the run_* functions
+    (which the v2 commands still use for delete, sudo switches and sign-in)."""
     prompt = payload.get("prompt") or ""
     m = PREFIX.match(prompt)
     if not m:

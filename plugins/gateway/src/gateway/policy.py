@@ -317,9 +317,9 @@ _BLOCKED = [
     (r"\bage\b[^|;&]*\s(-d|--decrypt)\b", "age --decrypt",
      "the secret's NAME as auth_ref on http_request (secret_list shows names)"),
     (r"\bsecret\s+(get|run|edit|reload)\b", "the user's personal secret store",
-     "only secrets the user added with /secret (secret_list shows names)"),
+     "only secrets the user added with /gate:add secret (secret_list shows names)"),
     (r"age/keys\.txt|secrets\.env\.age", "the user's personal age store",
-     "only secrets the user added with /secret (secret_list shows names)"),
+     "only secrets the user added with /gate:add secret (secret_list shows names)"),
 ]
 
 _BLOCKED_COMPILED = [(re.compile(p), name, route) for p, name, route in _BLOCKED]

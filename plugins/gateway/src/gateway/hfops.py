@@ -52,7 +52,7 @@ def pick(account: str | None, args: list[str], data: dict[str, Any]) -> tuple[st
         owners = [o.lower() for o in a.get("owners", [])]
         if owner and owners and owner.lower() not in owners:
             raise gitops.GitRefused(f"{account} is not for {owner}. If it should be, ask the user "
-                                    f"to run: /gate:account allow {account} {owner}")
+                                    f"to run: /gate:update {account} {owner}")
         return account, a
     owner = _repo_owner(args)
     if owner and hfs:
@@ -85,7 +85,7 @@ def hf_tool(args: list[str], cwd: str | None = None, account: str | None = None,
         ref, acct = pick(account, args, data)
         token = acct.get("secrets", {}).get("token")
         if not token:
-            raise gitops.GitRefused(f"{ref} has no token; ask the user to run /gate:account up {ref}")
+            raise gitops.GitRefused(f"{ref} has no token; ask the user to run /gate:update {ref}")
         cls = classify(args)
         decision = vault.effective_prompts(acct, data)[cls]
         if decision == "refuse":

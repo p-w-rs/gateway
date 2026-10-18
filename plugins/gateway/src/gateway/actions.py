@@ -267,7 +267,7 @@ def port_check(target: str, ports: list[int] | None = None,
 
 def _allowed_hosts(ref: str, cfg: dict[str, Any] | None = None) -> list[str]:
     """Hosts a vault secret or account token may be sent to (set with
-    /gate:secret allow or /gate:account allow)."""
+    /gate:update)."""
     if vault.parse_account_ref(ref):
         s = vault.account(ref)
     else:
@@ -400,8 +400,8 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
         who = f"{user}@{host}" if user else host
         return _refuse("run_privileged", host, (
             f"No sudo password is stored for {who}, so nothing can run as root "
-            f"there. Ask the user to run: /gate:sudo add USER {host} "
-            "(a browser form asks them for the password)."))
+            f"there. Ask the user to type /gate:add sudo (for {who}; a dialog asks "
+            "them for the password)."))
     if len(entries) > 1:
         return _refuse("run_privileged", host, (
             "Several users have sudo passwords for this host; pass user= one of: "
@@ -431,7 +431,7 @@ def run_privileged(host: str, argv: list[str], user: str | None = None,
             f"sudo is disabled on {host}, so each root command needs the user's "
             "approval: call run_privileged_confirm with the same arguments (Claude "
             "Code asks the user). If the user wants root without asking there, "
-            f"they can run /gate:sudo enable {host}.")}
+            f"they can run /gate:enable sudo {host}.")}
     gate = _gate("run_privileged", host, f"AS ROOT on {target}: {cmdline}", approve,
                  pre_approved=True)  # a 'refuse' tier in policy.json still wins
     if gate is not None:

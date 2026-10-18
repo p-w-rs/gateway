@@ -70,6 +70,5 @@ pijul = ["pijul"]
 server = "python run.py server"
 test = "python tests/run_tests.py"
 gateway = "python run.py gateway"        # terminal: pixi run gateway finish GRANT (no-display machines)
-vault = "python run.py vault"            # v0.5 name for the same
 log = "python run.py log"
 install = "python install.py"           # register the plugin + permission rules for this user

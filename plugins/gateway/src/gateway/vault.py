@@ -331,14 +331,23 @@ def account(ref: str, data: dict[str, Any] | None = None) -> dict[str, Any] | No
     return data["accounts"].get(ref)
 
 
-def effective_prompts(acct: dict[str, Any], data: dict[str, Any]) -> dict[str, str]:
-    """Per-class prompt policy: the account's own, then the vault default,
-    then DEFAULT_PROMPTS."""
+def effective_prompts(acct: dict[str, Any], data: dict[str, Any],
+                      session_id: str | None = None) -> dict[str, str]:
+    """Per-class prompt policy: a switch the user typed for this session
+    (/gate:enable CLASS ACCOUNT), then the account's own, then the vault
+    default, then DEFAULT_PROMPTS. The session is the MCP server's
+    (CLAUDE_CODE_SESSION_ID) unless given."""
+    if session_id is None:
+        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
     out = dict(DEFAULT_PROMPTS)
     out.update({k: v for k, v in data.get("account_prompts", {}).items()
                 if k in PROMPT_CLASSES and v in PROMPT_VALUES})
     out.update({k: v for k, v in acct.get("prompts", {}).items()
                 if k in PROMPT_CLASSES and v in PROMPT_VALUES})
+    if session_id:
+        for k, ids in acct.get("session_prompts", {}).items():
+            if k in PROMPT_CLASSES and session_id in ids:
+                out[k] = "auto"
     return out
 
 

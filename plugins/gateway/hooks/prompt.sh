@@ -9,7 +9,7 @@
 root=$1
 input=$(cat)
 
-if printf '%s' "$input" | grep -Eq '"prompt"[[:space:]]*:[[:space:]]*"[[:space:]]*/((gate:)?(secret|sudo|account)|gate:(add|update|delete|enable|disable|list|export|import))([[:space:]"\\]|$)'; then
+if printf '%s' "$input" | grep -Eq '"prompt"[[:space:]]*:[[:space:]]*"[[:space:]]*/((gate:)?(secret|sudo|account)|gate:(add|update|delete|enable|disable|block|list|export|import))([[:space:]"\\]|$)'; then
     out=$(printf '%s' "$input" | pixi run --manifest-path "$root/pixi.toml" --frozen \
         python "$root/run.py" hook-prompt 2>/dev/null)
     case $out in
