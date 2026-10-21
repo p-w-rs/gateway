@@ -19,11 +19,13 @@ wrapped (client.py). ensure_running():
 serve(): takes <run>/gated.lock (flock, non-blocking: a second daemon exits at
 once), detaches (fork, setsid, fork; stdin /dev/null, stdout and stderr to
 <data>/gated/gated.log, umask 077), removes a stale socket (the lock proves
-its daemon is gone, even after kill -9), listens on <run>/gated.sock (0600),
+its daemon is gone, even after kill -9), writes <run>/gated.pid (its pid and
+start time, for its tmux watchdog), listens on <run>/gated.sock (0600),
 then writes ~/.config/gateway/run/contract.json (0600, folder 0700) and
 emits daemon.started. It exits after IDLE_EXIT with no live registered
 session, terminal or job, when its socket is removed (the run dir deleted:
-nobody can reach it), when the plugin folder it runs from is gone or
+nobody can reach it), when the plugin folder it runs from is gone (an
+uninstall, or an update's sweep of the old version folder: `replaced`) or
 marked orphaned by Claude Code (`.orphaned_at`: uninstalled, or replaced by
 an update; then only once no live session is registered) and it holds no
 terminal or job, on SIGTERM/SIGINT or /local/stop:
@@ -32,13 +34,16 @@ its own) removed, and its tmux server stopped once no terminal or job of it
 runs there (Supervisor.stop_server; a live pane keeps the server for the
 next gated to re-adopt).
 
-Uninstalled while terminals or jobs still run (the plugin folder or its data
-folder gone, or the folder orphaned with no newer sibling version and no
-live session: `uninstalled_reason`), it drains (`drain`): contract.json goes
-at once (checkpoint stops delegating), daemon.draining is emitted, new
-terminals, jobs and remote runtimes are refused, and what runs is left to
-finish (never killed); it exits, with its tmux server, once no local
-terminal or job runs (remote ones run on in their hosts' runtimes).
+Uninstalled while terminals or jobs still run (its data folder gone, or the
+plugin folder gone or orphaned with no other, not orphaned version beside it
+and, orphaned, no live session: `uninstalled_reason`), it drains (`drain`):
+contract.json goes at once (checkpoint stops delegating), daemon.draining is
+emitted, new terminals, jobs, remote runtimes and pauses are refused, a job
+left suspended is resumed (no consumer could resume it any more), and what
+runs is left to finish (never killed); it exits, with its tmux server, once
+no local terminal or job runs (remote ones run on in their hosts' runtimes).
+The plugin folder gone with another version beside it is an update's sweep:
+the daemon serves on, as before, until it holds no terminal or job.
 
 The log (<data>/gated/gated.log, the detached daemon's stdout and stderr) is
 rotated to gated.log.1 past LOG_MAX, at start and while the daemon runs
@@ -79,6 +84,7 @@ IDLE_EXIT = 30 * 60
 TICK = 30.0
 START_WAIT = 10.0
 LOG_MAX = 1_000_000
+PAUSE_WAIT = 60.0            # drain waits at most this long for the pauses being applied
 
 
 class StartError(client.DaemonError):
@@ -382,6 +388,12 @@ class Daemon:
         # why the daemon takes no new work ("" while it serves): the plugin was uninstalled
         # while terminals or jobs still ran (drain)
         self.draining = ""
+        # this daemon's pid and start time for its tmux watchdog (write_pid)
+        self.pid_path = paths.gated_pid()
+        # the pauses being applied right now (pause_begin): drain waits for them, so
+        # a job one suspends is resumed with the rest; none starts once draining
+        self._pause_cv = threading.Condition()
+        self._pauses = 0
 
     # -- facts -----------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -777,6 +789,16 @@ class Daemon:
             pass
         return False
 
+    def replaced(self) -> bool:
+        """The folder this daemon's code runs from is gone, but another, not
+        orphaned version is installed beside it: Claude Code swept an update's
+        old version folder (2.1.301 does 14 days after marking it, unless a live
+        session uses it) while this daemon still serves its terminals or jobs.
+        An update, not an uninstall: it serves on (contract.json kept, new work
+        taken, as 0.9.0 did) and exits once it holds no terminal or job, so the
+        newer version's sessions start their own daemon then."""
+        return self.plugin_removed() and self.newer_sibling()
+
     def busy_here(self) -> str:
         """The local terminals and jobs (a draining daemon waits for these;
         remote ones run on in their hosts' runtimes without it)."""
@@ -789,25 +811,54 @@ class Daemon:
         """The plugin was uninstalled while terminals or jobs still run: stop
         advertising the contract at once, take no new work, and leave what
         runs to finish (never killed); the ticker exits once nothing does.
-        One way: a draining daemon never serves new work again."""
-        if self.draining:
-            return
-        self.draining = why
+        One way: a draining daemon never serves new work again. With the
+        contract gone no consumer can lift a pause any more: what a pause
+        suspended is resumed (after the pauses being applied right now), and a
+        new pause is refused (pause_begin)."""
+        with self._pause_cv:
+            if self.draining:
+                return
+            self.draining = why
+            self._pause_cv.wait_for(lambda: self._pauses <= 0, timeout=PAUSE_WAIT)
         # nothing new is written into a data folder an uninstall removed (a lazy
         # import's bytecode under pycache_prefix would make it again)
         sys.dont_write_bytecode = True
         self.remove_contract()
+        try:
+            resumed = self.terminals.resume_stopped()
+        except Exception as e:  # noqa: BLE001 - the drain goes on
+            self.log(f"terminals: resuming the suspended jobs failed ({type(e).__name__})")
+            resumed = []
         c = self.terminals.counts(local_only=True)
         self.events.emit("daemon.draining", reason="uninstalled", terminals=c["terminals"],
-                         jobs=c["jobs"])
+                         jobs=c["jobs"], resumed=len(resumed))
         self.log(f"{why}: taking no new work and advertising no contract; still running, left to "
-                 f"finish: {self.busy_here() or 'nothing'}; the daemon exits once they have ended")
+                 f"finish: {self.busy_here() or 'nothing'}; the daemon exits once they have ended"
+                 + (f"; resumed what a pause or a stop had suspended ({len(resumed)} job(s)): nothing "
+                    "could resume it any more" if resumed else ""))
+
+    def pause_begin(self) -> bool:
+        """A pause (/v1/pause) is about to apply: False once draining (the
+        contract is gone, so nothing could resume what it suspends: refused).
+        Each True is followed by pause_end()."""
+        with self._pause_cv:
+            if self.draining:
+                return False
+            self._pauses += 1
+            return True
+
+    def pause_end(self) -> None:
+        with self._pause_cv:
+            self._pauses -= 1
+            self._pause_cv.notify_all()
 
     def uninstalled_reason(self, live: int | None) -> str:
         """Why the plugin this daemon runs from counts as uninstalled, or "".
-        `live` None: only the checks that read no state (the first in a tick)."""
-        if self.plugin_removed():
-            return "the plugin folder it runs from is gone (uninstalled or replaced)"
+        `live` None: only the checks that read no state (the first in a tick).
+        A code folder removed while another version is installed beside it is
+        an update's sweep, not an uninstall (`replaced`)."""
+        if self.plugin_removed() and not self.newer_sibling():
+            return "the plugin folder it runs from is gone and no other version is installed (uninstalled)"
         if self.data_removed():
             return "the plugin's data folder is gone (uninstalled)"
         if live is not None and self.plugin_orphaned(live) and not self.newer_sibling():
@@ -839,8 +890,17 @@ class Daemon:
                         self.stop_soon("plugin removed")
                         return
                     continue
+                # an update's old version folder swept while this daemon runs
+                # from it: it serves on for what runs, and leaves once nothing does
+                replaced = self.replaced()
+                if replaced and not self.busy():
+                    self.log("the plugin folder it runs from is gone, replaced by an update (another "
+                             "version is installed beside it), and nothing runs: exiting")
+                    self.stop_soon("plugin removed")
+                    return
                 self.broker.tick()
-                self.watch_rights()
+                if not replaced:
+                    self.watch_rights()          # it imports from the code folder
                 live = self.registry.prune()
                 if self.plugin_orphaned(live) and not self.busy():
                     self.log("the plugin folder it runs from is orphaned (uninstalled or replaced) and "
@@ -910,7 +970,38 @@ class Daemon:
         except OSError:
             pass
 
+    def write_pid(self) -> None:
+        """<run>/gated.pid: `<pid> <start time>` (ps's lstart as the tmux
+        watchdog reads it: terminals.ps_start), written whole before the
+        socket is bound, so the file names this daemon by the time its socket
+        replaces a killed one's. The watchdog tells a killed gated (its socket
+        left behind) from a live one by it (terminals.WATCH_SCRIPT)."""
+        p = self.pid_path
+        start = terminals.ps_start(self.pid)
+        tmp = p.with_name(f".{p.name}.{self.pid}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{self.pid} {start}".rstrip() + "\n")
+            os.replace(tmp, p)
+        except OSError as e:
+            self.log(f"can't write the pid file ({type(e).__name__})")
+            # a killed predecessor's file would make the watchdog take this daemon
+            # for gone; without one it watches the socket alone
+            for q in (tmp, p):
+                with contextlib.suppress(OSError):
+                    q.unlink()
+
+    def remove_pid(self) -> None:
+        p = self.pid_path
+        try:
+            if p.read_text(encoding="utf-8").split()[:1] == [str(self.pid)]:
+                p.unlink()
+        except (OSError, ValueError):
+            pass
+
     def run(self) -> int:
+        self.write_pid()
         self.bind()
         self.write_contract()
         self.events.emit("daemon.started", version=self.version, pid=self.pid)
@@ -936,6 +1027,7 @@ class Daemon:
             self.broker.lock("exit")
             self.remove_contract()
             self.unbind()
+            self.remove_pid()
             with contextlib.suppress(Exception):
                 self.server.server_close()
             if self.stop_reason != "socket gone":

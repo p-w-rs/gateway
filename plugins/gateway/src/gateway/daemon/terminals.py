@@ -120,6 +120,10 @@ PAUSED = "gateway: the task is paused (checkpoint), so nothing is typed or start
 DRAINING = ("gateway: the gateway was uninstalled, so it starts no new terminals, jobs or remote "
             "runtimes; what still runs is left to finish (terminal_list and job_list show it) and "
             "the gateway daemon exits after it")
+# a pause that reaches a draining gated: contract.json is gone, so no consumer
+# could resume what it suspended (Daemon.drain resumes what is suspended already)
+PAUSE_DRAINING = ("gateway: the gateway was uninstalled, so it takes no new pause (nothing could "
+                  "resume it); what still runs is left to finish and the gateway daemon exits after it")
 STOP_REQ_WORDS = {"undelivered": "not delivered (the host couldn't be reached; nothing was stopped)",
                   "unsure": "outcome unknown (the close went out, its answer was lost; the host is "
                             "asked)"}
@@ -149,30 +153,48 @@ set -s exit-empty on
 # gated's own (local) server only: a watchdog session that stops the server
 # once its socket is gone or replaced (the run dir removed after gated was
 # stopped, e.g. by SIGTERM: nobody can reach that server or its panes again),
-# or once gated is gone (its socket removed: it exited, or was uninstalled)
-# and no pane of the server runs anything any more (dead panes kept for reads
-# are all that is left), and a hook that lets the server end as before when
-# the last real session closes (exit-empty), the watchdog being all that is
-# left.
+# or once gated is gone (it exited, was uninstalled, or was killed) and no
+# pane of the server runs anything any more (dead panes kept for reads are
+# all that is left), and a hook that lets the server end as before when the
+# last real session closes (exit-empty), the watchdog being all that is left.
 WATCH_SESSION = "gw-watch"
 WATCH_TICK = 5               # seconds between the watchdog's looks
 LOCAL_TMUX_CONF = (
     "set-hook -g session-closed "
     "'if -F \"#{==:#{server_sessions},1}\" \"kill-session -t =" + WATCH_SESSION + "\"'\n")
+# ps as gated and its watchdog both run it for a start time: one locale and one
+# time zone, so the same process prints the same words in both
+PS_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC0"}
 # Run by the server itself (tmux execs it without a shell: the watchdog's
 # parent is the server): `sh -c SCRIPT gw-watch <tmux socket> <gated socket>
-# <seconds>`. It notes the socket's inode and checks every few seconds that
-# the same socket is still there (a new server's socket at the same path is
-# another inode). While gated's socket is missing it counts the server's
-# children that have a terminal (each live pane's process, this watchdog's
-# own included; a dead pane has none, a pipe-pane helper has no tty): only
-# itself left, it stops the server. A listing it can't read (no ps, an odd
-# format: its own pane not seen) never stops anything.
+# <seconds> <gated pid file>`. It notes the socket's inode and checks every
+# few seconds that the same socket is still there (a new server's socket at
+# the same path is another inode). gated is gone when its socket is missing
+# (it exited), or when the socket is still there but the pid file next to it
+# (paths.gated_pid: `<pid> <start time>`, written before gated listens, so a
+# restarted gated names itself before its socket replaces the old one) names
+# a process that is dead (kill -0 fails: gone, or another user's), a zombie,
+# or another process (ps shows another start time): a SIGKILL, a crash or the
+# OOM killer leave the socket file behind. A pid file that is missing or
+# unreadable, or a ps that can't say, counts as gated alive. While gated is
+# gone it counts the server's children that have a terminal (each live pane's
+# process, this watchdog's own included; a dead pane has none, a pipe-pane
+# helper has no tty): only itself left, it stops the server. A listing it
+# can't read (no ps, an odd format: its own pane not seen) never stops
+# anything.
 WATCH_SCRIPT = (
-    's=$1; g=${2-}; t=${3:-5}; set -- $(ls -di "$s" 2>/dev/null); i=${1-}; [ -n "$i" ] || exit 0; '
+    's=$1; g=${2-}; t=${3:-5}; f=${4-}; set -- $(ls -di "$s" 2>/dev/null); i=${1-}; '
+    '[ -n "$i" ] || exit 0; '
     'while sleep "$t"; do [ -S "$s" ] || break; set -- $(ls -di "$s" 2>/dev/null); '
     '[ "${1-}" = "$i" ] || break; '
-    '[ -n "$g" ] && [ ! -S "$g" ] || continue; '
+    '[ -n "$g" ] || continue; '
+    'if [ -S "$g" ]; then [ -n "$f" ] && [ -f "$f" ] || continue; p=; l=; '
+    'read -r p l 2>/dev/null < "$f"; case "$p" in ""|*[!0-9]*) continue;; esac; '
+    'if kill -0 "$p" 2>/dev/null; then '
+    'c=$(LC_ALL=C TZ=UTC0 ps -o stat= -o lstart= -p "$p" 2>/dev/null) || continue; '
+    'set -- $c; [ "$#" -ge 2 ] || continue; '
+    'case "$1" in Z*) ;; *) shift; [ -n "$l" ] && [ "$*" != "$l" ] || continue;; esac; '
+    'fi; fi; '
     'o=$(ps -A -o ppid= -o tty= 2>/dev/null) || continue; '
     'n=$(printf "%s\\n" "$o" | awk -v p="$PPID" \'$1 == p && $2 !~ /^[?]+$/ { n++ } END { print n + 0 }\'); '
     '[ "$n" -ge 1 ] 2>/dev/null || continue; [ "$n" -gt 1 ] || break; '
@@ -591,6 +613,19 @@ def foreground_pgrp(pid: int) -> int:
         return int(r.stdout.strip() or 0)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return 0
+
+
+def ps_start(pid: int) -> str:
+    """`pid`'s start time as the tmux watchdog reads it (ps's lstart under
+    PS_ENV, its words single-spaced); "" when ps can't say."""
+    if pid <= 0:
+        return ""
+    try:
+        r = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                           text=True, timeout=5, env=dict(PS_ENV), stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return " ".join(r.stdout.split()) if r.returncode == 0 else ""
 
 
 def group_members(pgid: int) -> dict[int, str]:
@@ -1456,6 +1491,7 @@ class Supervisor:
         """The local server's watchdog session (LOCAL_TMUX_CONF), started
         once per server: tmux refuses a second one by name, which is fine."""
         gsock = getattr(self.d, "sock_path", None) or paths.gated_socket()
+        gpid = getattr(self.d, "pid_path", None) or paths.gated_pid()
         k = getattr(self.d, "k", None) or {}
         tick = k.get("watch_tick") if testing.active() is not None else None
         tick = str(int(tick)) if isinstance(tick, int) and not isinstance(tick, bool) and 0 < tick <= 60 \
@@ -1463,7 +1499,7 @@ class Supervisor:
         with contextlib.suppress(Exception):
             self.tmux.run("new-session", "-d", "-s", WATCH_SESSION, "-x", "20", "-y", "2",
                           "/bin/sh", "-c", WATCH_SCRIPT, WATCH_SESSION, str(self.sock), str(gsock),
-                          tick, check=False)
+                          tick, str(gpid), check=False)
 
     def open_terminal(self, session: Any, *, agent: str = "", cwd: Any = None, cols: Any = None,
                       rows: Any = None, env: Any = None, workspace: Any = "", task_ref: Any = "",
@@ -3253,6 +3289,45 @@ class Supervisor:
             outcomes.append({**base, "outcome": "running" + (" (detached)" if p.detached else "")})
         self.tick()
         return outcomes
+
+    def resume_stopped(self) -> list[str]:
+        """The plugin was uninstalled (lifecycle.Daemon.drain): contract.json
+        is gone, so no consumer can send /v1/resume any more, and a draining
+        gated leaves only once no local job runs. A job left suspended (a
+        pause's suspend, or job_signal STOP) would stay stopped, and gated, its
+        tmux server and the job with it, forever: each is resumed (SIGCONT to
+        its process group, as /v1/resume does), the session's pause record
+        kept (its consumer still holds the task paused; only the stop is
+        lifted). A local pane's process is signalled only while it is still the
+        process tmux named (pid and start time: the env's tmux may be deleted
+        by now). A pending interrupt escalation is left to happen (it ends the
+        job, as the pause asked). The ids resumed."""
+        with self.lock:
+            jobs = [p for p in self.panes.values() if p.kind == "job" and p.paused_as == "suspended"
+                    and (p.alive or (p.remote and p.live))]
+        done: list[str] = []
+        for p in jobs:
+            if not p.remote and p.pane_pid > 0 and p.pane_start is not None and \
+                    not peers.alive(p.pane_pid, p.pane_start):
+                continue                          # ended meanwhile: nothing to resume
+            try:
+                self._killpg(p, self._pgrp(p, foreground=False), "CONT")
+            except ProcessLookupError:
+                continue
+            except (OSError, TermError) as e:
+                self.d.log(f"terminals: {p.id}: resuming it failed "
+                           f"({e.code if isinstance(e, TermError) else type(e).__name__})")
+                continue
+            with self.lock:
+                p.paused_as = ""
+                self._changed()
+            done.append(p.id)
+        if done:
+            self.d.log(f"terminals: resumed {', '.join(done)} (SIGCONT): suspended, and nothing "
+                       "could resume them any more")
+            with contextlib.suppress(Exception):
+                self.tick()
+        return done
 
     # -- the contract's views --------------------------------------------------------------
     def contract_job(self, p: Pane) -> dict[str, Any]:

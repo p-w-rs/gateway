@@ -26,6 +26,9 @@ its own tmux server ([terminals.md](terminals.md)).
 ```
 <run>/gated.sock        the socket (0600; run dir /tmp/gw-$UID, 0700, owner-checked)
 <run>/gated.lock        single-instance flock (held by the daemon for its life)
+<run>/gated.pid         `<pid> <start time>` (ps lstart, LC_ALL=C TZ=UTC0), written whole
+                        before the socket is bound, removed at exit: the tmux watchdog
+                        tells a killed daemon (its socket left behind) from a live one
 <run>/gated.start.lock  flock that serializes starters
 <run>/gated-sessions.json   registered sessions (0600, written whole)
 <run>/gated-dialogs.json    dialog requests, leases (token sha256 only) and paused sessions:
@@ -44,7 +47,7 @@ its own tmux server ([terminals.md](terminals.md)).
 private/key.wrapped, private/key.recipient   the vault key with a passphrase (0600)
 ```
 
-`paths`: `gated_socket()`, `gated_lock()`, `gated_start_lock()`,
+`paths`: `gated_socket()`, `gated_lock()`, `gated_pid()`, `gated_start_lock()`,
 `gated_sessions()`, `gated_dir()`, `gated_log()`, `contract_dir()`,
 `contract_path()`, `wrapped_key_path()`, `recipient_path()`.
 
@@ -84,8 +87,9 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
 - `serve(detach)`: flock `gated.lock` without waiting (a second daemon prints
   "already running" and exits 0), then fork, setsid, fork (the daemon is not a
   session leader, so it can't get a terminal), stdio to the log, umask 077,
-  cwd `/`. A leftover socket is removed (the lock proves its daemon is gone,
-  also after `kill -9`), the socket bound (0600), contract.json written,
+  cwd `/`. `gated.pid` is written (its pid and ps start time, for the tmux
+  watchdog: terminals.md), a leftover socket is removed (the lock proves its
+  daemon is gone, also after `kill -9`), the socket bound (0600), contract.json written,
   `daemon.started` emitted. A consumer that reads a contract.json whose pid
   is dead treats the gateway as unavailable (CONTRACT-v1); the next start
   rewrites it.
@@ -99,7 +103,9 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   whose socket went with the run dir (`Supervisor.abandon`). It also exits
   when the plugin folder its code runs from is going away and it holds no
   terminal or job: removed (`paths.code_root()`'s run.py gone; checked first
-  in a tick, before anything that might import a module from it), or marked
+  in a tick, before anything that might import a module from it; with
+  another, not orphaned version beside it that is an update's sweep, below,
+  and the daemon serves on until it holds no terminal or job), or marked
   orphaned by Claude Code (`.orphaned_at`, which 2.1.301's `claude plugin
   uninstall` and an update write into the version folder they leave for a
   later sweep) once no live session is registered (a session still running
@@ -111,22 +117,37 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   job running left gated running forever, advertising the contract, its tmux
   server and watchdog running from deleted files: the env's tmux could no
   longer be run, so every pane query failed and counted as a blip). The
-  plugin counts as uninstalled (`uninstalled_reason`) when its code folder is
-  gone, its data folder is gone (`data_removed`: a plain `claude plugin
-  uninstall` deletes it, with the env this python and the env's tmux run
-  from), or its code folder is orphaned with no live session and no newer,
-  not orphaned sibling version beside it (`newer_sibling`: an update marks the
-  old folder the same way, and its daemon keeps serving its jobs and the
-  contract until it is free). Uninstalled with nothing running, the daemon
+  plugin counts as uninstalled (`uninstalled_reason`) when its data folder is
+  gone (`data_removed`: a plain `claude plugin uninstall` deletes it, with the
+  env this python and the env's tmux run from), or its code folder is gone or
+  orphaned (orphaned: with no live session) with no newer, not orphaned
+  sibling version beside it (`newer_sibling`: an update marks the old folder
+  the same way, and its daemon keeps serving its jobs and the contract until
+  it is free; Claude Code 2.1.301 removes that old folder 14 days later unless
+  a live session uses it, and a daemon still running a terminal or job from
+  it then serves on too, `replaced`: contract.json kept, new terminals and
+  jobs taken, no rights watch since that imports from the removed folder, and
+  it exits once it holds no terminal or job, as 0.9.0 did; 0.9.1 before
+  refix-gw drained it and refused every new terminal as "uninstalled").
+  Uninstalled with nothing running, the daemon
   exits as above. With terminals or jobs running it drains (`drain`, one way):
   contract.json is removed at once (checkpoint stops delegating: a missing
   file is "gateway not available" in CONTRACT-v1), `daemon.draining` is
-  emitted (`reason: "uninstalled"`, the local terminal and job counts),
+  emitted (`reason: "uninstalled"`, the local terminal and job counts, and
+  `resumed`: the jobs it resumed, below),
   `/health` carries `draining` (and `gated start`/`status` a `skew` note, so
   a reinstall's session says why it gets no new work yet), new terminals,
   jobs (`/agent/...`, `/ui/term/open`, `POST /v1/jobs`) and remote runtime
   staging are refused with 503 `draining` (an idempotency key seen before
   still returns its job), and the running ones are left alone, never killed;
+  pauses are refused too (`/v1/pause`: 503 `draining`; `pause_begin`, and
+  the drain waits for a pause being applied at that moment), and a job left
+  suspended (a pause's `suspend`, `job_signal STOP`) is resumed with SIGCONT
+  (`Supervisor.resume_stopped`; the session's pause record stays): with
+  contract.json gone checkpoint can't send `/v1/resume`, so the stopped job
+  kept the daemon, its tmux server and itself there forever (refix-gw;
+  keeping contract.json with a `draining` field instead was rejected in
+  0.9.1, since checkpoint 0.7.x would go on delegating);
   the vault keeps its lock rules (`broker.tick`), the rights watch stops
   (it would import from the removed folders), bytecode writing is switched
   off (a lazy import must not make the deleted data folder again), and no
@@ -243,7 +264,7 @@ event. `since(seq, wait, epoch=None)` long-polls (≤ 25 s on the route); a seq
 from another epoch (named, or past this epoch's end) starts over with
 `reset: true`; `truncated` says older events left the ring. Kinds now:
 `daemon.started`, `daemon.stopping`, `daemon.draining {reason, terminals,
-jobs}` (0.9.1; the plugin uninstalled while work runs; new within v1, which
+jobs, resumed}` (0.9.1; the plugin uninstalled while work runs; new within v1, which
 allows new kinds), `session.registered`, `session.ended`,
 `vault.wrapped`, `vault.unlocked`, `vault.locked`, `auth.waiting`,
 `auth.supplied`, `pause.applied`, and since phase 5 `job.started`,

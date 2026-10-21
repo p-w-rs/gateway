@@ -447,23 +447,31 @@ def r_pause(ctx: Ctx) -> dict[str, Any]:
     agent until resume) and each of its jobs' on_pause policy applied (only
     the task's jobs when task_ref is given), with what actually happened.
     Bound to the caller's session (_pause_session); a repeated pause_id gets
-    the first answer back and changes nothing."""
+    the first answer back and changes nothing. Refused while gated drains
+    (the plugin was uninstalled: contract.json is gone, so no consumer could
+    resume what a pause suspends; lifecycle.Daemon.drain)."""
     task = _task_arg(ctx)
     sid = _pause_session(ctx, task)
     pid_ = _pause_id_arg(ctx)
-    if pid_:
-        prev = ctx.daemon.dialogs.replay("pause", sid, pid_)
-        if prev is not None:
-            ctx.daemon.events.emit("pause.applied", session=sid, paused=True, task=task, replayed=True)
-            return {**prev, "replayed": True}
-    closed = ctx.daemon.dialogs.pause(sid)
-    outcomes = ctx.daemon.terminals.pause(sid, task)
-    ctx.daemon.events.emit("pause.applied", session=sid, paused=True, task=task)
-    out = {"ok": True, "paused": True, "outcomes": outcomes, "dialogs_closed": closed}
-    if pid_:
-        ctx.daemon.dialogs.remember_replay("pause", sid, pid_, out)
-        out["pause_id"] = pid_
-    return out
+    if not ctx.daemon.pause_begin():
+        raise _err(503, "draining", terminals.PAUSE_DRAINING)
+    try:
+        if pid_:
+            prev = ctx.daemon.dialogs.replay("pause", sid, pid_)
+            if prev is not None:
+                ctx.daemon.events.emit("pause.applied", session=sid, paused=True, task=task,
+                                       replayed=True)
+                return {**prev, "replayed": True}
+        closed = ctx.daemon.dialogs.pause(sid)
+        outcomes = ctx.daemon.terminals.pause(sid, task)
+        ctx.daemon.events.emit("pause.applied", session=sid, paused=True, task=task)
+        out = {"ok": True, "paused": True, "outcomes": outcomes, "dialogs_closed": closed}
+        if pid_:
+            ctx.daemon.dialogs.remember_replay("pause", sid, pid_, out)
+            out["pause_id"] = pid_
+        return out
+    finally:
+        ctx.daemon.pause_end()
 
 
 def r_resume(ctx: Ctx) -> dict[str, Any]:

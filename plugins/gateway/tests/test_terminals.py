@@ -1598,3 +1598,148 @@ def test_the_watchdog_stops_the_server_once_gated_is_gone_and_no_pane_runs():
         assert _alive(server), "the watchdog stopped a server whose job still runs"
         _end_pane(de, jid)
         assert _gone(server, 6), "the watchdog left the server with gated gone and nothing running"
+
+
+# ---------------------------------------------------------------------------
+# Re-fix of 0.9.1's verified findings (refix-gw): a killed gated and its
+# watchdog, a job left suspended at an uninstall, an update's sweep of the old
+# version folder
+# ---------------------------------------------------------------------------
+
+
+def _kept_exited_job(de: D.DaemonEnv, a: Agent) -> tuple[int, int, Path, list[str]]:
+    """A job that has exited (its dead pane kept for reads) and nothing else:
+    (gated's pid, the tmux server's pid, gated's pid file, its words)."""
+    jid = a.ok("/agent/job/start", {"argv": ["true"], "cwd": str(de.root)})["id"]
+    _job_wait(a, jid, ("exited",))
+    _wait_watchdog(de)
+    gated = de.daemon_pid()
+    pidf = de.run / "gated.pid"
+    return gated, _server_pid(de), pidf, pidf.read_text().split()
+
+
+def test_the_watchdog_stops_the_server_once_gated_was_killed_and_only_a_dead_pane_is_left():
+    """gated killed (SIGKILL, a crash, the OOM killer: no cleanup) leaves its
+    socket file behind, so the socket alone made the watchdog take it for
+    alive and the server ran on forever with its dead panes (and from deleted
+    binaries after an uninstall). gated writes its pid and start time next to
+    its socket before it listens; the watchdog reads them: while gated lives it
+    never stops a server whose panes are all dead (kept for reads); once that
+    pid is dead, or is another process (a reused pid: another start time), it
+    stops the server."""
+    with D.daemon_env(knobs={"watch_tick": 1}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        gated, server, pidf, words = _kept_exited_job(de, a)
+        assert words[:1] == [str(gated)] and len(words) > 1, words
+        assert " ".join(words[1:]) == T.ps_start(gated), "the pid file's start time isn't ps's"
+        time.sleep(3.0)                                  # three of the watchdog's looks
+        assert _alive(server), "the watchdog stopped the server of a live gated (only a dead pane)"
+        os.kill(gated, signal.SIGKILL)
+        assert _gone(gated, 5)
+        assert de.sock.exists() and pidf.exists(), "a killed gated cleaned up after itself?"
+        assert _gone(server, 6), "the watchdog left the server of a killed gated running"
+    # the pid file names a live process that started at another time (a reused pid)
+    with D.daemon_env(knobs={"watch_tick": 1}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        gated, server, pidf, words = _kept_exited_job(de, a)
+        os.kill(gated, signal.SIGKILL)
+        assert _gone(gated, 5)
+        pidf.write_text(f"{os.getpid()} Mon Jan 1 00:00:00 2001\n")
+        assert _gone(server, 6), "the watchdog took a reused pid for gated"
+
+
+def test_a_job_left_suspended_at_an_uninstall_is_resumed_and_gated_leaves_after_it():
+    """checkpoint paused the task (on_pause suspend: the job stopped), then a
+    plain uninstall: contract.json goes at once, so checkpoint can't find
+    gated to send /v1/resume, and the stopped job kept gated, its tmux server
+    and itself there forever. The drain resumes it (SIGCONT, counted in
+    daemon.draining), refuses a new pause (nothing could resume what it would
+    suspend) while it leaves other jobs alone, and gated leaves once the jobs
+    have ended."""
+    import shutil
+    with D.daemon_env(knobs={"watch_tick": 60}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        cwd = str(de.root)
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", "172"], "cwd": cwd, "on_pause": "suspend",
+                                        "task_ref": "t1"})["id"]
+        other = a.ok("/agent/job/start", {"argv": ["sleep", "173"], "cwd": cwd, "on_pause": "suspend",
+                                          "task_ref": "t2"})["id"]
+        time.sleep(0.5)
+        st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t1", "reason": "x"}, mode="x")
+        assert st == 200 and {o["job"]: o["outcome"] for o in r["outcomes"]} == \
+            {jid: "suspended (SIGSTOP)"}, r
+        _job_wait(a, jid, ("suspended",))
+        gated = de.daemon_pid()
+        server = _server_pid(de)
+
+        def stats(word: str) -> list[str]:
+            return [ln.split()[1] for ln in subprocess.run(["ps", "-axo", "pid=,stat=,command="],
+                                                            capture_output=True, text=True).stdout.splitlines()
+                    if ln.split()[2:] == ["sleep", word]]
+        assert stats("172") and all(s.startswith("T") for s in stats("172"))
+        log = open(paths.gated_log(), errors="replace")        # the file goes with the folder
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        assert not paths.contract_path().exists()
+        assert _job_wait(a, jid, ("running",))["state"] == "running", "the suspended job stayed stopped"
+        assert stats("172") and not any(s.startswith("T") for s in stats("172")), stats("172")
+        ev = _events(de, ("daemon.draining",))
+        assert ev and ev[-1]["resumed"] == 1 and ev[-1]["jobs"] == 2, ev
+        # a pause reaching the draining gated now is refused, and nothing is applied
+        st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t2", "reason": "x"}, mode="x")
+        assert st == 503 and r.get("error") == "draining" and "no new pause" in r["message"], (st, r)
+        time.sleep(0.3)
+        assert a.ok("/agent/job/status", {"id": other})["state"] == "running"
+        assert not any(s.startswith("T") for s in stats("173")), stats("173")
+        time.sleep(1.0)
+        assert de.daemon_pid() == gated and _alive(server), "gated left while its jobs run"
+        _end_pane(de, jid)
+        _end_pane(de, other)
+        assert _gone(gated, 10), "gated stayed after its last job ended"
+        assert _gone(server, 5), "its tmux server stayed"
+        text = log.read()
+        log.close()
+        assert f"terminals: resumed {jid} (SIGCONT)" in text, text[-800:]
+        assert "nothing runs any more: exiting" in text, text[-800:]
+        assert not data.exists(), "the deleted data folder was made again"
+        data.mkdir(parents=True)                                   # for the harness's cleanup
+
+
+def test_an_updates_sweep_of_the_old_version_folder_is_no_uninstall():
+    """An update leaves the old version folder orphaned beside the new one, and
+    Claude Code removes it 14 days later unless a live session uses it, while
+    the old gated may still run a terminal or job. That is no uninstall (0.9.1
+    drained it and refused every new terminal as "uninstalled"): gated serves
+    on (no drain, contract.json kept, new terminals taken) and leaves once
+    nothing runs, its tmux server with it."""
+    import shutil
+    with D.daemon_env(start=False, knobs={"watch_tick": 60}) as de:
+        copy = D.plugin_copy(de.root, D.plugin_version())
+        de.start_from(copy)
+        fc = de.claude()
+        a = Agent(de, fc)
+        tid = a.open()["id"]
+        D.plugin_copy(de.root, "99.0.0")                     # the update: a newer version beside it
+        (copy / ".orphaned_at").write_text("1792450000000")
+        time.sleep(0.5)
+        gated = de.daemon_pid()
+        shutil.rmtree(copy)                                  # the sweep of the old version folder
+        time.sleep(1.0)                                      # ten ticks
+        h = de.health() or {}
+        assert h.get("pid") == gated and not h.get("draining"), h
+        assert paths.contract_path().exists(), "the swept version's gated withdrew the contract"
+        t2 = a.open()["id"]
+        _wait_watchdog(de)
+        server = _server_pid(de)
+        time.sleep(0.5)
+        assert de.daemon_pid() == gated, "gated left while its terminals run"
+        a.ok("/agent/term/close", {"id": tid})
+        a.ok("/agent/term/close", {"id": t2})
+        assert _gone(gated, 10), "the swept version's gated stayed with nothing running"
+        assert _gone(server, 5), "its tmux server stayed"
+        assert "replaced by an update" in de.log(), de.log()[-800:]
+        assert not paths.contract_path().exists()

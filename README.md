@@ -29,11 +29,12 @@ Plugin `gate` (version 0.9.1) in the marketplace `gateway`
 automatically against a stand-in model, with the plugin installed from a git
 marketplace into a throwaway configuration, on macOS arm64 (Claude Code
 2.1.301) and a Debian 13 arm64 VM (Claude Code 2.1.304), 2026-10-21. The
-repository's own test suite (1222 tests) and its mutation checks (1041) pass
+repository's own test suite (1225 tests) and its mutation checks (1050) pass
 on macOS, and the suite on the Linux VM too (plugin 0.9.1). The fixes after
 the install test from GitHub (an uninstall while a job runs, the status line's
-warning sign, `~/.bashrc` on Debian) were checked live on the VM; the other
-live checks ran on 0.9.0.
+warning sign, `~/.bashrc` on Debian) were checked live on the VM; their
+follow-up fixes (a killed helper, a paused job at uninstall, the sweep of an
+updated version) in the suite only; the other live checks ran on 0.9.0.
 
 | Area | Built | Tested |
 |---|---|---|
@@ -655,8 +656,12 @@ exits 30 minutes after the last session ends (not while a terminal or job
 runs), and within about half a minute once its plugin is uninstalled and no
 session uses it. Uninstalled while a terminal or job still runs, it starts
 nothing new and stops offering itself to checkpoint at once, leaves that
-work running, and exits (with its private tmux) once it has ended. Its
-private tmux also goes whenever it exits with nothing running. Checkpoint finds it
+work running (a job checkpoint had paused by suspending it is resumed, since
+nothing could resume it any more), and exits (with its private tmux) once it
+has ended. After an update it keeps serving what runs, also once Claude Code
+removes the old version, and gives way to the new version when nothing does.
+Its private tmux also goes whenever it exits (or is killed) with nothing
+running. Checkpoint finds it
 through `~/.config/gateway/run/contract.json`
 ([docs/CONTRACT-v1.md](docs/CONTRACT-v1.md)); nothing secret is ever on that
 channel.
@@ -925,7 +930,9 @@ its next check (within about half a minute, once no session uses it) and
 exits, with its private tmux. If a gateway terminal or job still runs, it
 stops offering itself to checkpoint and refuses new terminals and jobs at
 once, leaves the running ones alone (never killed; jobs on remote hosts keep
-running there), and exits with its tmux once the local ones have ended. From
+running there; a job checkpoint had paused by suspending it is resumed, since
+checkpoint can't reach it any more), and exits with its tmux once the local
+ones have ended. From
 the next session Claude's terminal is back to normal.
 
 Your form and vault stay in `~/.config/gateway` (the `gate` launcher then only

@@ -402,9 +402,14 @@ plugins/gateway/
     process (pid and start time from tmux's last answer) decides only when
     its watch ends (gone/unknown, never "exited"), so a draining gated can
     leave. Uninstalled while work runs, gated drains (never kills it: no new
-    work, contract.json withdrawn at once, it leaves with its tmux server once
-    no local pane runs), and it stops its tmux server whenever it exits with no
-    local pane running (`stop_server`; a live pane keeps it for re-adoption). A paused session can stop or cancel a job but not resume it
+    work and no new pause, contract.json withdrawn at once, a job left
+    suspended resumed since nothing else could, it leaves with its tmux server
+    once no local pane runs; its code folder removed with another version
+    beside it is an update's sweep, not an uninstall: it serves on until
+    nothing runs), and it stops its tmux server whenever it exits with no
+    local pane running (`stop_server`; a live pane keeps it for re-adoption);
+    the watchdog stops it when gated is gone, also killed (`gated.pid`: pid
+    and start time; a leftover socket file isn't gated). A paused session can stop or cancel a job but not resume it
     (`job_signal CONT` refused); an interrupt's SIGTERM escalation is
     persisted and re-armed after a restart. The approval hook's per-call
     judging of `terminal_send` is a guardrail (split-bypassable), not the
@@ -556,7 +561,28 @@ pixi: `requires-pixi = ">=0.68.0"`, no upper bound. Tested range 0.68.0 to
 v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
 `/gate-doctor`'s verdict) and the docs; `test_packaging` keeps them in step.
 
-Last full run (2026-10-21, gw-fix, plugin 0.9.1: the GitHub install test's
+Last full run (2026-10-21, refix-gw, plugin 0.9.1: the verifier's three lows
+in the GitHub install fixes; DECISIONS "Re-fix of the GitHub install fixes"):
+1225 passed, 0 failed on macOS arm64 (`pixi run --locked test`, 357.1 s at 4
+at a time, pixi 0.81.0, GW_TEST_TMP in scratch; `claude plugin test .` 118
+pass inside test_mod) and 1225 passed, 0 failed on the Debian 13 arm64 VM
+(219.3 s; the working tree's `git ls-files -co --exclude-standard` without
+logs/ and quarantine/ under `~/gwrefix`, `pixi install --locked`, pixi 0.82.0,
+Claude Code 2.1.304, dash as /bin/sh, procps' ps, GW_TEST_TMP under /tmp; the
+three new tests included: the watchdog's `kill -0` and `ps -o stat= -o
+lstart=` under dash); on macOS again on the final tree (the pid file's
+write-failure path, three mutation snippets and docs changed since): 1225
+passed, 0 failed (350.6 s). Mutations: 1050 in all (new: 9 in
+mutations_terminals.py; three older snippets the change moved were updated:
+the watchdog's gated check, the ticker's broker tick, the pause route's
+replay); the all-files run (3 at a time) killed 1048, the two it couldn't
+place (moved snippets in mutations_daemon.py and mutations_policy.py) were
+fixed and those files re-run: 86 of 86 and 99 of 99 killed, so 1050 of 1050. The new mutations were also run on the VM
+(mutations_terminals.py `-k` watchdog, time zone, pid file, draining gated,
+sweep, swept: 19 of 19 killed). The VM was restored (`./vm.sh clean`,
+stopped). Not re-run: the TUI acceptances (acceptance_install's vmdrain
+included), the remote acceptance, the headless e2e suite.
+Before that (2026-10-21, gw-fix, plugin 0.9.1: the GitHub install test's
 findings; DECISIONS "GitHub install fixes"): 1222 passed, 0 failed on macOS
 arm64 (`pixi run --locked test`, 392.7 s at 4 at a time, pixi 0.81.0,
 GW_TEST_TMP in scratch; `claude plugin test .` 118 pass inside test_mod;
@@ -887,8 +913,9 @@ project context.
   the test run dir's private socket (`<run>/tmux.sock`); the daemon_env
   cleanup kills it (its argv names the run dir), and gated stops it when the
   run dir goes (so does the server's own `gw-watch` session once its socket
-  is gone, when gated was stopped first, or once gated's socket is gone and no
-  pane runs anything; gated itself stops it when it exits with nothing running;
+  is gone, when gated was stopped first, or once gated is gone, its socket
+  removed or its `gated.pid` naming a dead or other process, and no pane runs
+  anything; gated itself stops it when it exits with nothing running;
   terminals.md; the knob `watch_tick` shortens the watchdog's 5 s). Removing
   the override's data folder (`de.env.data`) is how a test makes a plain
   uninstall (the daemon log goes with it: open it first and read the open file).
@@ -1654,6 +1681,17 @@ line with ⚠ and `$.ui.status` takes no level); (4) the mod sets `SHLVL=1`
 where it is missing, so the `bash -c` that starts the prefix (stdin a
 socket) no longer sources `~/.bashrc` (upstream bash's rule, seen on Debian);
 (5) the version is 0.9.1.
+Re-fix (refix-gw, 2026-10-21, still 0.9.1: it hadn't shipped; DECISIONS
+"Re-fix of the GitHub install fixes"): (1) the watchdog tells a killed gated
+(SIGKILL, a crash: the socket file stays) by `<run>/gated.pid` (pid and ps
+start time under `LC_ALL=C TZ=UTC0`, written before the socket is bound) and
+stops a server of dead panes then; (2) a draining gated resumes the jobs left
+suspended (SIGCONT; `daemon.draining` counts them in `resumed`; the session's
+pause record kept) and refuses new pauses (503 `draining`), so a job
+checkpoint suspended no longer keeps gated, tmux and itself there forever
+once contract.json is gone; (3) a removed code folder with another, not
+orphaned version beside it (Claude Code's sweep of an update's old folder) is
+no uninstall: gated serves on and exits once nothing runs, as 0.9.0 did.
 
 Not done or not verified live (as of the 2026-10-21 acceptance; the per-phase
 notes below were written when each phase landed, and items the acceptance

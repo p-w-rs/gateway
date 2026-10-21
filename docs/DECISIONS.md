@@ -2062,9 +2062,9 @@ and the Debian 13 VM, Claude Code 2.1.301/2.1.304).
   but every `list-panes` then failed (the binary was gone), and a failed query
   while the server's pid lives is a blip by design (phase 5), so the panes
   stayed "live" forever and gated never left. Now (`Daemon.drain`,
-  `uninstalled_reason`): the code folder gone, the data folder gone, or the
-  code folder orphaned with no live session and no newer sibling version
-  counts as uninstalled; with nothing running gated exits as before, with
+  `uninstalled_reason`): the code folder gone (refix-gw: with no other
+  version beside it), the data folder gone, or the code folder orphaned with
+  no live session and no newer sibling version counts as uninstalled; with nothing running gated exits as before, with
   terminals or jobs running it drains: contract.json removed at once (a
   missing file is "gateway not available" in CONTRACT-v1, so checkpoint stops
   delegating; no CONTRACT change, which must stay identical in both repos),
@@ -2142,6 +2142,64 @@ and the Debian 13 VM, Claude Code 2.1.301/2.1.304).
   `git show main:.../vault.py` first; since 0.9.0 is on main that is v3's
   package module, which can't load alone (15 tests failed in 4 modules). The
   fixture, byte for byte the last v2 vault.py on main, is now the one source.
+
+## Re-fix of the GitHub install fixes (refix-gw, 0.9.1, 2026-10-21)
+
+Three lows a verifier found in the fixes above (probes in a scratch copy of
+aafaf3d, each compared with the commit before it). 0.9.1 hadn't shipped, so
+the version stays.
+
+- **A killed gated left its tmux server and dead panes running forever.**
+  The watchdog took gated's socket file for gated: a SIGKILL, a crash or the
+  OOM killer leave the file, so with only a dead pane kept for reads the
+  server never ended (8 looks later it still held `gw-watch` and the pane),
+  and after an uninstall nothing would adopt it again: the original symptom
+  by another road (0.9.0 the same). Now gated writes `<run>/gated.pid`
+  (`<pid> <start time>`, ps's `lstart` under `LC_ALL=C TZ=UTC0`, so gated and
+  the watchdog's ps print the same words) whole before it binds its socket
+  (a restarted gated names itself before its socket replaces the old one,
+  so a restart isn't taken for a death), and removes it at exit. The
+  watchdog counts gated gone when its socket is missing or the pid file names
+  a dead pid (`kill -0`), a zombie or another process (another start time);
+  a missing or unreadable file, or a ps that can't say, counts as alive (an
+  older gated that writes none keeps the old behaviour). Rejected: a lock
+  gated holds (no `flock` on macOS; a FIFO's EOF needs a reader that opens
+  before the writer goes), restarting the watchdog with gated's pid at each
+  adoption (a race with every restart, and a gated killed before it got
+  there leaves the old pid), `ps -o command=` naming `gated serve` (another
+  test root's gated, or any reused pid running one, would pass).
+- **A job a pause suspended couldn't be resumed after an uninstall**, so it,
+  gated and the tmux server stayed forever: the drain withdraws
+  contract.json at once, checkpoint's `discover()` then says absent and
+  never sends `/v1/resume`, and `job_signal CONT` is refused while the
+  session is paused (on 0.9.0 the contract stayed, so checkpoint could still
+  resume it). Now the drain resumes every job left suspended (a pause's
+  `suspend` or `job_signal STOP`; `Supervisor.resume_stopped`: SIGCONT to its
+  process group, a local one only while its process is still the one tmux
+  named, by pid and start time, since the env's tmux may be deleted; remote
+  ones best effort), counts them in `daemon.draining` (`resumed`) and the
+  log, keeps the session's pause record (checkpoint still holds the task
+  paused; only the stop is lifted, which is what kept everything there), and
+  leaves a pending interrupt escalation to happen (it ends the job, as the
+  pause asked). A pause reaching a draining gated is refused (503
+  `draining`: nothing could resume what it would suspend), and the drain
+  waits for a pause being applied at that moment (`pause_begin`/`pause_end`),
+  so what it suspends is resumed too. Rejected again: keeping contract.json
+  with `draining: true` (checkpoint 0.7.x ignores the field and would go on
+  delegating new work, as 0.9.1 found); leaving the job stopped (nothing
+  would ever end it); killing it (silent loss of user work).
+- **An update's sweep of the old version folder drained the old gated**,
+  which then refused every new terminal and job as "uninstalled": Claude
+  Code 2.1.301 removes an orphaned version folder 14 days after marking it
+  unless a live session uses it, and a persistent terminal or job may still
+  run on the old gated then. `newer_sibling()` covered only the orphaned
+  check. Now a removed code folder with another, not orphaned version beside
+  it is an update (`replaced`): gated serves on (contract.json kept, new
+  terminals and jobs taken, no rights watch: it imports from the removed
+  folder) and exits once it holds no terminal or job, as 0.9.0 did, so the
+  newer version's sessions start their own daemon; removed with no other
+  version it still drains. Rejected: only rewording the refusal (an update is
+  no reason to stop serving the sessions that use this daemon meanwhile).
 
 ## Rejected alternatives
 

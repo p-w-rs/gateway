@@ -327,6 +327,13 @@ def gated_lock() -> Path:
     return run_dir() / "gated.lock"
 
 
+def gated_pid() -> Path:
+    """gated's pid and its start time as ps prints it (`<pid> <lstart>`),
+    written before it listens: its tmux watchdog tells a gated that was killed
+    (its socket left behind) from a live one by it (daemon/terminals.py)."""
+    return run_dir() / "gated.pid"
+
+
 def gated_start_lock() -> Path:
     return run_dir() / "gated.start.lock"
 

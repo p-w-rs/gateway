@@ -76,7 +76,7 @@ How phase B's requests were settled is in
 | `Protected()` | the same, computed once (`contains`, `is_parent`, `candidates`, `entries` = existing files in protected places, for Glob) |
 | `user_home()`, `local_user()`, `describe(path)` | the user's home and login from the password database; `describe` turns a path into its `~/…` form |
 | `wrapped_key_path()`, `recipient_path()` | `private/key.wrapped` (the vault key encrypted to the user's passphrase) and `private/key.recipient` (its public recipient), PLAN-v4 phase 2 |
-| `gated_socket()`, `gated_lock()`, `gated_start_lock()`, `gated_sessions()`, `gated_dialogs()` | the daemon's socket, single-instance lock, starters' lock, session registry and dialog requests (metadata only) in the run dir |
+| `gated_socket()`, `gated_lock()`, `gated_pid()`, `gated_start_lock()`, `gated_sessions()`, `gated_dialogs()` | the daemon's socket, single-instance lock, pid and start time (for its tmux watchdog), starters' lock, session registry and dialog requests (metadata only) in the run dir |
 | `gated_dir()`, `gated_log()` | `$DATA/gated` (log, epoch counter, events/, machine-ids.json) and its log |
 | `gated_tmux_socket()`, `gated_tmux_conf()`, `gated_terms_dir()`, `gated_terminals()` | the supervisor's tmux socket and config and the panes' start files and FIFOs in the run dir; the terminal and job records in `$DATA/gated/terminals.json` (PLAN-v4 phase 5) |
 | `gated_remote()`, `runtime_src_dir()`, `runtime_data_dir()` | the remote hosts' runtime and identity state (`$DATA/gated/remote.json`); the runtime workspace in the plugin (`runtime/`); the packs and pixi-pack's cache (`$DATA/runtime/`) (PLAN-v4 phase 6) |

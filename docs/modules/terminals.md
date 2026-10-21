@@ -124,13 +124,23 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   the server): every 5 s it checks that the socket it started with (by inode) is still
   there, and once it isn't, it sends the server SIGTERM (acceptance 2026-10-21: the TUI
   harness left `new-session -d -s j_...` servers behind). Since 0.9.1 it also stops the
-  server once gated's own socket is gone (gated exited, or was uninstalled and left) and
+  server once gated is gone (it exited, was uninstalled and left, or was killed) and
   no pane of the server runs anything: it counts the server's children that have a
   terminal (each live pane's process and its own; a dead pane has none, a `pipe-pane`
   helper no tty) from `ps -A -o ppid= -o tty=`, and only itself left, it stops the
-  server; a listing it can't read (no `ps`, its own pane not in it) stops nothing. Its
-  arguments: the tmux socket, gated's socket, the seconds between looks (5; the test
-  knob `watch_tick`). A `session-closed` hook in the
+  server; a listing it can't read (no `ps`, its own pane not in it) stops nothing.
+  gated is gone when its socket is missing, or when the socket is still there but
+  `<run>/gated.pid` (`<pid> <start time>`: ps's `lstart` under `LC_ALL=C TZ=UTC0`,
+  `terminals.ps_start`; written whole by gated before it binds its socket, so a
+  restarted gated names itself before its socket replaces a killed one's) names a
+  process that is dead (`kill -0` fails), a zombie, or another process (ps shows
+  another start time: a reused pid). A SIGKILL, a crash or the OOM killer leave the
+  socket file behind; the socket alone made the watchdog take such a gated for alive
+  and keep a server of dead panes forever (refix-gw, 2026-10-21). A missing or
+  unreadable pid file, or a ps that can't say, counts as alive. Its arguments: the
+  tmux socket, gated's socket, the seconds between looks (5; the test knob
+  `watch_tick`), gated's pid file (an older gated's watchdog, without it, keeps
+  watching the socket only). A `session-closed` hook in the
   local config (`LOCAL_TMUX_CONF`) closes the watchdog when it is the last session, so
   the server still ends with its last terminal (`exit-empty`). `gw-watch` is no
   terminal or job (no `t_`/`j_` id): adoption, lists and `busy()` ignore it.
@@ -149,7 +159,16 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   working while the env's tmux can still be run), and gated leaves once no local one
   runs (`busy(local_only=True)`: remote panes run on in their hosts' runtimes). Records
   are never written into a data folder an uninstall removed (`_save` makes `gated/`
-  only inside an existing data folder).
+  only inside an existing data folder). A job left suspended (a pause's `suspend`, or
+  `job_signal STOP`) is resumed when the drain starts (`resume_stopped`: SIGCONT to its
+  process group, a local one only while its process is still the one tmux named, by pid
+  and start time; remote ones too, best effort): contract.json is gone, so no consumer
+  could send `/v1/resume` any more, and the stopped job would keep gated, its tmux
+  server and itself there forever (refix-gw). The session's pause record stays (its
+  consumer still holds the task paused; only the stop is lifted), a pending interrupt
+  escalation still happens, and a new `/v1/pause` is refused (503 `draining`,
+  `PAUSE_DRAINING`; the drain waits for a pause being applied at that moment, so what
+  it suspends is resumed too).
 - An exited pane's tmux session is kept an hour for reads (`RETAIN_DEAD`), its record
   24 h (`RECORD_KEEP`). Live panes keep gated from its idle exit and from a version
   restart (`Daemon.busy()`: "2 terminals and 1 job"); at most 64 live (`MAX_LIVE`).
@@ -296,7 +315,9 @@ interrupt escalation and its `paused_as` are persisted, so a gated restart re-ar
 promised SIGTERM (`_arm_term_escalation` from adopt) instead of silently dropping it.
 While a session is paused the agent may still stop or cancel a job, but **`job_signal
 CONT` is refused** (409 `paused`): resuming suspended work is checkpoint's `/v1/resume`,
-not something the paused agent undoes.
+not something the paused agent undoes. The one exception is an uninstall: a draining
+gated resumes what is suspended (no consumer could any more) and takes no new pause
+(Draining, above).
 
 ## Routes
 

@@ -29,8 +29,9 @@ KINDS: dict[str, tuple[str, ...]] = {
     "daemon.started": ("version", "pid"),
     "daemon.stopping": ("reason",),
     # the plugin was uninstalled while terminals or jobs still ran: no new work,
-    # the contract withdrawn, the daemon leaves once they have ended (lifecycle.drain)
-    "daemon.draining": ("reason", "terminals", "jobs"),
+    # the contract withdrawn, the jobs left suspended resumed (how many), the
+    # daemon leaves once they have ended (lifecycle.drain)
+    "daemon.draining": ("reason", "terminals", "jobs", "resumed"),
     "session.registered": ("session", "via", "ui"),
     "session.ended": ("session",),
     "vault.unlocked": ("how",),
