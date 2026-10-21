@@ -24,7 +24,7 @@ Sections (a baseline config has only the probe plugin, for comparison):
            environment never reaches a command), the gateway PATH, the probe
            plugin's bin/ and its env file kept
   hooks    the probe plugin's string-form hooks run through the prefix with
-           the same $0 and environment as in the baseline (but the three
+           the same $0 and environment as in the baseline (but the
            variables the gateway's mod sets); PreToolUse and PostToolUse see
            the original command
   perms    default permission mode: the dialog shows the original command,
@@ -70,8 +70,9 @@ RESULTS: list[dict] = []
 NOTES: list[str] = []
 PREBUILD_TIMEOUT = 1800
 # what differs between a hook's environment with the gateway and without it:
-# the gateway mod's own variables, and per-session values
-VOLATILE = re.compile(r"^(CLAUDE_CODE_SHELL_PREFIX|CLAUDE_CODE_SHELL|GW_MANAGED_DIR|"
+# the gateway mod's own variables (SHLVL too since 0.9.1, where Claude Code
+# runs without it: the harness's allowlisted environment), and per-session values
+VOLATILE = re.compile(r"^(CLAUDE_CODE_SHELL_PREFIX|CLAUDE_CODE_SHELL|GW_MANAGED_DIR|SHLVL|"
                       r"CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_MESSAGING_SOCKET|CLAUDE_CODE_MESSAGING_TOKEN|"
                       r"CLAUDE_PID|ANTHROPIC_BASE_URL|XDG_RUNTIME_DIR|CLAUDE_CONFIG_DIR|HOME|TMPDIR|"
                       r"CLAUDE_CODE_TMPDIR|CHECKPOINT_[A-Z_]*|GATEWAY_TEST_ROOT|XDG_[A-Z]*_HOME|"
@@ -580,7 +581,7 @@ def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dic
         menv = (root / "m1-probe" / "pre-env.txt").read_text() if (root / "m1-probe" / "pre-env.txt").exists() else ""
         a, b = norm_env(menv), norm_env(base.get("hook_env", ""))
         check("hooks: the probe's string-form hook (through gate-sh) has the baseline's $0 and environment, "
-              "but for the gateway mod's three variables and per-session values",
+              "but for the gateway mod's variables and per-session values",
               a == b and "ZERO=/bin/sh" in a, json.dumps({"only_managed": sorted(set(a) - set(b)),
                                                           "only_baseline": sorted(set(b) - set(a))}))
         check("hooks: the gateway mod's prefix is visible to hooks (as Claude Code passes its environment)",

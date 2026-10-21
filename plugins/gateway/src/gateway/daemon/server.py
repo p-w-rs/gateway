@@ -630,6 +630,8 @@ def r_remote_runtime(ctx: Ctx) -> dict[str, Any]:
     if action not in ("status", "provision", "clean"):
         raise _err(400, "bad_request", "gateway: action is status, provision or clean")
     d = ctx.daemon
+    if action != "status":
+        d.terminals.check_accepting()         # none staged or changed while gated drains
     name = d.remote.resolve(b.get("host"))
     if name is None:
         raise _err(404, "no_host", "gateway: no such remote host in gateway.toml (gate status lists "

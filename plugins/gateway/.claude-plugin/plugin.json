@@ -1,6 +1,6 @@
 {
   "name": "gate",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Hosts and accounts for Claude Code: sudo, ssh, scp, rsync, git, gh, hf, databricks and API keys work as normal commands while passwords, keys and tokens stay in the gateway's encrypted vault, go only where you allowed and never reach the chat. Approvals and secrets go through native Claude Code dialogs; Claude's commands run in a managed shell; shared terminals and jobs run locally or on remote hosts in the gateway's own runtime.",
   "author": {
     "name": "p-w-rs"

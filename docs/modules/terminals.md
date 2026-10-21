@@ -106,7 +106,14 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   alive a transient `list-panes` hiccup is ignored and the panes stay live (never marked
   gone for good); only when the server pid is gone — or unknown past `TMUX_GRACE` with
   the socket gone — are the panes reported gone. adopt retries a failed query a few times
-  before concluding a restart found no server.
+  before concluding a restart found no server. One exception (0.9.1): when the env's tmux
+  itself can't be run any more (`Tmux.runnable()`: a plain `claude plugin uninstall`
+  deleted the plugin's data folder, env included, while the server runs on from the
+  deleted files), a failed query would be "a blip" forever, so gated watches each local
+  pane's own process instead (`pane_pid` with the start time from tmux's last answer,
+  `Pane.pane_start`): while it lives the pane stays live; once it has ended the pane is
+  gone (a terminal) or unknown (a job, never "exited": its outcome isn't proven). This
+  decides only when a draining gated may leave (daemon.md, "Draining").
 - **The run dir removed** (a tmp cleaner; the harnesses): gated exits (its socket is
   gone) and stops its tmux server, which nobody could reach again (`abandon`, by the
   pid tmux reported, only while it is still the env's tmux and names this socket on its
@@ -116,10 +123,33 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   (started with the first local pane; tmux execs it without a shell, so its parent is
   the server): every 5 s it checks that the socket it started with (by inode) is still
   there, and once it isn't, it sends the server SIGTERM (acceptance 2026-10-21: the TUI
-  harness left `new-session -d -s j_...` servers behind). A `session-closed` hook in the
+  harness left `new-session -d -s j_...` servers behind). Since 0.9.1 it also stops the
+  server once gated's own socket is gone (gated exited, or was uninstalled and left) and
+  no pane of the server runs anything: it counts the server's children that have a
+  terminal (each live pane's process and its own; a dead pane has none, a `pipe-pane`
+  helper no tty) from `ps -A -o ppid= -o tty=`, and only itself left, it stops the
+  server; a listing it can't read (no `ps`, its own pane not in it) stops nothing. Its
+  arguments: the tmux socket, gated's socket, the seconds between looks (5; the test
+  knob `watch_tick`). A `session-closed` hook in the
   local config (`LOCAL_TMUX_CONF`) closes the watchdog when it is the last session, so
   the server still ends with its last terminal (`exit-empty`). `gw-watch` is no
   terminal or job (no `t_`/`j_` id): adoption, lists and `busy()` ignore it.
+- **gated exits** (any reason but the run dir going): with no local pane running
+  anything (the watchdog and dead panes kept for reads are all that is left) it stops
+  its tmux server at once (`stop_server`: `kill-server`; with the env's tmux deleted,
+  SIGTERM to the pid tmux last named, only with that pid's start time and while its
+  command line names this socket), so neither lingers (0.9.1: they did after the
+  `--keep-data` uninstall and every idle exit). A live pane keeps the server for the next
+  gated to re-adopt (a SIGTERM, an update's restart, which waits for no pane anyway);
+  the watchdog stops it once that pane has ended too, if no gated came back.
+- **Draining** (the plugin uninstalled while terminals or jobs run; daemon.md): new
+  terminals, jobs and remote runtimes are refused (503 `draining`, `DRAINING`; an
+  idempotency key seen before still returns its job, so a retry never starts it twice
+  elsewhere), the running ones are left alone (reads, writes, signals and closes keep
+  working while the env's tmux can still be run), and gated leaves once no local one
+  runs (`busy(local_only=True)`: remote panes run on in their hosts' runtimes). Records
+  are never written into a data folder an uninstall removed (`_save` makes `gated/`
+  only inside an existing data folder).
 - An exited pane's tmux session is kept an hour for reads (`RETAIN_DEAD`), its record
   24 h (`RECORD_KEEP`). Live panes keep gated from its idle exit and from a version
   restart (`Daemon.busy()`: "2 terminals and 1 job"); at most 64 live (`MAX_LIVE`).

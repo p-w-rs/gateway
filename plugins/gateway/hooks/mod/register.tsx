@@ -26,6 +26,7 @@ import {
   parseManagedState,
   parseStatus,
   setupReady,
+  shlvlOk,
   shouldProvision,
   statusLine,
   type DaemonHealth,
@@ -87,7 +88,7 @@ import {
 
 const POLL_MS = 3000          // launch.sh status while the env isn't ready
 const TICK_MS = 1000          // the elapsed time on the status line
-const READY_SHOWN_MS = 5000   // "gate: ready", then the line goes
+const READY_SHOWN_MS = 5000   // the "ready" toast (a normal state: no status line, whose glyph warns)
 const GIVE_UP_MS = 20 * 60 * 1000
 const LONG_POLL_S = 20        // one /ui/dialog/next wait at gated
 const SKEW_SHOWN_MS = 20000   // the daemon's version-skew notice, once
@@ -1040,7 +1041,18 @@ async function managedSetup($: Engine, located: Located, st: EnvStatus | undefin
   if (S.managed === undefined && plan.prefix !== undefined && before !== '' && before !== plan.prefix) S.managedReplaced = before
   S.managed = plan
   await $.env.set('GW_MANAGED_DIR', plan.dir)
-  if (plan.prefix !== undefined) await $.env.set('CLAUDE_CODE_SHELL_PREFIX', plan.prefix)
+  if (plan.prefix !== undefined) {
+    // bash run with -c, stdin a socket (as Claude Code starts the shell it
+    // runs the prefix from) and SHLVL unset or 0 counts itself started by
+    // sshd/rshd and sources ~/.bashrc before the command (upstream bash's
+    // isnetconn check; Debian also checks SSH_CLIENT): the rc's variables
+    // never reach a command (gate-sh removes them), but whatever its lines
+    // do runs. A Claude Code started from a terminal has SHLVL >= 1 already;
+    // one started without it (a launcher, a service, a harness) gets 1 here.
+    const lv = (await $.env.get('SHLVL').catch(() => undefined)) ?? ''
+    if (!shlvlOk(lv)) await $.env.set('SHLVL', '1')
+    await $.env.set('CLAUDE_CODE_SHELL_PREFIX', plan.prefix)
+  }
   if (plan.shell !== undefined) await $.env.set('CLAUDE_CODE_SHELL', plan.shell)
 }
 
@@ -1139,8 +1151,13 @@ async function watchSetup($: Engine, located: Located, first: EnvStatus | undefi
         }
         if (setupReady(last, managed())) {
           tick.cancel()
-          status($, 'setup', statusLine(last, now - t0, managed()))
-          $.clock.after(READY_SHOWN_MS, () => status($, 'setup', undefined))
+          // "ready" is the normal state: Claude Code draws every status line
+          // with its warning glyph (⚠; $.ui.status takes only the text, no
+          // level), so the status line goes and "ready" is a toast, which it
+          // draws without one. The warning stays for what is one: setting up
+          // (commands wait), failures, a waiting dialog, a refusal.
+          status($, 'setup', undefined)
+          $.ui.toast(statusLine(last, now - t0, managed()) ?? 'ready', { timeoutMs: READY_SHOWN_MS })
           return
         }
         if (now - t0 > GIVE_UP_MS) {

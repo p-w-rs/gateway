@@ -9,7 +9,7 @@
   unavailable) for popup.py (phase B), via testing.override(dialog=...).
 - make_fake_sudo(): a password sudo (-A/-S/-v/-n/-k, "Sorry, try again",
   NOPASSWD mode).
-- v2 vault builders using v2 code from git main (fallback: a vendored copy).
+- v2 vault builders using v2's own vault.py (tests/fixtures/v2_vault.py, the last v2 on main).
 - run_py()/run_launch(): run run.py or hooks/launch.sh as subprocesses with
   --test and GATEWAY_TEST_ROOT.
 - PYC/PYX: the test run's bytecode folder (under the test temp root) and the
@@ -382,28 +382,21 @@ class FakeVisudo:
 
 
 # ---------------------------------------------------------------------------
-# v2 vaults (built with v2 code from git main)
+# v2 vaults (built with v2's own code)
 # ---------------------------------------------------------------------------
 
 _V2_MOD = None
 
 
 def v2_module() -> Any:
-    """v2's vault.py from git main (fallback: tests/fixtures/v2_vault.py)."""
+    """v2's vault.py: tests/fixtures/v2_vault.py, byte for byte the last v2
+    vault.py on git main (0.6.0, c75fa82; ad546bc). It used to be read from
+    `git show main:...` first, which since 0.9.0 is on main gives v3's vault.py
+    (a package module that can't load alone), so the fixture is the one source."""
     global _V2_MOD
     if _V2_MOD is not None:
         return _V2_MOD
-    src = None
-    try:
-        r = subprocess.run(["git", "-C", str(REPO), "show",
-                            "main:plugins/gateway/src/gateway/vault.py"],
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and "def save" in r.stdout:
-            src = r.stdout
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    if src is None:
-        src = (TESTS / "fixtures" / "v2_vault.py").read_text()
+    src = (TESTS / "fixtures" / "v2_vault.py").read_text()
     d = Path(tempfile.mkdtemp(prefix="gwv2-", dir=tmp_base()))
     atexit.register(shutil.rmtree, d, True)
     (d / "gw_v2_vault.py").write_text(src)

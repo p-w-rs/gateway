@@ -107,9 +107,38 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   contract at the next tick, not 30 min later (acceptance 2026-10-21; a
   disabled plugin can't be seen from the daemon: a session without the
   gateway isn't registered, and its calls are refused).
-- Exit (idle, SIGTERM/SIGINT, `/local/stop`, restart): `daemon.stopping`, the
-  vault locked (`vault.locked` event), contract.json and the socket removed
-  when they are still this daemon's.
+- **Draining** (0.9.1; the GitHub install test found a plain uninstall with a
+  job running left gated running forever, advertising the contract, its tmux
+  server and watchdog running from deleted files: the env's tmux could no
+  longer be run, so every pane query failed and counted as a blip). The
+  plugin counts as uninstalled (`uninstalled_reason`) when its code folder is
+  gone, its data folder is gone (`data_removed`: a plain `claude plugin
+  uninstall` deletes it, with the env this python and the env's tmux run
+  from), or its code folder is orphaned with no live session and no newer,
+  not orphaned sibling version beside it (`newer_sibling`: an update marks the
+  old folder the same way, and its daemon keeps serving its jobs and the
+  contract until it is free). Uninstalled with nothing running, the daemon
+  exits as above. With terminals or jobs running it drains (`drain`, one way):
+  contract.json is removed at once (checkpoint stops delegating: a missing
+  file is "gateway not available" in CONTRACT-v1), `daemon.draining` is
+  emitted (`reason: "uninstalled"`, the local terminal and job counts),
+  `/health` carries `draining` (and `gated start`/`status` a `skew` note, so
+  a reinstall's session says why it gets no new work yet), new terminals,
+  jobs (`/agent/...`, `/ui/term/open`, `POST /v1/jobs`) and remote runtime
+  staging are refused with 503 `draining` (an idempotency key seen before
+  still returns its job), and the running ones are left alone, never killed;
+  the vault keeps its lock rules (`broker.tick`), the rights watch stops
+  (it would import from the removed folders), bytecode writing is switched
+  off (a lazy import must not make the deleted data folder again), and no
+  record is written into a removed data folder. It exits once no *local*
+  terminal or job runs (`busy_here`; remote ones run on in their hosts'
+  runtimes, and a reinstall re-adopts them from kept records), with its tmux
+  server (terminals.md, "gated exits"). A reinstall meanwhile finds the
+  draining daemon answering (no second one can start) until it leaves.
+- Exit (idle, SIGTERM/SIGINT, `/local/stop`, restart, drained): `daemon.stopping`,
+  the vault locked (`vault.locked` event), contract.json and the socket removed
+  when they are still this daemon's, then its tmux server stopped when no local
+  pane runs anything (`Supervisor.stop_server`, still under the instance lock).
 - The log: a detached daemon's stdout and stderr go to `gated.log`; past 1 MB
   (`LOG_MAX`) it becomes `gated.log.1` (replacing an older one) at start and,
   checked after every line the daemon writes, while it runs (a consumer
@@ -119,7 +148,8 @@ Test knobs, `<root>/gated-test.json`, read only under a test override:
 `idle_exit`, `tick`, `lock_after`, `test_routes`, `test_entries`, `ring`,
 `disk_max`, `log_max`, `busy` (stands in for live terminals and jobs),
 `clipboard`, `tmux` (a tmux the supervisor runs instead: a test's logging
-wrapper), and since phase 6 `runtime_artifacts` (prebuilt fake runtime
+wrapper), `watch_tick` (the tmux watchdog's seconds between looks, 1-60;
+0.9.1), and since phase 6 `runtime_artifacts` (prebuilt fake runtime
 artifacts: no pixi-pack, no network), `remote_corrupt_upload`,
 `remote_no_hash_tool`, `remote_df_avail_kb`, `remote_tick`, `remote_stale` (the
 host status's staleness window), `ssh` (an ssh wrapper that records its argv, or
@@ -212,7 +242,9 @@ short safe-charset string (`clean`); anything else never becomes part of an
 event. `since(seq, wait, epoch=None)` long-polls (≤ 25 s on the route); a seq
 from another epoch (named, or past this epoch's end) starts over with
 `reset: true`; `truncated` says older events left the ring. Kinds now:
-`daemon.started`, `daemon.stopping`, `session.registered`, `session.ended`,
+`daemon.started`, `daemon.stopping`, `daemon.draining {reason, terminals,
+jobs}` (0.9.1; the plugin uninstalled while work runs; new within v1, which
+allows new kinds), `session.registered`, `session.ended`,
 `vault.wrapped`, `vault.unlocked`, `vault.locked`, `auth.waiting`,
 `auth.supplied`, `pause.applied`, and since phase 5 `job.started`,
 `job.state`, `job.exited`, `job.output` (counts), `terminal.opened`,

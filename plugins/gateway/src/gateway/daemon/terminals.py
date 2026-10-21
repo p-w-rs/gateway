@@ -117,6 +117,9 @@ AUTH_WAITS = ("gateway: a password prompt waits in this terminal; the user answe
               "gateway's dialog (never type a password into a terminal); read the screen again "
               "after it is answered")
 PAUSED = "gateway: the task is paused (checkpoint), so nothing is typed or started until it resumes"
+DRAINING = ("gateway: the gateway was uninstalled, so it starts no new terminals, jobs or remote "
+            "runtimes; what still runs is left to finish (terminal_list and job_list show it) and "
+            "the gateway daemon exits after it")
 STOP_REQ_WORDS = {"undelivered": "not delivered (the host couldn't be reached; nothing was stopped)",
                   "unsure": "outcome unknown (the close went out, its answer was lost; the host is "
                             "asked)"}
@@ -146,20 +149,34 @@ set -s exit-empty on
 # gated's own (local) server only: a watchdog session that stops the server
 # once its socket is gone or replaced (the run dir removed after gated was
 # stopped, e.g. by SIGTERM: nobody can reach that server or its panes again),
-# and a hook that lets the server end as before when the last real session
-# closes (exit-empty), the watchdog being all that is left.
+# or once gated is gone (its socket removed: it exited, or was uninstalled)
+# and no pane of the server runs anything any more (dead panes kept for reads
+# are all that is left), and a hook that lets the server end as before when
+# the last real session closes (exit-empty), the watchdog being all that is
+# left.
 WATCH_SESSION = "gw-watch"
+WATCH_TICK = 5               # seconds between the watchdog's looks
 LOCAL_TMUX_CONF = (
     "set-hook -g session-closed "
     "'if -F \"#{==:#{server_sessions},1}\" \"kill-session -t =" + WATCH_SESSION + "\"'\n")
 # Run by the server itself (tmux execs it without a shell: the watchdog's
-# parent is the server). It notes the socket's inode and checks every 5 s
-# that the same socket is still there; a new server's socket at the same
-# path is another inode.
+# parent is the server): `sh -c SCRIPT gw-watch <tmux socket> <gated socket>
+# <seconds>`. It notes the socket's inode and checks every few seconds that
+# the same socket is still there (a new server's socket at the same path is
+# another inode). While gated's socket is missing it counts the server's
+# children that have a terminal (each live pane's process, this watchdog's
+# own included; a dead pane has none, a pipe-pane helper has no tty): only
+# itself left, it stops the server. A listing it can't read (no ps, an odd
+# format: its own pane not seen) never stops anything.
 WATCH_SCRIPT = (
-    's=$1; set -- $(ls -di "$s" 2>/dev/null); i=${1-}; [ -n "$i" ] || exit 0; '
-    'while sleep 5; do [ -S "$s" ] || break; set -- $(ls -di "$s" 2>/dev/null); '
-    '[ "${1-}" = "$i" ] || break; done; kill -TERM "$PPID"')
+    's=$1; g=${2-}; t=${3:-5}; set -- $(ls -di "$s" 2>/dev/null); i=${1-}; [ -n "$i" ] || exit 0; '
+    'while sleep "$t"; do [ -S "$s" ] || break; set -- $(ls -di "$s" 2>/dev/null); '
+    '[ "${1-}" = "$i" ] || break; '
+    '[ -n "$g" ] && [ ! -S "$g" ] || continue; '
+    'o=$(ps -A -o ppid= -o tty= 2>/dev/null) || continue; '
+    'n=$(printf "%s\\n" "$o" | awk -v p="$PPID" \'$1 == p && $2 !~ /^[?]+$/ { n++ } END { print n + 0 }\'); '
+    '[ "$n" -ge 1 ] 2>/dev/null || continue; [ "$n" -gt 1 ] || break; '
+    'done; kill -TERM "$PPID"')
 
 
 class TermError(Exception):
@@ -205,9 +222,17 @@ class Tmux:
     def __init__(self, binary: str, sock: Path, conf: Path, env: dict[str, str]):
         self.binary, self.sock, self.conf, self.env = binary, sock, conf, env
         self.server_pid = 0                # the server's pid, as tmux last said
+        self.server_start: float | None = None   # and its start time (a reused pid has another)
 
     def argv(self, *args: str) -> list[str]:
         return [self.binary, "-u", "-S", str(self.sock), "-f", str(self.conf), *args]
+
+    def runnable(self) -> bool:
+        """Can this tmux still be run? Not once the env it lives in is gone
+        (a plain `claude plugin uninstall` deletes the plugin's data folder):
+        then no query can reach the server, which runs on from the deleted
+        files."""
+        return os.path.isfile(self.binary) and os.access(self.binary, os.X_OK)
 
     def run(self, *args: str, input: bytes | None = None, timeout: float = 10.0,
             check: bool = True, insist: bool = False) -> bytes:
@@ -241,8 +266,9 @@ class Tmux:
                 continue
             d = dict(zip(INFO_FIELDS, parts))
             out.setdefault(d["session_name"], d)
-            if d.get("pid", "").isdigit():
+            if d.get("pid", "").isdigit() and int(d["pid"]) != self.server_pid:
                 self.server_pid = int(d["pid"])
+                self.server_start = peers.started(self.server_pid)
         return out
 
 
@@ -314,6 +340,7 @@ class Pane:
                                            # (removed at the host's next answer: no late paste)
         self.hash = ""
         self.pane_pid = 0
+        self.pane_start: float | None = None   # the pane process's start time (with pane_pid)
         self.tty = ""
         self.alive = False
         self.alt = False
@@ -744,6 +771,47 @@ class Supervisor:
                 os.kill(pid, signal.SIGTERM)
             self.d.log("terminals: the tmux socket is gone with the run dir; its server was stopped")
 
+    def stop_server(self) -> None:
+        """gated is exiting (any reason but its run dir going: abandon): its
+        local tmux server and the watchdog go too once no terminal or job runs
+        there, so dead panes kept for reads don't linger with nobody to read
+        them. A live pane keeps the server: a restarted gated re-adopts it (a
+        SIGTERM, an update), and the watchdog stops the server once gated is
+        gone and that pane has ended too. Asked of tmux (kill-server); when the
+        env's tmux can't be run any more (an uninstall deleted it) and no
+        record says a local pane is alive, the server tmux last named is sent
+        SIGTERM: only that pid with the start time tmux's answer had, and only
+        while its command line names this socket."""
+        tm = self._tmux
+        if tm is None:
+            return
+        if tm.runnable():
+            infos = tm.panes()
+            if infos is None:
+                return                           # no server answers: nothing to stop
+            live = sorted(n for n, i in infos.items()
+                          if n != WATCH_SESSION and i.get("pane_dead") != "1")
+            if live:
+                self.d.log(f"terminals: {len(live)} pane(s) still run; the tmux server is kept "
+                           "for the next gated")
+                return
+            with contextlib.suppress(TermError):
+                tm.run("kill-server", check=False)
+            self.d.log("terminals: no terminal or job runs; the tmux server was stopped")
+            return
+        with self.lock:
+            if any(p.alive and not p.remote for p in self.panes.values()):
+                return
+        pid = tm.server_pid
+        if pid <= 0 or not peers.alive(pid, tm.server_start):
+            return
+        if str(self.sock) not in (peers.argv(pid) or []):
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+        self.d.log("terminals: no terminal or job runs and the gateway's tmux can't be run any more; "
+                   "its server was stopped")
+
     def stop(self) -> None:
         self.stopping.set()
         with self.lock:
@@ -782,7 +850,8 @@ class Supervisor:
                 "idem": {k: [v[0], v[1]] for k, v in self.idem.items()}}
         tmp = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            # never the data folder itself: one an uninstall removed stays removed
+            self.state_path.parent.mkdir(exist_ok=True)
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -953,7 +1022,12 @@ class Supervisor:
             except ValueError:
                 return 0
         dead = info.get("pane_dead") == "1"
-        p.pane_pid = 0 if dead else num("pane_pid")
+        pp = 0 if dead else num("pane_pid")
+        if not p.remote and (pp != p.pane_pid or (pp and p.pane_start is None)):
+            # (a local pane's process: what a draining gated watches once its
+            # tmux can't be run any more, _tick)
+            p.pane_start = peers.started(pp) if pp else None
+        p.pane_pid = pp
         p.tty = info.get("pane_tty", "")
         p.cols, p.rows = num("pane_width") or p.cols, num("pane_height") or p.rows
         p.history = num("history_size")
@@ -1017,12 +1091,26 @@ class Supervisor:
         if not query_failed:
             self._panes_ok_at = fetched
         transient = query_failed and self._blip(fetched)
+        # The env's tmux itself is gone (an uninstall deleted the plugin's data
+        # folder): no query can reach the server, which runs on from the deleted
+        # files, so "a blip" would hold forever. The pane's own process (pid and
+        # start time from tmux's last answer) is all that is left to watch; one
+        # that has ended makes the pane gone/unknown (never "exited": its outcome
+        # isn't proven), so a draining gated can leave once nothing runs.
+        blind = query_failed and not self.tmux.runnable()
         with self.lock:
             for p in live:
                 if not p.live:
                     continue
                 info = (infos or {}).get(p.id)
                 if self._lost(p, info):
+                    if blind:
+                        if p.pane_pid and peers.alive(p.pane_pid, p.pane_start):
+                            continue
+                        self._mark_gone(p, "the gateway's tmux can't be run any more (the gateway "
+                                           "was uninstalled) and the pane's process has ended")
+                        self._dirty = True
+                        continue
                     if transient:
                         continue                   # a query blip; ask again next tick
                     if p.closing:
@@ -1146,10 +1234,9 @@ class Supervisor:
         return v[1]
 
     # -- counts ------------------------------------------------------------------------
-    def busy(self) -> str:
-        with self.lock:
-            t = sum(1 for p in self.panes.values() if p.alive and p.kind == "terminal")
-            j = sum(1 for p in self.panes.values() if p.alive and p.kind == "job")
+    def busy(self, local_only: bool = False) -> str:
+        c = self.counts(local_only)
+        t, j = c["terminals"], c["jobs"]
         parts = []
         if t:
             parts.append(f"{t} terminal{'s' if t != 1 else ''}")
@@ -1157,10 +1244,17 @@ class Supervisor:
             parts.append(f"{j} job{'s' if j != 1 else ''}")
         return " and ".join(parts)
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, local_only: bool = False) -> dict[str, int]:
         with self.lock:
-            return {"terminals": sum(1 for p in self.panes.values() if p.alive and p.kind == "terminal"),
-                    "jobs": sum(1 for p in self.panes.values() if p.alive and p.kind == "job")}
+            ps = [p for p in self.panes.values() if p.alive and not (local_only and p.remote)]
+        return {"terminals": sum(1 for p in ps if p.kind == "terminal"),
+                "jobs": sum(1 for p in ps if p.kind == "job")}
+
+    def check_accepting(self) -> None:
+        """New terminals and jobs (and remote runtimes) only while gated isn't
+        draining (the plugin was uninstalled: lifecycle.Daemon.drain)."""
+        if getattr(self.d, "draining", ""):
+            raise TermError(503, "draining", DRAINING)
 
     # -- starting panes ------------------------------------------------------------------
     # -- binding: host, workspace, policy (PLAN-v4 phase 7) ------------------------------
@@ -1361,13 +1455,20 @@ class Supervisor:
     def _watch(self) -> None:
         """The local server's watchdog session (LOCAL_TMUX_CONF), started
         once per server: tmux refuses a second one by name, which is fine."""
+        gsock = getattr(self.d, "sock_path", None) or paths.gated_socket()
+        k = getattr(self.d, "k", None) or {}
+        tick = k.get("watch_tick") if testing.active() is not None else None
+        tick = str(int(tick)) if isinstance(tick, int) and not isinstance(tick, bool) and 0 < tick <= 60 \
+            else str(WATCH_TICK)
         with contextlib.suppress(Exception):
             self.tmux.run("new-session", "-d", "-s", WATCH_SESSION, "-x", "20", "-y", "2",
-                          "/bin/sh", "-c", WATCH_SCRIPT, WATCH_SESSION, str(self.sock), check=False)
+                          "/bin/sh", "-c", WATCH_SCRIPT, WATCH_SESSION, str(self.sock), str(gsock),
+                          tick, check=False)
 
     def open_terminal(self, session: Any, *, agent: str = "", cwd: Any = None, cols: Any = None,
                       rows: Any = None, env: Any = None, workspace: Any = "", task_ref: Any = "",
                       via: str = "agent", host: Any = None) -> Pane:
+        self.check_accepting()
         host, mid = self._host(host)
         remote = host != "localhost"
         cwd, wid = self._bind(session, via, host, mid, workspace, cwd, remote)
@@ -1522,6 +1623,9 @@ class Supervisor:
     def _start_job(self, session: Any, key: str, *, agent: str, argv: Any, command: Any, cwd: Any,
                    host: Any, workspace: Any, task_ref: Any, on_pause: Any, idempotency_key: Any,
                    env: Any, via: str) -> tuple[Pane, bool]:
+        # (after the idempotency lookup: a retry of a job that started before
+        # the drain gets that job, never a refusal that would start it twice)
+        self.check_accepting()
         has_argv = argv not in (None, [], "")
         has_cmd = command not in (None, "")
         if has_argv == has_cmd:

@@ -128,8 +128,10 @@ app needs a manual check).
   session whose env isn't ready, the mod runs `sh hooks/launch.sh
   ensure-env` through `$.process.spawn` (an argv; POSIX sh is the OS's own
   on macOS and Linux) unless a build already runs (the build lock makes a
-  second one wait), and shows `gate: setting up… 0:12`, then `gate: ready`
-  for 5 s. `-p` and SDK sessions draw no status line; there the async
+  second one wait), and shows `gate: setting up… 0:12` on the status line,
+  then a `ready` toast for 5 s (0.9.1: Claude Code draws every status line
+  with its warning sign and `$.ui.status` takes no level, so the normal state
+  has none). `-p` and SDK sessions draw no status line; there the async
   classic SessionStart hook builds the env (it always runs, mods or not).
 - **Native gateway dialogs (PLAN-v4 phase 3).** Every question the
   gateway asks is a pane inside Claude Code, drawn by the mod from requests

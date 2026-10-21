@@ -54,6 +54,15 @@ Messages API.
             letter (its cache and data paths have them), first-use provisioning
             there, sessions from two other such folders: each recorded with its
             own folder
+  vmdrain   (only on the disposable Linux VM, ACCEPTANCE_DISPOSABLE_VM=1, not in
+            the default list) both plugins installed plainly into one config;
+            a warm session starts a gateway job and opens a terminal and runs a
+            Bash probe under a planted ~/.bashrc (Claude Code without SHLVL, as
+            the harness starts it: the rc must not run for the command); then a
+            plain `claude plugin uninstall` of both while they run: gated
+            drains (contract.json gone, gated and the work still running), and
+            once the job and the terminal end gated, its tmux server and
+            gw-watch go; the same with `--keep-data` (its data folder kept)
 
 Prints one line per check, keeps evidence (status samples, timings, the pixi
 and shim logs, `claude plugin` calls) in --tmp/acceptance-install.json; exits
@@ -221,6 +230,15 @@ def builders(datas: list[Path]) -> list[tuple[int, str]]:
     return out
 
 
+# The mod's "ready" (0.9.1): a toast, a box headed "gate" over "ready" (before,
+# the status line "gate: ready", which Claude Code draws with its warning sign)
+READY_TOAST = re.compile(r"│ gate\s*│[^\n]*\n[^\n]*│ ready\s*│")
+
+
+def gate_ready(text: str) -> bool:
+    return "gate: ready" in text or READY_TOAST.search(text) is not None
+
+
 class StatusSampler(threading.Thread):
     """Samples the session's status rows (the plugins' status lines) and the
     concurrent pixi installs per env folder."""
@@ -237,7 +255,10 @@ class StatusSampler(threading.Thread):
         last = None
         while not self.stop.is_set():
             try:
-                rows = [ln.strip() for ln in self.s.lines() if re.search(r"\b(gate|check):", ln)]
+                lines = self.s.lines()
+                rows = [ln.strip() for ln in lines if re.search(r"\b(gate|check):", ln)]
+                if READY_TOAST.search("\n".join(lines)):
+                    rows.append("gate: ready (toast)")
                 cur = " | ".join(rows)
                 if cur and cur != last:
                     self.seen.append((round(time.time() - self.t0, 1), cur[:300]))
@@ -431,6 +452,8 @@ def run(root: Path, ck_src: Path, only: set[str]) -> None:
         part_firstbash(root, pre)
     if "vmplain" in only:
         part_vmplain(root, pre)
+    if "vmdrain" in only:
+        part_vmdrain(root, pre, ck_src)
     shim = [ln for ln in pre.shim_log.read_text().splitlines() if ln.strip()]
     SUMMARY["undeclared_interpreter_calls"] = shim[:20]
     check("no plugin ran python3, python, node, npm, npx or uv by name (recording shims first on PATH)",
@@ -512,7 +535,7 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
         check(f"...and checkpoint's ({SUMMARY['restart_checkpoint_ready_s']} s)", okc)
         check("...never two pixi installs of one env at once (sampled every 0.5 s, both sessions)",
               samp.max_parallel <= 1, f"max {samp.max_parallel}")
-        rdy = wait(s2, lambda: "gate: ready" in " ".join(t for _t, t in samp.seen) or not re.search(
+        rdy = wait(s2, lambda: gate_ready(" ".join(t for _t, t in samp.seen)) or not re.search(
             r"gate: setting up", s2.text()), 60)
         rec = wait(s2, lambda: "check: recording" in s2.text(), 90)
         texts = " || ".join(t for _t, t in samp.seen)
@@ -761,7 +784,7 @@ def part_firstbash(root: Path, pre: Prereqs) -> None:
         try:
             s.start()
             s.wait_ready(180)
-            ready = wait(s, lambda: "gate: ready" in s.text(), BUILD_TIMEOUT, 0.2)
+            ready = wait(s, lambda: gate_ready(s.text()), BUILD_TIMEOUT, 0.2)
             t_ready = time.time()
             check("firstbash: the first session builds the env and says gate: ready", ready)
             tries, ran, first_err = 0, False, ""
@@ -864,6 +887,204 @@ def part_vmplain(root: Path, pre: Prereqs) -> None:
             os.kill(alive[0], signal.SIGTERM)
         time.sleep(2)
     shutil.rmtree(gwhome, ignore_errors=True)          # the throwaway VM user's gateway home made by this part
+
+
+def _vm_only(part: str) -> bool:
+    import pwd
+    if (sys.platform.startswith("linux") and os.uname().nodename == "gwtest-linux"
+            and os.environ.get("ACCEPTANCE_DISPOSABLE_VM") == "1" and pwd.getpwuid(os.getuid()).pw_dir == VM_HOME):
+        return True
+    note(f"{part}: skipped (only on the disposable test VM: host gwtest-linux, ACCEPTANCE_DISPOSABLE_VM=1)")
+    return False
+
+
+def part_vmdrain(root: Path, pre: Prereqs, ck_src: Path) -> None:
+    """Only on the disposable Linux test VM (the gateway installed plainly uses the VM test user's own
+    ~/.config/gateway and /tmp/gw-<uid>): an uninstall while a gateway job and terminal run (0.9.1; the
+    GitHub install test saw 0.9.0's gated run on forever, advertising the contract, its tmux server and
+    watchdog running from deleted files), with and without --keep-data, and the ~/.bashrc probe."""
+    print("vmdrain: uninstall while a gateway job and terminal run (plain installs, the VM)", flush=True)
+    if not _vm_only("vmdrain"):
+        return
+    gwhome = Path(VM_HOME) / ".config" / "gateway"
+    contract = gwhome / "run" / "contract.json"
+    run_dir = f"/tmp/gw-{os.getuid()}"
+    if gwhome.exists():
+        check("vmdrain: the VM's gateway home is fresh (./vm.sh clean first)", False)
+        return
+
+    class VMSession(driver.Session):
+        def check_gateways(self):          # the VM's own home is the throwaway one: no e2e redirection
+            self.gateway_mode = "vm-plain"
+            return []
+
+    cfg = root / "drain-cfg"
+    proj = root / "drain-proj"
+    home = root / "drain-home"             # every session's HOME: the planted rc lives here
+    for d in (proj, home):
+        d.mkdir(parents=True)
+    rclog = root / "drain-rc.log"
+    (home / ".bashrc").write_text(f'echo "rc pid=$$ shlvl=${{SHLVL-unset}}" >> {shlex_q(str(rclog))}\n')
+    rclog.write_text("")
+    gw_tool = "mcp__plugin_gate_gw__"
+
+    def gated_pids() -> list[int]:
+        return [pid for pid, _pp, cmd in ps_rows() if "run.py gated serve" in cmd and str(cfg) in cmd]
+
+    def tmux_pids() -> list[int]:
+        return [pid for pid, _pp, cmd in ps_rows()
+                if "tmux" in cmd and f"-S {run_dir}/tmux.sock" in cmd and "gw-watch" not in cmd]
+
+    def watch_pids() -> list[int]:
+        return [pid for pid, _pp, cmd in ps_rows() if "gw-watch" in cmd and f"{run_dir}/tmux.sock" in cmd]
+
+    def job_pids(word: str) -> list[int]:
+        return [pid for pid, _pp, cmd in ps_rows() if cmd.strip() == f"sleep {word}"]
+
+    def state() -> dict:
+        return {"gated": gated_pids(), "tmux": tmux_pids(), "gw-watch": watch_pids(),
+                "contract": contract.exists()}
+
+    # one git server for the part: a reinstall finds the marketplaces where they were added
+    h = install.Hermetic(root / "hd", extra_env=pre.env(), config_dir=cfg)
+    h.__enter__()
+
+    def install_both() -> tuple:
+        if "gateway" in h.repos:
+            return h.inst.install("gate@gateway"), h.inst.install("check@checkpoint")
+        return (h.install_from(REPO, repo="gateway", plugin="gate"),
+                h.install_from(ck_src, repo="checkpoint", plugin="check"))
+
+    def uninstall_both(g, c, keep: bool) -> list:
+        return [h.inst.uninstall(x.id, keep_data=keep, check=False) for x in (g, c)]
+
+    def session(name: str, replies=()) -> driver.Session:
+        return VMSession(root / name, proj, config_dir=cfg, home=home,
+                         extra_env={**pre.env(), "GATEWAY_TEST_ROOT": None}, replies=list(replies),
+                         permission_mode="bypassPermissions", debug_file=True, cols=160, rows=45, start=False)
+
+    def provision(name: str, g, first: bool) -> None:
+        s = session(name, ["ok"])
+        try:
+            t0 = time.time()
+            s.start()
+            s.wait_ready(180)
+            if first:
+                warned = wait(s, lambda: re.search(r"⚠ gate: (setting up|finishing setup)", s.text()) is not None,
+                              60, 0.2)
+                check("vmdrain: setting up shows on the status line with Claude Code's warning sign", warned,
+                      s.text()[-600:])
+            okb = wait(s, lambda: ready_envs(g.data_path) and (g.data_path / "managed" / "state.json").exists(),
+                       BUILD_TIMEOUT, 1.0)
+            check(f"vmdrain: {name}: first-use provisioning ({round(time.time() - t0)} s)", okb)
+            if first:
+                toast = wait(s, lambda: gate_ready(s.text()), 60, 0.2)
+                check("vmdrain: ready is a toast (gate / ready), never the warning-sign status line `⚠ gate: ready`",
+                      toast and "gate: ready" not in s.all_text(), s.text()[-800:])
+        finally:
+            s.close()
+
+    def run_tools(name: str, job_word: str, with_terminal: bool, probe: bool) -> None:
+        s = session(name)
+        try:
+            s.start()
+            s.wait_ready(180)
+            if probe:
+                rclog.write_text("")
+                cmd = ('echo "SELF=$$ SHLVL=${SHLVL-unset} BASH=$BASH"; echo "MARK=${FROM_RC:-none}"')
+                s.api.script([bash(cmd, "probe"), "probed"])
+                s.submit("probe the shell")
+                wait(s, lambda: "probed" in s.all_text(), 120)
+                from tui.fakeapi import result_text, tool_results
+                reqs = s.api.main_requests()
+                out = "\n".join(result_text(b) for b in tool_results(reqs[-1])) if reqs else ""
+                me = re.search(r"SELF=(\d+)", out)
+                logl = rclog.read_text()
+                SUMMARY["vmdrain_rc_probe"] = {"result": out[:400], "rc_log": logl[-600:]}
+                check("vmdrain: a Bash command's shell never ran the planted ~/.bashrc (Claude Code started "
+                      "without SHLVL; the gateway sets it)",
+                      me is not None and f"pid={me.group(1)} " not in logl and "/envs/" in out,
+                      json.dumps(SUMMARY["vmdrain_rc_probe"]))
+            s.api.script([{"tool": gw_tool + "job_start", "input": {"command": f"sleep {job_word}",
+                                                                      "cwd": str(proj)}}, "job started"])
+            s.submit("start a gateway job")
+            check(f"vmdrain: {name}: a gateway job runs (sleep {job_word})",
+                  wait(s, lambda: bool(job_pids(job_word)), 120), s.text()[-600:])
+            if with_terminal:
+                s.api.script([{"tool": gw_tool + "terminal_open", "input": {"cwd": str(proj)}},
+                              "terminal opened"])
+                s.submit("open a gateway terminal")
+                wait(s, lambda: "terminal opened" in s.all_text(), 120)
+        finally:
+            s.close()
+
+    def end_work(job_word: str) -> list[str]:
+        ended = []
+        for pid in job_pids(job_word):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+                ended.append(f"job {pid}")
+        for tm in tmux_pids():
+            for pid, pp, cmd in ps_rows():
+                if pp == tm and "gw-watch" not in cmd:
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGHUP)
+                        ended.append(f"pane {pid}: {cmd[:60]}")
+        return ended
+
+    def scenario(label: str, keep: bool, job_word: str, first: bool) -> None:
+        g, c = install_both()
+        check(f"vmdrain ({label}): gate and check install plainly from git snapshots of the working trees",
+              g.cache_path is not None and c.cache_path is not None)
+        provision(f"vd-{label}-s1", g, first)
+        run_tools(f"vd-{label}-s2", job_word, with_terminal=not keep, probe=first)
+        before = state()
+        SUMMARY[f"vmdrain_{label}_before"] = before
+        check(f"vmdrain ({label}): gated, its tmux server and gw-watch run, contract.json is there",
+              before["gated"] and before["tmux"] and before["gw-watch"] and before["contract"], json.dumps(before))
+        t0 = time.time()
+        rs = uninstall_both(g, c, keep)
+        check(f"vmdrain ({label}): `claude plugin uninstall{' --keep-data' if keep else ''}` of both succeeds",
+              all(r.ok for r in rs), str(rs)[:400])
+        check(f"vmdrain ({label}): ...the gateway's data folder {'stays' if keep else 'goes'}",
+              g.data_path.exists() == keep)
+        drained = wait(None, lambda: not contract.exists(), 45, 0.5)
+        mid = state()
+        SUMMARY[f"vmdrain_{label}_drained"] = {**mid, "seconds": round(time.time() - t0, 1),
+                                                "job": job_pids(job_word)}
+        check(f"vmdrain ({label}): within a tick contract.json goes (checkpoint stops delegating) while gated, "
+              "its tmux server and the job keep running", drained and mid["gated"] and mid["tmux"]
+              and job_pids(job_word), json.dumps(SUMMARY[f"vmdrain_{label}_drained"]))
+        time.sleep(5)
+        check(f"vmdrain ({label}): ...gated stays while the work runs (never killed)",
+              gated_pids() == mid["gated"] and job_pids(job_word), json.dumps(state()))
+        ended = end_work(job_word)
+        t1 = time.time()
+        gone = wait(None, lambda: not gated_pids() and not tmux_pids() and not watch_pids(), 90, 0.5)
+        after = state()
+        SUMMARY[f"vmdrain_{label}_after"] = {**after, "seconds": round(time.time() - t1, 1), "ended": ended}
+        check(f"vmdrain ({label}): once the work ends gated exits with its tmux server and gw-watch "
+              f"({SUMMARY[f'vmdrain_{label}_after']['seconds']} s)",
+              gone and not after["contract"], json.dumps(SUMMARY[f"vmdrain_{label}_after"]))
+        check(f"vmdrain ({label}): ...and the data folder is {'kept' if keep else 'not made again'}",
+              g.data_path.exists() == keep)
+        for pid in gated_pids() + tmux_pids() + watch_pids():
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+
+    try:
+        scenario("plain", False, "7301", True)
+        scenario("keepdata", True, "7302", False)
+    finally:
+        h.close()
+        for pid in job_pids("7301") + job_pids("7302"):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        shutil.rmtree(gwhome, ignore_errors=True)          # the throwaway VM user's gateway home
+
+
+def shlex_q(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
 if __name__ == "__main__":

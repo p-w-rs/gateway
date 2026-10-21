@@ -1081,3 +1081,41 @@ def test_launch_sh_writes_the_managed_files_once_a_build_finishes():
     assert '[ "$rc" -eq 0 ] && { managed_sync; warm_env; cleanup_envs; }' in text
     assert 'if ready; then [ -f "$DATA/managed/conf" ] || managed_sync; warm_env; cleanup_envs; return 0; fi' in text
     assert '"$PY" -I -S -X "pycache_prefix=$PYC" "$ROOT/run.py" managed-sync' in text
+
+
+def test_bash_c_with_a_socket_on_stdin_sources_bashrc_at_shell_level_1_and_shlvl_1_stops_it():
+    """Claude Code starts the shell that runs the prefix as `<shell> -c ...`
+    with stdin a socket. bash then counts itself started by sshd/rshd
+    (upstream bash's isnetconn check; Debian's also looks at SSH_CLIENT) and
+    sources ~/.bashrc before the command whenever its shell level is 1: SHLVL
+    unset, 0 or garbage in Claude Code's environment (a launcher, a service,
+    the TUI harness). The rc's variables never reach a command (gate-sh
+    removes them), but its lines run (the GitHub install test on Debian,
+    0.9.0). From SHLVL 1 on bash doesn't, which is why the mod sets SHLVL=1
+    where it is missing (register.tsx managedSetup, lib.ts shlvlOk; the mod's
+    tests check that). This pins the platform fact, for the env's bash (the
+    managed bash, CLAUDE_CODE_SHELL) and the system's."""
+    import socket
+    shells = [BASH] + [Path(b) for b in ("/bin/bash", "/usr/bin/bash") if Path(b).is_file()][:1]
+    with tempfile.TemporaryDirectory(dir=H.tmp_base()) as d:
+        home = Path(d) / "home"
+        home.mkdir()
+        log = Path(d) / "rc.log"
+        (home / ".bashrc").write_text(f'echo "rc $$" >> {sq(str(log))}\n')
+        for bash in shells:
+            for shlvl, stdin_kind, sourced in ((None, "socket", True), ("0", "socket", True),
+                                               ("x", "socket", True), ("1", "socket", False),
+                                               ("2", "socket", False), (None, "pipe", False)):
+                log.write_text("")
+                env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "LANG": "C"}
+                if shlvl is not None:
+                    env["SHLVL"] = shlvl
+                a, b = socket.socketpair() if stdin_kind == "socket" else os.pipe()
+                try:
+                    r = subprocess.run([str(bash), "-c", "echo ran"], stdin=a, env=env,
+                                       capture_output=True, text=True, timeout=30)
+                finally:
+                    for x in (a, b):
+                        x.close() if hasattr(x, "close") else os.close(x)
+                assert r.returncode == 0 and r.stdout.strip() == "ran", (bash, r.stderr)
+                assert bool(log.read_text().strip()) is sourced, (str(bash), shlvl, stdin_kind)

@@ -37,6 +37,7 @@ function world(on: any, answers: string[], gated: string[] = [daemonJson({ paren
   const spawns: Run[] = []
   const fetches: { url: string; init: any }[] = []
   const statuses: (string | undefined)[] = []
+  const toasts: string[] = []
   const registered: any[] = []
   // the process environment: $.env.set writes it, $.env.get reads it back
   const env: Record<string, string | undefined> = { HOME, CLAUDE_CONFIG_DIR: CONFIG, ...startEnv }
@@ -48,6 +49,7 @@ function world(on: any, answers: string[], gated: string[] = [daemonJson({ paren
   on('session.id', () => ({ value: 'sess-1' }))
   on('command.register', (_$: any, e: any) => { registered.push(e); return { value: { command: e.name } } })
   on('ui.status', (_$: any, e: any) => { statuses.push(e.text); return { value: undefined } })
+  on('ui.toast', (_$: any, e: any) => { toasts.push(e.text); return { value: undefined } })
   on('process.run', (_$: any, e: any) => {
     runs.push(e)
     const q = e.argv[2] === 'gated' ? gated : answers
@@ -68,7 +70,7 @@ function world(on: any, answers: string[], gated: string[] = [daemonJson({ paren
   // files['<root>/hooks/gate-sh'] stands for the plugin's own gate-sh, wherever the kit puts the plugin
   on('fs.read', (_$: any, e: any) => ({ value: e.path.endsWith('/.claude-plugin/plugin.json') ? '{"name":"gate","version":"0.7.0"}'
     : e.path.endsWith('/hooks/gate-sh') && !e.path.startsWith(DATA_ROOT) ? (files['<root>/hooks/gate-sh'] ?? '') : (files[e.path] ?? '') }))
-  return { runs, spawns, fetches, statuses, registered, clock, env, envSets }
+  return { runs, spawns, fetches, statuses, toasts, registered, clock, env, envSets }
 }
 
 const gatedRuns = (w: { runs: Run[] }) => w.runs.filter((r) => r.argv[2] === 'gated')
@@ -144,7 +146,7 @@ test('/gate-doctor reports an unmigrated 0.6 vault instead of "not set up yet"',
   expect(text).not.toContain('Vault: not set up yet')
 })
 
-test('a missing env: provisions by argv and shows setting up, then ready, then nothing', async ($: any, on: any) => {
+test('a missing env: provisions by argv and shows setting up, then a ready toast, then nothing', async ($: any, on: any) => {
   const w = world(on, [statusJson('missing'), statusJson('building'), statusJson('ready')])
   await start($)
   expect(w.spawns).toHaveLength(1)
@@ -159,13 +161,17 @@ test('a missing env: provisions by argv and shows setting up, then ready, then n
   expect(w.statuses.at(-1)).toBe('setting up… 0:01')
   await w.clock.advance(2000)                     // the 3 s poll: building
   expect(w.statuses.at(-1)).toBe('setting up… 0:03')
+  expect(w.toasts).toEqual([])
   await w.clock.advance(3000)                     // the next poll: ready
-  expect(w.statuses.at(-1)).toBe('ready')
-  await w.clock.advance(5000)
-  expect(w.statuses.at(-1)).toBeUndefined()       // cleared
+  // a normal state: Claude Code draws every status line with its warning
+  // glyph, so the line goes at once and "ready" is a toast (drawn without one)
+  expect(w.statuses.at(-1)).toBeUndefined()
+  expect(w.statuses).not.toContain('ready')
+  expect(w.toasts).toEqual(['ready'])
   const n = w.statuses.length
   await w.clock.advance(10_000)
   expect(w.statuses).toHaveLength(n)              // the timer stopped
+  expect(w.toasts).toEqual(['ready'])
   expect(w.spawns).toHaveLength(1)                // one build only
 })
 
@@ -181,10 +187,10 @@ test("ready waits for the managed shell's settings: the env built, the line says
   expect(gatedRuns(w).length).toBeGreaterThan(0)
   await w.clock.advance(3000)
   expect(w.statuses.at(-1)).toBe('finishing setup… 0:06')
+  expect(w.toasts).toEqual([])
   await w.clock.advance(3000)                     // the settings are written
-  expect(w.statuses.at(-1)).toBe('ready')
-  await w.clock.advance(5000)
   expect(w.statuses.at(-1)).toBeUndefined()
+  expect(w.toasts).toEqual(['ready'])
 })
 
 test("a built env without the managed shell's settings (a setup interrupted after the build): finishing setup, the daemon at once", async ($: any, on: any) => {
@@ -194,7 +200,9 @@ test("a built env without the managed shell's settings (a setup interrupted afte
   expect(w.statuses).toEqual(['finishing setup… 0:00'])
   expect(gatedRuns(w).length).toBeGreaterThan(0)
   await w.clock.advance(3000)
-  expect(w.statuses.at(-1)).toBe('ready')
+  expect(w.statuses.at(-1)).toBeUndefined()
+  expect(w.statuses).not.toContain('ready')
+  expect(w.toasts).toEqual(['ready'])
 })
 
 test("managed off (no prefix): ready doesn't wait for the managed shell's settings", async ($: any, on: any) => {
@@ -310,7 +318,7 @@ test('a missing env: no daemon until setup finishes, then one registration', asy
   expect(gatedRuns(w)).toHaveLength(0)
   expect(w.fetches).toHaveLength(0)
   await w.clock.advance(6000)                     // two polls: building, then ready
-  expect(w.statuses.at(-1)).toBe('ready')
+  expect(w.toasts).toEqual(['ready'])
   expect(gatedRuns(w)).toHaveLength(1)
   expect(w.fetches).toHaveLength(1)
   await w.clock.advance(10_000)
@@ -369,7 +377,31 @@ test('managed mode: session start sets the prefix to gate-sh, names its folder a
   expect(w.env.GW_MANAGED_DIR).toBe(`${DATA}/managed`)
   expect(w.env.CLAUDE_CODE_SHELL).toBe(`${ENVD}/.pixi/envs/default/bin/bash`)
   // before the dialog loop or the daemon: the prefix is the first thing set
-  expect(w.envSets.map((x) => x.name)).toEqual(['GW_MANAGED_DIR', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_CODE_SHELL'])
+  // (SHLVL first where it is missing: the next test)
+  expect(w.envSets.map((x) => x.name)).toEqual(['GW_MANAGED_DIR', 'SHLVL', 'CLAUDE_CODE_SHELL_PREFIX', 'CLAUDE_CODE_SHELL'])
+})
+
+// bash -c with a socket on stdin (as Claude Code starts the shell it runs the
+// prefix from) sources ~/.bashrc at shell level 1: SHLVL unset, 0 or garbage
+// (tests/test_managed.py shows it with the env's bash). A Claude Code started
+// from a terminal has SHLVL >= 1 and keeps it.
+for (const [start_, want] of [[undefined, '1'], ['', '1'], ['0', '1'], ['-3', '1'], ['x', '1'], ['999', '1'],
+                              ['1', '1'], ['2', '2'], ['998', '998']] as const) {
+  test(`managed mode: SHLVL ${JSON.stringify(start_)} becomes ${want} before the prefix`, async ($: any, on: any) => {
+    const w = world(on, [statusJson('ready')], undefined, {}, start_ === undefined ? {} : { SHLVL: start_ })
+    await start($)
+    expect(w.env.SHLVL).toBe(want)
+    const names = w.envSets.map((x) => x.name)
+    expect(names.includes('SHLVL')).toBe(want !== start_)
+    if (names.includes('SHLVL')) expect(names.indexOf('SHLVL')).toBeLessThan(names.indexOf('CLAUDE_CODE_SHELL_PREFIX'))
+  })
+}
+
+test('managed off: SHLVL is left alone (Claude Code runs its own shell as before)', async ($: any, on: any) => {
+  const w = world(on, [statusJson('ready')], undefined, { [STATE]: managedState({ mode: 'off', form_mode: 'off' }) })
+  await start($)
+  expect(w.env.SHLVL).toBe(undefined)
+  expect(w.envSets.map((x) => x.name)).not.toContain('SHLVL')
 })
 
 test('managed mode in -p (no surface): the prefix is set as well', async ($: any, on: any) => {

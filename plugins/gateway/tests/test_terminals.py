@@ -1431,3 +1431,170 @@ def test_terminal_list_and_job_list_are_bounded_for_the_agent():
         # the contract snapshot keeps every job
         st, snap = a.de.probe(fc, a.probe / "run.py", ["x"], "/v1/snapshot", method="GET")
         assert len([j for j in snap["jobs"]]) == n, len(snap["jobs"])
+
+
+# ---------------------------------------------------------------------------
+# An uninstall while terminals and jobs run; the tmux server after gated
+# (0.9.1, the GitHub install test: a plain `claude plugin uninstall` with a job
+# running left gated running forever, advertising the contract, its tmux
+# server and watchdog running from deleted files)
+# ---------------------------------------------------------------------------
+
+
+def _gone(pid: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+def _server_pid(de: D.DaemonEnv) -> int:
+    return int(_tmux(de, "display-message", "-p", "#{pid}").stdout.strip())
+
+
+def _wait_watchdog(de: D.DaemonEnv) -> None:
+    deadline = time.time() + 5           # the watchdog starts beside the pane, not before it
+    while time.time() < deadline:
+        if T.WATCH_SESSION in _tmux(de, "list-sessions", "-F", "#{session_name}").stdout.split():
+            return
+        time.sleep(0.1)
+    raise AssertionError("no watchdog session")
+
+
+def _end_pane(de: D.DaemonEnv, pid_: str) -> None:
+    """End a pane's processes behind gated's back (its process group)."""
+    root = int(_tmux(de, "display-message", "-p", "-t", f"={pid_}:", "#{pane_pid}").stdout.strip())
+    os.killpg(root, signal.SIGKILL)
+
+
+def test_an_uninstall_while_a_job_runs_drains_gated_and_it_leaves_with_its_tmux_after_the_job():
+    """A plain `claude plugin uninstall` deletes the plugin's data folder while
+    a job and a terminal run: gated drains at its next tick (contract.json
+    withdrawn at once, daemon.draining, new terminals and jobs refused while an
+    idempotent retry still gets the job it started), leaves the work running,
+    and exits once it has ended, its tmux server and watchdog with it. Nothing
+    makes the deleted data folder again."""
+    import shutil
+    with D.daemon_env(knobs={"watch_tick": 60}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        job = {"argv": ["sleep", "300"], "cwd": str(de.root), "idempotency_key": "k-drain"}
+        jid = a.ok("/agent/job/start", job)["id"]
+        tid = a.open()["id"]
+        _wait_watchdog(de)
+        server = _server_pid(de)
+        gated = de.daemon_pid()
+        assert paths.contract_path().exists()
+        log = open(paths.gated_log(), errors="replace")        # the file goes with the folder
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        assert "data folder is gone" in de.health()["draining"]
+        assert not paths.contract_path().exists(), "a draining gated still advertises the contract"
+        for path, body in (("/agent/job/start", {"argv": ["true"], "cwd": str(de.root)}),
+                           ("/agent/term/open", {"cwd": str(de.root)})):
+            st, r = a.call(path, body)
+            assert st == 503 and r.get("error") == "draining" and "uninstalled" in r["message"], (path, st, r)
+        st, r = fc.http("POST", "/ui/term/open", {"cwd": str(de.root)})
+        assert st == 503 and r.get("error") == "draining", (st, r)
+        again = a.ok("/agent/job/start", job)
+        assert again["id"] == jid and again["new"] is False, again
+        ev = _events(de, ("daemon.draining",))
+        assert ev and ev[-1]["reason"] == "uninstalled" and ev[-1]["jobs"] == 1 and ev[-1]["terminals"] == 1, ev
+        time.sleep(1.0)
+        assert de.daemon_pid() == gated and _alive(server), "gated left (or stopped tmux) while work runs"
+        assert _job_wait(a, jid, ("running",))["state"] == "running"
+        a.ok("/agent/term/close", {"id": tid})
+        time.sleep(0.5)
+        assert de.daemon_pid() == gated, "gated left while a job still runs"
+        _end_pane(de, jid)
+        assert _gone(gated, 10), "gated stayed after the last job ended"
+        assert _gone(server, 5), "its tmux server (and watchdog) stayed"
+        assert not data.exists(), "the deleted data folder was made again"
+        text = log.read()
+        log.close()
+        assert "taking no new work" in text and "nothing runs any more: exiting" in text, text[-800:]
+        assert "the tmux server was stopped" in text, text[-800:]
+        data.mkdir(parents=True)                                   # for the harness's cleanup
+
+
+def test_a_draining_gated_whose_tmux_was_deleted_watches_the_panes_processes():
+    """The uninstall deleted the env too (the data folder holds it): tmux
+    can't be run, so every query fails while the server runs on from the
+    deleted files (0.9.0 called that a blip forever). gated watches the pane's
+    own process instead (pid and start time from tmux's last answer): alive,
+    the job keeps gated; ended, the job is unknown (never "exited"), gated
+    exits and stops the server by its verified pid."""
+    import shutil
+    with D.daemon_env(start=False, knobs={"watch_tick": 60}) as de:
+        wb = de.root / "envbin"
+        wb.mkdir()
+        wrapper = wb / "tmux"
+        wrapper.write_text(f"#!/bin/sh\nexec '{paths.tool('tmux')}' \"$@\"\n")
+        os.chmod(wrapper, 0o755)
+        de.knobs(tmux=str(wrapper))
+        de.start()
+        fc = de.claude()
+        a = Agent(de, fc)
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", "300"], "cwd": str(de.root)})["id"]
+        _wait_watchdog(de)
+        server = _server_pid(de)
+        gated = de.daemon_pid()
+        time.sleep(0.5)                                  # a tick has seen the pane's process
+        log = open(paths.gated_log(), errors="replace")
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        wrapper.unlink()                                 # the env's tmux is gone with it
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        time.sleep(1.0)
+        s = a.ok("/agent/job/status", {"id": jid})
+        assert s["state"] == "running" and not s.get("gone"), s
+        assert de.daemon_pid() == gated and _alive(server)
+        _end_pane(de, jid)
+        assert _gone(gated, 10), ("gated stayed with its tmux unrunnable", log.read()[-800:])
+        assert _gone(server, 5), "the tmux server it could no longer run stayed"
+        text = log.read()
+        log.close()
+        assert f"{jid} is gone (the gateway's tmux can't be run any more" in text, text[-800:]
+        assert "its server was stopped" in text, text[-800:]
+        assert not data.exists(), "the deleted data folder was made again"
+        data.mkdir(parents=True)
+
+
+def test_a_gated_that_exits_with_nothing_running_stops_its_tmux_server():
+    """gated exiting for good (here `gated stop`) with only a dead pane left
+    for reads: the tmux server and its watchdog go with it at once (the
+    watchdog's own look is minutes away here), rather than lingering."""
+    with D.daemon_env(knobs={"watch_tick": 60}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        jid = a.ok("/agent/job/start", {"argv": ["true"], "cwd": str(de.root)})["id"]
+        _job_wait(a, jid, ("exited",))
+        _wait_watchdog(de)
+        server = _server_pid(de)
+        de.stop()
+        assert _gone(server, 3), "the tmux server stayed after gated exited with nothing running"
+        assert "the tmux server was stopped" in de.log()
+
+
+def test_the_watchdog_stops_the_server_once_gated_is_gone_and_no_pane_runs():
+    """gated stopped (SIGTERM) while a job runs keeps its tmux server for the
+    next gated; if none comes and the job then ends, the watchdog sees gated's
+    socket gone and no pane running anything (only itself) and stops the
+    server. While the job runs it never does."""
+    with D.daemon_env(knobs={"watch_tick": 1}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", "300"], "cwd": str(de.root)})["id"]
+        _wait_watchdog(de)
+        server = _server_pid(de)
+        gated = de.daemon_pid()
+        os.kill(gated, signal.SIGTERM)
+        assert _gone(gated, 10)
+        assert not de.sock.exists()
+        time.sleep(3.0)                                  # three of the watchdog's looks
+        assert _alive(server), "the watchdog stopped a server whose job still runs"
+        _end_pane(de, jid)
+        assert _gone(server, 6), "the watchdog left the server with gated gone and nothing running"

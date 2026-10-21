@@ -87,10 +87,11 @@ def test_claude_plugin_validate_passes_for_the_plugin_and_the_marketplace():
         assert f"answers its own command: command.run{{command={c}}}" in out, out
     assert "ui.render{component=Pane, requestId=gate-dialog}, ui.message, prompt.edit" in out, out
     assert "surface modules: hooks/mod/field.tsx" in out, out
-    # managed execution (PLAN-v4 phase 4): the mod writes exactly these three
+    # managed execution (PLAN-v4 phase 4): the mod writes exactly these
     # variables (the prefix, the shell Claude Code starts it from, the folder
-    # of gate-sh's settings) and no other
-    assert "env writes: CLAUDE_CODE_SHELL, CLAUDE_CODE_SHELL_PREFIX, GW_MANAGED_DIR\n" in out, out
+    # of gate-sh's settings, and SHLVL where it is missing or 0, so the shell
+    # that starts the prefix doesn't source ~/.bashrc: 0.9.1) and no other
+    assert "env writes: CLAUDE_CODE_SHELL, CLAUDE_CODE_SHELL_PREFIX, GW_MANAGED_DIR, SHLVL\n" in out, out
     # the marketplace: only where this plugin folder sits in its repository (a copy of the
     # plugin folder alone, as the Linux VM runs got before, has no marketplace to validate)
     if not (H.REPO / ".claude-plugin" / "marketplace.json").is_file():

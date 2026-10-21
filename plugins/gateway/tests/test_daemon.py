@@ -781,8 +781,10 @@ def test_a_daemon_whose_plugin_folder_is_removed_exits_and_withdraws_the_contrac
     """`claude plugin uninstall gate@gateway` removes the plugin's cache
     folder or marks it orphaned: the daemon running from it stops at its next
     tick (not 30 min later), removing contract.json, so checkpoint stops
-    finding a gateway; one that still holds terminals or jobs, or (orphaned)
-    still serves a live session, keeps serving them."""
+    finding a gateway; one that still holds terminals or jobs keeps running
+    for them but drains (contract.json withdrawn at once, no new work:
+    test_terminals' uninstall tests), and (orphaned) one that still serves a
+    live session keeps serving it."""
     import shutil
     with D.daemon_env(start=False) as de:
         copy = D.plugin_copy(de.root, D.plugin_version())
@@ -797,8 +799,27 @@ def test_a_daemon_whose_plugin_folder_is_removed_exits_and_withdraws_the_contrac
         h = de.start_from(copy)
         shutil.rmtree(copy)
         time.sleep(1.0)
-        assert de.daemon_pid() == h["pid"], "a daemon holding jobs keeps serving them"
+        assert de.daemon_pid() == h["pid"], "a daemon holding jobs keeps running for them"
+        assert "plugin folder it runs from is gone" in (de.health() or {}).get("draining", ""), de.health()
+        assert not paths.contract_path().exists(), "a draining daemon still advertises the contract"
+        assert "taking no new work" in de.log(), de.log()[-600:]
+    # an update (a newer sibling version folder beside the orphaned one) isn't
+    # an uninstall: a daemon holding jobs keeps serving them and the contract
+    with D.daemon_env(knobs={"busy": "1 job"}, start=False) as de:
+        copy = D.plugin_copy(de.root, D.plugin_version())
+        h = de.start_from(copy)
+        D.plugin_copy(de.root, "99.0.0")
+        (copy / ".orphaned_at").write_text("1792450000000")
+        time.sleep(1.0)
+        assert de.daemon_pid() == h["pid"] and not (de.health() or {}).get("draining"), de.health()
         assert paths.contract_path().exists()
+    # uninstalled with --keep-data (orphaned, no sibling) while it holds jobs: drains
+    with D.daemon_env(knobs={"busy": "1 job"}, start=False) as de:
+        copy = D.plugin_copy(de.root, D.plugin_version())
+        h = de.start_from(copy)
+        (copy / ".orphaned_at").write_text("1792450000000")
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        assert de.daemon_pid() == h["pid"] and not paths.contract_path().exists()
     # Claude Code's uninstall (2.1.301) keeps the version folder and marks it
     # orphaned (`.orphaned_at`) for a later sweep; an update marks the old one
     # the same way: a session still running that version keeps the daemon

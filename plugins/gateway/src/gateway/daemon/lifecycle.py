@@ -28,7 +28,17 @@ marked orphaned by Claude Code (`.orphaned_at`: uninstalled, or replaced by
 an update; then only once no live session is registered) and it holds no
 terminal or job, on SIGTERM/SIGINT or /local/stop:
 daemon.stopping, the vault locked, the socket and contract.json (when still
-its own) removed.
+its own) removed, and its tmux server stopped once no terminal or job of it
+runs there (Supervisor.stop_server; a live pane keeps the server for the
+next gated to re-adopt).
+
+Uninstalled while terminals or jobs still run (the plugin folder or its data
+folder gone, or the folder orphaned with no newer sibling version and no
+live session: `uninstalled_reason`), it drains (`drain`): contract.json goes
+at once (checkpoint stops delegating), daemon.draining is emitted, new
+terminals, jobs and remote runtimes are refused, and what runs is left to
+finish (never killed); it exits, with its tmux server, once no local
+terminal or job runs (remote ones run on in their hosts' runtimes).
 
 The log (<data>/gated/gated.log, the detached daemon's stdout and stderr) is
 rotated to gated.log.1 past LOG_MAX, at start and while the daemon runs
@@ -38,8 +48,8 @@ keeps it bounded.
 Test overrides: `run.py --test gated ...` with GATEWAY_TEST_ROOT (and
 GATEWAY_TEST_RUN for a short run dir) runs everything inside the test root;
 <root>/gated-test.json holds the test knobs (idle_exit, tick, lock_after,
-test_routes, test_entries, ring, disk_max, log_max, clipboard, tmux), read
-only under a test override.
+test_routes, test_entries, ring, disk_max, log_max, busy, clipboard, tmux,
+watch_tick), read only under a test override.
 """
 from __future__ import annotations
 
@@ -197,7 +207,16 @@ def _skew(h: dict[str, Any], mine: str, *, older: bool = False) -> dict[str, Any
     if version_key(theirs) > version_key(mine) or (older and version_key(theirs) < version_key(mine)):
         h = dict(h)
         h["skew"] = skew_text(theirs, mine)
+    if h.get("draining"):
+        # an uninstalled copy's daemon finishing what runs (Daemon.drain): it
+        # still answers, so no other can start, but it takes no new work
+        h = dict(h)
+        h["skew"] = "; ".join(t for t in (str(h.get("skew") or ""), DRAINING_SKEW) if t)
     return h
+
+
+DRAINING_SKEW = ("the gateway daemon of an uninstalled copy is finishing its terminals and jobs and "
+                 "takes no new ones; a new one starts once they have ended")
 
 
 UNRESPONSIVE_GRACE = 3.0   # a daemon that took the connection gets this long to answer /health
@@ -357,6 +376,12 @@ class Daemon:
         self.sock_ino: int | None = None
         # the plugin folder this code runs from (never an override): its removal stops the daemon
         self.code_root = paths.code_root()
+        # the plugin's data folder (its env, with this python and the env's tmux; the records;
+        # this log): a plain `claude plugin uninstall` deletes it
+        self.data_root = paths.data_dir()
+        # why the daemon takes no new work ("" while it serves): the plugin was uninstalled
+        # while terminals or jobs still ran (drain)
+        self.draining = ""
 
     # -- facts -----------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -405,12 +430,15 @@ class Daemon:
 
     def health(self) -> dict[str, Any]:
         live = self.registry.count()
-        return {"ok": True, "version": self.version, "protocol": PROTOCOL, "pid": self.pid,
-                "epoch": self.epoch, "started": round(self.started, 3),
-                "uptime": round(time.monotonic() - self.t0, 1), "vault": self.broker.state(),
-                "sessions": live, "socket": str(self.sock_path),
-                "lock_after": int(self.broker.lock_after()), "dialogs": self.dialogs.count(),
-                **self.terminals.counts()}
+        h = {"ok": True, "version": self.version, "protocol": PROTOCOL, "pid": self.pid,
+             "epoch": self.epoch, "started": round(self.started, 3),
+             "uptime": round(time.monotonic() - self.t0, 1), "vault": self.broker.state(),
+             "sessions": live, "socket": str(self.sock_path),
+             "lock_after": int(self.broker.lock_after()), "dialogs": self.dialogs.count(),
+             **self.terminals.counts()}
+        if self.draining:
+            h["draining"] = self.draining
+        return h
 
     def locked_message(self, peer: Any) -> str:
         """The locked refusal for the caller's session: in one where a gateway
@@ -728,8 +756,63 @@ class Daemon:
     def plugin_removed(self) -> bool:
         return not (self.code_root / "run.py").is_file()
 
+    def data_removed(self) -> bool:
+        """The plugin's data folder is gone: a plain `claude plugin uninstall`
+        deletes it, with the env this python and the env's tmux run from."""
+        return not self.data_root.is_dir()
+
     def plugin_orphaned(self, live: int) -> bool:
         return live == 0 and (self.code_root / ".orphaned_at").exists()
+
+    def newer_sibling(self) -> bool:
+        """Another, not orphaned version folder beside this one in Claude
+        Code's plugin cache: an update (its sessions use this daemon until it
+        is free), not an uninstall."""
+        try:
+            for d in self.code_root.parent.iterdir():
+                if d != self.code_root and (d / "run.py").is_file() and \
+                        not (d / ".orphaned_at").exists():
+                    return True
+        except OSError:
+            pass
+        return False
+
+    def busy_here(self) -> str:
+        """The local terminals and jobs (a draining daemon waits for these;
+        remote ones run on in their hosts' runtimes without it)."""
+        b = self.k.get("busy") if testing.active() is not None else None
+        if isinstance(b, str) and b:
+            return b
+        return self.terminals.busy(local_only=True)
+
+    def drain(self, why: str) -> None:
+        """The plugin was uninstalled while terminals or jobs still run: stop
+        advertising the contract at once, take no new work, and leave what
+        runs to finish (never killed); the ticker exits once nothing does.
+        One way: a draining daemon never serves new work again."""
+        if self.draining:
+            return
+        self.draining = why
+        # nothing new is written into a data folder an uninstall removed (a lazy
+        # import's bytecode under pycache_prefix would make it again)
+        sys.dont_write_bytecode = True
+        self.remove_contract()
+        c = self.terminals.counts(local_only=True)
+        self.events.emit("daemon.draining", reason="uninstalled", terminals=c["terminals"],
+                         jobs=c["jobs"])
+        self.log(f"{why}: taking no new work and advertising no contract; still running, left to "
+                 f"finish: {self.busy_here() or 'nothing'}; the daemon exits once they have ended")
+
+    def uninstalled_reason(self, live: int | None) -> str:
+        """Why the plugin this daemon runs from counts as uninstalled, or "".
+        `live` None: only the checks that read no state (the first in a tick)."""
+        if self.plugin_removed():
+            return "the plugin folder it runs from is gone (uninstalled or replaced)"
+        if self.data_removed():
+            return "the plugin's data folder is gone (uninstalled)"
+        if live is not None and self.plugin_orphaned(live) and not self.newer_sibling():
+            return "the plugin folder it runs from is orphaned (uninstalled) and no session uses it"
+        return ""
 
     def _ticker(self) -> None:
         while not self.stopping.wait(self.tick_s):
@@ -738,10 +821,24 @@ class Daemon:
                     self.log("the socket is gone: exiting")
                     self.stop_soon("socket gone")
                     return
-                if self.plugin_removed() and not self.busy():
-                    self.log("the plugin folder it runs from is gone (uninstalled or replaced): exiting")
-                    self.stop_soon("plugin removed")
-                    return
+                # checked first, before anything that might import from the
+                # removed folders
+                why = self.uninstalled_reason(None)
+                if why and not self.draining:
+                    if not self.busy():
+                        self.log(f"{why}: exiting")
+                        self.stop_soon("plugin removed")
+                        return
+                    self.drain(why)
+                if self.draining:
+                    self.broker.tick()
+                    self.registry.prune()
+                    self.dialogs.tick()
+                    if not self.busy_here():
+                        self.log(f"{self.draining}; nothing runs any more: exiting")
+                        self.stop_soon("plugin removed")
+                        return
+                    continue
                 self.broker.tick()
                 self.watch_rights()
                 live = self.registry.prune()
@@ -750,6 +847,10 @@ class Daemon:
                              "no session uses it: exiting")
                     self.stop_soon("plugin removed")
                     return
+                why = self.uninstalled_reason(live)
+                if why:
+                    self.drain(why)
+                    continue
                 self.dialogs.tick()
                 if live or self.busy():
                     self.last_busy = time.monotonic()
@@ -837,6 +938,14 @@ class Daemon:
             self.unbind()
             with contextlib.suppress(Exception):
                 self.server.server_close()
+            if self.stop_reason != "socket gone":
+                # its tmux server and watchdog go too once no terminal or job runs
+                # there (a live pane keeps them for the next gated to re-adopt;
+                # still under the instance lock, so no new gated uses that server yet)
+                try:
+                    self.terminals.stop_server()
+                except Exception as e:  # noqa: BLE001 - the exit goes on
+                    self.log(f"terminals: stopping the tmux server failed ({type(e).__name__})")
             self.events.close()
             self.log(f"stopped ({self.stop_reason})")
         return 0

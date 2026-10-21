@@ -2049,6 +2049,100 @@ mutation:
   (`ckpt_cli_env`: the sessions' own, under the harness state root, refused
   unless scratch).
 
+## GitHub install fixes (gw-fix, 0.9.1, 2026-10-21)
+
+Found by the install test from GitHub (both plugins from `p-w-rs/*` on macOS
+and the Debian 13 VM, Claude Code 2.1.301/2.1.304).
+
+- **A plain uninstall with a job running left gated running forever** (still
+  advertising contract.json, its tmux server and watchdog running from deleted
+  files, even after the job and terminal ended). Cause: `claude plugin
+  uninstall` deletes the plugin's data folder, which holds the env: gated's
+  own python and the env's tmux. gated stayed for its live panes as designed,
+  but every `list-panes` then failed (the binary was gone), and a failed query
+  while the server's pid lives is a blip by design (phase 5), so the panes
+  stayed "live" forever and gated never left. Now (`Daemon.drain`,
+  `uninstalled_reason`): the code folder gone, the data folder gone, or the
+  code folder orphaned with no live session and no newer sibling version
+  counts as uninstalled; with nothing running gated exits as before, with
+  terminals or jobs running it drains: contract.json removed at once (a
+  missing file is "gateway not available" in CONTRACT-v1, so checkpoint stops
+  delegating; no CONTRACT change, which must stay identical in both repos),
+  `daemon.draining` emitted (a new event kind, which v1 allows), new
+  terminals, jobs and remote runtime staging refused with 503 `draining`
+  (after the idempotency lookup, so a retry of a job started before gets that
+  job instead of being run twice by checkpoint's own runner), `/health`
+  carries `draining` and `gated start`/`status` a skew note (a reinstall's
+  session can't start a second daemon meanwhile and says why). The running
+  work is left alone, never killed (the user's choice to make: they can stop
+  it; the plugin going away is no reason to kill a training run). When the
+  env's tmux can't be run any more, gated watches each local pane's own
+  process (pid and start time from tmux's last answer); an ended one is
+  gone/unknown, never "exited" (the phase 5 rule "never claimed alive from a
+  saved pid" still holds: a pid only ends a pane's watch, and only when tmux
+  can't be asked at all). It exits once no local terminal or job runs (remote
+  ones run on in their hosts' runtimes; a reinstall re-adopts them from kept
+  records), with its tmux server. While draining: no rights watch (it imports
+  from the removed folders), bytecode writing off and records never written
+  into a removed data folder (`_save` and `save_host` no longer create
+  parents: a lazy import's pycache or a record would have made
+  `plugins/data/gate-gateway` again after the uninstall). An update is no
+  uninstall: an orphaned folder with a newer sibling keeps serving its jobs
+  and the contract until it is free, as before. Rejected: killing the jobs at
+  uninstall (silent loss of user work); exiting at once and leaving the
+  panes to the watchdog alone (nobody would answer for them meanwhile, and a
+  reinstall would adopt them as orphans); marking contract.json "draining"
+  instead of removing it (checkpoint 0.7.x would ignore the unknown field and
+  go on delegating); a private copy of tmux to keep querying (its libraries
+  are in the deleted env too).
+- **The tmux server and gw-watch outlived gated** (the `--keep-data` case and
+  every idle exit): `remain-on-exit` keeps dead panes for reads, so the server
+  never became empty, and the watchdog only reacted to its socket going. Now
+  gated stops its server when it exits for good with no local pane running
+  anything (`stop_server`: `kill-server`, or with the env's tmux deleted
+  SIGTERM to the pid tmux last named, checked by its start time and its
+  command line naming this socket); a live pane keeps it for the next gated
+  (SIGTERM, an update), as before. And the watchdog now also stops the server
+  once gated's socket is gone and no pane runs anything (it counts the
+  server's children with a terminal; a listing it can't read stops nothing),
+  which covers a gated that left with a pane still running when that pane
+  ends later. Rejected: having gw-watch alone do it (a 5 s lag and no way to
+  tell a restart from an exit), killing the server on SIGTERM regardless (a
+  restart re-adopts live panes).
+- **Status lines drew "⚠ gate: ready".** `$.ui.status(text)` takes only the
+  text (types 2.1.299; Claude Code 2.1.301 pins it as a notification with no
+  color, and the notice renderer draws every such line with its warning
+  glyph and color: probed with a throwaway mod in the TUI harness, which also
+  showed `$.ui.toast` as a plain box and `$.ui.log` with a neutral bullet).
+  There is no level or kind to pass, so the normal state leaves the status
+  line: "ready" is a toast (5 s), and the status line is kept for what warrants
+  the sign: setting up (commands wait), a failed setup, a waiting dialog, a
+  refused key, a daemon of another version (or a draining one). checkpoint's
+  "⚠ check: recording" is checkpoint's to change.
+- **Debian: the shell that starts the prefix sourced ~/.bashrc.** Not
+  Debian-specific: upstream bash, run as `bash -c` (not interactive, not a
+  login shell, not `sh`, no `--norc`) with a socket on stdin at shell level 1,
+  takes itself for an rshd/sshd command and sources `~/.bashrc` first
+  (`isnetconn` in `run_startup_files`; Debian's `SSH_SOURCE_BASHRC` adds
+  `SSH_CLIENT` under the same rule). Claude Code starts that shell exactly so,
+  and the TUI harness (like any launcher or service) gives Claude Code no
+  `SHLVL`. Reproduced on macOS with the env's bash 5.2 and the system's 3.2.
+  Claude Code takes no flags for `CLAUDE_CODE_SHELL` (a bash or zsh path,
+  given `-c` only), so the mod sets `SHLVL=1` before the prefix where it is
+  missing, empty, 0, garbage or 999 and up (bash then runs at level 2); a
+  Claude Code started from a terminal has it already and is left alone, and
+  "off" mode doesn't touch it. Rejected: a wrapper script as
+  `CLAUDE_CODE_SHELL` adding `--norc` (a file Claude Code runs for every
+  command and its snapshot, outside the plugin's read-only folder or with an
+  env path it would have to find on its own; phase 4 rejected a data-folder
+  `CLAUDE_CODE_SHELL`), bash in `sh` mode (posix mode would change Claude
+  Code's snapshot and its `-l` fallback reads `~/.profile`). Left documented:
+  Claude Code's `-l` when it has no snapshot (never seen).
+- **The v2 vault builder read v3.** `harness.v2_module` took
+  `git show main:.../vault.py` first; since 0.9.0 is on main that is v3's
+  package module, which can't load alone (15 tests failed in 4 modules). The
+  fixture, byte for byte the last v2 vault.py on main, is now the one source.
+
 ## Rejected alternatives
 
 - **MCP tools first** (v2's design): every git, gh, ssh and sudo action

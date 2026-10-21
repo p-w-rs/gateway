@@ -18,7 +18,7 @@ redesigning anything. The upgrade in progress: [docs/PLAN-v4.md](docs/PLAN-v4.md
 A Claude Code plugin, `gate` (`plugins/gateway/`), in the marketplace
 `gateway` (`.claude-plugin/marketplace.json`). Users install it with
 `/plugin marketplace add p-w-rs/gateway` and `/plugin install gate@gateway`.
-v3 (plugin 0.9.0) gives Claude the user's machines ("hosts") and accounts as
+v3 (plugin 0.9.1) gives Claude the user's machines ("hosts") and accounts as
 ordinary commands (`sudo`, `ssh`, `git`, `gh`, ...) through stand-ins on
 Claude's PATH, keeps every secret in an age vault Claude can't read, and lets
 the user (or Claude, when asked) edit what Claude may do in one form,
@@ -95,7 +95,7 @@ docs/
   phaseB-requests/                  how the build groups' requests were settled (RESOLUTION.md)
   history/                          earlier plans (REDESIGN-v3.md) and the first build's notes
 plugins/gateway/
-  .claude-plugin/plugin.json        name "gate", version 0.9.0
+  .claude-plugin/plugin.json        name "gate", version 0.9.1
   .mcp.json                         MCP server "gw": sh hooks/launch.sh mcp, "alwaysLoad": true
   hooks/hooks.json                  every hook, exec form (table in MODULES-v3.md, "Wiring"; the
                                     async SessionStart `hook-daemon` starts gated and registers the
@@ -397,7 +397,14 @@ plugins/gateway/
     from a saved pid: a lost pane is gone (terminal) or unknown (job, with no
     `ended` time: the outcome is unproven), never "exited"; a *failed*
     `list-panes` query is a blip (told from a dead server by its pid), not
-    death. A paused session can stop or cancel a job but not resume it
+    death. The one exception (0.9.1): when the env's tmux can't be run at all
+    (`Tmux.runnable()`: an uninstall deleted the data folder), a pane's own
+    process (pid and start time from tmux's last answer) decides only when
+    its watch ends (gone/unknown, never "exited"), so a draining gated can
+    leave. Uninstalled while work runs, gated drains (never kills it: no new
+    work, contract.json withdrawn at once, it leaves with its tmux server once
+    no local pane runs), and it stops its tmux server whenever it exits with no
+    local pane running (`stop_server`; a live pane keeps it for re-adoption). A paused session can stop or cancel a job but not resume it
     (`job_signal CONT` refused); an interrupt's SIGTERM escalation is
     persisted and re-armed after a restart. The approval hook's per-call
     judging of `terminal_send` is a guardrail (split-bypassable), not the
@@ -521,7 +528,10 @@ pixi exec --spec python=3.12 --spec pyte python tests/acceptance_terminals.py --
 pixi exec --spec python=3.12 --spec pyte python tests/acceptance_install.py --tmp DIR [--checkpoint DIR] [--only prereq,cold,warm,update,uninstall,spaced,firstbash]
                                          # brief 14.1: both plugins from git-source marketplaces with only claude,
                                          # a recording pixi and pixi's git on PATH; cold provisioning, interrupted
-                                         # setup, warm/offline start, update after a restart, uninstall, spaced paths
+                                         # setup, warm/offline start, update after a restart, uninstall, spaced paths;
+                                         # on the disposable VM only (ACCEPTANCE_DISPOSABLE_VM=1): vmplain, and vmdrain
+                                         # (plain installs, an uninstall while a job and terminal run, with and without
+                                         # --keep-data, the ~/.bashrc probe); needs a git on PATH for its git server
 pixi exec --spec python=3.12 --spec pyte python tests/acceptance_canaries.py --tmp DIR [--pixi-cache DIR2] [--checkpoint DIR]
                                          # brief 14.9/14.13: canaries through every input route, both plugins,
                                          # telemetry on behind the record-only proxy, everything scanned
@@ -546,7 +556,42 @@ pixi: `requires-pixi = ">=0.68.0"`, no upper bound. Tested range 0.68.0 to
 v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
 `/gate-doctor`'s verdict) and the docs; `test_packaging` keeps them in step.
 
-Last full run (2026-10-21, gw-reruns: the skill's checkpoint-jobs text,
+Last full run (2026-10-21, gw-fix, plugin 0.9.1: the GitHub install test's
+findings; DECISIONS "GitHub install fixes"): 1222 passed, 0 failed on macOS
+arm64 (`pixi run --locked test`, 392.7 s at 4 at a time, pixi 0.81.0,
+GW_TEST_TMP in scratch; `claude plugin test .` 118 pass inside test_mod;
+the first run failed 15 tests in test_session, test_migrate, test_harness_run
+and test_gate: the harness built v2 vaults from `git show main:` vault.py,
+which is v3 since 0.9.0 is on main, so the v2 fixture is now its source) and
+1222 passed, 0 failed on the Debian 13 arm64 VM (217.1 s; the working tree's
+files under `~/gwfix`, `pixi install --locked`, pixi 0.82.0, Claude Code
+2.1.304, GW_TEST_TMP under /tmp; the watchdog's `ps -A -o ppid= -o tty=` and
+Debian's bash with SSH_SOURCE_BASHRC included); on macOS again on the final
+tree (docs and acceptance scripts changed since): 1222 passed, 0 failed
+(357.8 s). Mutations: 1041 of 1041
+killed (the all-files run, 18 min 4 s at 3 at a time, beside the VM work;
+new: 3 in mutations_daemon.py, 11 in mutations_terminals.py, 3 in
+mutations_managed.py; four older snippets the change moved were updated).
+Live on the VM (`tests/acceptance_install.py --only vmdrain`, both plugins
+installed plainly from git snapshots of the working trees, gateway 0.9.1 and
+checkpoint 0.7.3, through tests/tui's install route; `ACCEPTANCE_DISPOSABLE_VM=1`,
+a scratch git first on PATH for the harness's git server): 30 of 30 in 137 s.
+A warm session started a gateway job and terminal; a plain `claude plugin
+uninstall` of both: contract.json gone 24.6 s later (the 30 s tick) while
+gated, its tmux server and gw-watch and the job ran on; once the job and the
+terminal ended, gated, the tmux server (run from the deleted env: gated
+watched the panes' processes and stopped the server by its pid) and gw-watch
+were gone 25.0 s later, the data folder not made again. With `--keep-data`:
+contract.json gone after 29.1 s, everything gone 25.5 s after the job ended,
+the data folder kept. The planted `~/.bashrc` (Claude Code started without
+`SHLVL`, as the harness does) didn't run for the Bash command (its shell's
+pid not in the rc's log; one line from Claude Code's own snapshot shell at
+SHLVL 2), and setup showed `⚠ gate: setting up…`, then the `ready` toast,
+never `⚠ gate: ready`. The VM was restored (`./vm.sh clean`, stopped). Not
+re-run: the other TUI acceptances (acceptance_install's other parts check the
+toast now; acceptance_managed counts SHLVL as the mod's), the remote
+acceptance, the headless e2e suite.
+Before that (2026-10-21, gw-reruns: the skill's checkpoint-jobs text,
 plugin.json's description, SessionStart's job line, and an "ask" right no
 longer honoured inside a gateway terminal or job; DECISIONS "Re-runs and
 shipped text"): 1217 passed, 0 failed on macOS arm64 (`pixi run --locked
@@ -842,7 +887,12 @@ project context.
   the test run dir's private socket (`<run>/tmux.sock`); the daemon_env
   cleanup kills it (its argv names the run dir), and gated stops it when the
   run dir goes (so does the server's own `gw-watch` session once its socket
-  is gone, when gated was stopped first; terminals.md). Never reach the user's tmux server. The `tmux` knob points
+  is gone, when gated was stopped first, or once gated's socket is gone and no
+  pane runs anything; gated itself stops it when it exits with nothing running;
+  terminals.md; the knob `watch_tick` shortens the watchdog's 5 s). Removing
+  the override's data folder (`de.env.data`) is how a test makes a plain
+  uninstall (the daemon log goes with it: open it first and read the open file).
+  Never reach the user's tmux server. The `tmux` knob points
   gated at a logging wrapper (what reached tmux's argv). A test that waits
   for output must look for text the typed line itself can't show (the
   `Agent.run` marker, `"GOT""LEN"`): the echoed command contains its own
@@ -1054,9 +1104,10 @@ project context.
 - The audit log (`$CLAUDE_PLUGIN_DATA/audit.jsonl`) is shared by all
   sessions on the machine.
 
-## Status (2026-10-21, v3 / plugin 0.9.0)
+## Status (2026-10-21, v3 / plugin 0.9.1)
 
-On branch `v3-hosts-accounts`, nothing committed yet. Phases A (core), B
+0.9.0 is committed on main (a8dd5ec); 0.9.1 (the GitHub install test's
+fixes, below) is committed locally on main, not pushed. Phases A (core), B
 (sudo, ssh, accounts, ux groups) and C (integration) are done: every phase B
 request is settled in `docs/phaseB-requests/RESOLUTION.md`; hooks, MCP and
 manifests are wired; the v2 modules, commands and installer are gone (only
@@ -1589,6 +1640,20 @@ CLAUDE.md); historical passages that quote the old advice are marked
 superseded, the only exemption. (6) Found on the way: `gate workspace
 remove` refused a host's last workspace and called every removal a
 narrowing; it now removes it and says when the removal waits for the OK.
+
+GitHub install fixes (2026-10-21, plugin 0.9.1; DECISIONS "GitHub install
+fixes"): (1) an uninstall while terminals or jobs run drains gated
+(`Daemon.drain`: contract.json withdrawn at once, `daemon.draining`, new
+terminals, jobs and remote runtimes refused with 503 `draining`, the work
+left to finish, never killed; it exits with its tmux server once no local
+pane runs; with the env's tmux deleted it watches the panes' own processes);
+(2) gated stops its tmux server and watchdog when it exits with no local
+pane running, and the watchdog also stops the server once gated's socket is
+gone and no pane runs; (3) "ready" is a toast (Claude Code draws every status
+line with ⚠ and `$.ui.status` takes no level); (4) the mod sets `SHLVL=1`
+where it is missing, so the `bash -c` that starts the prefix (stdin a
+socket) no longer sources `~/.bashrc` (upstream bash's rule, seen on Debian);
+(5) the version is 0.9.1.
 
 Not done or not verified live (as of the 2026-10-21 acceptance; the per-phase
 notes below were written when each phase landed, and items the acceptance

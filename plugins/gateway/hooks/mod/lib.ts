@@ -263,6 +263,14 @@ export function shouldProvision(st: EnvStatus | undefined): boolean {
   return st !== undefined && (st.state === 'missing' || st.state === 'failed')
 }
 
+// Is SHLVL one that keeps a `bash -c` with a socket on stdin from sourcing
+// ~/.bashrc (bash counts itself started by sshd/rshd at shell level 1: SHLVL
+// unset, 0 or garbage; from 1000 on bash resets it to 1)? The mod sets 1
+// otherwise (managedSetup; docs/modules/managed.md, "Known limits").
+export function shlvlOk(v: string | undefined): boolean {
+  return v !== undefined && /^[1-9][0-9]{0,2}$/.test(v) && Number(v) < 999
+}
+
 // Is setup done, so that Claude's commands run? The env is built and, when
 // this session runs them through the managed shell (`managed`: the mod set
 // the prefix), the managed shell's settings are written too: launch.sh

@@ -88,9 +88,14 @@ only when that env is ready), never from `state.json`'s `bash` (phase 4
 review: a rewritten `bash` made Claude Code start every command, gate-sh
 included, from another program with the full environment).
 Another plugin's or the user's prefix is replaced (named in `/gate-doctor`).
-In `-p` and SDK sessions the same happens (the mod runs there too). The mod
-writes exactly these three variables (`claude plugin validate`'s "env writes",
-pinned by `test_mod`).
+Before the prefix, where Claude Code's own `SHLVL` is missing, empty, 0, not a
+number or 999 and up, the mod sets `SHLVL=1` (0.9.1; `lib.ts` `shlvlOk`): bash
+started as `-c` with a socket on stdin, which is how Claude Code starts the
+shell it runs the prefix from, sources `~/.bashrc` before the command at shell
+level 1 (below, "Known limits"). In `-p` and SDK sessions the same happens (the
+mod runs there too). The mod writes exactly these four variables (`claude
+plugin validate`'s "env writes", pinned by `test_mod`); with the mode "off" it
+writes only `GW_MANAGED_DIR`.
 
 `/gate-doctor` prints the mode, whether this session's prefix is active (from
 the process environment, so also after `/reload-plugins`), the managed bash
@@ -366,11 +371,29 @@ check costs nothing while the prefix is the gateway's (a string compare in
 
 - Claude Code starts the prefix through a shell: with `CLAUDE_CODE_SHELL` set
   (the env built before the session's first command) that is the managed
-  bash, which reads no rc (`bash -c`); before that, the user's shell (zsh
-  reads `~/.zshenv`; bash `$BASH_ENV`). gate-sh discards everything such a
-  shell set (removed by name), but not what it did. Claude Code also runs the user's
-  login rc once per session to make its snapshot; the gateway never sources
-  the snapshot.
+  bash; before that, the user's shell (zsh reads `~/.zshenv`; bash
+  `$BASH_ENV`). Claude Code spawns it as `<shell> -c '<prefix> <script>'`
+  with stdin a socket (its code adds `-l` when it has no shell snapshot:
+  then a bash reads the login files, and Debian's `~/.profile` sources
+  `~/.bashrc`; never seen in a run, not prevented), and
+  bash with `-c`, not interactive, not a login shell, not `sh`, no
+  `--norc`, at shell level 1 (`SHLVL` unset, empty, 0 or garbage before it
+  adds one) and a socket on stdin takes itself for an rshd/sshd command and
+  sources `~/.bashrc` first (upstream bash's `isnetconn` check in
+  `run_startup_files`, on macOS and Linux alike; Debian's build also counts
+  `SSH_CLIENT`, under the same shell-level rule). Found on Debian by the
+  GitHub install test (0.9.0: a planted rc's line ran with the command's pid,
+  its variables and alias didn't reach the command); reproduced with the env's
+  bash 5.2 and macOS's bash 3.2 (`test_managed::test_bash_c_with_a_socket_on_
+  stdin_sources_bashrc_at_shell_level_1_and_shlvl_1_stops_it`). Claude Code
+  offers no way to add `--norc` (`CLAUDE_CODE_SHELL` must be a bash or zsh
+  path and gets only `-c`), so the mod makes the shell level 2 instead: it
+  sets `SHLVL=1` where it is missing (a Claude Code started from a terminal
+  has 1 or more already). gate-sh still discards everything such a shell set
+  (removed by name), but not what it did; zsh's `~/.zshenv` (before the env
+  is built, a zsh login shell) stays. Claude Code also runs the user's login
+  rc once per session to make its snapshot; the gateway never sources the
+  snapshot.
 - The system prompt still names the user's `$SHELL`; the session context says
   where Claude's commands run.
 - Claude Code's snapshot also shadows `find` and `grep` with its embedded bfs

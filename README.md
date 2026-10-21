@@ -16,7 +16,7 @@ before waits for your OK in the gateway's own dialog inside Claude Code.
 It also gives Claude real terminals and long-running jobs, here and on your
 other machines, that you can watch and take over in a pane.
 
-Plugin `gate` (version 0.9.0) in the marketplace `gateway`
+Plugin `gate` (version 0.9.1) in the marketplace `gateway`
 (`github.com/p-w-rs/gateway`). Sister plugin:
 [checkpoint](https://github.com/p-w-rs/checkpoint).
 
@@ -29,9 +29,11 @@ Plugin `gate` (version 0.9.0) in the marketplace `gateway`
 automatically against a stand-in model, with the plugin installed from a git
 marketplace into a throwaway configuration, on macOS arm64 (Claude Code
 2.1.301) and a Debian 13 arm64 VM (Claude Code 2.1.304), 2026-10-21. The
-repository's own test suite (1214 tests) and its mutation checks (1019) pass
-on macOS; the suite also passed on the Linux VM (last run there just before
-the final round of fixes).
+repository's own test suite (1222 tests) and its mutation checks (1041) pass
+on macOS, and the suite on the Linux VM too (plugin 0.9.1). The fixes after
+the install test from GitHub (an uninstall while a job runs, the status line's
+warning sign, `~/.bashrc` on Debian) were checked live on the VM; the other
+live checks ran on 0.9.0.
 
 | Area | Built | Tested |
 |---|---|---|
@@ -185,11 +187,13 @@ gateway to.
 ## Your first session
 
 - The gateway builds its tools with pixi in the background. The line under
-  the prompt shows `gate: setting up… 0:12`, a few seconds of `gate:
-  finishing setup… 0:41` while the managed shell's settings are written,
-  then `gate: ready`. It takes about a minute (longer on a slow network). If
-  Claude Code quits or the machine sleeps meanwhile, the next session takes
-  the setup over and finishes it.
+  the prompt shows `⚠ gate: setting up… 0:12`, a few seconds of `⚠ gate:
+  finishing setup… 0:41` while the managed shell's settings are written
+  (Claude's commands wait meanwhile, hence Claude Code's warning sign), then
+  the line goes and a small `gate` / `ready` notice shows for a few seconds
+  in the top right corner. It takes about a minute (longer on a slow
+  network). If Claude Code quits or the machine sleeps meanwhile, the next
+  session takes the setup over and finishes it.
 - Until then Claude's commands are refused with "gateway: the managed shell
   isn't ready" (they run only in the gateway's own bash, never in your login
   shell instead), other gateway commands say `gateway: still setting up
@@ -458,6 +462,15 @@ started without your profile, rc files, aliases or functions, with:
   before. Claude Code's permission prompts, "don't ask again" rules, hooks,
   results, exit codes, Escape and timeouts are unchanged; the prompt shows
   the command Claude wrote.
+- **Your `~/.bashrc` doesn't run per command either.** Claude Code hands each
+  command to the gateway through a short `bash -c` with a socket on stdin,
+  and bash reads `~/.bashrc` first in that case when `SHLVL` is unset or 0
+  (it takes itself for an ssh command; Debian's bash also when `SSH_CLIENT`
+  is set). A Claude Code started from a terminal has `SHLVL` 1 or more; for
+  one started without it (a launcher, a service) the gateway sets `SHLVL=1`
+  in its session (0.9.1; before, the rc's lines ran, though its variables
+  never reached a command). Once per session Claude Code still runs your
+  login rc for its own snapshot, which the gateway never uses.
 
 **Using your own tools.** Say "Claude, I want my Homebrew tools" (or `cargo`,
 `node` from nvm, a `JAVA_HOME`): Claude can look at what this machine has with
@@ -640,7 +653,10 @@ task.
 The gateway's helper, `gated`, runs one per user, started on demand; it
 exits 30 minutes after the last session ends (not while a terminal or job
 runs), and within about half a minute once its plugin is uninstalled and no
-session uses it. Checkpoint finds it
+session uses it. Uninstalled while a terminal or job still runs, it starts
+nothing new and stops offering itself to checkpoint at once, leaves that
+work running, and exits (with its private tmux) once it has ended. Its
+private tmux also goes whenever it exits with nothing running. Checkpoint finds it
 through `~/.config/gateway/run/contract.json`
 ([docs/CONTRACT-v1.md](docs/CONTRACT-v1.md)); nothing secret is ever on that
 channel.
@@ -746,7 +762,8 @@ vault; upgrading again later keeps the v3 vault.
   session; it sees the stale setup and finishes it. **Setup failed**: the
   message names the log; it's retried at every session start; `/gate-doctor`
   shows the reason.
-- **"the managed shell isn't ready"**: wait for `gate: ready`.
+- **"the managed shell isn't ready"**: wait until the `gate: setting up…`
+  line under the prompt goes (a `ready` notice shows in the corner).
 - **"the gateway vault is locked"**: `/gate-unlock`. **Passphrase
   forgotten**: the vault can't be opened; import your last export (`gate
   import FILE`) or set things up again.
@@ -862,7 +879,8 @@ Each with the smallest remedy.
   `scripts = true`. Remedy: keep the session open until it ends.
 - **The very first setup** (about a minute after install): Claude's commands
   are refused, and output masking and the rights checks wait for the tools;
-  only the reduced checks run. Remedy: wait for `gate: ready`.
+  only the reduced checks run. Remedy: wait for the `ready` notice (the
+  `gate: setting up…` line goes).
 - **git marketplaces need git on PATH** (also for `marketplace update`), and
   some pixi installs don't put `~/.pixi/bin` on PATH. Remedy: `export
   PATH="$HOME/.pixi/bin:$PATH"`.
@@ -872,6 +890,12 @@ Each with the smallest remedy.
 - **The `http` tool and the account tools ignore proxies and custom CA
   bundles** (so credentials can't be routed through an interceptor). Remedy:
   a direct network for them; git uses your proxy settings.
+- **Status lines carry Claude Code's warning sign** (`⚠ gate: setting up…`):
+  Claude Code draws every plugin's status line that way and offers plugins
+  no other kind. The gateway uses the line only while something needs you or
+  waits (setup, a failed setup, a waiting dialog, a refused key, a daemon
+  from another version) and says `ready` in a corner notice instead. Remedy:
+  none needed.
 - **A disabled (not uninstalled) gateway's helper** keeps running until it
   has been idle 30 minutes; it refuses that session's calls and checkpoint
   says so. Remedy: none needed; `pkill -f "run.py gated serve"` stops it now.
@@ -898,9 +922,11 @@ Each with the smallest remedy.
 app: **+** → **Plugins** → **Manage plugins**). That removes the plugin and
 its data folder (`--keep-data` keeps it). The background helper notices at
 its next check (within about half a minute, once no session uses it) and
-exits, unless a gateway terminal or job still runs (then it stays until they
-end). From the next session Claude's terminal is back to
-normal.
+exits, with its private tmux. If a gateway terminal or job still runs, it
+stops offering itself to checkpoint and refuses new terminals and jobs at
+once, leaves the running ones alone (never killed; jobs on remote hosts keep
+running there), and exits with its tmux once the local ones have ended. From
+the next session Claude's terminal is back to normal.
 
 Your form and vault stay in `~/.config/gateway` (the `gate` launcher then only
 says the plugin isn't there, and `env.sh` does nothing), so a reinstall picks

@@ -1402,7 +1402,8 @@ class Remotes:
             data = {"version": 1, "hosts": self.saved}
             tmp = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
             try:
-                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                # never the data folder itself: one an uninstall removed stays removed
+                self.state_path.parent.mkdir(exist_ok=True)
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f)
