@@ -10,8 +10,8 @@ of its two redirections works in a session:
   In a session it makes every Python hook, the MCP server and every stand-in
   exit 2 ("GATEWAY_TEST_ROOT is set but this isn't a `run.py --test` ...")
   and the sh hooks resolve no home: safe, but inert, and the screen need not
-  say so (the mod's status line still reaches "gate: ready", /gate-doctor
-  answers), so a test built on it can pass falsely.
+  say so (the mod shows no warning: setup still ends in its "ready" toast,
+  /gate-doctor answers), so a test built on it can pass falsely.
 * The e2e marker: a file `e2e-root` in the plugin folder naming a scratch
   root (and a short run dir). The gateway honours it only when the plugin
   folder, the marker and the named folders all follow hooks/e2e.sh's rules

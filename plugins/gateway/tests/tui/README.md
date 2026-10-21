@@ -172,8 +172,8 @@ of its two redirections only one works in a session:
   `launch.sh MODE --test`, which hooks.json never passes. In a session every
   Python hook, the MCP server and every stand-in then exit 2 ("GATEWAY_TEST_ROOT
   is set but this isn't a `run.py --test` ...", in the debug log only) while
-  the status line still says "gate: ready": inert, and a test on it can pass
-  falsely.
+  the mod shows no warning (setup still ends in its "ready" toast): inert,
+  and a test on it can pass falsely.
 - The e2e marker (`e2e-root` in the plugin folder, naming a root and a run
   dir) works, but the gateway honours it only when the plugin folder, the
   marker and the named folders follow `hooks/e2e.sh`'s rules (spelled with

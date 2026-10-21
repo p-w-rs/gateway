@@ -28,8 +28,9 @@ Messages API.
             the only git on the session PATH besides the OS's; the plugins'
             marketplaces are added and installed with it
   cold      session 1 in a project folder with a space and a non-ASCII letter:
-            both plugins start provisioning by themselves and say so on the
-            status line (sampled); mid-build, every pixi install, its builder
+            both plugins start provisioning by themselves and say so (the
+            gateway on its status line, checkpoint in the prompt footer;
+            sampled); mid-build, every pixi install, its builder
             and claude are SIGKILLed (the interrupted setup); session 2 (a
             restart) takes the stale build locks over, finishes, never runs two
             builds of one env at once, and the plugins work: a Bash command
@@ -240,8 +241,9 @@ def gate_ready(text: str) -> bool:
 
 
 class StatusSampler(threading.Thread):
-    """Samples the session's status rows (the plugins' status lines) and the
-    concurrent pixi installs per env folder."""
+    """Samples the session's status rows (the gateway's status line and ready
+    toast, checkpoint's footer label) and the concurrent pixi installs per env
+    folder."""
 
     def __init__(self, s: driver.Session, datas: list[Path]):
         super().__init__(daemon=True)
@@ -483,7 +485,7 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
         texts = " || ".join(t for _t, t in samp.seen)
         check("the status line shows the gateway's progress (gate: setting up… m:ss)",
               re.search(r"gate: setting up… \d+:\d\d", texts), texts[-600:])
-        check("the status line shows checkpoint setting up (check: setting up its runtime)",
+        check("the footer shows checkpoint setting up (check: setting up its runtime)",
               "check: setting up its runtime" in texts, texts[-600:])
         check("...and checkpoint says once that its first-time setup is running (session start message)",
               "first-time setup is running" in s1.all_text().replace("\n", " "), s1.all_text()[-600:])
@@ -539,7 +541,8 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
             r"gate: setting up", s2.text()), 60)
         rec = wait(s2, lambda: "check: recording" in s2.text(), 90)
         texts = " || ".join(t for _t, t in samp.seen)
-        check("...the status lines end at gate: ready and check: recording", rdy and rec, texts[-500:])
+        check("...setup ends: no gate: setting up any more (the ready toast), and check: recording", rdy and rec,
+              texts[-500:])
         logs = [str(x) for x in gdata.glob("envs/*/install.log")]
         SUMMARY["gateway_install_log"] = logs
         n0 = len(s2.api.main_requests())
@@ -773,7 +776,7 @@ def part_spaced(root: Path, pre: Prereqs, ck_src: Path) -> None:
 
 def part_firstbash(root: Path, pre: Prereqs) -> None:
     """A plain first session (nothing interrupted): the gateway builds its env during it; the moment the
-    status line says ready, Claude runs Bash, then again every 2 s until a command runs."""
+    ready toast shows, Claude runs Bash, then again every 2 s until a command runs."""
     print("firstbash: Bash right after the first session's setup says ready", flush=True)
     with install.Hermetic(root / "hf", extra_env=pre.env()) as h:
         gi = h.install_gateway_e2e(REPO)
@@ -786,7 +789,7 @@ def part_firstbash(root: Path, pre: Prereqs) -> None:
             s.wait_ready(180)
             ready = wait(s, lambda: gate_ready(s.text()), BUILD_TIMEOUT, 0.2)
             t_ready = time.time()
-            check("firstbash: the first session builds the env and says gate: ready", ready)
+            check("firstbash: the first session builds the env and says ready (the toast)", ready)
             tries, ran, first_err = 0, False, ""
             while time.time() - t_ready < 90 and not ran:
                 tries += 1
@@ -803,8 +806,8 @@ def part_firstbash(root: Path, pre: Prereqs) -> None:
                     s.pump(2.0)
             SUMMARY["firstbash"] = {"tries": tries, "ran": ran, "window_s": round(time.time() - t_ready, 1),
                                     "first_error": first_err}
-            check("firstbash: the first Bash command after gate: ready runs (no not-ready window)", ran and tries == 1,
-                  json.dumps(SUMMARY["firstbash"]))
+            check("firstbash: the first Bash command after the ready toast runs (no not-ready window)",
+                  ran and tries == 1, json.dumps(SUMMARY["firstbash"]))
         finally:
             s.close()
         stop_gated(h.root)
