@@ -1,58 +1,67 @@
 ---
-description: Quick guide to gateway - what it does and how to add accounts, secrets and sudo
+description: Quick guide to the gateway - what it does and how to ask for hosts and accounts
+argument-hint: "[question]"
+disable-model-invocation: true
 ---
 
-Give the user a short, friendly guide to the gateway plugin, based on the
-reference below. Write for someone who may never have used git, ssh or
-tokens. Keep it to about a screen: a one-line summary, then the commands they
-type, then what Claude can and can't do. Then call the `account_list` and
-`secret_list` tools and show what the gateway holds now (names only; never
-values). If their message has a question after the command, answer that
-instead of the full guide.
+Give the user a short, friendly guide to the gateway plugin (about one
+screen) from the reference below. If they asked a question after the command
+($ARGUMENTS), answer that instead. Never ask for a password, token or key in
+chat, and don't run commands for this.
 
 Reference:
 
-**What it is.** The gateway holds the user's passwords, tokens, SSH keys and
-sign-ins, and is the only way Claude uses them. Claude never sees a value;
-the gateway puts it into each request or command itself, sends it only where
-the user allowed, and logs every use (`/gate:log`).
+- **What it is.** Claude uses this computer's sudo, the user's other machines
+  over ssh, and their accounts (GitHub, Hugging Face, Azure / Databricks, the
+  ML Catalog, Pijul, container registries, API keys) with ordinary commands.
+  The gateway puts the password, key or token into that one command, sends it
+  only where the user allowed, and keeps the values in an encrypted vault
+  Claude can't read.
+- **The form.** `~/.config/gateway/gateway.toml` lists hosts and accounts and
+  what Claude may do: `true` (no prompt), `"ask"` (Claude Code asks each time
+  Claude runs that ssh or sudo itself; scp, rsync, git and scripts are then
+  refused for it) or `false` (refused). The user can edit it or ask Claude to. Taking
+  rights away works at once; adding a host or widening a right waits for their
+  OK in the gateway's dialog, a pane inside Claude Code (Approve / Decline).
+  Secrets are typed only in that dialog (click its field, then type; or
+  Paste from clipboard), never in chat. In `claude -p`, VS Code or the
+  mobile app no dialog can open: the gateway says so and asks nothing.
+  `/gate-dialog` shows a dialog that is waiting; `/gate-unlock` and
+  `/gate-lock` unlock and lock the vault.
+- **What Claude runs.** `sudo ...`, `ssh HOST CMD`, `scp`, `rsync`, `git`,
+  `gh`, `hf`, `databricks`, `crane`, `pijul`, `asiml`; the `http` and
+  `download` tools for the web (curl and wget are refused). In auto mode,
+  sudo, ssh and the gateway's own commands for what the form allows run with
+  no prompt; everything else goes through auto mode as usual.
+- **Where Claude's commands run.** In the gateway's own bash (no login
+  profile, aliases or tokens; PATH: the gateway's stand-ins, bash, pixi, the
+  system folders). The user's own tools come in only as imports they approve:
+  `[shell] import_path` / `import_env` in the form ("give Claude my Homebrew
+  tools"); `[shell] managed = "off"` gives Claude Code's own shell back.
+  `/gate-doctor` shows the managed shell's PATH and imports.
+- **Policy and workspaces.** Finer rules than the rights: `"allow"`,
+  `"ask"` or `"deny"` per host, workspace, account and action (read, exec,
+  write, network, elevation, credential use, imports, provisioning,
+  forwarding) in `[policy]`, `[hosts.NAME.policy]`,
+  `[hosts.NAME.workspaces.W]` (a named folder on a host, with the matching
+  folder here) and `[accounts.NAME.policy]`. The strictest rule wins, every
+  refusal names the rule, and loosening one waits for the user's OK like any
+  widening. ssh agent, X11 and -R/-W forwarding only where a host's own
+  policy turns it on. This is the gateway's own policy, separate from Claude
+  Code's permission modes. `/gate-hosts` and `/gate-accounts` show hosts,
+  workspaces, accounts and their state, and edit them.
+- **sudo.** The gateway never changes the machine's sudo rules: sudo that is
+  already passwordless is used as it is; otherwise the password is stored or
+  asked for each time in the gateway's dialog ("Remember it" unticked: used
+  once). The approval shows whom sudo runs as, and where.
+- **Examples to ask for.** "Add my server homelab at 192.168.1.20, user alex,
+  with sudo." "Ask me before sudo on homelab." "Add my work GitHub for the
+  acme-corp repos." "Add my OpenAI key." "Import my servers from
+  ~/.ssh/config." "Add a workspace app on homelab at /srv/app." "Don't let
+  Claude write to homelab." "Export my gateway (only the GitHub account)."
+  "Copy my gateway to homelab."
+- **When something goes wrong.** `gate status` (or `/gate:status`) shows
+  everything, `gate why` explains the last refusal, `gate log` shows what the
+  gateway did. In the user's own terminal: `~/.config/gateway/gate status`.
 
-**Commands you type** (Claude takes it from there with a few questions;
-anything secret is typed in a small dialog box, never in the chat):
-- `/gate:add account`: GitHub, Hugging Face, a server over SSH, Azure /
-  Databricks, the ASI ML Catalog, a container registry, Pijul. You can also
-  say it directly: `/gate:add github`, `/gate:add ssh`, …
-- `/gate:add secret`: an API key or token for a website.
-- `/gate:add sudo`: a computer's administrator password, so Claude can run
-  admin commands there. Each one still asks you first.
-- `/gate:update NAME`: change something, e.g. `/gate:update github:work`.
-- `/gate:delete NAME`: remove it.
-- `/gate:enable sudo HOST` (or `… always`): let admin commands on that
-  machine run without asking, for this session or always.
-  `/gate:disable sudo HOST` undoes it.
-- `/gate:enable exec ssh:NAME` (or `delete`, `write`, `read`; add `always`
-  to keep it): stop asking before that kind of action on one account, e.g.
-  running commands on your server. `/gate:disable exec ssh:NAME` asks again;
-  `/gate:block write github:work` makes an account read-only.
-- `/gate:enable reuse ssh:NAME`: keep that server's connection open for this
-  session, so commands there are quicker.
-- `/gate:export`: save everything to a file locked with a passphrase, to
-  move it to another computer; `/gate:import FILE` brings it in there.
-- `/gate:list`: what the gateway holds. `/gate:log`: what it did.
-
-**On a machine with no screen** (over ssh): when a dialog can't open, Claude
-gives you a command to run in a terminal there,
-`pixi run --manifest-path …/pixi.toml gateway finish g-…`, which asks the same
-thing at a hidden prompt.
-
-**What Claude can and can't do.**
-- Claude uses git, gh, hf, ssh, docker push/pull, Azure and the rest only
-  through the gateway's tools, as the right account.
-- In Claude's own terminal, those commands, your own tokens, your ssh-agent
-  and your credential files are off limits.
-- Deleting and running commands on servers ask you first (Claude Code's
-  permission prompt), unless you switched that off with `/gate:enable`.
-  A plain force-push is always refused.
-- Admin (root) commands always ask, unless you enabled sudo for that machine.
-- Claude can't add or change anything in the gateway by itself: every change
-  starts with a command you type.
+End with: `/gate:status` shows what the gateway holds now.

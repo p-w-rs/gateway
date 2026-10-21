@@ -10,7 +10,7 @@
     {
       "name": "gate",
       "source": "./plugins/gateway",
-      "description": "Audited single path for network, credential, and certificate work."
+      "description": "Hosts and accounts for Claude Code: sudo, ssh, git and your accounts work as normal commands while secrets stay in the gateway's vault."
     }
   ]
 }

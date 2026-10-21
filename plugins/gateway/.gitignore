@@ -3,3 +3,9 @@ logs/
 quarantine/
 __pycache__/
 *.pyc
+# Written by Claude Code when it loads the mod from this folder (--plugin-dir):
+# the API's type declarations, and a tsconfig.json at the plugin root that
+# extends them. Shipping the tsconfig without the (ignored) types it extends
+# would break; both stay out of git.
+.claude-plugin/types/
+/tsconfig.json

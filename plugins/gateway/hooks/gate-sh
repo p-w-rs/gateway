@@ -1,0 +1,254 @@
+#!/bin/sh
+# gate-sh: the gateway's CLAUDE_CODE_SHELL_PREFIX (PLAN-v4 phase 4; docs/modules/managed.md).
+# POSIX sh. The gateway mod sets the prefix to this file at session start in
+# managed mode ([shell] managed = "on", the default, or "warn"), with
+# GW_MANAGED_DIR naming the folder Python writes the managed shell's files to.
+#
+# Claude Code runs every shell command it starts through the prefix with ONE
+# argument (FEASIBILITY-v4 P2; the forms below were recorded on 2.1.301):
+#
+#  * a classic hook's command string (and an MCP server's quoted argv, a
+#    status line command, ...), which Claude Code would otherwise run as
+#    `/bin/sh -c STRING`: run exactly that way, with the same stdin, stdout,
+#    stderr, environment and exit status (nothing but builtins runs first);
+#
+#  * a Bash-tool script (the Bash tool, run_in_background, Monitor, the
+#    user's ! commands, subagents, skills' ! injection; bash or zsh alike):
+#
+#      source <cfg>/shell-snapshots/snapshot-<shell>-*.sh 2>/dev/null || true && \
+#      <other plugins' CLAUDE_ENV_FILE text> ... && eval '<command>' [< /dev/null] && \
+#      pwd -P >| <tmp>/claude-XXXX-cwd
+#
+#    The snapshot (the user's functions, aliases, options and login PATH) is
+#    never sourced: its `source` is replaced by the gateway's rc, and the rest
+#    (the env-file text, Claude Code's own segments, the eval'd command, the
+#    cwd tracker) runs unchanged under the gateway env's bash, started with
+#    --noprofile --norc in a curated environment: the platform variables
+#    below, the gateway PATH (stand-ins, the env's runtime tools, approved
+#    imports, system dirs, other plugins' bin/ folders), Claude Code's own
+#    variables, the managed shell's folder, and approved imports; no
+#    credential-looking variable. Every other variable is removed by name
+#    (`env -u NAME`), so values never reach a command line: any local user
+#    can read a process's arguments, while its environment is the owner's.
+#    The command's exit status is bash's, and exec keeps one process (Claude
+#    Code's interrupt and timeout kill it).
+#
+# A string that has the shape of a Bash-tool script but doesn't parse (exit
+# 126), or a managed shell that isn't ready (exit 75), is reported on stderr
+# and NOT run: the gateway never falls back to the user's own shell.
+
+# Hook strings first, with builtins only and no variable assigned (exactness:
+# a variable set here would reach the hook if its name were exported):
+# anything without a Bash-tool script's shape goes to /bin/sh -c, as Claude
+# Code runs it without a prefix.
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' "gateway: the managed shell (gate-sh) was called with $# arguments instead of one; nothing was run" >&2
+  exit 126
+fi
+# A Bash-tool script: Claude Code's snapshot source as its first segment
+# (refused below when the rest of the shape is missing), or else the whole
+# shape: the cwd tracker as the last segment (one word naming a -cwd file,
+# bare or quoted) and an eval of the command.
+gw_tool_shape() {
+  case $1 in 'source '*/shell-snapshots/snapshot-*) return 0 ;; esac
+  case $1 in *' && pwd -P >| '*) ;; *) return 1 ;; esac
+  case ${1##*' && pwd -P >| '} in
+  \'*-cwd\') ;;
+  '' | *[!A-Za-z0-9@%+=:,./_-]*) return 1 ;;
+  *-cwd) ;;
+  *) return 1 ;;
+  esac
+  case $1 in 'eval '* | *' && eval '*) return 0 ;; esac
+  return 1
+}
+if ! gw_tool_shape "$1"; then
+  # macOS's /bin/sh is bash, which counts itself in SHLVL: the shell that
+  # started this file and this file's own shell are one level each where
+  # Claude Code's /bin/sh is one, so give one back (dash leaves SHLVL alone).
+  if [ -n "${BASH_VERSION-}" ]; then
+    case ${SHLVL-} in '' | *[!0-9]*) ;; *) [ "$SHLVL" -gt 0 ] && SHLVL=$((SHLVL - 1)) ;; esac
+  fi
+  exec /bin/sh -c "$1"
+fi
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin   # this file's own helpers (sed, env); not the command's
+GW_SCRIPT=$1
+
+gw_unknown() {
+  printf '%s\n' "gateway: the managed shell doesn't recognize how Claude Code asked to run this command ($1); it was not run, and the gateway never falls back to your own shell. /gate-doctor shows the managed shell's state; the user can switch it off with [shell] managed = \"off\" in gateway.toml (that needs their OK in the gateway's dialog)." >&2
+  exit 126
+}
+
+gw_notready() {
+  _todo=${2-}
+  [ -n "$_todo" ] || _todo="/gate-doctor shows the gateway's setup; on a first run, setup takes about a minute."
+  printf '%s\n' "gateway: the managed shell isn't ready ($1); the command was not run (the gateway never falls back to your own shell). $_todo" >&2
+  exit 75
+}
+
+# A word as Claude Code quotes it: bare, or '...' with '"'"' for a quote.
+gw_unquote() {
+  case $1 in
+  \'*\')
+    _u=${1#\'}
+    _u=${_u%\'}
+    case $_u in
+    *\'*) printf '%s' "$_u" | sed "s/'\"'\"'/'/g" ;;
+    *) printf '%s' "$_u" ;;
+    esac ;;
+  *\'* | *\"* | *' '*) return 1 ;;
+  *) printf '%s' "$1" ;;
+  esac
+}
+
+# The cwd tracker: the last segment, a file Claude Code reads back.
+case $GW_SCRIPT in *' && pwd -P >| '*) ;; *) gw_unknown "no working-directory tracker at its end" ;; esac
+GW_CWDQ=${GW_SCRIPT##*' && pwd -P >| '}
+case $GW_CWDQ in
+*"
+"*) gw_unknown "a line break after the working-directory tracker" ;;
+\'*-cwd\') ;;
+'' | *[!A-Za-z0-9@%+=:,./_-]*) gw_unknown "no working-directory tracker at its end" ;;
+*-cwd) ;;
+*) gw_unknown "no working-directory tracker at its end" ;;
+esac
+case $GW_SCRIPT in
+'eval '* | *' && eval '*) ;;
+*) gw_unknown "no eval of the command" ;;
+esac
+
+# The snapshot's source, replaced by the gateway's rc. Without a snapshot
+# (Claude Code couldn't make one) the script has no source segment.
+GW_SNAP=
+GW_BODY=$GW_SCRIPT
+case $GW_SCRIPT in
+'source '*)
+  _r=${GW_SCRIPT#source }
+  case $_r in *' 2>/dev/null || true && '*) ;; *) gw_unknown "an unexpected first segment" ;; esac
+  _q=${_r%%' 2>/dev/null || true && '*}
+  GW_BODY=${_r#*' 2>/dev/null || true && '}
+  GW_SNAP=$(gw_unquote "$_q") || gw_unknown "an unexpected snapshot path"
+  case $GW_SNAP in
+  /*/shell-snapshots/snapshot-*.sh) ;;
+  *) gw_unknown "a source of something other than Claude Code's shell snapshot" ;;
+  esac ;;
+*/shell-snapshots/snapshot-*) gw_unknown "a shell snapshot outside the first segment" ;;
+esac
+
+# The managed shell's files (managed.py writes them at session start, after a
+# form change and after an approval): conf holds one KEY=VALUE per line.
+case ${GW_MANAGED_DIR-} in
+/*) ;;
+*) gw_notready "the gateway mod didn't name its managed-shell folder: CLAUDE_CODE_SHELL_PREFIX names gate-sh, but GW_MANAGED_DIR is missing or not an absolute path" \
+  "The gateway mod sets both at session start, and Claude's commands keep both, so a Claude Code started from one of them stays managed; a Claude Code started some other way with CLAUDE_CODE_SHELL_PREFIX set by hand needs GW_MANAGED_DIR too, or neither (unset CLAUDE_CODE_SHELL_PREFIX and CLAUDE_CODE_SHELL). /gate-doctor shows the gateway's setup." ;;
+esac
+GW_CONF=$GW_MANAGED_DIR/conf
+gw_read_conf() {
+  GW_BASH='' GW_RC='' GW_PATH='' GW_ENV='' GW_MINE='' GW_FORM='' GW_SYNC='' GW_UNLOCKED=''
+  [ -f "$GW_CONF" ] && [ ! -L "$GW_CONF" ] || return 1
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    case $_l in
+    bash=*) GW_BASH=${_l#bash=} ;;
+    rc=*) GW_RC=${_l#rc=} ;;
+    path=*) GW_PATH=${_l#path=} ;;
+    env=*) GW_ENV=${_l#env=} ;;
+    mine=*) GW_MINE=${_l#mine=} ;;
+    form=*) GW_FORM=${_l#form=} ;;
+    sync=*) GW_SYNC=${_l#sync=} ;;
+    unlocked=*) GW_UNLOCKED=${_l#unlocked=} ;;
+    esac
+  done < "$GW_CONF"
+  return 0
+}
+gw_read_conf || gw_notready "its settings haven't been written yet"
+# gateway.toml changed after the settings were written (FileChanged didn't
+# run yet), or the vault was unlocked since (approved imports are inside it):
+# renew them first, so a narrowing applies to this command.
+if { [ -n "$GW_FORM" ] && [ "$GW_FORM" -nt "$GW_CONF" ]; } ||
+   { [ -n "$GW_UNLOCKED" ] && [ "$GW_UNLOCKED" -nt "$GW_CONF" ]; }; then
+  if [ -x "$GW_SYNC" ]; then "$GW_SYNC" < /dev/null > /dev/null 2>&1; fi
+  gw_read_conf || gw_notready "its settings couldn't be read"
+  if [ -n "$GW_FORM" ] && [ "$GW_FORM" -nt "$GW_CONF" ]; then
+    gw_notready "gateway.toml changed and its settings couldn't be renewed"
+  fi
+fi
+case $GW_BASH in /*) ;; *) gw_notready "no managed bash yet" ;; esac
+case $GW_BASH in *=*) gw_notready "the managed bash's path holds '='" ;; esac
+[ -x "$GW_BASH" ] || gw_notready "the gateway's environment is still being set up"
+case $GW_RC in /*) ;; *) gw_notready "no rc file yet" ;; esac
+[ -f "$GW_RC" ] && [ -r "$GW_RC" ] || gw_notready "its rc file is missing"
+case $GW_PATH in /*) ;; *) gw_notready "no PATH yet" ;; esac
+
+# Other plugins' bin/ folders, which Claude Code puts on PATH through the
+# snapshot: read (never sourced) from its PATH line, appended last.
+GW_PLUGIN_BINS=
+if [ -n "$GW_SNAP" ] && [ -f "$GW_SNAP" ] && [ -r "$GW_SNAP" ]; then
+  _line=$(sed -n 's/^export PATH=//p' "$GW_SNAP" | tail -n 1)
+  _line=$(gw_unquote "$_line") || _line=
+  set -f
+  _ifs=$IFS
+  IFS=:
+  for _d in $_line; do
+    case $_d in
+    /*/bin)
+      if [ -f "${_d%/bin}/.claude-plugin/plugin.json" ]; then
+        case ":$GW_PATH$GW_PLUGIN_BINS:" in *":$_d:"*) ;; *) GW_PLUGIN_BINS="$GW_PLUGIN_BINS:$_d" ;; esac
+      fi ;;
+    esac
+  done
+  IFS=$_ifs
+  set +f
+fi
+
+# The curated environment: what it keeps of Claude Code's environment (by
+# name), everything else removed by name. Only names reach env's command
+# line (every local user can read a process's arguments; its environment
+# only the owner can), never a value.
+GW_PASS='HOME USER LOGNAME LANG TERM TMPDIR TZ PWD XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR __CF_USER_TEXT_ENCODING CLAUDECODE GIT_EDITOR AI_AGENT COREPACK_ENABLE_AUTO_PIN NoDefaultCurrentDirectoryInExePath GW_MANAGED_DIR'
+gw_credlike() {
+  case $1 in
+  *TOKEN* | *SECRET* | *PASSW* | *PASSPHRASE* | *CRED* | *API_KEY* | *APIKEY* | *ACCESS_KEY* | *PRIVATE_KEY* | *CLIENT_KEY* | *CLIENT_CERT* | *AUTH* | *COOKIE* | *SESSION_KEY*) return 0 ;;
+  esac
+  return 1
+}
+# Every name in the environment this shell gives its children (one per line
+# that holds a '='; a line of a value that spans lines can add a name that
+# isn't there, which `env -u` ignores): kept, or removed with `-u NAME`
+# (ordinary names collected in GW_DROP, which splits safely; any other name
+# as positional arguments).
+GW_ENVTEXT=$(env) || gw_notready "its environment couldn't be listed"
+GW_KEEP=" $GW_PASS $GW_ENV "
+GW_DROP=
+set --
+set -f
+_ifs=$IFS
+IFS='
+'
+for _l in $GW_ENVTEXT; do
+  case $_l in [!=]*=*) ;; *) continue ;; esac
+  _n=${_l%%=*}
+  case $_n in
+  *[!A-Za-z0-9_]* | [0-9]*) set -- "$@" -u "$_n"; continue ;;
+  # others = "mine" (approved): the user's own ssh agent and token variables
+  *) case " $GW_MINE " in *" $_n "*) continue ;; esac
+     # the platform's, Claude Code's own, approved imports: never a credential-looking one
+     case $_n in
+     LC_* | CLAUDE_*) gw_credlike "$_n" || continue ;;
+     *) case $GW_KEEP in *" $_n "*) gw_credlike "$_n" || continue ;; esac ;;
+     esac ;;
+  esac
+  GW_DROP="$GW_DROP -u $_n"
+done
+IFS=$_ifs
+set +f
+GW_ENVTEXT=
+
+gw_q() {
+  case $1 in
+  *\'*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+  *) printf "'%s'" "$1" ;;
+  esac
+}
+set -f
+exec /usr/bin/env $GW_DROP "$@" "PATH=$GW_PATH$GW_PLUGIN_BINS" "SHELL=$GW_BASH" \
+  "$GW_BASH" --noprofile --norc -c ". $(gw_q "$GW_RC") && $GW_BODY"

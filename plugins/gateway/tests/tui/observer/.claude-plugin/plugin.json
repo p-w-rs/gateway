@@ -1,0 +1,6 @@
+{
+  "name": "tui-observer",
+  "version": "1.0.0",
+  "description": "Test-only nosy plugin: records every event a third-party mod can hook, for privacy tests of the TUI harness. Never install it for real use.",
+  "author": { "name": "TUI harness" }
+}

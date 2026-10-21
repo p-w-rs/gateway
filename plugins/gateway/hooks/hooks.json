@@ -1,11 +1,41 @@
 {
+  "description": "Gateway v3: Claude's environment and context (SessionStart, SubagentStart), the gateway daemon started and the session registered with it (async SessionStart), the approval hook for sudo/ssh/gate (PreToolUse Bash|Monitor, the user's Terminal panel, checkpoint's job_start and the gateway's own job_start and terminal_send), the gateway tools' decisions, the file guard (fails closed; also the desktop app's session export and transcript search), output scrubbing and form checks (PostToolUse; also checkpoint's job_tail, job_status and job_stop, which return a job's log), warnings for failed calls whose output Claude Code shows unmasked (PostToolUseFailure), the paste guard (UserPromptSubmit) and gateway.toml changes (FileChanged). See docs/SPEC-v3.md sections 7, 8, 12 and 14. The hooks module (mod/register.tsx; Claude Code 2.1.287+ terminal, 2.1.286+ desktop) adds the setup status line, provisioning at session start, the immediate /gate-doctor, the gateway's native dialogs, the terminal pane (/gate-terminal) and managed execution (CLAUDE_CODE_SHELL_PREFIX -> hooks/gate-sh: Claude's commands run in the gateway's own bash); every guard stays in the classic hooks, which hold when mods are off (the Bash hook then denies in managed mode: managed shell unavailable).",
+  "modules": ["./mod/register.tsx"],
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "pixi run --manifest-path \"${CLAUDE_PLUGIN_ROOT}/pixi.toml\" --frozen python \"${CLAUDE_PLUGIN_ROOT}/run.py\" hook-session"
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-session"],
+            "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "ensure-env"],
+            "async": true,
+            "timeout": 900
+          },
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-daemon"],
+            "async": true,
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-subagent"],
+            "timeout": 15
           }
         ]
       }
@@ -15,29 +45,95 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/prompt.sh\" \"${CLAUDE_PLUGIN_ROOT}\"",
-            "timeout": 330
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/prompt.sh"],
+            "timeout": 15,
+            "onFailure": "block"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Monitor|mcp__terminal__run_in_terminal|mcp__plugin_check_jobs__job_start|mcp__plugin_gate_gw__job_start|mcp__plugin_gate_gw__terminal_send",
         "hooks": [
           {
             "type": "command",
-            "command": "pixi run --manifest-path \"${CLAUDE_PLUGIN_ROOT}/pixi.toml\" --frozen python \"${CLAUDE_PLUGIN_ROOT}/run.py\" hook-route",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/pre_bash.sh"],
             "timeout": 15
           }
         ]
       },
       {
-        "matcher": "mcp__plugin_gate_gw__.*|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "mcp__plugin_gate_gw__.*",
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/perm.sh\" \"${CLAUDE_PLUGIN_ROOT}\"",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/mcp_perm.sh"],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-files"],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__ccd_session_mgmt__(export_transcript|search_session_transcripts|list_events)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-files"],
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts|mcp__ccd_session_mgmt__list_events|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status|mcp__plugin_check_jobs__job_stop)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/post.sh"],
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts|mcp__ccd_session_mgmt__list_events|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status|mcp__plugin_check_jobs__job_stop)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/post.sh"],
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "hook-filechanged"],
             "timeout": 15
           }
         ]

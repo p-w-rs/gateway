@@ -1,365 +1,626 @@
-"""The gateway's own encrypted vault: secrets and sudo passwords.
+"""Vault v3: ~/.config/gateway/private/vault.age (SPEC 3).
 
-Separate from any personal secret store. Lives in $GATEWAY_HOME (default
-${XDG_CONFIG_HOME:-~/.config}/gateway):
+age-encrypted JSON (same crypto and locking as v2): `age -e -r RECIPIENT`
+and `age -d -i key.txt` through stdin/stdout only, atomic replace, and a
+flock on private/.lock around every read-modify-write. age comes from the
+gateway's pixi env by absolute path (never PATH).
 
-    key.txt     age identity, generated on first write (mode 600)
-    store.age   the vault, age-encrypted JSON (mode 600)
+    {"version": 3,
+     "machine": {"id", "name", "hostname"},
+     "localhost": {"sudo": {USER: {"password", "updated", "stale"}}},
+     "hosts": {NAME: {"keys": [{"private", "public", "fingerprint", "created", "retired"}],
+                      "host_keys": ["ssh-ed25519 AAAA..."],
+                      "sudo": {USER: {"password", "updated", "stale"}},
+                      "probe": {"nopasswd": {USER: "<when>"}}}},
+     "accounts": {NAME: {"kind", "token": {"value", "source", "updated", "stale"},
+                         "ssh_key": {"private", "public", "fingerprint"},
+                         "entra": {"refresh_token" | "client_secret", "client_id", "tenant_id",
+                                   "refreshed", "kind"},     (client_secret: a service principal)
+                         "host_keys": [...],
+                         "bound": {"hosts": [...], "tenant", "client_id", "auth", "scope"}}},
+     "approved": {"form_sha256", "at", "rights": {...}},      (consent.py)
+     "form_last_good": "<text>",
+     "aliases": {"github:work": "github-work"},
+     "events": [{"n", "at", "what", "detail"}], "events_seen": N,
+     "migrated": {"from", "store_sha256", "at", "report", "shown"}}
 
-The JSON looks like:
-    {"version": 1,
-     "secrets": {"HF_TOKEN": {"value": "...", "description": "...",
-                              "hosts": ["huggingface.co"], "updated": "..."}},
-     "sudo": {"alice@localhost": {"user": "alice", "host": "localhost",
-                                   "password": "...", "updated": "..."}},
-     "accounts": {"github:work": {"kind": "github", "host": "github.com",
-                                  "login": "...", "owners": ["asirobots"],
-                                  "hosts": ["github.com", "api.github.com"],
-                                  "secrets": {"token": "...", "ssh_key": "..."},
-                                  "public_key": "ssh-ed25519 ...", "prompts": {},
-                                  "updated": "..."}},
-     "account_prompts": {"read": "auto", "write": "auto", ...}}
-
-An account is a named identity of a known kind (KINDS). Everything under its
-"secrets" is a value; the rest is what Claude may see (catalog()). Version 1
-vaults (no accounts) are read as-is and saved as version 2.
-
-Values are only ever decrypted into memory. The `age` binary comes from the
-plugin's pixi env, so this works the same on macOS, Linux and Windows.
+cache.age holds short-lived tokens (Entra access tokens, ACR refresh tokens)
+keyed by account and scope, with their expiry; it is safe to delete.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
+import copy
+import fcntl
 import json
 import os
 import re
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
 
-NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-# ssh alias, hostname, IPv4 or IPv6 (no leading '-', so never an ssh option).
-HOST_RE = re.compile(r"[A-Za-z0-9_\[][A-Za-z0-9._:%\[\]-]*")
-USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9._-]*")
-LOCAL_ALIASES = {"localhost", "local", "127.0.0.1", "::1", "this"}
+from . import paths, testing
+
+# hashlib, shutil, socket, tempfile and uuid are imported where they are used: the
+# PostToolUse hook loads this module for every response once a vault exists
+# (review round 5).
+
+VERSION = 3
+MAX_EVENTS = 100
+EVENT_KINDS = ("widen", "narrow", "bind", "export", "copy", "import", "migrate", "reject",
+               "hostkey", "forget")
+
+# Built-in SSH host keys (type + base64). GitHub's are its published keys
+# (fingerprints SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU ed25519,
+# p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM ecdsa, uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s
+# rsa); ssh.github.com:443 uses the same keys. hf.co's ed25519 key
+# (SHA256:dVjzGIdV7d6cwKIeZiCoRMa2gMvSKfGZAvHf4gMiMao) and the Nest's
+# (SHA256:iJjr1ZMOZNRGcEtLSDXFUUH0C4+5t7X9Wmhu4T4vcQI) were read 2026-10-17/18.
+GITHUB_HOST_KEYS = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
+]
+HF_HOST_KEYS = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINJjhgtT9FOQrsVSarIoPVI1jFMh3VSHdKfdqp/O776s"]
+NEST_HOST_KEYS = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6"]
+BUILTIN_HOST_KEYS: dict[tuple[str, int], list[str]] = {
+    ("github.com", 22): GITHUB_HOST_KEYS,
+    ("ssh.github.com", 443): GITHUB_HOST_KEYS,
+    ("ssh.github.com", 22): GITHUB_HOST_KEYS,
+    ("hf.co", 22): HF_HOST_KEYS,
+    ("nest.pijul.com", 22): NEST_HOST_KEYS,
+}
 
 
-def home() -> Path:
-    override = os.environ.get("GATEWAY_HOME")
-    if override:
-        return Path(override)
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "gateway"
+class VaultError(Exception):
+    """The vault can't be read or written (message holds no secret)."""
 
 
-def key_path() -> Path:
-    return home() / "key.txt"
+class VaultLocked(VaultError):
+    """The vault key has a passphrase (key mode "wrapped") and the gateway
+    daemon holds it locked, or can't be reached. The message says what to do
+    next (the daemon words it for the caller's session: interactive or not)."""
 
 
-def store_path() -> Path:
-    return home() / "store.age"
+# PLAN-v4 phase 2: the vault key's modes (key_mode()). "unwrapped": the age
+# identity in private/key.txt, read by each gateway process as before.
+# "wrapped": private/key.wrapped (the identity encrypted to the user's
+# passphrase) and private/key.recipient; only the gateway daemon holds the
+# unlocked identity, and every other process gets (scoped) vault data from it
+# over its socket (daemon/broker.py, daemon/client.py).
+#
+# In the daemon process, _DAEMON_IDENTITY is the broker's identity(): it
+# answers the identity to decrypt with (None in unwrapped mode: key.txt is
+# read as before) or raises VaultLocked.
+_DAEMON_IDENTITY: Any = None
 
 
-def norm_host(host: str) -> str:
-    h = host.strip().lower()
-    return "localhost" if h in LOCAL_ALIASES else h
+def key_mode() -> str:
+    """'unwrapped' (key.txt), 'wrapped' (key.wrapped, no key.txt) or 'none'."""
+    if paths.key_path().is_file():
+        return "unwrapped"
+    if paths.wrapped_key_path().is_file():
+        return "wrapped"
+    return "none"
 
 
-def _age(tool: str = "age") -> str:
-    path = shutil.which(tool)
-    if not path:
-        raise RuntimeError(f"the {tool} binary was not found (it ships in the plugin's pixi env)")
-    return path
-
-
-VERSION = 2
-
-
-def _empty() -> dict[str, Any]:
-    # sudo_enabled: hosts enabled in every session (`/gate:enable sudo HOST always`).
-    # sudo_session: {host: [session ids]} enabled for those sessions only.
-    # run_privileged runs without asking there; elsewhere it needs approval.
-    # accounts / account_prompts: see the module docstring and KINDS.
-    return {"version": VERSION, "secrets": {}, "sudo": {}, "sudo_enabled": [],
-            "sudo_session": {}, "accounts": {}, "account_prompts": {},
-            # grants: open guided setups (setup.py), by id; never hold a value.
-            "grants": {},
-            # ssh_reuse: {ssh account: [session ids]} where the user typed
-            # /gate:enable reuse ACCOUNT (connection reuse, sshconf.py).
-            "ssh_reuse": {}}
-
-
-MAX_SESSIONS_PER_HOST = 20  # oldest session grants are dropped beyond this
-
-
-def load() -> dict[str, Any]:
-    """Decrypt the vault into memory. A missing vault is an empty one."""
-    if not store_path().exists():
-        return _empty()
-    if not key_path().is_file():
-        raise RuntimeError(f"vault key missing: {key_path()}")
-    out = subprocess.run([_age(), "-d", "-i", str(key_path()), str(store_path())],
-                         stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
-    if out.returncode != 0:
-        raise RuntimeError("could not decrypt the vault with its key")
-    data = json.loads(out.stdout.decode("utf-8"))
-    for k, v in _empty().items():
-        data.setdefault(k, v)
-    return data
-
-
-def _ensure_key() -> str:
-    """Create the vault dir and key if needed; return the key's recipient."""
-    d = home()
-    d.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(d, 0o700)
-    if not key_path().exists():
-        old = os.umask(0o077)
-        try:
-            subprocess.run([_age("age-keygen"), "-o", str(key_path())],
-                           check=True, capture_output=True, timeout=15)
-        finally:
-            os.umask(old)
-    with contextlib.suppress(OSError):
-        os.chmod(key_path(), 0o600)
-    out = subprocess.run([_age("age-keygen"), "-y", str(key_path())],
-                         check=True, capture_output=True, text=True, timeout=15)
-    return out.stdout.strip()
-
-
-def save(data: dict[str, Any]) -> None:
-    """Encrypt and atomically replace the vault. Plaintext goes via stdin only."""
-    recipient = _ensure_key()
-    data["version"] = VERSION
-    tmp = store_path().with_name(f"store.age.{os.getpid()}.tmp")
-    old = os.umask(0o077)
-    try:
-        subprocess.run([_age(), "-e", "-r", recipient, "-o", str(tmp)],
-                       input=json.dumps(data).encode("utf-8"),
-                       check=True, capture_output=True, timeout=15)
-        os.replace(tmp, store_path())
-    finally:
-        os.umask(old)
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-
-
-@contextlib.contextmanager
-def locked() -> Iterator[None]:
-    """Serialize read-modify-write cycles across processes."""
-    home().mkdir(parents=True, exist_ok=True)
-    with open(home() / ".lock", "a+") as f:
-        try:
-            import fcntl
-            fcntl.flock(f, fcntl.LOCK_EX)
-        except ImportError:  # Windows
-            import msvcrt
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-        yield
+def brokered() -> bool:
+    """Does this process get vault data from the gateway daemon? Only for a
+    wrapped key, and never in the daemon itself."""
+    return _DAEMON_IDENTITY is None and key_mode() == "wrapped"
 
 
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def empty() -> dict[str, Any]:
+    return {"version": VERSION, "machine": {}, "localhost": {"sudo": {}}, "hosts": {},
+            "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {},
+            "events": [], "events_seen": 0, "migrated": None}
+
+
+def _fill(data: dict[str, Any]) -> dict[str, Any]:
+    for k, v in empty().items():
+        data.setdefault(k, v)
+    data["localhost"].setdefault("sudo", {})
+    return data
+
+
 # ---------------------------------------------------------------------------
-# Lookups used by the gateway tools
+# age
 # ---------------------------------------------------------------------------
 
 
-def secret(name: str) -> dict[str, Any] | None:
-    return load()["secrets"].get(name)
+def _age(tool: str = "age") -> str:
+    try:
+        return paths.tool(tool)
+    except paths.ToolMissing as e:
+        raise VaultError(str(e)) from None
 
 
-def sudo_entries(host: str) -> list[dict[str, Any]]:
-    h = norm_host(host)
-    return [e for e in load()["sudo"].values() if e.get("host") == h]
+def exists() -> bool:
+    return paths.vault_path().is_file()
 
 
-def allow_secret_host(name: str, host: str) -> list[str]:
-    """Add a host to a secret's allowed list (the user approved it)."""
+def ensure_key() -> str:
+    """private/ (0700) and key.txt (0600, created if missing). Returns the
+    key's recipient. A wrapped key is never replaced by a new key.txt."""
+    paths.ensure_private()
+    k = paths.key_path()
+    if not k.exists() and paths.wrapped_key_path().is_file():
+        return recipient()
+    if not k.exists():
+        old = os.umask(0o077)
+        try:
+            subprocess.run([_age("age-keygen"), "-o", str(k)], check=True,
+                           capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            raise VaultError("age-keygen could not create the vault key") from None
+        finally:
+            os.umask(old)
+    with contextlib.suppress(OSError):
+        os.chmod(k, 0o600)
+    return recipient()
+
+
+def recipient() -> str:
+    if not paths.key_path().is_file() and paths.wrapped_key_path().is_file():
+        try:
+            r = paths.recipient_path().read_text(encoding="ascii").strip()
+        except OSError:
+            r = ""
+        if not re.fullmatch(r"age1[0-9a-z]{58}", r):
+            raise VaultError("the vault key's recipient (private/key.recipient) is missing")
+        return r
+    out = subprocess.run([_age("age-keygen"), "-y", str(paths.key_path())],
+                         capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    if out.returncode != 0 or not out.stdout.startswith("age1"):
+        raise VaultError("the vault key can't be read")
+    return out.stdout.strip()
+
+
+def _decrypt(path: Path) -> bytes:
+    if _DAEMON_IDENTITY is not None:
+        ident = _DAEMON_IDENTITY()          # the daemon: its unlocked identity (or VaultLocked)
+        if ident is not None:
+            from .daemon import broker
+            return broker.decrypt_file(ident, path)
+    if not paths.key_path().is_file():
+        if paths.wrapped_key_path().is_file():
+            raise VaultLocked("gateway: the gateway vault is locked")
+        raise VaultError("the vault key (private/key.txt) is missing")
+    out = subprocess.run([_age(), "-d", "-i", str(paths.key_path()), str(path)],
+                         stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    if out.returncode != 0:
+        raise VaultError(f"could not decrypt {path.name} with the vault key")
+    return out.stdout
+
+
+def _encrypt_to(path: Path, plaintext: bytes) -> None:
+    rec = ensure_key()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    old = os.umask(0o077)
+    try:
+        r = subprocess.run([_age(), "-e", "-r", rec, "-o", str(tmp)], input=plaintext,
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            raise VaultError(f"age could not encrypt {path.name}")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        os.umask(old)
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+# ---------------------------------------------------------------------------
+# load / save / lock
+# ---------------------------------------------------------------------------
+
+
+def load() -> dict[str, Any]:
+    """Decrypt the vault into memory. A missing vault is an empty one. With a
+    wrapped key (brokered()): the daemon's view for this program (secrets it
+    may not see are sentinels), asked of the daemon on every call."""
+    p = paths.vault_path()
+    if not p.exists():
+        return empty()
+    if brokered():
+        from .daemon import client
+        return _fill(client.vault_read())
+    try:
+        data = json.loads(_decrypt(p).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise VaultError("the vault isn't valid JSON") from None
+    if not isinstance(data, dict) or data.get("version") != VERSION:
+        raise VaultError(f"unexpected vault version {data.get('version') if isinstance(data, dict) else '?'}")
+    return _fill(data)
+
+
+def save(data: dict[str, Any], *, migrating: bool = False) -> None:
+    """Encrypt and atomically replace the vault. While a v2 store.age waits
+    for migration, a new vault.age is never created (except by migration), so
+    a failed migration retries next time instead of being skipped."""
+    p = paths.vault_path()
+    if not migrating and not p.exists() and paths.v2_store_path().exists():
+        raise VaultError("the 0.6 vault hasn't been migrated yet (run gate migrate)")
+    data["version"] = VERSION
+    data["events"] = list(data.get("events") or [])[-MAX_EVENTS:]
+    if brokered():
+        from .daemon import client
+        client.vault_write(data, migrating=migrating)
+        return
+    _encrypt_to(p, json.dumps(data, sort_keys=True).encode("utf-8"))
+
+
+@contextlib.contextmanager
+def locked() -> Iterator[None]:
+    """Serialize read-modify-write cycles across processes (private/.lock)."""
+    paths.ensure_private()
+    with open(paths.lock_path(), "a+") as f:
+        with contextlib.suppress(OSError):
+            os.chmod(paths.lock_path(), 0o600)
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def edit() -> Iterator[dict[str, Any]]:
+    """with vault.edit() as data: ... -- locked load, saved if changed."""
     with locked():
         data = load()
-        s = data["secrets"].get(name)
-        if s is None:
-            raise RuntimeError(f"no secret named {name}")
-        if host not in s.setdefault("hosts", []):
-            s["hosts"].append(host)
+        before = json.dumps(data, sort_keys=True)
+        yield data
+        if json.dumps(data, sort_keys=True) != before:
             save(data)
-        return list(s["hosts"])
-
-
-def sudo_enabled(host: str, session_id: str | None = None,
-                 data: dict[str, Any] | None = None) -> bool:
-    """Enabled for every session, or for this session (if its id is known)."""
-    data = data if data is not None else load()
-    h = norm_host(host)
-    return h in data["sudo_enabled"] or bool(
-        session_id and session_id in data["sudo_session"].get(h, []))
-
-
-def sudo_state(host: str, session_id: str | None = None,
-               data: dict[str, Any] | None = None) -> str:
-    data = data if data is not None else load()
-    h = norm_host(host)
-    if h in data["sudo_enabled"]:
-        return "ENABLED in every session: runs without asking"
-    if session_id and session_id in data["sudo_session"].get(h, []):
-        return "ENABLED for this session: runs without asking"
-    return "disabled: each root command asks"
-
-
-def enable_for_session(data: dict[str, Any], host: str, session_id: str) -> None:
-    ids = data["sudo_session"].setdefault(norm_host(host), [])
-    if session_id not in ids:
-        ids.append(session_id)
-        del ids[:-MAX_SESSIONS_PER_HOST]
-
-
-def clear_sudo(data: dict[str, Any], host: str) -> None:
-    """Disable sudo on a host everywhere (all sessions and 'always')."""
-    h = norm_host(host)
-    if h in data["sudo_enabled"]:
-        data["sudo_enabled"].remove(h)
-    data["sudo_session"].pop(h, None)
 
 
 # ---------------------------------------------------------------------------
-# Accounts: named identities of a known kind
+# cache.age (short-lived tokens)
 # ---------------------------------------------------------------------------
 
-# kind:name, e.g. github:work. The name part is lower case so refs are stable.
-ACCOUNT_RE = re.compile(r"([a-z]+):([a-z0-9][a-z0-9._-]{0,63})")
-# A GitHub/HF owner or org, a Nest user, ... (no '/', never a leading '-').
-OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}")
-EMAIL_RE = re.compile(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+")
-GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
-PROMPT_CLASSES = ("read", "write", "delete", "exec")
-PROMPT_VALUES = ("auto", "ask", "refuse")
-DEFAULT_PROMPTS = {"read": "auto", "write": "auto", "delete": "ask", "exec": "ask"}
-
-# The Azure CLI's public client: Microsoft's own SDKs default to it for
-# interactive sign-in, and it is pre-authorized for ARM, Storage and Databricks.
-AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
-
-# fields: the non-secret settings the form asks for (besides description).
-# secrets: which credential kinds the account can hold.
-# owners: whether the scope includes owners/orgs (beyond hosts).
-KINDS: dict[str, dict[str, Any]] = {
-    "github": {"label": "GitHub", "host": "github.com",
-               "fields": ("host", "login", "name", "email"),
-               "secrets": ("token", "ssh_key"), "owners": True},
-    "hf": {"label": "Hugging Face", "host": "huggingface.co",
-           "fields": ("login",), "secrets": ("token", "ssh_key"), "owners": True},
-    "pijul": {"label": "Pijul (the Nest or a self-hosted server)", "host": "nest.pijul.com",
-              "fields": ("host", "login", "name", "email", "remote_pijul"),
-              "secrets": ("ssh_key",), "owners": True},
-    "azure": {"label": "Azure (Microsoft Entra ID)", "host": "management.azure.com",
-              "fields": ("tenant", "client_id", "login"), "secrets": ("refresh_token",),
-              "owners": False},
-    "mlcat": {"label": "ASI ML Catalog", "host": "app-dev-ai-mlreg.azurewebsites.net",
-              "fields": ("host", "login"), "secrets": ("refresh_token",), "owners": False},
-    "ssh": {"label": "SSH host", "host": "",
-            "fields": ("host", "user", "port", "jump"), "secrets": ("ssh_key",), "owners": False},
-    "registry": {"label": "Container registry", "host": "",
-                 "fields": ("host", "login", "via"), "secrets": ("token",), "owners": True},
-}
-SECRET_FIELDS = ("token", "ssh_key", "refresh_token")  # refresh_token: an SSO sign-in
-
-
-# The Nest's SSH host key (ed25519, SHA256:iJjr1ZMOZNRGcEtLSDXFUUH0C4+5t7X9Wmhu4T4vcQI),
-# read 2026-10-17. Pijul can't ask whether to trust a new key without a
-# terminal, so pijul and ssh accounts carry pinned keys.
-NEST_KNOWN_HOSTS = ("nest.pijul.com ssh-ed25519 "
-                    "AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6")
-PINNED_KINDS = ("pijul", "ssh")
-
-
-def keyscan(host: str, port: str = "") -> str:
-    """The host's SSH keys as known_hosts lines (ssh-keyscan), or "".
-    Used only from a setup the user started (/gate:add, /gate:update: their trust decision);
-    GATEWAY_KEYSCAN=none turns it off (tests)."""
-    if host == "nest.pijul.com" and port in ("", "22"):
-        return NEST_KNOWN_HOSTS
-    if os.environ.get("GATEWAY_KEYSCAN") == "none" or not HOST_RE.fullmatch(host):
-        return ""
-    tool = Path(sys.executable).parent / "ssh-keyscan"
-    cmd = [str(tool) if tool.exists() else (shutil.which("ssh-keyscan") or "ssh-keyscan"),
-           "-T", "5", "-t", "ed25519,ecdsa,rsa"]
-    if port and port != "22":
-        cmd += ["-p", port]
+def cache_load() -> dict[str, Any]:
+    p = paths.cache_path()
+    if not p.exists():
+        return {"tokens": {}}
+    if brokered():
+        from .daemon import client
+        try:
+            c = client.cache_read()
+        except VaultError:
+            return {"tokens": {}}
+        return c if isinstance(c.get("tokens"), dict) else {"tokens": {}}
     try:
-        out = subprocess.run(cmd + ["--", host], capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return "\n".join(l for l in out.stdout.splitlines() if l.strip() and not l.startswith("#"))
+        c = json.loads(_decrypt(p).decode("utf-8"))
+        if isinstance(c, dict) and isinstance(c.get("tokens"), dict):
+            return c
+    except (VaultError, UnicodeDecodeError, ValueError):
+        pass
+    return {"tokens": {}}  # unreadable cache: start over (it is safe to lose)
 
 
-def host_key_fingerprints(known_hosts: str) -> list[str]:
-    out = []
-    for line in known_hosts.splitlines():
-        parts = line.split()
-        if len(parts) >= 3:
-            out.append(f"{parts[1]} {fingerprint_of(' '.join(parts[1:3]))}")
+def cache_save(c: dict[str, Any]) -> None:
+    t = time.time()
+    c["tokens"] = {k: v for k, v in c.get("tokens", {}).items()
+                   if isinstance(v, dict) and float(v.get("expires", 0)) > t}
+    if brokered():
+        from .daemon import client
+        client.cache_write(c)
+        return
+    _encrypt_to(paths.cache_path(), json.dumps(c, sort_keys=True).encode("utf-8"))
+
+
+def _ckey(account: str, scope: str) -> str:
+    return f"{account}|{scope}"
+
+
+def cache_get(account: str, scope: str, margin: float = 120.0) -> str | None:
+    """A cached token valid for at least `margin` more seconds, or None."""
+    e = cache_load()["tokens"].get(_ckey(account, scope))
+    if e and float(e.get("expires", 0)) - margin > time.time():
+        return e.get("value")
+    return None
+
+
+def cache_put(account: str, scope: str, value: str, expires_at: float) -> None:
+    """Store a minted token (call under locked())."""
+    c = cache_load()
+    c["tokens"][_ckey(account, scope)] = {"value": value, "expires": float(expires_at)}
+    cache_save(c)
+
+
+def cache_clear(account: str | None = None) -> None:
+    if account is None:
+        with contextlib.suppress(FileNotFoundError):
+            paths.cache_path().unlink()
+        return
+    c = cache_load()
+    c["tokens"] = {k: v for k, v in c["tokens"].items() if not k.startswith(account + "|")}
+    cache_save(c)
+
+
+def cache_values() -> list[str]:
+    return [v["value"] for v in cache_load()["tokens"].values() if v.get("value")]
+
+
+# ---------------------------------------------------------------------------
+# Events (last 100 security events; SessionStart shows the new ones)
+# ---------------------------------------------------------------------------
+
+
+def add_event(data: dict[str, Any], what: str, detail: str) -> dict[str, Any]:
+    evs = data.setdefault("events", [])
+    n = max([e.get("n", 0) for e in evs] + [data.get("events_seen", 0)]) + 1
+    e = {"n": n, "at": now(), "what": what, "detail": str(detail)[:500]}
+    evs.append(e)
+    del evs[:-MAX_EVENTS]
+    return e
+
+
+def new_events(data: dict[str, Any]) -> list[dict[str, Any]]:
+    seen = data.get("events_seen", 0) or 0
+    return [e for e in data.get("events", []) if e.get("n", 0) > seen]
+
+
+def mark_events_seen(data: dict[str, Any]) -> None:
+    ns = [e.get("n", 0) for e in data.get("events", [])]
+    if ns:
+        data["events_seen"] = max(ns + [data.get("events_seen", 0) or 0])
+
+
+# ---------------------------------------------------------------------------
+# Machine identity
+# ---------------------------------------------------------------------------
+
+
+def machine_id() -> str | None:
+    """IOPlatformUUID (macOS), /etc/machine-id (Linux), else None."""
+    o = testing.get("machine_id")
+    if o is not None:
+        return o
+    if os.path.exists("/usr/sbin/ioreg"):
+        try:
+            out = subprocess.run(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                                 capture_output=True, text=True, timeout=5,
+                                 stdin=subprocess.DEVNULL)
+            m = re.search(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]{36})"', out.stdout)
+            if m:
+                return m.group(1).upper()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    for f in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            v = Path(f).read_text().strip()
+            if re.fullmatch(r"[0-9a-f]{32}", v):
+                return v
+        except OSError:
+            continue
+    return None
+
+
+def short_hostname() -> str:
+    import socket
+    h = socket.gethostname().split(".")[0].lower()
+    h = re.sub(r"[^a-z0-9-]", "-", h).strip("-")
+    if not h or not h[0].isalpha():
+        h = "m-" + h if h else "machine"
+    return h[:32]
+
+
+def ensure_machine(data: dict[str, Any]) -> bool:
+    """Fill data['machine'] (id, name, hostname). True if it changed. A
+    machine without a stable id keeps a random one stored in the vault."""
+    import socket
+    import uuid
+    m = data.setdefault("machine", {})
+    before = dict(m)
+    mid = machine_id()
+    if mid:
+        m["id"] = mid
+    elif not str(m.get("id", "")).startswith("random:"):
+        m["id"] = "random:" + str(uuid.uuid4())
+    m.setdefault("name", short_hostname())
+    m["hostname"] = socket.gethostname()
+    return m != before
+
+
+# ---------------------------------------------------------------------------
+# Records and lookups (never hand values to anything that prints)
+# ---------------------------------------------------------------------------
+
+
+def resolve(data: dict[str, Any], name: str, entries: Any = ()) -> str:
+    """Follow aliases (github:work -> github-work, OPENAI_API_KEY -> ...). A
+    name in `entries` (the form's entry names) is never redirected."""
+    if name in entries:
+        return name
+    return (data.get("aliases") or {}).get(name, name)
+
+
+def host_record(data: dict[str, Any], name: str) -> dict[str, Any]:
+    h = data.setdefault("hosts", {}).setdefault(name, {})
+    h.setdefault("keys", [])
+    h.setdefault("host_keys", [])
+    h.setdefault("sudo", {})
+    h.setdefault("probe", {"nopasswd": {}})
+    return h
+
+
+def account_record(data: dict[str, Any], name: str, kind: str | None = None) -> dict[str, Any]:
+    a = data.setdefault("accounts", {}).setdefault(name, {})
+    if kind:
+        a.setdefault("kind", kind)
+    a.setdefault("bound", {"hosts": []})
+    a["bound"].setdefault("hosts", [])
+    return a
+
+
+def sudo_entry(data: dict[str, Any], host: str, user: str) -> dict[str, Any] | None:
+    if host == "localhost":
+        return (data.get("localhost") or {}).get("sudo", {}).get(user)
+    return ((data.get("hosts") or {}).get(host) or {}).get("sudo", {}).get(user)
+
+
+def set_sudo(data: dict[str, Any], host: str, user: str, password: str) -> None:
+    rec = {"password": password, "updated": now(), "stale": False}
+    if host == "localhost":
+        data.setdefault("localhost", {}).setdefault("sudo", {})[user] = rec
+    else:
+        host_record(data, host)["sudo"][user] = rec
+
+
+def forget_sudo(data: dict[str, Any], host: str, user: str) -> bool:
+    """Drop one stored sudo password (passwordless sudo replaced it)."""
+    m = (data.get("localhost") or {}).get("sudo", {}) if host == "localhost" else \
+        ((data.get("hosts") or {}).get(host) or {}).get("sudo", {})
+    return m.pop(user, None) is not None
+
+
+# The user's answer to gate check's "store the sudo password, or set up
+# passwordless sudo?" per (host, user): "password" or "nopasswd". Per machine
+# (an install on this machine's hosts), so export leaves it out.
+def sudo_choice(data: dict[str, Any], host: str, user: str) -> str | None:
+    c = ((data.get("sudo_choice") or {}).get(host) or {}).get(user)
+    # "ask" (PLAN-v4 phase 7): leave the password to the per-call dialog;
+    # "nopasswd" is only kept from earlier versions (the gateway installed a rule then)
+    return c if c in ("password", "nopasswd", "ask") else None
+
+
+def set_sudo_choice(data: dict[str, Any], host: str, user: str, choice: str | None) -> None:
+    m = data.setdefault("sudo_choice", {}).setdefault(host, {})
+    if choice is None:
+        m.pop(user, None)
+    else:
+        m[user] = choice
+    if not m:
+        data["sudo_choice"].pop(host, None)
+
+
+def mark_stale(data: dict[str, Any], entry: str, what: str, user: str | None = None) -> bool:
+    """Mark a rejected credential stale (never retried). what: sudo|token."""
+    if what == "sudo" and user:
+        e = sudo_entry(data, entry, user)
+        if e is not None:
+            e["stale"] = True
+            return True
+    if what == "token":
+        t = ((data.get("accounts") or {}).get(entry) or {}).get("token")
+        if t:
+            t["stale"] = True
+            return True
+    return False
+
+
+def key_record(private: str, public: str | None = None, created: str | None = None) -> dict[str, Any]:
+    pub = public or public_key_of(private)
+    return {"private": normalize_key(private), "public": pub.strip(),
+            "fingerprint": fingerprint_of(pub), "created": created or now(), "retired": None}
+
+
+def live_keys(host: dict[str, Any]) -> list[dict[str, Any]]:
+    return [k for k in host.get("keys", []) if not k.get("retired")]
+
+
+def meta(data: dict[str, Any]) -> dict[str, Any]:
+    """What is stored, without any value (for status, stubs, git config)."""
+    out: dict[str, Any] = {"localhost": {"sudo": {}}, "hosts": {}, "accounts": {}}
+    for u, e in (data.get("localhost") or {}).get("sudo", {}).items():
+        out["localhost"]["sudo"][u] = {"stale": bool(e.get("stale")), "updated": e.get("updated")}
+    for n, h in (data.get("hosts") or {}).items():
+        out["hosts"][n] = {
+            "keys": [k.get("fingerprint", "") for k in live_keys(h)],
+            "host_keys": host_key_fingerprints(h.get("host_keys", [])),
+            "sudo": {u: {"stale": bool(e.get("stale")), "updated": e.get("updated")}
+                     for u, e in (h.get("sudo") or {}).items()},
+            "installed": h.get("installed"),
+        }
+    for n, a in (data.get("accounts") or {}).items():
+        tok = a.get("token") or {}
+        out["accounts"][n] = {
+            "kind": a.get("kind"),
+            "token": bool(tok.get("value")), "token_source": tok.get("source"),
+            "stale": bool(tok.get("stale")),
+            "ssh_key": bool((a.get("ssh_key") or {}).get("private")),
+            "ssh_fingerprint": (a.get("ssh_key") or {}).get("fingerprint"),
+            "entra": bool((a.get("entra") or {}).get("refresh_token")
+                          or (a.get("entra") or {}).get("client_secret")),
+            "bound": list((a.get("bound") or {}).get("hosts") or []),
+        }
     return out
 
 
-def default_hosts(kind: str, host: str) -> list[str]:
-    """Where an account's credentials may go by default (host names, no ports)."""
-    if host and not host.startswith("[") and host.count(":") == 1:
-        host = host.split(":", 1)[0]
-    if kind == "github" and (host == "github.com" or host.endswith(".ghe.com")):
-        return [host, f"api.{host}"]
-    if kind == "hf":
-        return [host, "hf.co"] if host == "huggingface.co" else [host]
-    return [host] if host else []
+def all_values(data: dict[str, Any]) -> list[str]:
+    """Every secret value in the vault (for scrubbing)."""
+    vals: list[str] = []
+    for e in (data.get("localhost") or {}).get("sudo", {}).values():
+        vals.append(e.get("password") or "")
+    for h in (data.get("hosts") or {}).values():
+        vals += [k.get("private") or "" for k in h.get("keys", [])]
+        vals += [e.get("password") or "" for e in (h.get("sudo") or {}).values()]
+    for a in (data.get("accounts") or {}).values():
+        vals.append((a.get("token") or {}).get("value") or "")
+        vals.append((a.get("ssh_key") or {}).get("private") or "")
+        vals.append((a.get("entra") or {}).get("refresh_token") or "")
+        vals.append((a.get("entra") or {}).get("client_secret") or "")
+    return [v for v in dict.fromkeys(vals) if v and not is_redacted(v)]
 
 
-def parse_account_ref(ref: str) -> tuple[str, str] | None:
-    m = ACCOUNT_RE.fullmatch(ref or "")
-    return (m.group(1), m.group(2)) if m and m.group(1) in KINDS else None
+def is_redacted(v: Any) -> bool:
+    """A sentinel the gateway daemon put where a value this program may not
+    see was (daemon/broker.py); never a credential."""
+    return isinstance(v, str) and v.startswith("gw-redacted:") and len(v) == 44
 
 
-def account(ref: str, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    data = data if data is not None else load()
-    return data["accounts"].get(ref)
+def labeled_secrets(data: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    """(section, entry, what, value) for every secret value in the vault:
+    section is "localhost", "hosts" or "accounts"; what is "sudo password",
+    "ssh key", "token" or "sign-in". For a warning that names what to replace
+    and how (never the value itself)."""
+    out: list[tuple[str, str, str, str]] = []
+    for e in (data.get("localhost") or {}).get("sudo", {}).values():
+        out.append(("localhost", "localhost", "sudo password", e.get("password") or ""))
+    for name, h in (data.get("hosts") or {}).items():
+        out += [("hosts", name, "ssh key", k.get("private") or "") for k in h.get("keys", [])]
+        out += [("hosts", name, "sudo password", e.get("password") or "")
+                for e in (h.get("sudo") or {}).values()]
+    for name, a in (data.get("accounts") or {}).items():
+        out.append(("accounts", name, "token", (a.get("token") or {}).get("value") or ""))
+        out.append(("accounts", name, "ssh key", (a.get("ssh_key") or {}).get("private") or ""))
+        out.append(("accounts", name, "sign-in", (a.get("entra") or {}).get("refresh_token") or ""))
+        out.append(("accounts", name, "client secret",
+                    (a.get("entra") or {}).get("client_secret") or ""))
+    return [t for t in out if t[3] and not is_redacted(t[3])]
 
 
-def effective_prompts(acct: dict[str, Any], data: dict[str, Any],
-                      session_id: str | None = None) -> dict[str, str]:
-    """Per-class prompt policy: a switch the user typed for this session
-    (/gate:enable CLASS ACCOUNT), then the account's own, then the vault
-    default, then DEFAULT_PROMPTS. The session is the MCP server's
-    (CLAUDE_CODE_SESSION_ID) unless given."""
-    if session_id is None:
-        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
-    out = dict(DEFAULT_PROMPTS)
-    out.update({k: v for k, v in data.get("account_prompts", {}).items()
-                if k in PROMPT_CLASSES and v in PROMPT_VALUES})
-    out.update({k: v for k, v in acct.get("prompts", {}).items()
-                if k in PROMPT_CLASSES and v in PROMPT_VALUES})
-    if session_id:
-        for k, ids in acct.get("session_prompts", {}).items():
-            if k in PROMPT_CLASSES and session_id in ids:
-                out[k] = "auto"
-    return out
+def labeled_values(data: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(entry, what, value) for every secret value in the vault (labeled_secrets
+    without the section)."""
+    return [(e, w, v) for _s, e, w, v in labeled_secrets(data)]
 
 
-def methods(acct: dict[str, Any]) -> list[str]:
-    return [k for k in SECRET_FIELDS if acct.get("secrets", {}).get(k)]
+def export_view(data: dict[str, Any]) -> dict[str, Any]:
+    """The vault minus cache-like and per-machine consent state (SPEC 16)."""
+    d = copy.deepcopy(data)
+    for k in ("approved", "imported", "form_last_good", "events", "events_seen", "sudo_choice"):
+        d.pop(k, None)
+    return d
 
 
-def _ssh_keygen() -> str:
-    path = shutil.which("ssh-keygen")
-    if not path:
-        raise RuntimeError("ssh-keygen was not found (it ships with OpenSSH)")
-    return path
+# ---------------------------------------------------------------------------
+# SSH keys (carried over from v2)
+# ---------------------------------------------------------------------------
+
+
+def normalize_key(private_key: str) -> str:
+    """LF line endings, no stray spaces, one trailing newline."""
+    return "\n".join(line.strip() for line in private_key.strip().splitlines()) + "\n"
 
 
 def _ssh_string(buf: bytes, pos: int) -> tuple[bytes, int]:
@@ -369,17 +630,9 @@ def _ssh_string(buf: bytes, pos: int) -> tuple[bytes, int]:
     return buf[pos + 4:pos + 4 + n], pos + 4 + n
 
 
-def normalize_key(private_key: str) -> str:
-    """A pasted key as ssh-add wants it: LF line endings (browsers submit
-    textareas with CRLF), no stray spaces, one trailing newline."""
-    return "\n".join(line.strip() for line in private_key.strip().splitlines()) + "\n"
-
-
 def public_key_of(private_key: str) -> str:
-    """The OpenSSH public key line for an OpenSSH private key, parsed here
-    (stdlib only; nothing written to disk). Keys with a passphrase are
-    refused: the gateway loads keys into a private ssh-agent unattended."""
-    import base64
+    """The OpenSSH public key line of an unencrypted OpenSSH private key,
+    parsed in Python (nothing written to disk). Passphrase keys are refused."""
     text = private_key.strip()
     head, tail = "-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----"
     if not (text.startswith(head) and text.endswith(tail)):
@@ -401,79 +654,106 @@ def public_key_of(private_key: str) -> str:
     except (ValueError, IndexError) as e:
         raise ValueError("that is not an OpenSSH private key") from e
     if cipher != b"none":
-        raise ValueError("that key has a passphrase; the gateway needs a key without one "
-                         "(it never leaves the vault and a private agent)")
+        raise ValueError("that key has a passphrase; the gateway needs a key without one")
     if nkeys != 1 or priv[:4] != priv[4:8]:
         raise ValueError("that is not an OpenSSH private key")
     return f"{keytype.decode()} {base64.b64encode(blob).decode()}"
 
 
 def fingerprint_of(public_key: str) -> str:
-    """SHA256:… as ssh-keygen -l prints it."""
-    import base64
+    """SHA256:... as ssh-keygen -l prints it ("" if unparsable)."""
     import hashlib
-    try:
-        blob = base64.b64decode(public_key.split()[1])
-    except (IndexError, ValueError):
-        return ""
-    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    parts = public_key.split()
+    for i, p in enumerate(parts):  # accept "host type key" and "type key"
+        if p.startswith(("ssh-", "ecdsa-", "sk-")) and i + 1 < len(parts):
+            try:
+                blob = base64.b64decode(parts[i + 1], validate=True)
+            except ValueError:
+                return ""
+            return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    return ""
+
+
+def key_comment(name: str, data: dict[str, Any]) -> str:
+    """The comment on a key the gateway makes for entry NAME:
+    `gateway-NAME@MACHINE`, so an authorized_keys line says which entry and
+    which machine's gateway it belongs to (README, Uninstall)."""
+    m = (data.get("machine") or {}).get("name") or short_hostname()
+    m = re.sub(r"[^a-z0-9-]", "-", str(m).lower())[:32] or "machine"
+    return f"gateway-{name}@{m}"
 
 
 def generate_ssh_key(comment: str) -> tuple[str, str]:
-    """A new ed25519 key pair (private, public). ssh-keygen can only write
-    files, so it writes into a private temp dir inside the vault home, which
-    is read and removed at once."""
+    """A new ed25519 key pair (private, public). ssh-keygen writes only files,
+    so it writes into a 0700 temp dir inside private/, read and removed at once."""
+    import shutil
     import tempfile
-    home().mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix=".keygen-", dir=home()))
+    paths.ensure_private()
+    tmp = Path(tempfile.mkdtemp(prefix=".keygen-", dir=paths.private_dir()))
     try:
         os.chmod(tmp, 0o700)
-        subprocess.run([_ssh_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", comment,
-                        "-f", str(tmp / "k")], check=True, capture_output=True,
+        try:
+            kg = paths.tool("ssh-keygen")
+        except paths.ToolMissing as e:
+            raise VaultError(str(e)) from None
+        subprocess.run([kg, "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f",
+                        str(tmp / "k")], check=True, capture_output=True,
                        stdin=subprocess.DEVNULL, timeout=15)
         return (tmp / "k").read_text().strip() + "\n", (tmp / "k.pub").read_text().strip()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def account_view(ref: str, acct: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
-    """What Claude may know about one account: never a value."""
-    kind = acct.get("kind", "")
-    view = {"kind": kind, "description": acct.get("description", "")}
-    for f in KINDS.get(kind, {}).get("fields", ()):
-        if acct.get(f):
-            view[f] = acct[f]
-    if KINDS.get(kind, {}).get("owners"):
-        view["owners"] = list(acct.get("owners", []))
-    view["hosts"] = list(acct.get("hosts", []))
-    view["methods"] = methods(acct)
-    if acct.get("public_key"):
-        view["key_fingerprint"] = acct.get("key_fingerprint", "")
-        view["public_key"] = acct["public_key"]  # the half to paste on a site; not a secret
-    if kind in PINNED_KINDS:
-        view["host_keys"] = host_key_fingerprints(acct.get("known_hosts", ""))
-    view["prompts"] = effective_prompts(acct, data)
-    return view
+def norm_host_key(line: str) -> str | None:
+    """'host type key [comment]' or 'type key' -> 'type key' (None if not a key)."""
+    parts = line.split()
+    for i, p in enumerate(parts):
+        if p.startswith(("ssh-", "ecdsa-", "sk-")) and i + 1 < len(parts):
+            return f"{p} {parts[i + 1]}"
+    return None
 
 
-def catalog(data: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Everything Claude may know about the vault: never a value."""
-    data = data if data is not None else load()
-    return {
-        "secrets": {n: {"description": s.get("description", ""),
-                        "hosts": list(s.get("hosts", []))}
-                    for n, s in sorted(data["secrets"].items())},
-        "sudo": sorted(data["sudo"]),
-        "sudo_enabled": sorted(data["sudo_enabled"]),
-        "sudo_session": {h: list(ids) for h, ids in data["sudo_session"].items() if ids},
-        "accounts": {r: account_view(r, a, data) for r, a in sorted(data["accounts"].items())},
-    }
+def host_key_fingerprints(keys: list[str] | str) -> list[str]:
+    """['ssh-ed25519 SHA256:...'] for host keys (list or known_hosts text)."""
+    if isinstance(keys, str):
+        keys = keys.splitlines()
+    out = []
+    for k in keys:
+        n = norm_host_key(k)
+        if n:
+            out.append(f"{n.split()[0]} {fingerprint_of(n)}")
+    return out
 
 
-def all_values(data: dict[str, Any] | None = None) -> list[str]:
-    data = data if data is not None else load()
-    vals = [s["value"] for s in data["secrets"].values()]
-    vals += [e["password"] for e in data["sudo"].values()]
-    vals += [v for a in data["accounts"].values()
-             for v in a.get("secrets", {}).values() if isinstance(v, str)]
-    return [v for v in vals if v]
+def builtin_host_keys(host: str, port: int = 22) -> list[str]:
+    return list(BUILTIN_HOST_KEYS.get((host.lower(), int(port)), []))
+
+
+def keyscan(host: str, port: int = 22) -> list[str]:
+    """The host's SSH keys ('type key'), built-in for github.com, hf.co and the
+    Nest; else ssh-keyscan (from the pixi env). [] if unreachable. Used only by
+    setup the user started (gate check); migration never scans."""
+    built = builtin_host_keys(host, port)
+    if built:
+        return built
+    fake = testing.get("keyscan")
+    if fake is not None:
+        if callable(fake):
+            return list(fake(host, int(port)))
+        return list(fake.get(f"{host}:{port}", fake.get(host, [])))
+    try:
+        tool = paths.tool("ssh-keyscan")
+    except paths.ToolMissing:
+        return []
+    if host.startswith("-"):
+        return []
+    cmd = [tool, "-T", "5", "-t", "ed25519,ecdsa,rsa"]
+    if int(port) != 22:
+        cmd += ["-p", str(int(port))]
+    try:
+        out = subprocess.run(cmd + ["--", host], capture_output=True, text=True, timeout=20,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    keys = [norm_host_key(l) for l in out.stdout.splitlines() if l.strip() and not l.startswith("#")]
+    return list(dict.fromkeys(k for k in keys if k))

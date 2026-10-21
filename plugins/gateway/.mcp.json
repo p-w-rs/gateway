@@ -2,16 +2,9 @@
   "mcpServers": {
     "gw": {
       "type": "stdio",
-      "command": "pixi",
-      "args": [
-        "run",
-        "--manifest-path",
-        "${CLAUDE_PLUGIN_ROOT}/pixi.toml",
-        "--frozen",
-        "python",
-        "${CLAUDE_PLUGIN_ROOT}/run.py",
-        "server"
-      ]
+      "command": "sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh", "mcp"],
+      "alwaysLoad": true
     }
   }
 }

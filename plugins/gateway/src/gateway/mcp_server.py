@@ -1,693 +1,474 @@
-"""Minimal MCP stdio server for gateway — pure standard library.
+"""The MCP server `gw` (SPEC 14): hand-rolled stdio JSON-RPC, standard library only.
 
-Implements just enough of the Model Context Protocol to expose tools over
-stdio JSON-RPC: initialize, tools/list, tools/call — plus a server-to-client
-`elicitation/create` request, used to get the USER's approval for actions whose
-policy tier is "ask". The model has no way to approve on the user's behalf.
-No third-party dependencies, so it runs anywhere the plugin's pixi Python runs.
+Tools: `http` and `download` (web.py), `host_inspect` (managed.inspect: a
+read-only look at what this machine offers for the managed shell), and the
+terminal and job tools (PLAN-v4 phase 5: `terminal_open`, `terminal_read`,
+`terminal_send`, `terminal_resize`, `terminal_signal`, `terminal_close`,
+`terminal_list`, `job_start`, `job_status`, `job_tail`, `job_signal`,
+`job_list`), which ask gated's supervisor over its socket (terminals.py;
+the PTYs live in gated's tmux, never on this server's stdio), each
+listed with
+`_meta: {"anthropic/alwaysLoad": true}` so Claude sees them without a
+ToolSearch round trip. initialize negotiates the protocol version (the
+client's if supported, else the newest we speak), ping answers {},
+notifications get no answer, unknown methods get -32601, a line that isn't
+JSON gets -32700 (id null), a JSON value that isn't a request -32600.
+
+tools/call runs on worker threads (a slow download doesn't block a ping or
+another call); every message goes out through one locked writer, so lines
+never interleave. Errors never carry raw exception text.
 """
 from __future__ import annotations
 
-import itertools
+import concurrent.futures
 import json
 import sys
-from collections import deque
-from typing import Any
+import threading
+from typing import Any, Callable, TextIO
 
-from . import __version__, actions, dbops, ghops, gitops, hfops, mirrors, mlcat, pijulops, policy, regops, sshops, vault
+from . import __version__
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+# Version comes from the package (kept equal to plugin.json), so an update
+# never leaves the server reporting a stale number (tests/test_release.py).
+SERVER_INFO = {"name": "gw", "version": __version__}
+MAX_WORKERS = 8
+ALWAYS = {"anthropic/alwaysLoad": True}
+INSTRUCTIONS = (
+    "The gateway's web tools. http: any http(s) request (GET/HEAD need no prompt); with "
+    "account=NAME the gateway adds that account's key or token, only for the account's own "
+    "sites. download: save a file into the project (never overwrites, never executable). "
+    "curl and wget are refused in Bash; use these instead. host_inspect: what this machine "
+    "offers the managed shell (login PATH folders, toolchains, project toolchain files), read "
+    "without running anything. Terminals (terminal_*): real PTYs the user can watch and take "
+    "over (/gate-terminal); read the screen, then send input quoting the seq you read (a stale "
+    "seq or a terminal the user holds is refused: read again). Never type a password into a "
+    "terminal: a password prompt opens the gateway's own dialog for the user. Jobs (job_*): a "
+    "command run in its own PTY that outlives this turn and session; job_tail shows its output.")
 
-_PRIV_SCHEMA: dict[str, Any] = {
+HTTP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "host": {"type": "string",
-                 "description": "'localhost', an ssh alias, host name or IP"},
-        "user": {"type": "string",
-                 "description": "only if several users are stored for the host"},
+        "url": {"type": "string", "description": "an http:// or https:// URL"},
+        "method": {"type": "string", "default": "GET",
+                   "description": "GET, HEAD, POST, PUT, PATCH, DELETE, ..."},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {"type": "string", "description": "request body (text)"},
+        "json": {"description": "a JSON value sent as the body (sets Content-Type)"},
+        "account": {"type": "string",
+                    "description": "a gateway account (gate status lists them); its key or token "
+                                   "is added, only for the account's own sites"},
+        "auth": {"type": "string",
+                 "description": "api-key accounts only, to override where the key goes: bearer, "
+                                "basic, header:NAME, header:NAME:PREFIX or query:PARAM"},
+        "scope": {"type": "string",
+                  "description": "azure accounts, for a host listed under `sites`: its Entra scope "
+                                 "(https://example.com/.default)"},
+        "save_to": {"type": "string",
+                    "description": "write the response body to this new file instead of returning it"},
+        "timeout": {"type": "number", "default": 30, "maximum": 300},
+        "max_bytes": {"type": "integer", "default": 5000000},
+    },
+    "required": ["url"],
+}
+DOWNLOAD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "an http:// or https:// URL"},
+        "account": {"type": "string", "description": "a gateway account whose credential the site needs"},
+        "save_to": {"type": "string",
+                    "description": "a new file (default: the project folder + the URL's file name)"},
+    },
+    "required": ["url"],
+}
+INSPECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "host": {"type": "string", "default": "localhost",
+                 "description": "localhost, or a host in gateway.toml (its name or id): read on "
+                                "that host through the gateway's own connection (its read "
+                                "policy decides)"},
+        "project": {"type": "string",
+                    "description": "a project folder whose toolchain files to list (default: the "
+                                   "session's project)"},
+    },
+}
+ID_PROP = {"type": "string", "description": "a terminal id (t_...) or job id (j_...)"}
+SIGNAL_PROP = {"type": "string", "enum": ["INT", "TERM", "KILL", "HUP", "QUIT", "STOP", "CONT",
+                                          "TSTP", "USR1", "USR2", "WINCH"]}
+HOST_PROP = {"type": "string", "default": "localhost",
+             "description": "localhost, or a host in gateway.toml (its name or id): the terminal "
+                            "or job then runs there in the gateway's managed remote runtime (bash "
+                            "and tmux staged on first use; ssh = true needed)"}
+TERM_OPEN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "host": HOST_PROP,
+        "cwd": {"type": "string", "description": "absolute folder to start in (default: the project "
+                                                 "on localhost, the home folder on a remote host)"},
+        "cols": {"type": "integer", "minimum": 20, "maximum": 400, "default": 120},
+        "rows": {"type": "integer", "minimum": 5, "maximum": 150, "default": 32},
+        "workspace": {"type": "string", "description": "a workspace of that host (its name or w_ "
+                                                       "id): cwd defaults to its root and must be "
+                                                       "inside it"},
+        "task_ref": {"type": "string", "description": "an opaque task reference to keep with it"},
+    },
+}
+TERM_READ_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": ID_PROP,
+        "history": {"type": "integer", "minimum": 0, "maximum": 2000, "default": 0,
+                    "description": "also return this many lines of scrollback above the screen"},
+        "take": {"type": "boolean", "default": False,
+                 "description": "take the input from another agent of this session (or adopt a "
+                                "terminal whose session ended); never from the user"},
+    },
+    "required": ["id"],
+}
+TERM_SEND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": ID_PROP,
+        "seq": {"type": "integer", "description": "the seq of the screen you read (terminal_read, "
+                                                  "or the last send's answer)"},
+        "text": {"type": "string", "description": "text to type (no control characters; a newline "
+                                                  "is Enter)"},
+        "keys": {"type": "array", "items": {"type": "string"},
+                 "description": "keys after the text: Enter, Tab, Escape, BSpace, Up, Down, Left, "
+                                "Right, Home, End, PageUp, PageDown, Delete, F1-F12, C-a..C-z, M-x"},
+        "enter": {"type": "boolean", "default": False, "description": "press Enter at the end"},
+        "delay_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 0,
+                     "description": "wait this long before typing (the input is queued meanwhile; a "
+                                    "user takeover cancels it)"},
+        "read_after": {"type": "boolean", "default": True,
+                       "description": "return the screen after the input"},
+    },
+    "required": ["id", "seq"],
+}
+TERM_RESIZE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"id": ID_PROP, "cols": {"type": "integer", "minimum": 20, "maximum": 400},
+                   "rows": {"type": "integer", "minimum": 5, "maximum": 150}},
+    "required": ["id", "cols", "rows"],
+}
+TERM_SIGNAL_SCHEMA: dict[str, Any] = {
+    "type": "object", "properties": {"id": ID_PROP, "signal": SIGNAL_PROP},
+    "required": ["id", "signal"],
+}
+ID_ONLY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {"id": ID_PROP}, "required": ["id"]}
+EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
+JOB_START_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "a bash command string (or give argv)"},
         "argv": {"type": "array", "items": {"type": "string"},
-                 "description": "e.g. [\"systemctl\", \"restart\", \"caddy\"]"},
-        "timeout": {"type": "integer", "default": 120,
-                    "description": "seconds, max 600"},
+                 "description": "the program and its arguments (or give command)"},
+        "cwd": {"type": "string", "description": "absolute folder to run in (default: the project "
+                                                 "on localhost, the home folder on a remote host)"},
+        "host": HOST_PROP,
+        "workspace": {"type": "string", "description": "a workspace of that host (its name or w_ "
+                                                       "id): cwd defaults to its root and must be "
+                                                       "inside it"},
+        "on_pause": {"type": "string", "enum": ["continue", "interrupt", "suspend", "detach"],
+                     "default": "continue",
+                     "description": "what a pause of the task does to this job"},
+        "idempotency_key": {"type": "string",
+                            "description": "the same key within 24 h returns the job it started "
+                                           "instead of starting another"},
+        "task_ref": {"type": "string"},
     },
-    "required": ["host", "argv"],
+}
+JOB_TAIL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"id": ID_PROP,
+                   "bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 8192},
+                   "lines": {"type": "integer", "minimum": 1, "description": "at most this many lines"}},
+    "required": ["id"],
 }
 
-_GIT_SCHEMA: dict[str, Any] = {
+RUNTIME_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "git arguments without 'git', e.g. [\"push\", \"origin\", \"main\"]"},
-        "cwd": {"type": "string", "description": "the repository (absolute path); for clone, "
-                                                 "the directory to clone into"},
-        "account": {"type": "string", "description": "KIND:NAME, only to choose between "
-                                                     "several accounts that fit the remote"},
-        "timeout": {"type": "integer", "default": 300},
+        "host": {"type": "string", "description": "a remote host in gateway.toml (name or id)"},
+        "action": {"type": "string", "enum": ["status", "provision", "clean"], "default": "status",
+                   "description": "status: identity, reachability, authentication and runtime "
+                                  "readiness; provision: stage the runtime now; clean: remove the "
+                                  "host's older runtime versions that run nothing"},
     },
-    "required": ["args", "cwd"],
-}
-_GH_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "gh arguments without 'gh', e.g. [\"pr\", \"list\"]"},
-        "cwd": {"type": "string", "description": "a repository (absolute path), so gh knows "
-                                                 "the repo and the account"},
-        "account": {"type": "string", "description": "github:NAME"},
-        "timeout": {"type": "integer", "default": 300},
-    },
-    "required": ["args"],
+    "required": ["host"],
 }
 
-_HF_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "hf arguments without 'hf', e.g. [\"download\", \"org/model\"]"},
-        "cwd": {"type": "string", "description": "working directory (absolute path)"},
-        "account": {"type": "string", "description": "hf:NAME"},
-        "timeout": {"type": "integer", "default": 1800},
-    },
-    "required": ["args"],
-}
-
-_PIJUL_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "pijul arguments without 'pijul', e.g. [\"record\", \"-a\", \"-m\", \"msg\"]"},
-        "cwd": {"type": "string", "description": "the repository (absolute path)"},
-        "account": {"type": "string", "description": "pijul:NAME"},
-        "timeout": {"type": "integer", "default": 600},
-    },
-    "required": ["args", "cwd"],
-}
-
-_COPY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "account": {"type": "string", "description": "ssh:NAME"},
-        "direction": {"type": "string", "enum": ["up", "down"]},
-        "local": {"type": "string", "description": "absolute local path"},
-        "remote": {"type": "string", "description": "path on the server"},
-        "recursive": {"type": "boolean", "default": False},
-        "timeout": {"type": "integer", "default": 1800},
-    },
-    "required": ["account", "direction", "local", "remote"],
-}
-
-_DB_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "databricks arguments, e.g. [\"clusters\", \"list\"]"},
-        "account": {"type": "string", "description": "azure:NAME"},
-        "workspace": {"type": "string", "description": "the workspace host or URL"},
-        "cwd": {"type": "string"},
-        "timeout": {"type": "integer", "default": 600},
-    },
-    "required": ["args", "account", "workspace"],
-}
-
-_MLW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "action": {"type": "string", "enum": ["init", "clone", "pull", "push", "status"]},
-        "cwd": {"type": "string", "description": "the workspace folder (absolute path)"},
-        "artifact": {"type": "string", "description": "datasets/NAME[@rev] or models/NAME[@rev]"},
-        "revision": {"type": "string", "description": "pull: a revision hash, or latest"},
-        "data_dir": {"type": "string", "default": "data"},
-        "account": {"type": "string", "description": "mlcat:NAME"},
-        "timeout": {"type": "integer", "default": 3600},
-    },
-    "required": ["action", "cwd"],
-}
-
-_REG_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "args": {"type": "array", "items": {"type": "string"},
-                 "description": "crane arguments, e.g. [\"ls\", \"ghcr.io/org/image\"]"},
-        "account": {"type": "string", "description": "registry:NAME"},
-        "timeout": {"type": "integer", "default": 1800},
-    },
-    "required": ["args", "account"],
-}
+TERM_TOOLS: list[tuple[str, str, dict[str, Any], str]] = [
+    ("terminal_open", "/agent/term/open", TERM_OPEN_SCHEMA,
+     "Open a persistent terminal (a real PTY in the gateway's managed bash: no user rc, the "
+     "gateway's PATH and stand-ins) that survives this turn and a Claude Code restart, and that "
+     "the user can watch and take over with /gate-terminal ID. Returns its id and first screen "
+     "(seq, lines, cursor)."),
+    ("terminal_read", "/agent/term/read", TERM_READ_SCHEMA,
+     "Read a terminal's screen, bounded and scrubbed of secrets: visible lines, cursor, whether a "
+     "full-screen program uses the alternate screen, the title, owner (agent or user), seq (quote "
+     "it in terminal_send), truncated; optionally the last N scrollback lines."),
+    ("terminal_send", "/agent/term/send", TERM_SEND_SCHEMA,
+     "Type into a terminal you hold: text and/or keys. Quote the seq you read: if the screen "
+     "changed since, or the user took the input, it is refused and you read again. Never type a "
+     "password: a password prompt opens the gateway's dialog for the user. Returns the screen "
+     "after."),
+    ("terminal_resize", "/agent/term/resize", TERM_RESIZE_SCHEMA,
+     "Resize a terminal you hold (columns, rows)."),
+    ("terminal_signal", "/agent/term/signal", TERM_SIGNAL_SCHEMA,
+     "Send a signal to a terminal's foreground program (INT is what ^C does)."),
+    ("terminal_close", "/agent/term/close", ID_ONLY_SCHEMA,
+     "Close a terminal (its programs get a hangup) or a job's pane."),
+    ("terminal_list", "/agent/term/list", EMPTY_SCHEMA,
+     "List the gateway's terminals and jobs: id, state, owner, cwd, which are this session's."),
+    ("job_start", "/agent/job/start", JOB_START_SCHEMA,
+     "Start a command as a gateway job in its own PTY (the managed environment): it outlives this "
+     "turn and session; poll it with job_status/job_tail. on_pause says what pausing the task "
+     "does to it; an idempotency_key makes a retry return the same job. On a remote host a "
+     "start whose answer was lost comes back as state unknown (start_confirmed false): the "
+     "gateway asks the host; don't start it again before job_status says."),
+    ("job_status", "/agent/job/status", ID_ONLY_SCHEMA,
+     "A job's state (running, waiting_auth, suspended, disconnected, exited, canceled, failed, "
+     "unknown), exit code or signal, command (scrubbed), times; stop_requested when a close "
+     "didn't (provably) reach its host."),
+    ("job_tail", "/agent/job/tail", JOB_TAIL_SCHEMA,
+     "The end of a job's output, scrubbed of secrets and bounded (64 KiB at most), with "
+     "truncated and offset."),
+    ("job_signal", "/agent/job/signal", TERM_SIGNAL_SCHEMA,
+     "Send a signal to a job's process group (TERM or KILL stops it: state canceled)."),
+    ("job_list", "/agent/job/list", EMPTY_SCHEMA, "List the gateway's jobs."),
+    ("host_runtime", "/agent/remote/runtime", RUNTIME_SCHEMA,
+     "A remote host's managed runtime (the gateway's own bash and tmux there, used by terminals and "
+     "jobs on that host): its verified machine identity, whether it is reachable and accepts the "
+     "gateway's key, and the runtime's readiness and version, as of the last contact "
+     "(checked_at; unknown once nothing has asked the host for a while); or stage it now, or "
+     "clean old versions. Nothing of the host's own shell setup is used."),
+]
+TERM_ROUTES = {name: route for name, route, _schema, _desc in TERM_TOOLS}
 
 TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "http_request",
-        "description": (
-            "Make an HTTP request (any method, custom headers, body). Use this "
-            "INSTEAD OF curl, wget, Invoke-WebRequest, or Invoke-RestMethod. For "
-            "simply reading a web page, prefer the built-in WebFetch tool. "
-            "Only http:// and https:// URLs. If policy requires approval, the "
-            "user is prompted directly. Authenticate with auth_ref = the NAME of "
-            "a secret the user stored with /gate:add secret (see secret_list or the "
-            "session's vault catalog); it is sent only to hosts the user allowed "
-            "and its value is never shown to you."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "method": {"type": "string", "default": "GET"},
-                "url": {"type": "string"},
-                "headers": {"type": "object"},
-                "body": {"type": "string"},
-                "auth_ref": {"type": "string",
-                             "description": "Secret NAME from the vault (e.g. HF_TOKEN), or an account with a token (e.g. github:work)"},
-                "auth_scope": {"type": "string",
-                               "description": "azure accounts only: arm (default), storage, "
-                                              "graph, databricks, or a full scope like "
-                                              "api://<app>/.default"},
-                "auth_header": {"type": "string", "default": "Authorization",
-                                "description": "Header to put the secret in, e.g. X-Api-Key"},
-                "auth_scheme": {"type": "string", "default": "Bearer",
-                                "description": "Prefix before the value; \"\" for the raw value"},
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "download",
-        "description": ("Download a file to the quarantine folder (not executed; "
-                        "never overwrites; size-capped). Use INSTEAD OF curl -O / wget."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"url": {"type": "string"}},
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "port_check",
-        "description": ("Check whether TCP ports are reachable on a host you "
-                        "operate. Use INSTEAD OF nmap/masscan for simple up/down "
-                        "connectivity checks. The user may be asked to approve."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "target": {"type": "string"},
-                "ports": {"type": "array", "items": {"type": "integer"}},
-            },
-            "required": ["target"],
-        },
-    },
-    {
-        "name": "secret_list",
-        "description": ("List the vault's secrets (names, descriptions, allowed "
-                        "hosts) and stored sudo targets. Never returns values. Use "
-                        "INSTEAD OF `security find/dump`, cmdkey, or certutil -store."),
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "secret_use",
-        "description": ("Check that a vault secret NAME exists and which hosts it "
-                        "may be sent to, without revealing its value."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"ref": {"type": "string"}},
-            "required": ["ref"],
-        },
-    },
-    {
-        "name": "run_privileged",
-        "description": ("Run one command as root (sudo) on 'localhost' or on a "
-                        "host with a stored sudo password, where the user has "
-                        "ENABLED sudo: it runs without asking. On a host where "
-                        "sudo is disabled it is refused: use run_privileged_confirm "
-                        "instead. The sudo password is injected by the gateway "
-                        "and never shown to you. Remote hosts are reached with "
-                        "ssh keys. Pass the command as an argv list, not a shell "
-                        "string; it gets no stdin. Network/credential tools "
-                        "(curl, wget, ...) are refused here too."),
-        "inputSchema": _PRIV_SCHEMA,
-    },
-    {
-        "name": "run_privileged_confirm",
-        "description": ("Same as run_privileged, for hosts where sudo is disabled: "
-                        "the user approves each call in Claude Code's permission "
-                        "prompt, seeing the exact host and argv."),
-        "inputSchema": _PRIV_SCHEMA,
-    },
-    {
-        "name": "cert_inspect",
-        "description": ("Inspect a server's TLS certificate (subject, issuer, "
-                        "expiry, SANs, SHA-256 fingerprint). Works on self-signed or "
-                        "expired certs too: `verified` and `verify_error` say whether "
-                        "normal validation passed. Use INSTEAD OF certutil / "
-                        "openssl s_client."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"host": {"type": "string"},
-                           "port": {"type": "integer", "default": 443}},
-            "required": ["host"],
-        },
-    },
-    {
-        "name": "file_hash",
-        "description": "Hash a local file. Use INSTEAD OF certutil -hashfile.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"},
-                           "algo": {"type": "string", "default": "sha256"}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "gate_setup",
-        "description": (
-            "Finish a setup the user started by typing /gate:add or /gate:update (read the "
-            "gate:setup skill first). Pass the grant id from that command's note and a "
-            "proposal; the gateway shows the user a native dialog with the change and asks "
-            "there for any password or token (never ask for those in chat). Proposal: "
-            "secret {what:'secret', name, description, hosts:[...], new_value?}; sudo "
-            "{what:'sudo', user, host}; account {what:'account', kind, name, description, "
-            "fields:{host, login, name, email, user, port, jump, tenant, via, ...}, owners:[...], "
-            "credentials:{browser?: true, token?: 'ask', ssh_key?: 'generate'|'file', "
-            "ssh_key_file?: path}}. For an update, give only what changes. If it answers "
-            "refused, fix the proposal and call again with the same grant."),
-        "inputSchema": {"type": "object", "properties": {
-            "grant": {"type": "string", "description": "the id from the /gate: command's note, e.g. g-1a2b3c4d"},
-            "proposal": {"type": "object"}}, "required": ["grant", "proposal"]},
-    },
-    {
-        "name": "account_list",
-        "description": ("The user's gateway accounts (KIND:NAME, e.g. github:work): kind, "
-                        "login, owners/hosts they are for, methods (token, ssh_key), prompt "
-                        "policy. Never values. The git and gh tools pick the matching "
-                        "account themselves; pass account= only to choose between several."),
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "git",
-        "description": ("Run ANY git command (use INSTEAD OF git in Bash). Local commands run "
-                        "without credentials. fetch/pull/push/clone/ls-remote use the "
-                        "user's account for that remote's host and owner (token for https, "
-                        "SSH key for ssh), never the user's own environment. If the "
-                        "account's policy asks first, the call is refused with use: "
-                        "git_confirm: then call git_confirm with the same arguments. Plain "
-                        "force pushes are refused (use --force-with-lease via git_confirm). "
-                        "Non-interactive only: pass -m messages, no editors or -i/-p."),
-        "inputSchema": _GIT_SCHEMA,
-    },
-    {
-        "name": "git_confirm",
-        "description": ("Same as git, after Claude Code asks the user: for calls the account's "
-                        "policy marks ask (often deletes or force-with-lease), or that the "
-                        "user should see first."),
-        "inputSchema": _GIT_SCHEMA,
-    },
-    {
-        "name": "git_identity",
-        "description": ("Make this repo commit as an account: sets the repo's own user.name "
-                        "and user.email from the account (and gateway.account). No secrets."),
-        "inputSchema": {"type": "object",
-                        "properties": {"cwd": {"type": "string", "description": "the repo (absolute path)"},
-                                       "account": {"type": "string", "description": "KIND:NAME"}},
-                        "required": ["cwd", "account"]},
-    },
-    {
-        "name": "gh",
-        "description": ("Run GitHub's CLI as a gateway account (use INSTEAD OF gh in Bash): "
-                        "pr/issue/run/release/repo view|list|create|..., gh api. The account "
-                        "comes from account=, else the repo's origin, else the only GitHub "
-                        "account. Refused: auth, extensions, alias, config, browse/--web, "
-                        "repo clone/sync, pr checkout, and repo create/fork with clone/push/remote options (use the git tool). If the "
-                        "policy asks first, call gh_confirm with the same arguments."),
-        "inputSchema": _GH_SCHEMA,
-    },
-    {
-        "name": "git_mirror",
-        "description": ("Keep a repo's branches and tags the same on several remotes (e.g. "
-                        "personal and work GitHub), each fetched/pushed as its own account. "
-                        "action: status (compare), sync (fast-forward the remotes that are "
-                        "behind; diverged branches and conflicting tags are left alone, never "
-                        "forced), add/remove (the saved set, in the repo's gateway.mirror "
-                        "config). See the accounts skill."),
-        "inputSchema": {"type": "object", "properties": {
-            "cwd": {"type": "string", "description": "the repo (absolute path)"},
-            "action": {"type": "string", "enum": ["status", "sync", "add", "remove"]},
-            "remotes": {"type": "array", "items": {"type": "string"},
-                        "description": "remote names; default: the saved set"},
-            "branches": {"type": "array", "items": {"type": "string"},
-                         "description": "only these branches (default: all on any remote)"},
-            "tags": {"type": "boolean", "default": True}},
-            "required": ["cwd", "action"]},
-    },
-    {
-        "name": "hf",
-        "description": ("Run the Hugging Face CLI as a gateway account (use INSTEAD OF hf / "
-                        "huggingface-cli in Bash): download, upload (Xet), repo create/delete, "
-                        "ls, jobs, cache. The account comes from account=, else the repo id's "
-                        "owner, else the only HF account. Sign-in (hf auth) is the gateway's. "
-                        "Git pushes to the Hub go through the git tool. If the policy asks "
-                        "first, call hf_confirm with the same arguments."),
-        "inputSchema": _HF_SCHEMA,
-    },
-    {
-        "name": "hf_confirm",
-        "description": "Same as hf, after Claude Code asks the user.",
-        "inputSchema": _HF_SCHEMA,
-    },
-    {
-        "name": "pijul",
-        "description": ("Run ANY pijul command as a gateway Pijul account (use INSTEAD OF pijul "
-                        "in Bash): init/add/record/log/diff/channel locally; push/pull/clone "
-                        "over ssh://user@host/owner/repo (the Nest is nest.pijul.com). record "
-                        "signs with the account's key; push/pull authenticate with it. The "
-                        "user's own pijul config and identities are never used. If the "
-                        "policy asks first, call pijul_confirm with the same arguments."),
-        "inputSchema": _PIJUL_SCHEMA,
-    },
-    {
-        "name": "pijul_confirm",
-        "description": "Same as pijul, after Claude Code asks the user.",
-        "inputSchema": _PIJUL_SCHEMA,
-    },
-    {
-        "name": "ssh_exec",
-        "description": ("Run a command on a server as a gateway ssh account (use INSTEAD OF ssh "
-                        "in Bash). argv is a list (no shell strings). The account's key and "
-                        "pinned host key are used, never the user's own ssh setup. Most "
-                        "accounts ask first (exec=ask): then call ssh_exec_confirm. For root, "
-                        "use run_privileged."),
-        "inputSchema": {"type": "object", "properties": {
-            "account": {"type": "string", "description": "ssh:NAME"},
-            "argv": {"type": "array", "items": {"type": "string"}},
-            "timeout": {"type": "integer", "default": 300}},
-            "required": ["account", "argv"]},
-    },
-    {
-        "name": "ssh_exec_confirm",
-        "description": "Same as ssh_exec, after Claude Code asks the user.",
-        "inputSchema": {"type": "object", "properties": {
-            "account": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
-            "timeout": {"type": "integer", "default": 300}}, "required": ["account", "argv"]},
-    },
-    {
-        "name": "ssh_copy",
-        "description": ("Copy a file or folder to (up) or from (down) a server as a gateway ssh "
-                        "account (use INSTEAD OF scp/rsync/sftp in Bash). If the policy asks "
-                        "first, call ssh_copy_confirm."),
-        "inputSchema": _COPY_SCHEMA,
-    },
-    {
-        "name": "ssh_copy_confirm",
-        "description": "Same as ssh_copy, after Claude Code asks the user.",
-        "inputSchema": _COPY_SCHEMA,
-    },
-    {
-        "name": "ssh_hosts",
-        "description": ("The gateway's ssh accounts (read-only): routes (ways in, tried in "
-                        "order), jump host, host-key policy and pinned fingerprints, key "
-                        "fingerprints, whether connection reuse is on for this session. With "
-                        "probe=true, also which route it would use right now and why. Use it "
-                        "to explain or troubleshoot ssh; never shows a key or password."),
-        "inputSchema": {"type": "object", "properties": {
-            "account": {"type": "string", "description": "ssh:NAME (default: all)"},
-            "probe": {"type": "boolean", "default": False}}},
-    },
-    {
-        "name": "databricks",
-        "description": ("Run the Databricks CLI as a gateway azure account (use INSTEAD OF "
-                        "databricks in Bash): workspace is the workspace host (e.g. "
-                        "adb-123.4.azuredatabricks.net, which must be one of the account's "
-                        "hosts); an Entra token is minted for it. auth/configure/sync and "
-                        "--profile/--host are refused. If the policy asks first, call "
-                        "databricks_confirm."),
-        "inputSchema": _DB_SCHEMA,
-    },
-    {
-        "name": "databricks_confirm",
-        "description": "Same as databricks, after Claude Code asks the user.",
-        "inputSchema": _DB_SCHEMA,
-    },
-    {
-        "name": "mlcat",
-        "description": ("Read the ASI ML Catalog as a gateway mlcat account: action=search "
-                        "(kind, query, page), item (kind=dataset|model, name, version), files "
-                        "(version, prefix, skip, take). Use mlcat_workspace to get or publish "
-                        "data. Never run asiml or dvc in Bash."),
-        "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["search", "item", "files"]},
-            "account": {"type": "string"}, "kind": {"type": "string"}, "name": {"type": "string"},
-            "version": {"type": "string"}, "query": {"type": "string"},
-            "page": {"type": "integer"}, "page_size": {"type": "integer"},
-            "prefix": {"type": "string"}, "skip": {"type": "integer"}, "take": {"type": "integer"}},
-            "required": ["action"]},
-    },
-    {
-        "name": "mlcat_workspace",
-        "description": ("asiml's workspace commands, as a gateway mlcat account (same "
-                        ".asiml format): init (artifact=datasets/NAME or models/NAME, data_dir), "
-                        "clone (artifact=datasets/NAME[@rev] into an empty cwd), pull "
-                        "(revision, or latest), push (publish the data folder; needs "
-                        "Catalog.Writer), status. Storage passes stay inside the gateway. If "
-                        "the policy asks first, call mlcat_workspace_confirm."),
-        "inputSchema": _MLW_SCHEMA,
-    },
-    {
-        "name": "mlcat_workspace_confirm",
-        "description": "Same as mlcat_workspace, after Claude Code asks the user.",
-        "inputSchema": _MLW_SCHEMA,
-    },
-    {
-        "name": "registry",
-        "description": ("Container images as a gateway registry account, no Docker needed (use "
-                        "INSTEAD OF docker/podman login/push/pull, skopeo, oras or crane in "
-                        "Bash): crane commands such as ls, manifest, digest, pull IMAGE "
-                        "FILE.tar, push FILE.tar IMAGE, copy SRC DST, tag, delete. ghcr.io can "
-                        "sign in through a GitHub account, ACR through an azure account. If the "
-                        "policy asks first, call registry_confirm."),
-        "inputSchema": _REG_SCHEMA,
-    },
-    {
-        "name": "registry_confirm",
-        "description": "Same as registry, after Claude Code asks the user.",
-        "inputSchema": _REG_SCHEMA,
-    },
-    {
-        "name": "gh_confirm",
-        "description": "Same as gh, after Claude Code asks the user.",
-        "inputSchema": _GH_SCHEMA,
-    },
-]
+    {"name": "http",
+     "description": "HTTP request through the gateway (instead of curl/wget). With account=NAME "
+                    "the gateway adds that account's credential for its own sites. The response "
+                    "comes back scrubbed of secrets; binary bodies as base64 or save_to.",
+     "inputSchema": HTTP_SCHEMA, "_meta": dict(ALWAYS)},
+    {"name": "download",
+     "description": "Download a file (binary-safe) into the project or save_to; never overwrites, "
+                    "never sets the exec bit; returns path, size and sha256.",
+     "inputSchema": DOWNLOAD_SCHEMA, "_meta": dict(ALWAYS)},
+    {"name": "host_inspect",
+     "description": "What this machine offers Claude's managed shell, read-only and scoped: the "
+                    "folders a login shell would put on PATH (from /etc/paths and the shell rc "
+                    "files, read as text, never run), toolchain folders (Homebrew, MacPorts, "
+                    "pyenv, nvm, rustup, pixi, ...) with some of their programs, the project's "
+                    "toolchain files and the names of importable variables, plus the managed "
+                    "shell's current PATH and imports with their origins. With a remote host "
+                    "the same is read on that host (files read, folders listed; nothing run). "
+                    "Nothing is imported by looking: an import is a [shell] (or [hosts.NAME."
+                    "shell]) entry in gateway.toml the user approves.",
+     "inputSchema": INSPECT_SCHEMA, "_meta": dict(ALWAYS)},
+] + [{"name": n, "description": d, "inputSchema": sch, "_meta": dict(ALWAYS)}
+     for n, _r, sch, d in TERM_TOOLS]
+TOOL_NAMES = tuple(t["name"] for t in TOOLS)
+
+
+def terminal_env() -> dict[str, str]:
+    """What a new terminal or job may take from this server's environment
+    (Claude Code's): the platform's variables and the managed shell's approved
+    imports (its conf's env= and mine= names). gated checks them again."""
+    import os
+    from .daemon import terminals
+    conf = terminals.read_conf()
+    names = set(conf.get("env", "").split()) | set(conf.get("mine", "").split())
+    out = {}
+    for k, v in os.environ.items():
+        if k in terminals.PLATFORM_PASS or k.startswith("LC_") or k in names:
+            out[k] = v
+    return out
+
+
+def call_terminal(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    import os
+    from .daemon import client
+    from .daemon import is_local_host
+    body = {k: v for k, v in args.items() if not k.startswith("__")}
+    body["tool_use_id"] = args.get("__tool_use_id") or ""
+    remote = False
+    if name in ("terminal_open", "job_start"):
+        # this machine named by its own contract id is localhost (PLAN-v4
+        # phase 7): it gets the project folder and the managed imports like
+        # "localhost", never a remote host's defaults
+        if is_local_host(body.get("host")):
+            if body.get("host") not in (None, ""):
+                body["host"] = "localhost"
+        else:
+            remote = True
+    if name in ("terminal_open", "job_start"):
+        if not body.get("cwd") and not remote:
+            body["cwd"] = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        if not remote:
+            body["env"] = terminal_env()
+    timeout = 30.0
+    if remote or name == "host_runtime":
+        timeout = 900.0            # the first use stages the runtime on the host
+    if name == "terminal_send":
+        try:
+            timeout += max(0, min(30000, int(args.get("delay_ms") or 0))) / 1000.0
+        except (TypeError, ValueError):
+            pass
+    return client.term_call(TERM_ROUTES[name], body, timeout=timeout)
+
+
+def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    from . import web
+    if not isinstance(args, dict):
+        args = {}
+    if name in TERM_ROUTES:
+        return call_terminal(name, args)
+    args = {k: v for k, v in args.items() if not k.startswith("__")}
+    if name == "http":
+        return web.http(args)
+    if name == "download":
+        return web.download(args)
+    if name == "host_inspect":
+        import os
+        from . import managed
+        from .daemon import is_local_host
+        host = args.get("host") if isinstance(args.get("host"), str) else None
+        if not is_local_host(host):
+            from .daemon import client
+            return client.term_call("/agent/remote/inspect", {"host": host}, timeout=120.0)
+        project = args.get("project") if isinstance(args.get("project"), str) else None
+        if not project:
+            project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        return managed.inspect(host, project)
+    return {"ok": False, "error": "gateway: unknown tool; the tools are " + ", ".join(TOOL_NAMES)}
 
 
 class Server:
-    """Stdio JSON-RPC loop. Holds client capabilities so tools can elicit."""
-
-    def __init__(self, stdin=None, stdout=None):
+    def __init__(self, stdin: TextIO | None = None, stdout: TextIO | None = None,
+                 tool: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+                 workers: int = MAX_WORKERS):
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
-        self.client_caps: dict[str, Any] = {}
-        self._ids = itertools.count(1)
-        self._backlog: deque[dict[str, Any]] = deque()
+        self.tool = tool or call_tool
+        self._lock = threading.Lock()
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                                           thread_name_prefix="gw-tool")
+        self.protocol = PROTOCOL_VERSION
 
-    # -- transport ---------------------------------------------------------
     def send(self, obj: dict[str, Any]) -> None:
-        self.stdout.write(json.dumps(obj) + "\n")
-        self.stdout.flush()
-
-    def _read(self) -> dict[str, Any] | None:
-        while True:
-            line = self.stdin.readline()
-            if not line:
-                return None
-            line = line.strip()
-            if not line:
-                continue
+        line = json.dumps(obj) + "\n"
+        with self._lock:
             try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                self.stdout.write(line)
+                self.stdout.flush()
+            except (OSError, ValueError):
+                pass
 
     def result(self, rid: Any, result: dict[str, Any]) -> None:
         self.send({"jsonrpc": "2.0", "id": rid, "result": result})
 
-    # -- approval via elicitation -----------------------------------------
-    def form(self, message: str, properties: dict[str, Any] | None = None,
-             required: list[str] | None = None) -> dict[str, Any] | bool | None:
-        """Show the USER an in-app form (MCP elicitation). Returns the
-        submitted fields (a dict) if accepted, False if declined/cancelled, or
-        None if this client can't show forms. The model never sees the answer:
-        it goes from the client straight back to this server."""
-        if "elicitation" not in self.client_caps:
-            return None
-        schema: dict[str, Any] = {"type": "object", "properties": properties or {}}
-        if required:
-            schema["required"] = required
-        eid = f"gateway-elicit-{next(self._ids)}"
-        self.send({"jsonrpc": "2.0", "id": eid, "method": "elicitation/create",
-                   "params": {"message": message, "requestedSchema": schema}})
-        while True:
-            msg = self._read()
-            if msg is None:
-                return None
-            if msg.get("id") == eid and "method" not in msg:
-                res = msg.get("result") or {}
-                # Diagnostics only: the client's action/error, never field values.
-                policy.audit("elicitation_result", {
-                    "action": res.get("action"), "error": msg.get("error"),
-                    "fields": sorted(properties or {}),
-                    "returned_fields": sorted(res.get("content") or {})})
-                if "error" in msg:
-                    return None
-                if res.get("action") != "accept":
-                    return False
-                return dict(res.get("content") or {})
-            if msg.get("method") == "ping" and msg.get("id") is not None:
-                self.result(msg["id"], {})
-            else:
-                self._backlog.append(msg)  # handle after this call finishes
+    def error(self, rid: Any, code: int, msg: str) -> None:
+        self.send({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}})
 
-    def approve(self, message: str, remember: str | None = None) -> bool | str | None:
-        """Yes/no question. True, "always" (the `remember` checkbox ticked),
-        False (declined), or None if this client can't show a prompt."""
-        props = ({"remember": {"type": "boolean", "title": remember, "default": False}}
-                 if remember else {})
-        answer = self.form(message, props)
-        if not isinstance(answer, dict):
-            return answer
-        return "always" if remember and answer.get("remember") is True else True
+    def _call(self, rid: Any, name: str, args: dict[str, Any]) -> None:
+        try:
+            out = self.tool(name, args)
+        except Exception as e:  # noqa: BLE001
+            out = {"ok": False, "error": f"gateway: the {name if name in TOOL_NAMES else ''} "
+                                         f"tool failed ({type(e).__name__}); try again or tell the user"}
+        if not isinstance(out, dict):
+            out = {"ok": False, "error": "gateway: the tool returned nothing"}
+        self.result(rid, {"content": [{"type": "text", "text": json.dumps(out, indent=1)}],
+                          "isError": not out.get("ok", False)})
 
-    # -- dispatch ----------------------------------------------------------
     def handle(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
         rid = msg.get("id")
-        params = msg.get("params") or {}
-
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if method is None:
+            return                      # a response to something we never sent
+        if rid is None:
+            return                      # notifications (initialized, cancelled, ...)
         if method == "initialize":
-            self.client_caps = params.get("capabilities") or {}
             asked = params.get("protocolVersion")
-            self.result(rid, {
-                "protocolVersion": asked if asked in SUPPORTED_VERSIONS
-                else PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "gateway", "version": __version__},
-            })
-        elif method == "notifications/initialized":
-            pass  # no response to notifications
+            self.protocol = asked if asked in SUPPORTED_VERSIONS else PROTOCOL_VERSION
+            self.result(rid, {"protocolVersion": self.protocol,
+                              "capabilities": {"tools": {"listChanged": False}},
+                              "serverInfo": SERVER_INFO, "instructions": INSTRUCTIONS})
+        elif method == "ping":
+            self.result(rid, {})
         elif method == "tools/list":
             self.result(rid, {"tools": TOOLS})
         elif method == "tools/call":
-            name = params.get("name", "")
-            args = params.get("arguments") or {}
-            try:
-                out = dispatch(name, args, self.approve, self.form)
-            except Exception as e:  # noqa: BLE001
-                out = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
-            self.result(rid, {
-                "content": [{"type": "text", "text": json.dumps(out, indent=2)}],
-                "isError": not out.get("ok", False),
-            })
-        elif method == "ping":
-            self.result(rid, {})
-        elif rid is not None and method is not None:
-            self.send({"jsonrpc": "2.0", "id": rid,
-                       "error": {"code": -32601,
-                                 "message": f"method not found: {method}"}})
-
-    def run(self) -> None:
-        while True:
-            msg = self._backlog.popleft() if self._backlog else self._read()
-            if msg is None:
+            name = params.get("name")
+            args = params.get("arguments")
+            if not isinstance(name, str):
+                self.error(rid, -32602, "tools/call needs a tool name")
                 return
-            self.handle(msg)
+            args = dict(args) if isinstance(args, dict) else {}
+            for k in [k for k in args if k.startswith("__")]:
+                args.pop(k)                      # reserved for the server's own notes
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            tid = meta.get("claudecode/toolUseId")
+            if isinstance(tid, str):
+                args["__tool_use_id"] = tid      # which agent loop called (the mod told gated)
+            self._pool.submit(self._call, rid, name, args)
+        else:
+            self.error(rid, -32601, "method not found")
+
+    def serve(self) -> None:
+        try:
+            for line in self.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    self.error(None, -32700, "parse error")   # JSON-RPC: id null
+                    continue
+                if isinstance(msg, dict):
+                    self.handle(msg)
+                elif isinstance(msg, list) and msg:      # a batch (2025-03-26)
+                    for m in msg:
+                        if isinstance(m, dict):
+                            self.handle(m)
+                        else:
+                            self.error(None, -32600, "invalid request")
+                else:
+                    self.error(None, -32600, "invalid request")
+        finally:
+            self._pool.shutdown(wait=True)
 
 
-def dispatch(name: str, args: dict[str, Any],
-             approve: actions.Approver = None, form: Any = None) -> dict[str, Any]:
-    if name == "gate_setup":
-        from . import setup
-        return setup.gate_setup(str(args.get("grant", "")), args.get("proposal") or {})
-    if name == "http_request":
-        return actions.http_request(
-            args.get("method", "GET"), args["url"], args.get("headers"),
-            args.get("body"), args.get("auth_ref"), approve=approve,
-            auth_header=args.get("auth_header", "Authorization"),
-            auth_scheme=args.get("auth_scheme", "Bearer"), auth_scope=args.get("auth_scope"))
-    if name == "download":
-        return actions.download(args["url"], approve=approve)
-    if name == "port_check":
-        return actions.port_check(args["target"], args.get("ports"), approve=approve)
-    if name == "secret_list":
-        return actions.secret_list(approve=approve)
-    if name == "secret_use":
-        return actions.secret_use_check(args["ref"], approve=approve)
-    if name in ("run_privileged", "run_privileged_confirm"):
-        return actions.run_privileged(args["host"], args["argv"], args.get("user"),
-                                      args.get("timeout", 120), approve=approve,
-                                      confirmed=name == "run_privileged_confirm")
-    if name == "cert_inspect":
-        return actions.cert_inspect(args["host"], args.get("port", 443))
-    if name == "file_hash":
-        return actions.file_hash(args["path"], args.get("algo", "sha256"))
-    if name == "account_list":
-        cat = vault.catalog()
-        policy.audit("account_list", {})
-        return {"ok": True, "accounts": cat["accounts"],
-                "note": "Never values. Missing one? Ask the user to type /gate:add account "
-                        "(or /gate:add github, hf, ssh, ...); to change one, /gate:update KIND:NAME."}
-    if name in ("git", "git_confirm"):
-        return gitops.git_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
-                               confirmed=name == "git_confirm",
-                               timeout=min(int(args.get("timeout", 300)), 1800))
-    if name == "git_identity":
-        return gitops.git_identity(args.get("cwd", ""), args.get("account", ""))
-    if name == "git_mirror":
-        return mirrors.git_mirror(args.get("cwd", ""), args.get("action", "status"),
-                                  args.get("remotes"), args.get("branches"),
-                                  args.get("tags", True))
-    if name in ("hf", "hf_confirm"):
-        return hfops.hf_tool(args.get("args"), args.get("cwd"), args.get("account"),
-                             confirmed=name == "hf_confirm",
-                             timeout=min(int(args.get("timeout", 1800)), 7200))
-    if name in ("pijul", "pijul_confirm"):
-        return pijulops.pijul_tool(args.get("args"), args.get("cwd", ""), args.get("account"),
-                                   confirmed=name == "pijul_confirm",
-                                   timeout=min(int(args.get("timeout", 600)), 3600))
-    if name in ("ssh_exec", "ssh_exec_confirm"):
-        return sshops.ssh_exec(args.get("account", ""), args.get("argv"),
-                               confirmed=name == "ssh_exec_confirm",
-                               timeout=min(int(args.get("timeout", 300)), 3600))
-    if name == "ssh_hosts":
-        return sshops.ssh_hosts(args.get("account") or "", bool(args.get("probe")))
-    if name in ("ssh_copy", "ssh_copy_confirm"):
-        return sshops.ssh_copy(args.get("account", ""), args.get("direction", ""),
-                               args.get("local", ""), args.get("remote", ""),
-                               bool(args.get("recursive")), confirmed=name == "ssh_copy_confirm",
-                               timeout=min(int(args.get("timeout", 1800)), 7200))
-    if name in ("databricks", "databricks_confirm"):
-        return dbops.databricks_tool(args.get("args"), args.get("account", ""),
-                                     args.get("workspace", ""), args.get("cwd"),
-                                     confirmed=name == "databricks_confirm",
-                                     timeout=min(int(args.get("timeout", 600)), 3600))
-    if name == "mlcat":
-        return mlcat.mlcat_tool(args.get("action", ""), args.get("account"), args.get("kind", ""),
-                                args.get("name", ""), args.get("version", ""),
-                                args.get("query", ""), int(args.get("page", 1)),
-                                int(args.get("page_size", 30)), args.get("prefix", ""),
-                                int(args.get("skip", 0)), int(args.get("take", 200)))
-    if name in ("mlcat_workspace", "mlcat_workspace_confirm"):
-        return mlcat.mlcat_workspace(args.get("action", ""), args.get("cwd", ""),
-                                     args.get("artifact", ""), args.get("revision", ""),
-                                     args.get("data_dir", "data"), args.get("account"),
-                                     confirmed=name == "mlcat_workspace_confirm",
-                                     timeout=min(int(args.get("timeout", 3600)), 14400))
-    if name in ("registry", "registry_confirm"):
-        return regops.registry_tool(args.get("args"), args.get("account", ""),
-                                    confirmed=name == "registry_confirm",
-                                    timeout=min(int(args.get("timeout", 1800)), 7200))
-    if name in ("gh", "gh_confirm"):
-        return ghops.gh_tool(args.get("args"), args.get("cwd"), args.get("account"),
-                             confirmed=name == "gh_confirm",
-                             timeout=min(int(args.get("timeout", 300)), 1800))
-    return {"ok": False, "reason": f"unknown tool {name}"}
+def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """One message -> its response, synchronously (tests, simple callers)."""
+    out: list[dict[str, Any]] = []
+
+    class _Buf:
+        def write(self, s: str) -> None:
+            out.append(json.loads(s))
+
+        def flush(self) -> None:
+            pass
+    srv = Server(stdin=None, stdout=_Buf(), workers=1)  # type: ignore[arg-type]
+    try:
+        srv.handle(msg)
+    finally:
+        srv._pool.shutdown(wait=True)
+    return out[0] if out else None
+
+
+def serve(stdin: TextIO | None = None, stdout: TextIO | None = None) -> None:
+    Server(stdin, stdout).serve()
 
 
 def main() -> None:
-    Server().run()
+    serve()
 
 
 if __name__ == "__main__":
