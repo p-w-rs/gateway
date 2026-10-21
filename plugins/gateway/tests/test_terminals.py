@@ -1743,3 +1743,190 @@ def test_an_updates_sweep_of_the_old_version_folder_is_no_uninstall():
         assert _gone(server, 5), "its tmux server stayed"
         assert "replaced by an update" in de.log(), de.log()[-800:]
         assert not paths.contract_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# fix2 (0.9.1, a verifier's lows): a stop that reaches a draining gated, a
+# stop that doesn't hold, the drain's count and log, a row the line editor
+# filled exactly
+# ---------------------------------------------------------------------------
+
+
+def _stats(word: str) -> list[str]:
+    """ps states of the `sleep WORD` processes (a job's unique sleep)."""
+    return [ln.split()[1] for ln in subprocess.run(["ps", "-axo", "pid=,stat=,command="],
+                                                    capture_output=True, text=True).stdout.splitlines()
+            if ln.split()[2:] == ["sleep", word]]
+
+
+def _pane_root(de: D.DaemonEnv, pid_: str) -> int:
+    return int(_tmux(de, "display-message", "-p", "-t", f"={pid_}:", "#{pane_pid}").stdout.strip())
+
+
+def test_a_jobs_stop_is_refused_while_gated_drains_so_nothing_is_left_stopped_forever():
+    """The drain resumes what was suspended when it began, but a STOP the
+    session's agent (or the pane, or a contract caller) sent afterwards was
+    taken (200, "suspended"): once the session ended nothing could resume the
+    job, so it, gated and the tmux server stayed forever. Now a job's STOP or
+    TSTP is refused while gated drains (503 `draining`, as a new pause is);
+    the job runs on, other signals still work, and gated leaves after it.
+    The draining gated's log lines also go to the gateway home's run folder,
+    which a plain uninstall keeps (gated.log goes with the data folder)."""
+    import shutil
+    with D.daemon_env(knobs={"watch_tick": 60}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        w = f"174.{secrets.randbelow(10**6)}"          # this run's sleep (others may run beside it)
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", w], "cwd": str(de.root)})["id"]
+        _job_wait(a, jid, ("running",))
+        _wait_watchdog(de)
+        gated, server = de.daemon_pid(), _server_pid(de)
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        for sig in ("STOP", "TSTP"):
+            st, r = a.call("/agent/job/signal", {"id": jid, "signal": sig})
+            assert st == 503 and r.get("error") == "draining" and "stops no job" in r["message"], \
+                (sig, st, r)
+        st, r = fc.http("POST", "/ui/term/signal", {"id": jid, "signal": "STOP"})
+        assert st == 503 and r.get("error") == "draining", (st, r)
+        st, r = a.call(f"/v1/jobs/{jid}/signal", {"signal": "STOP"}, mode="x")
+        assert st == 503 and r.get("error") == "draining", (st, r)
+        time.sleep(0.3)
+        assert a.ok("/agent/job/status", {"id": jid})["state"] == "running"
+        assert _stats(w) and not any(s.startswith("T") for s in _stats(w)), _stats(w)
+        a.ok("/agent/job/signal", {"id": jid, "signal": "TERM"})       # other signals still go
+        assert _gone(gated, 10), "gated stayed after the job ended"
+        assert _gone(server, 5), "its tmux server stayed"
+        note = (paths.contract_dir() / "gated-drain.log").read_text()
+        assert "taking no new work" in note and "nothing runs any more: exiting" in note, note[-800:]
+        assert (paths.contract_dir() / "gated-drain.log").stat().st_mode & 0o077 == 0
+        assert not data.exists(), "the deleted data folder was made again"
+        data.mkdir(parents=True)
+
+
+def test_a_jobs_stop_is_recorded_only_when_it_holds_and_the_drain_counts_only_stopped_jobs():
+    """job_signal TSTP was sent with killpg, which tmux undoes (it continues a
+    pane's own process after any stop but SIGTTIN/SIGTTOU), yet the job was
+    recorded 'suspended', and the drain then said it resumed a job that never
+    stopped. Now a job's STOP and TSTP both use the group stop, read back in
+    ps: a stop that holds is 'suspended'; one that doesn't (here one child
+    stops but its zombie sibling can't) is continued, so nothing stays half
+    stopped without a record, and answered with the real state and a note. The drain continues every job recorded
+    suspended but counts (and logs as resumed) only one ps showed stopped."""
+    import shutil
+    with D.daemon_env(knobs={"watch_tick": 60}) as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        cwd = str(de.root)
+        n = secrets.randbelow(10**6)                   # this run's sleeps (others may run beside it)
+        w5, w6, w7, w8 = (f"{x}.{n}" for x in (185, 186, 187, 188))
+        held = a.ok("/agent/job/start", {"argv": ["sleep", w6], "cwd": cwd})["id"]
+        loose = a.ok("/agent/job/start", {"command": f"sleep {w7} & (sleep 0.3) & exec sleep {w5}",
+                                          "cwd": cwd})["id"]
+        behind = a.ok("/agent/job/start", {"argv": ["sleep", w8], "cwd": cwd})["id"]
+        for j in (held, loose, behind):
+            _job_wait(a, j, ("running",))
+        time.sleep(1.0)       # loose's short child has exited: a zombie its exec'd sleep never reaps
+        r = a.ok("/agent/job/signal", {"id": held, "signal": "TSTP"})
+        assert r["state"] == "suspended" and "note" not in r, r
+        assert _stats(w6) and all(s.startswith("T") for s in _stats(w6)), _stats(w6)
+        r = a.ok("/agent/job/signal", {"id": loose, "signal": "TSTP"})
+        assert r["state"] == "running" and "doesn't show as stopped" in r.get("note", ""), r
+        r = a.ok("/agent/job/signal", {"id": loose, "signal": "STOP"})
+        assert r["state"] == "running" and "continued" in r.get("note", ""), r
+        time.sleep(0.2)
+        assert a.ok("/agent/job/status", {"id": loose})["state"] == "running"
+        assert _stats(w7) and not any(s.startswith("T") for s in _stats(w7) + _stats(w5)), \
+            (_stats(w7), _stats(w5))
+        assert a.ok("/agent/job/signal", {"id": behind, "signal": "STOP"})["state"] == "suspended"
+        os.killpg(_pane_root(de, behind), signal.SIGCONT)   # continued behind gated's back
+        time.sleep(0.2)
+        assert not any(s.startswith("T") for s in _stats(w8)), _stats(w8)
+        gated = de.daemon_pid()
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        # /health says draining at once; the event follows the resume
+        ev = de.wait_for(lambda: _events(de, ("daemon.draining",)), 10)
+        assert ev and ev[-1]["resumed"] == 1 and ev[-1]["jobs"] == 3, ev
+        for j in (held, behind, loose):
+            assert _job_wait(a, j, ("running",))["state"] == "running"
+        assert not any(s.startswith("T") for s in _stats(w6) + _stats(w8)), \
+            (_stats(w6), _stats(w8))
+        drain_log = paths.contract_dir() / "gated-drain.log"
+        de.wait_for(lambda: drain_log.exists() and "taking no new work" in drain_log.read_text(), 10)
+        note = drain_log.read_text()
+        assert f"terminals: resumed {held} (SIGCONT)" in note, note[-800:]
+        assert f"{behind} was recorded suspended but nothing of it showed stopped" in note, note[-800:]
+        assert "(1 job(s))" in note, note[-800:]
+        for j in (held, loose, behind):
+            _end_pane(de, j)
+        assert _gone(gated, 10), "gated stayed after its jobs ended"
+        data.mkdir(parents=True)
+
+
+def test_a_command_line_that_fills_its_rows_exactly_is_read_apart_from_its_output():
+    """The line editor wraps a command line that fills its last row exactly
+    by writing the next character, so tmux marks that row soft-wrapped and
+    `capture-pane -J` glued the command's first output line onto it: the
+    agent read `...$ echo "WR""AP..."WRAPQQ...` as one line (acceptance_terminals
+    lost its PID0 line whenever its --tmp made the prompt that long). The
+    agent now reads the screen's rows, each as the pane shows it."""
+    with D.daemon_env() as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        cols = 80
+        tid = a.open(cols=cols, rows=30)["id"]
+        a.run(tid, "clear")
+        v = a.read(tid)
+        prompt = v["cursor"]["x"]
+        assert prompt > 0, v
+        base = 'echo "WR""AP' + "Q" * 10 + '"'
+        pad = -(prompt + len(base) + 4) % cols          # ": " + pad + "; " ends the row exactly
+        line = ": " + "p" * pad + "; " + base
+        assert (prompt + len(line)) % cols == 0
+        want = "WRAP" + "Q" * 10
+        a.ok("/agent/term/send", {"id": tid, "seq": v["seq"], "text": line, "enter": True})
+        r = a.wait(tid, want)
+        assert want in r["lines"], ("the output isn't a row of its own", r["lines"])
+        assert not any('"' + want in ln or ln.endswith('"') and want in ln for ln in r["lines"]), r["lines"]
+        a.ok("/agent/term/close", {"id": tid})
+
+
+def test_rows_line_up_with_their_rejoined_lines_and_a_value_across_a_wrap_is_masked_in_both():
+    rows = ["p$ echo ab", "cdef", "abcdef", "", "x", ""]
+    joined = ["p$ echo abcdef", "abcdef", "", "x", ""]
+    groups = T.align_rows(joined, rows)
+    assert groups == [[0, 1], [2], [3], [4], [5]], groups
+    assert T.align_rows(["p$ echo abcdefX"], rows) is None
+    assert T.align_rows(joined[:-1], rows) is None
+    assert T.align_rows(joined + [""], rows) is None
+
+    def spans(ln: str) -> list[tuple[int, int]]:
+        i = ln.find("abcdef")
+        return [] if i < 0 else [(i, i + 6)]
+    assert T.mask_rows(rows, joined, groups, spans) == ["p$ echo ***", "***", "abcdef", "", "x", ""]
+    # a value over three rows, and two values in one logical line
+    rows3, j3 = ["ab", "cd", "ef", "z"], ["abcdef", "z"]
+    assert T.mask_rows(rows3, j3, T.align_rows(j3, rows3), lambda ln: [(1, 5)] if len(ln) > 1 else []) == \
+        ["a***", "***", "***f", "z"]
+    rows2, j2 = ["xxSECRETAyyS", "ECRETBzz"], ["xxSECRETAyySECRETBzz"]
+    out = T.mask_rows(rows2, j2, T.align_rows(j2, rows2), lambda ln: [(2, 9), (11, 18)])
+    assert out == ["xx***yy***", "***zz"], out
+    # the scrubber's spans cover everything scrub_text masks
+    import base64
+    from gateway import scrub
+    with H.gateway_env():
+        sec = "s3cr3t-" + secrets.token_hex(8)
+        tok = "ghp_" + secrets.token_hex(12)
+        b64 = base64.b64encode(sec.encode()).decode()
+        text = f"a {sec} b {tok} Authorization: Bearer abc.def c {b64}"
+        masked = scrub.scrub_text(text, extra=[sec])
+        assert all(x not in masked for x in (sec, tok, "abc.def", b64))
+        sp = scrub.text_spans(text, extra=[sec])
+        kept = "".join(ch for i, ch in enumerate(text) if not any(a_ <= i < b_ for a_, b_ in sp))
+        for gone in (sec, tok, "abc.def", b64):
+            assert gone not in kept, gone[:4]
+        assert kept.startswith("a ") and " b " in kept and "Authorization: Bearer " in kept, kept
+        assert scrub.text_spans("nothing to see", extra=[sec]) == []

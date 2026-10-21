@@ -24,9 +24,11 @@ docs/modules/terminals.md has the whole picture; in short:
   reported as gone (a terminal) or unknown (a job: its outcome can't be
   proven). Nothing is ever claimed alive from a saved pid: tmux is asked.
 - **Reading**: `capture-pane -e` once per read; plain lines for the agent
-  (bounded: rows, columns, history lines, bytes; scrubbed), styled runs for
-  the terminal pane. `seq` counts screen changes (content, cursor, title,
-  size, alternate screen) and every ownership change.
+  (the physical rows, bounded: rows, columns, history lines, bytes;
+  scrubbed, a value across a soft wrap masked in each row it spans by the
+  rejoined line, `_agent_rows`), styled runs for the terminal pane. `seq`
+  counts screen changes (content, cursor, title, size, alternate screen) and
+  every ownership change.
 - **Writing**: one writer at a time. `owner` is "agent" or "user"; the user
   takes the input from the pane (a click, a key, the Take button) at once:
   queued agent writes then fail ("input taken by the user; re-read the
@@ -124,6 +126,18 @@ DRAINING = ("gateway: the gateway was uninstalled, so it starts no new terminals
 # could resume what it suspended (Daemon.drain resumes what is suspended already)
 PAUSE_DRAINING = ("gateway: the gateway was uninstalled, so it takes no new pause (nothing could "
                   "resume it); what still runs is left to finish and the gateway daemon exits after it")
+# a job's STOP or TSTP reaching a draining gated: the drain resumed what was
+# stopped when it began, and a job stopped later would keep gated, its tmux
+# server and itself there forever once its session ends
+STOP_DRAINING = ("gateway: the gateway was uninstalled, so it stops no job (nothing could resume "
+                 "it); what still runs is left to finish and the gateway daemon exits after it")
+# a job's STOP or TSTP that didn't hold (ps shows a member not stopped): it is
+# continued and not recorded suspended, so nothing claims a stop that isn't there
+NOT_STOPPED = ("the job doesn't show as stopped after the stop (a job that is only its pane's own "
+               "process can't be stopped, tmux continues that one; or one of its processes ended "
+               "meanwhile), so it was continued and runs on")
+NOT_STOPPED_AGAIN = ("the job doesn't show as stopped after the stop; it stays recorded as "
+                     "suspended by the earlier stop (resuming it continues it)")
 STOP_REQ_WORDS = {"undelivered": "not delivered (the host couldn't be reached; nothing was stopped)",
                   "unsure": "outcome unknown (the close went out, its answer was lost; the host is "
                             "asked)"}
@@ -644,11 +658,14 @@ def group_members(pgid: int) -> dict[int, str]:
 
 
 def stop_group(pgid: int, root: int) -> bool:
-    """Suspend a pane's process group; True when every member shows stopped.
-    tmux resumes a pane's own process (its child) when SIGSTOP stops it
-    (server_child_stopped sends SIGCONT for any stop but SIGTTIN/SIGTTOU), so
-    the pane's root process gets SIGTTOU (which stops it unless it ignores
-    it: then it is waiting or ignoring anyway) and the rest SIGSTOP."""
+    """Suspend a pane's process group; True when every member but the root
+    shows stopped (and there is one), or the root itself does. tmux resumes a
+    pane's own process (its child) when SIGSTOP stops it (server_child_stopped
+    sends SIGCONT for any stop but SIGTTIN/SIGTTOU), so the pane's root process
+    gets SIGTTOU and the rest SIGSTOP. The pane's group is orphaned (its
+    leader's parent is the tmux server, in another session), so the kernel
+    drops SIGTTOU (and SIGTSTP) there: the root, a shell waiting for its
+    children, runs on, and a job that is only its root can't be stopped."""
     members = group_members(pgid)
     if not members:
         return False
@@ -660,6 +677,60 @@ def stop_group(pgid: int, root: int) -> bool:
     others = [st for pid, st in after.items() if pid != root]
     return bool(after) and all(st.startswith("T") for st in others) and \
         (bool(others) or after.get(root, "").startswith("T"))
+
+
+def align_rows(joined: list[str], rows: list[str]) -> list[list[int]] | None:
+    """For each logical line of `capture-pane -J` the indexes of the physical
+    rows (`capture-pane -N -T`, same region, same command) it joins: each
+    logical line is its rows' text end to end (tmux joins a soft-wrapped row
+    with the next). None when they don't line up (the caller then reads the
+    logical lines)."""
+    out: list[list[int]] = []
+    i = 0
+    for ln in joined:
+        if i >= len(rows):
+            return None
+        acc, idx = rows[i], [i]
+        i += 1
+        while acc != ln:
+            if i >= len(rows) or not ln.startswith(acc):
+                return None
+            acc += rows[i]
+            idx.append(i)
+            i += 1
+        out.append(idx)
+    return out if i == len(rows) else None
+
+
+def mask_rows(rows: list[str], joined: list[str], groups: list[list[int]],
+              spans_of: Callable[[str], list[tuple[int, int]]]) -> list[str]:
+    """The physical rows with what the scrubber finds in each logical line
+    masked in every row it spans (each masked run in a row becomes `***`): a
+    value printed across a soft-wrap boundary is masked in both rows, never
+    left as two halves to splice. A line of one row is left to the row's own
+    scrub."""
+    out = list(rows)
+    for ln, idx in zip(joined, groups):
+        if len(idx) < 2:
+            continue
+        spans = spans_of(ln)
+        if not spans:
+            continue
+        off = 0
+        for i in idx:
+            r = rows[i]
+            a, b = off, off + len(r)
+            off = b
+            hit = [(max(s, a) - a, min(e, b) - a) for s, e in spans if s < b and e > a]
+            if not hit:
+                continue
+            parts, pos = [], 0
+            for s, e in hit:                  # sorted and disjoint (merged spans)
+                parts += [r[pos:s], "***"]
+                pos = e
+            parts.append(r[pos:])
+            out[i] = "".join(parts)
+    return out
 
 
 def signal_word(sg: str | None) -> str | None:
@@ -1912,6 +1983,55 @@ class Supervisor:
             return vis.split("\n"), hist.strip("\n").split("\n") if hist.strip("\n") else []
         return text.split("\n"), []
 
+    def _agent_rows(self, p: Pane, history: int = 0) -> tuple[list[str], list[str]] | None:
+        """The agent's lines: the screen's physical rows (`capture-pane -N
+        -T`, row for row what the pane shows), scrubbed, with every value the
+        scrubber finds in a soft-wrap rejoined line (`capture-pane -J`, the
+        same region in the same tmux command) masked in each row it spans
+        (`mask_rows`), so a value printed across a wrap is never two halves.
+        Rows, not the rejoined lines: tmux also joins a row the shell's line
+        editor filled exactly (it wraps it by writing the next character) with
+        the row the command's output then starts on. History and screen are
+        one region, so a value across their boundary is caught too.
+        (visible rows, history rows), or None when the pane can't be read
+        this way or the two captures don't line up (the caller falls back to
+        the rejoined lines)."""
+        hist_n = max(0, min(HISTORY_MAX, int(history or 0)))
+        mark = SEP + "GW" + secrets.token_hex(6) + SEP
+        rng = ["-S", f"-{hist_n}"] if hist_n else []
+        args = ["display-message", "-p", "-t", p.target, mark + "#{pane_height} #{history_size}", ";",
+                "capture-pane", "-p", "-N", "-T", *rng, "-t", p.target, ";",
+                "display-message", "-p", mark, ";",
+                "capture-pane", "-p", "-J", *rng, "-t", p.target]
+        try:
+            out = self._tm(p).run(*args, timeout=10 if not p.remote else 30)
+        except TermError:
+            return None
+        parts = out.decode("utf-8", "replace").split(mark)
+        if len(parts) != 3 or parts[0].strip():
+            return None
+        head, _, rows_text = parts[1].partition("\n")
+        nums = head.split()
+        if len(nums) != 2 or not all(x.isdigit() for x in nums):
+            return None
+        h, hs = int(nums[0]), int(nums[1])
+        joined_text = parts[2].removeprefix("\n")
+
+        def lines_of(t: str) -> list[str]:
+            return (t[:-1] if t.endswith("\n") else t).split("\n")
+        rows, joined = lines_of(rows_text), lines_of(joined_text)
+        n_hist = min(hist_n, hs)
+        if h <= 0 or len(rows) != n_hist + h:
+            return None
+        groups = align_rows(joined, rows)
+        if groups is None:
+            return None
+        from .. import scrub
+        extra = list(p.secrets)
+        rows = mask_rows(rows, joined, groups, lambda ln: scrub.text_spans(ln, extra=extra))
+        vis, hist = (self._scrub_lines(p, part) for part in (rows[n_hist:], rows[:n_hist]))
+        return [r.rstrip(" ") for r in vis], [r.rstrip(" ") for r in hist]
+
     def _scrub_lines(self, p: Pane, lines: list[str]) -> list[str]:
         if not lines:
             return lines
@@ -1996,17 +2116,23 @@ class Supervisor:
             out.update({"seq": p.seq, "lines": []})
             out.setdefault("note", e.message)
             return out
-        # the agent reads logical (soft-wrap rejoined) lines so a value split
-        # across a wrap boundary is scrubbed whole; the physical rows (cap) are
-        # kept for the pane and for seq
-        joined = self._capture_joined(p, history=hist_n)
-        plain, hist_plain = joined if joined is not None else (cap["plain"], cap["history"])
-        lines = self._scrub_lines(p, plain)
+        # the agent reads the physical rows with a value split across a
+        # soft-wrap boundary masked in both (_agent_rows); if that can't be
+        # had, the logical (rejoined) lines, scrubbed whole
+        rows = self._agent_rows(p, history=hist_n)
+        if rows is not None:
+            lines, hist = rows
+            keep = cap["cursor"][1] + 1
+        else:
+            joined = self._capture_joined(p, history=hist_n)
+            plain, hist_plain = joined if joined is not None else (cap["plain"], cap["history"])
+            lines = self._scrub_lines(p, plain)
+            hist = self._scrub_lines(p, hist_plain) if hist_plain else []
+            keep = cap["cursor"][1] + 1 if joined is None else 0
         # the record's facts as of now, not as of before the capture (a remote
         # capture takes a round trip: a credential supplied meanwhile is on the
         # screen and must be on the record too)
         out = self.describe(p, me)
-        keep = cap["cursor"][1] + 1 if joined is None else 0
         while lines and not lines[-1].strip() and len(lines) > keep:
             lines.pop()
         vis, t1, used = self._bounded(lines, VIEW_BYTES)
@@ -2014,8 +2140,7 @@ class Supervisor:
                     "cursor": {"x": cap["cursor"][0], "y": cap["cursor"][1]},
                     "alternate_screen": cap["alt"], "title": cap["title"], "lines": vis,
                     "truncated": t1, "history_size": cap["history_size"]})
-        if hist_plain:
-            hist = self._scrub_lines(p, hist_plain)
+        if hist:
             hb, t2, _ = self._bounded(list(reversed(hist)), max(0, VIEW_BYTES - used))
             out["history"] = list(reversed(hb))
             out["history_truncated"] = t2 or len(hb) < len(hist)
@@ -2357,11 +2482,47 @@ class Supervisor:
             return self._tm(p).stop_group(pg, p.pane_pid)
         return stop_group(pg, p.pane_pid)
 
+    def _cont_group(self, p: Pane, pg: int) -> bool:
+        """SIGCONT to a job's process group; True when ps showed a member of it
+        stopped (state T) just before (raises like _killpg)."""
+        if p.remote:
+            return self._tm(p).cont_group(pg)
+        was = any(st.startswith("T") for st in group_members(pg).values())
+        os.killpg(pg, signal.SIGCONT)
+        return was
+
+    def _stop_begin(self) -> bool:
+        """A job's STOP or TSTP is about to apply: False once gated drains
+        (lifecycle.Daemon.pause_begin, as a pause: the drain waits for the
+        ones being applied, so what they stop is resumed with the rest)."""
+        begin = getattr(self.d, "pause_begin", None)
+        if begin is None:
+            return not getattr(self.d, "draining", "")
+        return bool(begin())
+
+    def _stop_end(self) -> None:
+        end = getattr(self.d, "pause_end", None)
+        if end is not None:
+            end()
+
     def signal(self, pid: Any, who: Any, sig: Any, *, by: str = "agent") -> dict[str, Any]:
         p = self.get(pid)
         name = screen.signal_name(sig)
         if name is None:
             raise TermError(400, "bad_signal", "gateway: signal is one of " + ", ".join(screen.SIGNALS))
+        # a job's STOP or TSTP suspends it (the group stop below); refused once
+        # gated drains: nothing could resume it then (the drain resumed what
+        # was stopped when it began)
+        suspend = p.kind == "job" and name in ("STOP", "TSTP")
+        if suspend and not self._stop_begin():
+            raise TermError(503, "draining", STOP_DRAINING)
+        try:
+            return self._signal(p, who, name, by, suspend)
+        finally:
+            if suspend:
+                self._stop_end()
+
+    def _signal(self, p: Pane, who: Any, name: str, by: str, suspend: bool) -> dict[str, Any]:
         with self.lock:
             if by == "agent":
                 if p.kind == "terminal" and p.owner == "user":
@@ -2383,8 +2544,19 @@ class Supervisor:
                         "note": f"{p.id} had already ended"}
         # a terminal: its foreground job (as a key would); a job: its process group
         pg = self._pgrp(p, foreground=p.kind == "terminal")
+        stopped: bool | None = None           # a job's STOP or TSTP: did it hold (ps)?
+        was = p.paused_as
         try:
-            if name == "STOP":
+            if suspend:
+                # tmux resumes a pane's own process after any stop but SIGTTIN or
+                # SIGTTOU (so a plain SIGTSTP never holds): the group stop, read
+                # back in ps; a job is recorded suspended only when it is
+                stopped = self._stop_group(p, pg)
+                if not stopped and was != "suspended":
+                    # nothing is left half stopped without a record (the drain
+                    # and /v1/resume continue only what is recorded)
+                    self._killpg(p, pg, "CONT")
+            elif name == "STOP":
                 self._stop_group(p, pg)               # tmux would resume the pane's own process
             else:
                 self._killpg(p, pg, name)
@@ -2396,14 +2568,17 @@ class Supervisor:
             if p.kind == "job":
                 if name in ("TERM", "KILL", "INT", "HUP", "QUIT"):
                     p.cancel = p.cancel or name in ("TERM", "KILL")
-                if name in ("STOP", "TSTP"):
+                if stopped:
                     p.paused_as = "suspended"
                 elif name == "CONT" and p.paused_as == "suspended":
                     p.paused_as = ""
             self._dirty = True
         time.sleep(0.2)
         self._look(p)
-        return {"ok": True, "id": p.id, "signal": name, "state": p.state, "exit": p.exit}
+        out = {"ok": True, "id": p.id, "signal": name, "state": p.state, "exit": p.exit}
+        if stopped is False:
+            out["note"] = NOT_STOPPED if was != "suspended" else NOT_STOPPED_AGAIN
+        return out
 
     def _look(self, p: Pane) -> None:
         """Ask again now about this pane: the local tick, or its host's poll."""
@@ -3311,7 +3486,7 @@ class Supervisor:
                     not peers.alive(p.pane_pid, p.pane_start):
                 continue                          # ended meanwhile: nothing to resume
             try:
-                self._killpg(p, self._pgrp(p, foreground=False), "CONT")
+                was_stopped = self._cont_group(p, self._pgrp(p, foreground=False))
             except ProcessLookupError:
                 continue
             except (OSError, TermError) as e:
@@ -3321,7 +3496,14 @@ class Supervisor:
             with self.lock:
                 p.paused_as = ""
                 self._changed()
-            done.append(p.id)
+            # counted (and logged) only when ps showed a member stopped before the
+            # SIGCONT: a record that says suspended for a job that runs (continued
+            # behind gated's back) is corrected, never reported as resumed
+            if was_stopped:
+                done.append(p.id)
+            else:
+                self.d.log(f"terminals: {p.id} was recorded suspended but nothing of it showed "
+                           "stopped; the record was corrected")
         if done:
             self.d.log(f"terminals: resumed {', '.join(done)} (SIGCONT): suspended, and nothing "
                        "could resume them any more")

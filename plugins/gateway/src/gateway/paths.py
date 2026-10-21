@@ -661,6 +661,8 @@ def tool(name: str) -> str:
     cands = [Path(sys.executable).parent / name, env_bin() / name]
     o = testing.active()
     if o is not None and o.tools and name in o.tools:
+        if o.extra.get("exclusive_tools"):
+            cands = []                    # a test's tool only (its removal: an uninstall)
         cands.insert(0, Path(o.tools[name]))
     for c in cands:
         if c.is_file() and os.access(c, os.X_OK):

@@ -329,8 +329,8 @@ MUTATIONS = [
      "            )\n",
      TD + "test_version_skew_a_busy_older_daemon_is_kept_and_reported"),
     ("the log is rotated only at start", DS + "lifecycle.py",
-     "                pass\n            self._rotate_if_big()\n",
-     "                pass\n",
+     "                self._drain_note(stamped)\n            self._rotate_if_big()\n",
+     "                self._drain_note(stamped)\n",
      TD + "test_the_daemons_log_is_rotated_while_it_runs"),
     # --- phase-1 findings ------------------------------------------------------------
     ("the test guard resolves (stats) the protected folders again", S + "testing.py",

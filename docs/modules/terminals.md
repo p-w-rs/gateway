@@ -160,15 +160,33 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   runs (`busy(local_only=True)`: remote panes run on in their hosts' runtimes). Records
   are never written into a data folder an uninstall removed (`_save` makes `gated/`
   only inside an existing data folder). A job left suspended (a pause's `suspend`, or
-  `job_signal STOP`) is resumed when the drain starts (`resume_stopped`: SIGCONT to its
-  process group, a local one only while its process is still the one tmux named, by pid
-  and start time; remote ones too, best effort): contract.json is gone, so no consumer
-  could send `/v1/resume` any more, and the stopped job would keep gated, its tmux
-  server and itself there forever (refix-gw). The session's pause record stays (its
-  consumer still holds the task paused; only the stop is lifted), a pending interrupt
-  escalation still happens, and a new `/v1/pause` is refused (503 `draining`,
-  `PAUSE_DRAINING`; the drain waits for a pause being applied at that moment, so what
-  it suspends is resumed too).
+  `job_signal STOP`/`TSTP`) is resumed when the drain starts (`resume_stopped`: SIGCONT
+  to its process group, a local one only while its process is still the one tmux named,
+  by pid and start time): contract.json is gone, so no consumer could send `/v1/resume`
+  any more, and the stopped job would keep gated, its tmux server and itself there
+  forever (refix-gw). A job counts as resumed (`daemon.draining`'s `resumed`, the log)
+  only when ps showed a member of its group stopped just before the SIGCONT; a record
+  that said suspended for a job that ran (continued behind gated's back) is corrected
+  and logged as such (fix2). A remote one is resumed through the host's live master:
+  a plain uninstall deletes the env's ssh with the data folder, so a draining gated
+  uses the system's ssh (`/usr/bin/ssh`, by path; `ssh_conf.allow_system_ssh`) with the
+  call's generated config, never as a master (`ControlMaster=no`), and with no live
+  master (`ControlPersist` 120 s after its last use; the host's poller keeps it in use
+  until the env goes, and the drain starts within a tick, 30 s) or no system ssh it
+  can't: the job then stays stopped on its host (below). The session's pause
+  record stays (its consumer still holds the task paused; only the stop is lifted), a
+  pending interrupt escalation still happens, and a new `/v1/pause` is refused (503
+  `draining`, `PAUSE_DRAINING`; the drain waits for a pause being applied at that
+  moment, so what it suspends is resumed too), and so is a job's STOP or TSTP from the
+  agent, the pane or a contract caller (503 `draining`, `STOP_DRAINING`; counted like a
+  pause being applied, `pause_begin`): a job stopped after the drain began kept
+  everything there once its session ended (fix2). Every other signal still works.
+  **A remote job a pause suspended can still be left stopped** when the drain can't
+  reach its host that way (no system ssh at `/usr/bin/ssh`, the master gone, the host
+  down): it stays stopped there with its runtime's tmux, and a plain uninstall deletes
+  the records that would re-adopt it. Remedy: resume the task (checkpoint) before
+  uninstalling, or uninstall with `--keep-data`, or on the host `kill -CONT -- -PGID`
+  (the job's process group; `ps -o pid,pgid,stat,command` shows it with state T).
 - An exited pane's tmux session is kept an hour for reads (`RETAIN_DEAD`), its record
   24 h (`RECORD_KEEP`). Live panes keep gated from its idle exit and from a version
   restart (`Daemon.busy()`: "2 terminals and 1 job"); at most 64 live (`MAX_LIVE`).
@@ -190,10 +208,21 @@ shapes, plus the values this pane was given through the dialog), the pane's view
 again. Two paths that would otherwise slip a value past the per-line scrub are closed:
 the **title** a program sets (OSC 2) is scrubbed where it is stored (`_mask` in
 `_update`/`_capture`), so it is masked in `terminal_read`/`terminal_list`/`job_status`,
-the pane view and the records; and the agent's plain lines are captured with
-`capture-pane -J` (`_capture_joined`), which rejoins tmux's soft-wrapped rows into
-logical lines so a value printed across a wrap boundary is one string the scrubber
-catches, not two halves the agent could splice. `terminal_list`/`job_list` return at
+the pane view and the records; and a value printed across a soft-wrap boundary is
+masked in both rows, never left as two halves the agent could splice: the agent reads
+the screen's physical rows (`capture-pane -N -T`, row for row what the pane shows) and,
+in the same tmux command, the soft-wrap rejoined lines (`capture-pane -J`) of the same
+region, history and screen together (`_agent_rows`); each rejoined line is its rows'
+text end to end (`align_rows`), so whatever the scrubber finds in it
+(`scrub.text_spans`: the same literals, shapes and Authorization value as
+`scrub_text`) is masked in every row it spans (`mask_rows`), then each row is scrubbed
+on its own and its trailing spaces trimmed. Rows, not the rejoined lines (0.9.0 to
+refix-gw handed the agent the `-J` lines): the shell's line editor wraps a command line
+that fills its last row exactly by writing the next character, so tmux marks that row
+soft-wrapped and `-J` glued the command's first output line onto it (`...$ echo
+"PID""0=$$ START"PID0=4333 START`; fix2). If the two captures don't line up (or
+`-N -T` fails) the agent gets the rejoined lines as before (`_capture_joined`),
+scrubbed whole. `terminal_list`/`job_list` return at
 most `LIST_MAX` records to the agent (live first, newest next, with the true total and
 `truncated`); the pane's own list and the contract snapshot stay complete.
 
@@ -239,11 +268,23 @@ most `LIST_MAX` records to the agent (live first, newest next, with the true tot
 ## Signals
 
 `terminal_signal` sends to the terminal's foreground process group (ps's `tpgid`, as a
-key would: INT is ^C); `job_signal` and the contract's signal to the job's process group
-(the pane's root). TERM or KILL marks a job `canceled`. STOP suspends with
-`stop_group`: tmux resumes a pane's own process when SIGSTOP stops it (its
-`server_child_stopped` sends SIGCONT for any stop but SIGTTIN/SIGTTOU), so the root
-gets SIGTTOU and the rest SIGSTOP, and the result is checked in `ps` (state T).
+key would: INT is ^C; TSTP is ^Z, job control in the pane's shell); `job_signal` and the
+contract's signal to the job's process group (the pane's root). TERM or KILL marks a job
+`canceled`. STOP (and a job's TSTP) suspends with `stop_group`: tmux resumes a pane's
+own process when any stop but SIGTTIN/SIGTTOU stops it (its `server_child_stopped` sends
+SIGCONT to the group), so the root gets SIGTTOU and the rest SIGSTOP, and the result is
+checked in `ps` (state T). The pane's group is orphaned (its leader's parent, the tmux
+server, is in another session), so the kernel drops SIGTTOU and SIGTSTP there: the
+root, a shell waiting for its children, runs on, and a job that is only its root
+(`exec ...`) can't be suspended at all (the answer says so; a terminal's foreground
+job is a group of its own whose parent, the pane's shell, is in the same session, so
+^Z works there). A job is recorded `suspended` only when that check holds;
+otherwise it is continued (nothing left half stopped without a record, which neither
+`/v1/resume` nor the drain would continue) and the answer carries its real state and a
+note (`NOT_STOPPED`; a job a pause or an earlier stop suspended keeps that record,
+`NOT_STOPPED_AGAIN`). 0.9.1 before fix2 sent a job's TSTP with killpg, which the
+kernel dropped, and recorded `suspended` for every STOP and TSTP. While gated drains a job's
+STOP or TSTP is refused (Draining, above).
 
 ## Password prompts
 

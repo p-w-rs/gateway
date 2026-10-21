@@ -286,7 +286,9 @@ plugins/gateway/
     bashisms; the desktop app gives hooks a minimal PATH), except
     `hooks/mod/` (the mod, TypeScript, run by Claude Code itself). External
     binaries: the pixi env's age, OpenSSH, gh, git-lfs (and git as a
-    fallback), the system's sudo, git and sshd. One exception since PLAN-v4
+    fallback), the system's sudo, git and sshd (and its ssh, by path, only for
+    `others = "mine"`, "use my own login once" and a draining gated whose env
+    lost its own: `ssh_conf.allow_system_ssh`). One exception since PLAN-v4
     phase 3: PyNaCl (libsodium), imported only by gated's `daemon/dialogs.py`
     to open the dialog's sealed boxes (`_nacl()` adds the env's
     site-packages for that import, since gated runs with `-I -S`); the mod
@@ -389,7 +391,11 @@ plugins/gateway/
     can't type and the pane's typed text is refused; the agent sees
     "[credential supplied]". Reads and tails are bounded and scrubbed,
     including the terminal title (OSC 2) and values split across a soft-wrap
-    boundary (the agent reads `capture-pane -J` logical lines); the main
+    boundary (the agent reads the physical rows, `capture-pane -N -T`, with
+    what the scrubber finds in each `-J` rejoined line masked in every row it
+    spans; never the rejoined lines themselves, which glue a row the line
+    editor filled exactly to the output after it, unless the two captures
+    don't line up); the main
     agent's input is held under its empty loop id (unclaimed is `None`, not
     `""`); `terminal_list`/`job_list` to the agent are bounded. A seq handed
     to the agent is persisted, so a restart's bump makes a pre-crash seq
@@ -402,15 +408,18 @@ plugins/gateway/
     process (pid and start time from tmux's last answer) decides only when
     its watch ends (gone/unknown, never "exited"), so a draining gated can
     leave. Uninstalled while work runs, gated drains (never kills it: no new
-    work and no new pause, contract.json withdrawn at once, a job left
-    suspended resumed since nothing else could, it leaves with its tmux server
+    work, no new pause and no job STOP/TSTP, contract.json withdrawn at once,
+    a job left suspended resumed since nothing else could (counted only when
+    ps showed it stopped; a remote one through the live master by the
+    system's ssh, the env's being deleted), it leaves with its tmux server
     once no local pane runs; its code folder removed with another version
     beside it is an update's sweep, not an uninstall: it serves on until
     nothing runs), and it stops its tmux server whenever it exits with no
     local pane running (`stop_server`; a live pane keeps it for re-adoption);
     the watchdog stops it when gated is gone, also killed (`gated.pid`: pid
     and start time; a leftover socket file isn't gated). A paused session can stop or cancel a job but not resume it
-    (`job_signal CONT` refused); an interrupt's SIGTERM escalation is
+    (`job_signal CONT` refused); a job is recorded suspended only when ps
+    shows the stop held (else it is continued); an interrupt's SIGTERM escalation is
     persisted and re-armed after a restart. The approval hook's per-call
     judging of `terminal_send` is a guardrail (split-bypassable), not the
     boundary: the stand-ins and the encrypted vault are. The user's tmux
@@ -561,7 +570,30 @@ pixi: `requires-pixi = ">=0.68.0"`, no upper bound. Tested range 0.68.0 to
 v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
 `/gate-doctor`'s verdict) and the docs; `test_packaging` keeps them in step.
 
-Last full run (2026-10-21, refix-gw, plugin 0.9.1: the verifier's three lows
+Last full run (2026-10-21, fix2-gateway, plugin 0.9.1: a verifier's four lows
+after the re-fix; DECISIONS "Verifier lows after the re-fix"): 1230 passed, 0
+failed on macOS arm64 (`pixi run --locked test`, 369.7 s at 4 at a time, pixi
+0.81.0, GW_TEST_TMP in scratch; `claude plugin test .` 118 pass inside
+test_mod; new: 4 tests in test_terminals, 1 in test_remote, each failing on
+HEAD's code first). The run before it failed one new test on a race of its
+own (it read `daemon.draining` as soon as /health said draining, which comes
+first; the tests now wait for the event and the drain log, and their sleeps
+carry a per-run word, since parallel runs of the same test saw each other's
+processes). Mutations: 1062 in all (new: 7 in mutations_terminals.py, 5 in
+mutations_remote.py; the wrap-boundary mutation now removes `mask_rows`; two
+older snippets the change moved were updated: the log rotation in
+mutations_daemon.py, the pause's suspend in mutations_terminals.py); the
+all-files run (17 min 13 s at 3 at a time) killed 1060, the two moved
+snippets were fixed and those files re-run whole: 86 of 86 and 82 of 82, so
+1062 of 1062. Live on macOS (Claude Code 2.1.301, tests/tui, scratch configs,
+the fake API, telemetry behind the record-only proxy):
+`tests/acceptance_terminals.py` 73 of 73 (128 s), and 73 of 73 again with a
+--tmp 15 characters longer, so that the prompt plus `echo "PID""0=$$ START"`
+is exactly 220 characters, twice the 110-column pane: the verifier's case,
+which failed 3 checks before. Not re-run: anything on the VM (this task
+didn't use it: the suite on Linux, acceptance_install's vmdrain, the remote
+acceptance), the other TUI acceptances, the headless e2e suite.
+Before that (2026-10-21, refix-gw, plugin 0.9.1: the verifier's three lows
 in the GitHub install fixes; DECISIONS "Re-fix of the GitHub install fixes"):
 1225 passed, 0 failed on macOS arm64 (`pixi run --locked test`, 357.1 s at 4
 at a time, pixi 0.81.0, GW_TEST_TMP in scratch; `claude plugin test .` 118
@@ -936,7 +968,10 @@ project context.
   `remote_corrupt_upload`, `remote_no_hash_tool`, `remote_df_avail_kb`,
   `remote_tick`, `remote_stale`, `ssh` (an argv-logging wrapper, or
   `test_remote._lossy_ssh`, which drops one answer: after the command ran, after
-  the marker, before it reached the host). A test that needs the host's
+  the marker, before it reached the host), `tools` (wrappers for env tools by
+  name) with `exclusive_tools` (a named tool is only its wrapper, so removing
+  the wrapper is the env losing it, as a plain uninstall does) and
+  `system_ssh` (the "system" ssh a draining gated falls back to). A test that needs the host's
   connection to drop closes the masters and clears the address cache in
   process (`ssh.close_masters`, `ssh_conf.cache_clear`: same run dir).
 - Never ssh or scp to a real machine (the user's `~/.ssh/config` has real
@@ -1097,8 +1132,13 @@ project context.
 - **pixi**: use `pixi run --locked ...`; another plugin of the user's
   (pixi-guard) may refuse a bare `python3`.
 - **tmux under gated** (`daemon/terminals.py`): tmux resumes a pane whose own
-  process SIGSTOP stopped (SIGCONT for any stop but SIGTTIN/SIGTTOU), so a
-  suspend stops the root with SIGTTOU (`stop_group`); `-t =NAME` works for
+  process SIGSTOP stopped (SIGCONT for any stop but SIGTTIN/SIGTTOU), and a
+  pane's process group is orphaned (its leader's parent, the tmux server, is
+  in another session), so the kernel drops SIGTTOU and SIGTSTP there: a
+  suspend SIGSTOPs every member but the root (`stop_group`; the root, a shell
+  waiting for its children, runs on, and a job that is only its root can't be
+  suspended); a row the line editor filled exactly is marked soft-wrapped,
+  so `capture-pane -J` joins it to the next row (read rows, `-N -T`); `-t =NAME` works for
   session commands but a pane-scoped command needs `=NAME:`; Linux's tmux
   gives `#{pane_dead_signal}` as a number, macOS's as a name
   (`signal_word`); `#{pid}` is the server's pid. A pane's tty is read with
@@ -1557,7 +1597,9 @@ so `terminal_read`/`terminal_list`/`job_status`, the pane view and the records
 are all masked. (2) A vault value printed across a **soft-wrap boundary** no
 longer reaches the agent as two splice-able halves: the agent's plain lines
 (and history) are captured with `capture-pane -J` (`_capture_joined`), so a
-wrapped value is one logical string the scrubber catches. (3) The **main
+wrapped value is one logical string the scrubber catches (since fix2 the agent
+reads the physical rows and the `-J` line only finds what to mask in them:
+`-J` also glued a row the line editor filled exactly to the output). (3) The **main
 agent** (empty loop id) now counts as a real input holder (`holder is None`
 means unclaimed, not `""`), so a subagent can't write into its terminal
 without a take, and vice versa. (4) A **transient `list-panes` failure** (one
@@ -1692,6 +1734,20 @@ checkpoint suspended no longer keeps gated, tmux and itself there forever
 once contract.json is gone; (3) a removed code folder with another, not
 orphaned version beside it (Claude Code's sweep of an update's old folder) is
 no uninstall: gated serves on and exits once nothing runs, as 0.9.0 did.
+Verifier lows after the re-fix (fix2-gateway, 2026-10-21, still 0.9.1;
+DECISIONS "Verifier lows after the re-fix"): (1) a job's STOP or TSTP is
+refused while gated drains (503 `draining`; a stop after the drain began kept
+everything there forever once its session ended); (2) a job's STOP and TSTP
+both use the group stop, read back in ps, and a job is recorded suspended only
+when it held (else continued, with a note); the drain counts as resumed only
+jobs ps showed stopped; (3) the drain resumes a remote job a pause suspended
+through the live master with the system's ssh (`/usr/bin/ssh`, never a
+master), since a plain uninstall deletes the env's; when that can't work the
+job stays stopped on its host (documented, with the remedy); (4) the agent
+reads a terminal's physical rows, with values across a soft wrap masked in
+each row from the rejoined line, so a command line that filled its rows
+exactly is no longer glued to its output; and the draining gated's log lines
+also go to `~/.config/gateway/run/gated-drain.log`, which an uninstall keeps.
 
 Not done or not verified live (as of the 2026-10-21 acceptance; the per-phase
 notes below were written when each phase landed, and items the acceptance

@@ -92,10 +92,39 @@ class SshError(Exception):
         self.printed = printed      # the pop-up module already printed it
 
 
+# The system's ssh, by absolute path, for a draining gated only
+# (daemon/lifecycle.Daemon.drain calls allow_system_ssh): a plain uninstall
+# deletes the env's ssh with the data folder, and a remote job a pause suspended
+# is then resumed through the gateway's live master (its ControlPath in the run
+# dir) with the call's generated config (`-F`: no user or system ssh config is
+# read). It never starts a master (`ControlMaster=no` on its command line), and
+# with no live master the call stops before ssh runs (the agent it would need
+# is the env's ssh-agent, gone too). Never used by the stand-ins or `gate`.
+SYSTEM_SSH = "/usr/bin/ssh"
+_SYSTEM_SSH_OK = threading.Event()
+
+
+def allow_system_ssh() -> None:
+    _SYSTEM_SSH_OK.set()
+
+
+def _system_ssh() -> str | None:
+    if not _SYSTEM_SSH_OK.is_set():
+        return None
+    p = SYSTEM_SSH
+    v = testing.get("system_ssh") if testing.active() is not None else None
+    if isinstance(v, str) and os.path.isabs(v):
+        p = v                          # a test names the "system" ssh
+    return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+
+
 def ssh_bin() -> str:
     try:
         return paths.tool("ssh")
     except paths.ToolMissing:
+        fb = _system_ssh()
+        if fb is not None:
+            return fb
         raise SshError("gateway: the gateway's ssh isn't installed yet (first run); try again "
                        "in a minute", 75) from None
 
@@ -734,7 +763,10 @@ class Conn:
         return self.target.alias
 
     def base(self) -> list[str]:
-        return [ssh_bin(), "-F", str(self.prepare())]
+        b = ssh_bin()
+        # the system's ssh (a draining gated, the env's deleted): never a master
+        no_master = ["-o", "ControlMaster=no"] if b == _system_ssh() else []
+        return [b, "-F", str(self.prepare()), *no_master]
 
     def control_path(self, link: Link) -> str | None:
         """The hop's shared ControlPath (read once, before any solo rewrite)."""

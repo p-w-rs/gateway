@@ -1766,3 +1766,99 @@ def test_ssh_refusing_a_changed_host_key_asks_the_user_at_once():
             ssh_conf.scan_keys = old
         assert [x.get("what") for x in opened] == ["host key"], opened
         assert h.change is not None and h.change["kind"] == "host_key" and h.conn is None
+
+
+def test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master():
+    """A plain uninstall deletes the env (ssh, ssh-agent, ...) with the data
+    folder. The drain resumed a local job a pause had suspended, but the
+    remote one stayed stopped on its host ("resuming it failed
+    (remote_unreachable)": the env's ssh was gone), its runtime's tmux with it,
+    and the records that could re-adopt it went with the folder. A draining
+    gated now uses the system's ssh (by absolute path; here a logging wrapper
+    around it) with the call's generated config and never as a master, so it
+    reaches the host through the gateway's live master and resumes the job."""
+    import shutil
+    import tempfile
+    tb = Path(tempfile.mkdtemp(prefix="gwtools-", dir=str(H.tmp_base())))
+    wrappers = {}
+    for n in ("ssh", "ssh-agent", "ssh-add", "ssh-keyscan"):
+        w = tb / n
+        w.write_text(f"#!/bin/sh\nexec {S.sq(R.ENV_BIN / n)} \"$@\"\n")
+        os.chmod(w, 0o755)
+        wrappers[n] = str(w)
+    syslog = tb / "system-ssh.log"
+    real = "/usr/bin/ssh" if os.access("/usr/bin/ssh", os.X_OK) else str(R.ENV_BIN / "ssh")
+    sysw = tb / "system-ssh"
+    sysw.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {S.sq(syslog)}\nexec {S.sq(real)} \"$@\"\n")
+    os.chmod(sysw, 0o755)
+    knobs = {"tools": wrappers, "exclusive_tools": True, "system_ssh": str(sysw)}
+    try:
+        with R.remote_env(knobs=knobs) as re_:
+            sshd = re_.se.sshd("box")
+            re_.add_host("box", sshd)
+            fc = re_.de.claude()
+            a = _agent(re_, fc)
+            cwd = str(_work(re_))
+            n = secrets.randbelow(10**6)               # this run's sleeps (others may run beside it)
+            w6, w7 = f"176.{n}", f"177.{n}"
+            rj = a.ok("/agent/job/start", {"host": "box", "argv": ["sleep", w6], "cwd": cwd,
+                                           "on_pause": "suspend", "task_ref": "t1"})["id"]
+            lj = a.ok("/agent/job/start", {"argv": ["sleep", w7], "cwd": cwd,
+                                           "on_pause": "suspend", "task_ref": "t1"})["id"]
+            for j in (rj, lj):
+                _job_wait(a, j, ("running",))
+            st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t1", "reason": "x"}, mode="x")
+            assert st == 200 and {o["job"]: o["outcome"] for o in r["outcomes"]} == \
+                {rj: "suspended (SIGSTOP)", lj: "suspended (SIGSTOP)"}, r
+
+            def stats(word: str) -> list[str]:
+                return [ln.split()[1] for ln in subprocess.run(
+                    ["ps", "-axo", "pid=,stat=,command="], capture_output=True,
+                    text=True).stdout.splitlines() if ln.split()[2:] == ["sleep", word]]
+            assert stats(w6) and all(s.startswith("T") for s in stats(w6)), stats(w6)
+            for w in wrappers.values():
+                os.unlink(w)                  # the env's ssh tools go with the data folder
+            time.sleep(1.0)                   # five polls of the host, all failing now
+            assert not syslog.exists(), "the system's ssh ran before any drain"
+            data = Path(re_.de.env.data)
+            shutil.rmtree(data)
+            assert re_.de.wait_for(lambda: (re_.de.health() or {}).get("draining"), 10), re_.de.health()
+            deadline = time.time() + 15
+            while time.time() < deadline and any(s.startswith("T") for s in stats(w6) + stats(w7)):
+                time.sleep(0.2)
+            assert not any(s.startswith("T") for s in stats(w6)), \
+                ("the remote job stayed stopped", stats(w6),
+                 (paths.contract_dir() / "gated-drain.log").read_text()[-600:])
+            assert not any(s.startswith("T") for s in stats(w7)), stats(w7)
+            # the processes run on before the drain's event and its log line
+            ev = re_.de.wait_for(lambda: R.events(re_.de, fc, ("daemon.draining",)), 10)
+            assert ev and ev[-1]["resumed"] == 2, ev
+            calls = syslog.read_text()
+            assert "-o ControlMaster=no" in calls and "-F " in calls, calls[-400:]
+            drain_log = paths.contract_dir() / "gated-drain.log"
+            re_.de.wait_for(lambda: drain_log.exists() and "taking no new work" in drain_log.read_text(), 10)
+            note = drain_log.read_text()
+            assert rj in note and "resumed" in note and "resuming it failed" not in note, note[-600:]
+            gated = re_.de.daemon_pid()
+            root = int(subprocess.run([str(R.ENV_BIN / "tmux"), "-S", str(re_.de.run / "tmux.sock"),
+                                       "display-message", "-p", "-t", f"={lj}:", "#{pane_pid}"],
+                                      capture_output=True, text=True, timeout=10,
+                                      env={"PATH": "/usr/bin:/bin"}).stdout.strip())
+            os.killpg(root, signal.SIGKILL)
+            deadline = time.time() + 10
+            while time.time() < deadline and gated and _pid_alive(gated):
+                time.sleep(0.1)
+            assert not (gated and _pid_alive(gated)), "gated stayed after the local job ended"
+            data.mkdir(parents=True)
+    finally:
+        shutil.rmtree(tb, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True

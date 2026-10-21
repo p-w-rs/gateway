@@ -655,10 +655,11 @@ The gateway's helper, `gated`, runs one per user, started on demand; it
 exits 30 minutes after the last session ends (not while a terminal or job
 runs), and within about half a minute once its plugin is uninstalled and no
 session uses it. Uninstalled while a terminal or job still runs, it starts
-nothing new and stops offering itself to checkpoint at once, leaves that
-work running (a job checkpoint had paused by suspending it is resumed, since
-nothing could resume it any more), and exits (with its private tmux) once it
-has ended. After an update it keeps serving what runs, also once Claude Code
+(or pauses, or stops) nothing new and stops offering itself to checkpoint at
+once, leaves that work running (a job checkpoint had paused by suspending it
+is resumed, since nothing could resume it any more; see
+[Uninstall](#uninstall) for one on a remote host), and exits (with its
+private tmux) once it has ended. After an update it keeps serving what runs, also once Claude Code
 removes the old version, and gives way to the new version when nothing does.
 Its private tmux also goes whenever it exits (or is killed) with nothing
 running. Checkpoint finds it
@@ -702,6 +703,7 @@ it on.
 | Backups | `~/.config/gateway/private/backups/` (the 0.6 conversion, before every import) | until you delete them |
 | Launcher and env file | `~/.config/gateway/gate`, `env.sh` | rewritten every session; inert after uninstall |
 | Discovery file for checkpoint | `~/.config/gateway/run/contract.json` | while the helper runs |
+| The helper's log after an uninstall | `~/.config/gateway/run/gated-drain.log` (written only while it winds down after an uninstall with work running) | until the next such uninstall replaces it, or you delete it |
 | Built tools, stand-ins, git settings, the managed shell's settings, remote packs | the plugin's data folder: `~/.claude/plugins/data/gate-gateway` (or under `$CLAUDE_CONFIG_DIR`) | updates keep it (an old tool set unused for 7 days is removed); uninstall deletes the folder, `--keep-data` keeps it |
 | Audit log (values redacted) | data folder, `audit.jsonl` | rotated at 5 MB, one older copy |
 | The helper's log and event log | data folder, `gated/` | log rotated at 1 MB; events of the last 5 helper starts |
@@ -932,7 +934,16 @@ stops offering itself to checkpoint and refuses new terminals and jobs at
 once, leaves the running ones alone (never killed; jobs on remote hosts keep
 running there; a job checkpoint had paused by suspending it is resumed, since
 checkpoint can't reach it any more), and exits with its tmux once the local
-ones have ended. From
+ones have ended. A remote job paused that way is resumed through the
+helper's open connection to its host, with the system's ssh
+(`/usr/bin/ssh`, since the gateway's own is deleted with the data folder);
+without one (no `/usr/bin/ssh`, the host unreachable) it stays stopped on
+the host: resume the task in checkpoint before you uninstall, uninstall with
+`--keep-data`, or run `kill -CONT -- -PGID` for the job on the host (`ps -o
+pid,pgid,stat,command` shows it stopped, state T). What the helper did after
+the uninstall (what it waited for, what it resumed, when it left) is in
+`~/.config/gateway/run/gated-drain.log`, since its usual log goes with the
+data folder. From
 the next session Claude's terminal is back to normal.
 
 Your form and vault stay in `~/.config/gateway` (the `gate` launcher then only

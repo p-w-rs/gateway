@@ -1330,6 +1330,24 @@ class RemoteTmux:
         rc, _o, _e = self._call(f"kill -s {sig} -- -{int(pgid)} 2>/dev/null")
         return rc == 0
 
+    def cont_group(self, pgid: int) -> bool:
+        """SIGCONT to a process group on the host; True when a member of it
+        showed stopped (ps state T) just before. ProcessLookupError when the
+        host has no such group."""
+        if pgid <= 1:
+            raise ProcessLookupError(pgid)
+        script = (f"g={int(pgid)}\n"
+                  "s=$(ps -axo pgid=,stat= 2>/dev/null | awk -v g=\"$g\" "
+                  "'$1==g && $2 ~ /^T/ {print \"T\"; exit}')\n"
+                  'kill -s CONT -- "-$g" 2>/dev/null && printf "GW_CONT %s\\n" "${s:-R}"\n')
+        # insist: the drain asks once (a poll that failed just before, the env's
+        # ssh gone, would otherwise fail it fast)
+        _rc, out, _e = self._call(script, insist=True)
+        m = re.search(rb"GW_CONT (T|R)", out)
+        if m is None:
+            raise ProcessLookupError(pgid)
+        return m.group(1) == b"T"
+
     def fg_pgrp(self, pid: int) -> int:
         if pid <= 0:
             return 0

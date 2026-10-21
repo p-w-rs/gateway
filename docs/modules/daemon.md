@@ -141,13 +141,20 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   staging are refused with 503 `draining` (an idempotency key seen before
   still returns its job), and the running ones are left alone, never killed;
   pauses are refused too (`/v1/pause`: 503 `draining`; `pause_begin`, and
-  the drain waits for a pause being applied at that moment), and a job left
-  suspended (a pause's `suspend`, `job_signal STOP`) is resumed with SIGCONT
-  (`Supervisor.resume_stopped`; the session's pause record stays): with
+  the drain waits for a pause being applied at that moment), and so is a
+  job's STOP or TSTP (`job_signal`, the pane, the contract's signal: 503
+  `draining`; counted like a pause being applied), and a job left
+  suspended (a pause's `suspend`, `job_signal STOP`/`TSTP`) is resumed with
+  SIGCONT (`Supervisor.resume_stopped`; the session's pause record stays;
+  `resumed` counts only jobs ps showed stopped just before): with
   contract.json gone checkpoint can't send `/v1/resume`, so the stopped job
   kept the daemon, its tmux server and itself there forever (refix-gw;
   keeping contract.json with a `draining` field instead was rejected in
-  0.9.1, since checkpoint 0.7.x would go on delegating);
+  0.9.1, since checkpoint 0.7.x would go on delegating; a stop after the
+  drain began did the same until fix2). A remote job is resumed through the
+  host's live master by the system's ssh (`ssh_conf.allow_system_ssh`, from
+  the drain on: a plain uninstall deletes the env's ssh; terminals.md,
+  "Draining", says when that can't work and the remedy);
   the vault keeps its lock rules (`broker.tick`), the rights watch stops
   (it would import from the removed folders), bytecode writing is switched
   off (a lazy import must not make the deleted data folder again), and no
@@ -156,6 +163,12 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   runtimes, and a reinstall re-adopts them from kept records), with its tmux
   server (terminals.md, "gated exits"). A reinstall meanwhile finds the
   draining daemon answering (no second one can start) until it leaves.
+  From the drain on every log line also goes to
+  `~/.config/gateway/run/gated-drain.log` (`DRAIN_LOG`, 0600, started over
+  at a drain's first line, at most 64 KiB, never a folder made: a gateway
+  home deleted too gets nothing): a plain uninstall deleted gated.log with
+  the data folder, and this file says what the draining daemon waited for,
+  what it resumed (or failed to) and when it left (fix2).
 - Exit (idle, SIGTERM/SIGINT, `/local/stop`, restart, drained): `daemon.stopping`,
   the vault locked (`vault.locked` event), contract.json and the socket removed
   when they are still this daemon's, then its tmux server stopped when no local

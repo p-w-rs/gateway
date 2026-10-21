@@ -38,10 +38,14 @@ Uninstalled while terminals or jobs still run (its data folder gone, or the
 plugin folder gone or orphaned with no other, not orphaned version beside it
 and, orphaned, no live session: `uninstalled_reason`), it drains (`drain`):
 contract.json goes at once (checkpoint stops delegating), daemon.draining is
-emitted, new terminals, jobs, remote runtimes and pauses are refused, a job
-left suspended is resumed (no consumer could resume it any more), and what
-runs is left to finish (never killed); it exits, with its tmux server, once
-no local terminal or job runs (remote ones run on in their hosts' runtimes).
+emitted, new terminals, jobs, remote runtimes, pauses and a job's STOP or
+TSTP are refused, a job left suspended is resumed (no consumer could resume
+it any more; a remote one through the host's live master by the system's
+ssh, since the env's may be gone), and what runs is left to finish (never
+killed); it exits, with its tmux server, once no local terminal or job runs
+(remote ones run on in their hosts' runtimes). From the drain on every log
+line also goes to <gateway home>/run/gated-drain.log, which an uninstall
+keeps (gated.log goes with the data folder).
 The plugin folder gone with another version beside it is an update's sweep:
 the daemon serves on, as before, until it holds no terminal or job.
 
@@ -74,7 +78,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .. import paths, testing, vault
+from .. import paths, ssh_conf, testing, vault
 from . import (CONTRACT_ID, CONTRACT_VERSIONS, FEATURES, PROTOCOL, plugin_version, skew_text,
                version_key)
 from . import broker as brokermod
@@ -84,6 +88,8 @@ IDLE_EXIT = 30 * 60
 TICK = 30.0
 START_WAIT = 10.0
 LOG_MAX = 1_000_000
+DRAIN_LOG = "gated-drain.log"   # in the gateway home's run/: the draining daemon's log lines
+DRAIN_LOG_MAX = 65536
 PAUSE_WAIT = 60.0            # drain waits at most this long for the pauses being applied
 
 
@@ -368,12 +374,19 @@ class Daemon:
             # shorter staleness window for host status, and an ssh wrapper that
             # records its argv (or drops answers)
             for name in ("runtime_artifacts", "remote_corrupt_upload", "remote_no_hash_tool",
-                         "remote_df_avail_kb", "remote_tick", "remote_stale"):
+                         "remote_df_avail_kb", "remote_tick", "remote_stale", "system_ssh",
+                         "exclusive_tools"):
                 if self.k.get(name) is not None:
                     testing.active().extra[name] = self.k[name]
             sshw = self.k.get("ssh")
             if isinstance(sshw, str) and os.path.isabs(sshw):
                 testing.active().tools["ssh"] = sshw
+            # wrappers for the env's tools (with exclusive_tools, removing one is
+            # the env losing it: a plain uninstall)
+            tw = self.k.get("tools")
+            if isinstance(tw, dict):
+                testing.active().tools.update({n: v for n, v in tw.items()
+                                               if isinstance(v, str) and os.path.isabs(v)})
         self.last_busy = time.monotonic()
         self.server: server.Server | None = None
         # resolved once: paths.run_dir() creates a missing run dir, and a daemon
@@ -388,6 +401,10 @@ class Daemon:
         # why the daemon takes no new work ("" while it serves): the plugin was uninstalled
         # while terminals or jobs still ran (drain)
         self.draining = ""
+        # where the draining daemon's log lines also go (the gateway home's run/,
+        # which an uninstall keeps; resolved now: nothing is imported later)
+        self.drain_dir = paths.contract_dir()
+        self._drain_logged = False
         # this daemon's pid and start time for its tmux watchdog (write_pid)
         self.pid_path = paths.gated_pid()
         # the pauses being applied right now (pause_begin): drain waits for them, so
@@ -398,12 +415,40 @@ class Daemon:
     # -- facts -----------------------------------------------------------------
     def log(self, line: str) -> None:
         with self._log_lock:
+            stamped = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} gated[{self.pid}] {line}\n"
             try:
-                sys.stderr.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} gated[{self.pid}] {line}\n")
+                sys.stderr.write(stamped)
                 sys.stderr.flush()
             except (OSError, ValueError):
                 pass
+            if getattr(self, "draining", ""):
+                self._drain_note(stamped)
             self._rotate_if_big()
+
+    def _drain_note(self, stamped: str) -> None:
+        """While draining, each log line also goes to <gateway home>/run/
+        gated-drain.log (0600, started over at a drain's first line, at most
+        DRAIN_LOG_MAX): a plain uninstall deleted gated.log with the data
+        folder, and this folder (where contract.json was) stays, so what the
+        draining daemon waits for, what it resumed and when it left can still
+        be read. Never makes a folder (a gateway home deleted too gets nothing)."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
+        if not self._drain_logged:
+            flags |= os.O_TRUNC
+        try:
+            if not self.drain_dir.is_dir():
+                return
+            fd = os.open(self.drain_dir / DRAIN_LOG, flags, 0o600)
+        except OSError:
+            return
+        self._drain_logged = True
+        try:
+            if os.fstat(fd).st_size < DRAIN_LOG_MAX:
+                os.write(fd, stamped.encode("utf-8", "replace"))
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _rotate_if_big(self) -> None:
         """Past log_max the log becomes gated.log.1 (replacing an older one)
@@ -824,6 +869,10 @@ class Daemon:
         # import's bytecode under pycache_prefix would make it again)
         sys.dont_write_bytecode = True
         self.remove_contract()
+        # the env's ssh may be gone with the data folder: a remote job left
+        # suspended is then resumed through the live master by the system's ssh
+        # (ssh_conf.allow_system_ssh)
+        ssh_conf.allow_system_ssh()
         try:
             resumed = self.terminals.resume_stopped()
         except Exception as e:  # noqa: BLE001 - the drain goes on

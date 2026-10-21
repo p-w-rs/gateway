@@ -179,6 +179,16 @@ step does nothing there.
    meanwhile); any other call keeps it until its ssh ends. ssh's environment
    is an allowlist (PATH, HOME, USER, LOGNAME, LANG, LC_*, TZ, TERM, TMPDIR,
    GIT_PROTOCOL): never `SSH_AUTH_SOCK`.
+   The binary is the env's ssh (`ssh_bin`, `paths.tool`). One exception
+   (fix2, 0.9.1): a draining gated (the plugin uninstalled while work runs;
+   `ssh_conf.allow_system_ssh`, called by `Daemon.drain`, never by a
+   stand-in or `gate`) whose env lost its ssh with the data folder uses the
+   system's (`SYSTEM_SSH`, `/usr/bin/ssh`, by path) with the same generated
+   config (`-F`: no user or system ssh config is read) and
+   `-o ControlMaster=no` (`Conn.base`), so it only rides the gateway's live
+   master; with none the call stops before ssh runs (the agent it would
+   need is the env's ssh-agent, gone too). It lets the drain resume a remote
+   job a pause suspended (terminals.md, "Draining").
 8. **Audit**: one `use` line per credential use (tool, target, account for
    endpoints, `ssh NAME CMD...` summary, address, via, master reuse, remote
    sudo, why that address); the session id comes from audit.py. The gate

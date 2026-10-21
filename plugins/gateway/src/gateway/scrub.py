@@ -24,6 +24,9 @@
 - `scrub_text(text, extra=None)`: every vault and cache value (>= 8 chars,
   in all their forms; cached per process by the files' mtimes) plus `extra`
   literals plus the token shape patterns.
+- `text_spans(text, extra=None)`: where scrub_text finds something to mask
+  (character spans), for text shown in pieces (a terminal's physical rows
+  masked by their soft-wrap rejoined line, daemon/terminals.py).
 """
 from __future__ import annotations
 
@@ -485,3 +488,37 @@ def scrub_text(text: str, extra: list[str] | None = None) -> str:
     for rx in SHAPES:
         text = rx.sub("***", text)
     return AUTH_HEADER.sub(lambda m: m.group(1) + "***", text)
+
+
+def text_spans(text: str, extra: list[str] | None = None) -> list[tuple[int, int]]:
+    """Where in `text` (character offsets, merged, sorted) scrub_text finds
+    something to mask: every occurrence of the same literals (vault and cache
+    values in all their forms, `extra`), the token shapes and an
+    Authorization header's value, each looked for in the original text (a
+    superset of what scrub_text masks after its literal pass). For a caller
+    that shows the text in pieces and masks each piece by where the whole
+    matched: a terminal's physical rows, by their soft-wrap rejoined line."""
+    if not text:
+        return []
+    pats = set(vault_values())
+    pats |= set(expand(extra or [], ("x-access-token",)))
+    spans: list[tuple[int, int]] = []
+    for raw in pats:
+        lit = raw.decode("utf-8", "surrogatepass")
+        i = text.find(lit)
+        while i != -1:
+            spans.append((i, i + len(lit)))
+            i = text.find(lit, i + 1)
+    for rx in SHAPES:
+        spans += [m.span() for m in rx.finditer(text) if m.end() > m.start()]
+    spans += [(m.end(1), m.end()) for m in AUTH_HEADER.finditer(text)]
+    if not spans:
+        return []
+    spans.sort()
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]

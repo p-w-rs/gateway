@@ -294,6 +294,26 @@ MUTATIONS = [
      '            if age > stale_after and (reach, auth) != ("unknown", "unknown"):\n',
      "            if False:\n",
      T + "test_host_runtime_status_says_when_the_host_last_answered_and_goes_unknown_when_stale"),
+    # --- a plain uninstall with a remote job a pause suspended (fix2, 0.9.1) ----------------
+    ("a draining gated whose env lost its ssh can't reach the host (no system ssh)",
+     "src/gateway/ssh_conf.py",
+     "        fb = _system_ssh()\n        if fb is not None:\n            return fb\n",
+     "        fb = None\n        if fb is not None:\n            return fb\n",
+     T + "test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master"),
+    ("the drain never allows the system's ssh", "src/gateway/daemon/lifecycle.py",
+     "        ssh_conf.allow_system_ssh()\n", "        pass\n",
+     T + "test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master"),
+    ("the system's ssh is used before any drain", "src/gateway/ssh_conf.py",
+     "    if not _SYSTEM_SSH_OK.is_set():\n        return None\n", "",
+     T + "test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master"),
+    ("the system's ssh may start a master", "src/gateway/ssh_conf.py",
+     '        no_master = ["-o", "ControlMaster=no"] if b == _system_ssh() else []\n',
+     "        no_master = []\n",
+     T + "test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master"),
+    ("the drain's remote resume fails fast after a failed poll", R,
+     "        _rc, out, _e = self._call(script, insist=True)\n",
+     "        _rc, out, _e = self._call(script)\n",
+     T + "test_a_plain_uninstall_resumes_a_remote_job_a_pause_suspended_through_the_live_master"),
 ]
 
 if __name__ == "__main__":

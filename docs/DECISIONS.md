@@ -2201,6 +2201,80 @@ the version stays.
   version it still drains. Rejected: only rewording the refusal (an update is
   no reason to stop serving the sessions that use this daemon meanwhile).
 
+## Verifier lows after the re-fix (fix2-gateway, 0.9.1, 2026-10-21)
+
+Four lows a verifier reproduced on 90732f2/de3a357 (k1, k1b, k15a/b, k16 and
+the acceptance's PID0 line). 0.9.1 hadn't shipped, so the version stays.
+
+- **A job's STOP during the drain was never resumed.** `resume_stopped` runs
+  once, when the drain starts; a STOP the session's agent, the pane
+  (`/ui/term/signal`) or a contract caller sent afterwards was taken (200,
+  "suspended"), and once the session ended the job, gated and the tmux
+  server stayed forever: the refix-gw forever-state by a later road. Now a
+  job's STOP or TSTP is refused while gated drains (503 `draining`,
+  `STOP_DRAINING`), counted like a pause being applied (`pause_begin`/
+  `pause_end`), so the drain also waits for a stop under way and resumes
+  what it stopped. Every other signal still works, and a terminal's TSTP or
+  STOP (job control in its shell, which keeps the terminal open anyway) is
+  not refused. Rejected: resuming at every tick of a draining gated (it
+  would undo a stop the person asked for while the session still runs, and
+  hide the refusal).
+- **A job's TSTP (and a STOP that didn't hold) was recorded "suspended" for
+  a running job**, and the drain then said it resumed it. A pane's process
+  group is orphaned (its leader's parent is the tmux server, in another
+  session), so the kernel drops SIGTSTP and SIGTTOU there, and tmux
+  continues the pane's own process after SIGSTOP: TSTP by killpg never
+  stopped anything, and `_stop_group`'s answer was ignored for STOP. Now a
+  job's STOP and TSTP both use the group stop (SIGSTOP to every member but
+  the root, read back in ps), the job is recorded suspended only when that
+  holds, and otherwise it is continued (nothing left half stopped without a
+  record, which neither `/v1/resume` nor the drain would continue) and the
+  answer carries the real state and a note (a job a pause suspended keeps
+  that record). The drain counts a job as resumed only when ps showed a
+  member stopped just before its SIGCONT (a remote one: the same check in
+  the host's ps, `RemoteTmux.cont_group`), and a record that said suspended
+  for a running job is corrected and logged as such. Found on the way: a
+  job that is only its pane's own process (`exec ...`) can't be suspended at
+  all (the root never stops; the pause and the signal say so); left as is.
+- **On a plain uninstall a remote job a pause suspended stayed stopped** on
+  its host: the env's ssh goes with the data folder, so the drain's SIGCONT
+  failed (`remote_unreachable`), and the records that could re-adopt it
+  were deleted too. Now a draining gated may use the system's ssh
+  (`/usr/bin/ssh` by path, already what `others = "mine"` and "use my own
+  login once" run; `ssh_conf.allow_system_ssh`, never in a stand-in or
+  `gate`) with the call's generated config and `-o ControlMaster=no`, so it
+  only rides the gateway's live master (the run dir keeps its ControlPath;
+  `ControlPersist` 120 s, and the drain starts within a 30 s tick of the
+  uninstall); with no master the call stops before ssh runs (the agent it
+  would need is the env's, gone too), and the drain asks once even right
+  after a failed poll (`insist`). When it still can't (no system ssh, the
+  host down, the master gone) the job stays stopped there, stated in
+  terminals.md, daemon.md and the README with the remedy (resume first,
+  `--keep-data`, or `kill -CONT -- -PGID` on the host). Rejected: the remote
+  runtime continuing jobs marked paused once gated stops polling (a host
+  that merely lost its link would resume work a pause meant to hold);
+  resuming remote jobs before the env can go (an uninstall gives no
+  warning); a mux client of our own over the master's socket (the system's
+  ssh already speaks it).
+- **Terminal reads glued a command's first output line onto its command
+  line** when prompt and command filled their rows exactly: the line editor
+  wraps such a line by writing the next character, so tmux marks the row
+  soft-wrapped and `capture-pane -J` (the agent's lines since the phase 5
+  review) joined the output to it (`...$ echo "PID""0=$$ START"PID0=76777
+  START`; acceptance_terminals failed with a --tmp of exactly that length).
+  Now the agent reads the physical rows (`capture-pane -N -T`) and, in the
+  same tmux command and region (history and screen together), the rejoined
+  lines only to find values across a wrap: each rejoined line is its rows
+  end to end (`align_rows`), and what `scrub.text_spans` finds there is
+  masked in every row it spans (`mask_rows`) before each row's own scrub.
+  If the two don't line up the rejoined lines are used as before. Rejected:
+  re-splitting the joined line where the shell wrote a newline (tmux keeps
+  no such mark), padding commands in the acceptance script (the agent would
+  still misread such lines).
+- The draining gated's log went only into the deleted data folder; from
+  the drain on its lines also go to `~/.config/gateway/run/gated-drain.log`
+  (0600, never a folder made, 64 KiB at most).
+
 ## Rejected alternatives
 
 - **MCP tools first** (v2's design): every git, gh, ssh and sudo action
