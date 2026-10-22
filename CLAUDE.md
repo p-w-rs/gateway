@@ -584,9 +584,15 @@ other files weren't re-run (unchanged since 1062 of 1062). Live on macOS
 `tests/acceptance_install.py` default parts 50 of 50 (87 s; gate 0.9.1,
 check 0.7.3); its spaced part's wait after a submit, and bare sleeps after a
 submit in acceptance_terminals.py and acceptance_managed.py, now pump the
-pty (Claude Code writes to it synchronously). Not re-run: anything on the
-VM, the other TUI acceptances (their changed waits included), the headless
-e2e suite.
+pty (Claude Code writes to it synchronously). Then on macOS
+`acceptance_terminals` 73 of 73 (at the --tmp length that once glued an
+exactly filled line) and `acceptance_managed` 38 of 38. On the Debian 13
+arm64 VM (Claude Code 2.1.304, this tree with check 0.7.3 at dbea426): 1231
+passed, 0 failed; `acceptance_install` default parts 50 of 50, `--only
+vmplain` 14 of 14, `--only vmdrain` 30 of 30, `acceptance_managed` 38 of 38,
+`acceptance_terminals` 73 of 73. Not re-run on this tree: dialogs,
+canaries, native UI and remote (last green at 1786e51 or earlier), the
+headless e2e suite.
 Before that (2026-10-21, fix2-gateway, plugin 0.9.1: a verifier's four lows
 after the re-fix; DECISIONS "Verifier lows after the re-fix"): 1230 passed, 0
 failed on macOS arm64 (`pixi run --locked test`, 369.7 s at 4 at a time, pixi
