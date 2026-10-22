@@ -495,15 +495,14 @@ def cancel_steps(s: driver.Session) -> dict:
     s.send("\x1b")          # Escape interrupts the running tool
     s.pump(1.0)
     s.send("\x1b")
-    time.sleep(11)
-    s.pump(1)
+    s.pump(12)              # waits read the pty: Claude Code writes to it synchronously
     pid = (s.cwd / "long.pid").read_text().strip() if (s.cwd / "long.pid").exists() else ""
     alive = bool(pid) and subprocess.run(["ps", "-p", pid], capture_output=True).returncode == 0
     out["interrupt"] = {"started": started, "file": (s.cwd / "after-interrupt.txt").exists(), "alive": alive}
     s.api.push(bash("sleep 9; touch after-timeout.txt", "a timed-out command", timeout=2000), "timeout turn")
     s.submit("run the timed command")
     wait(s, lambda: "timeout turn" in s.text(), 60)
-    time.sleep(9)
+    s.pump(9)
     out["timeout"] = {"file": (s.cwd / "after-timeout.txt").exists()}
     return out
 

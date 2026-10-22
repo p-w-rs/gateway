@@ -527,7 +527,7 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
     print("fullscr: less from the system", flush=True)
     r = ag.tool("terminal_read", {"id": tid})
     r = ag.tool("terminal_send", {"id": tid, "seq": r["seq"], "text": f"/usr/bin/less '{pages}'", "enter": True})
-    time.sleep(0.5)
+    s.pump(0.5)                 # a wait reads the pty (Claude Code writes to it synchronously)
     r = ag.tool("terminal_read", {"id": tid})
     check("a full-screen program: alternate_screen is true and the lines are its screen",
           bool(r) and r.get("alternate_screen") is True and has_line(r, lambda ln: ln.startswith("page line")),
@@ -560,7 +560,7 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
 
     print("signals: the agent's terminal_signal, the pane's Ctrl-] c", flush=True)
     r = ag.tool("terminal_send", {"id": tid, "seq": r["seq"], "text": "sleep 300", "enter": True})
-    time.sleep(0.5)
+    s.pump(0.5)
     ag.tool("terminal_signal", {"id": tid, "signal": "INT"})
     r = ag.tool("terminal_read", {"id": tid})
     r = ag.tool("terminal_send", {"id": tid, "seq": r["seq"], "text": 'echo "ST""ATUS=$?"', "enter": True})
@@ -667,7 +667,7 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
     check("job_start starts a job (j_..., running, on_pause kept)", jid.startswith("j_") and
           (j or {}).get("on_pause") == "interrupt", json.dumps(j)[:400])
     show("job_start", j, ("id", "state", "command", "on_pause", "host"))
-    time.sleep(1.5)
+    s.pump(1.5)
     st = ag.tool("job_status", {"id": jid})
     check("job_status: exited with code 3", bool(st) and st.get("state") == "exited" and st.get("exit") == 3,
           json.dumps(st)[:400])
@@ -817,7 +817,7 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
             screen_r = ag.tool("terminal_read", {"id": tid})
             if has_line(screen_r, lambda ln: ln.startswith(f"RIGHTS-{n} ")):
                 break
-            time.sleep(0.5)
+            s.pump(0.5)
         return codes, rd(Path(f"{out}.sudo")), rd(Path(f"{out}.ssh")), screen_r
 
     # 1. no form: localhost's sudo is true (the default, the sudo step used it)

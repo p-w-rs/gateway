@@ -1120,6 +1120,17 @@ class Supervisor:
         from .. import scrub
         return _clean(scrub.scrub_text(s[:1000], extra=list(p.secrets)), limit)
 
+    @staticmethod
+    def _live_job_state(p: Pane) -> str:
+        """A live job's state from its records (lock held): suspended while a
+        stop holds, waiting_auth while its password prompt waits on the
+        person, else running."""
+        if p.paused_as == "suspended":
+            return "suspended"
+        if p.auth is not None and p.auth.get("state") in ("asking", "unavailable", "cancelled"):
+            return "waiting_auth"
+        return "running"
+
     def _update(self, p: Pane, info: dict[str, str]) -> None:
         """Facts from list-panes (lock held)."""
         def num(k: str) -> int:
@@ -1155,9 +1166,7 @@ class Supervisor:
             p.auth = None
             p.echo_off = False
         elif not dead and p.kind == "job":
-            want = "suspended" if p.paused_as == "suspended" else \
-                ("waiting_auth" if p.auth is not None and p.auth.get("state") in
-                 ("asking", "unavailable", "cancelled") else "running")
+            want = self._live_job_state(p)
             if want != p.state:
                 p.state = want
                 self._emit("job.state", job=p.id, state=want)
@@ -3495,6 +3504,13 @@ class Supervisor:
                 continue
             with self.lock:
                 p.paused_as = ""
+                # its state too: only _update (list-panes) maps paused_as to the
+                # state, and with the env's tmux gone (a plain uninstall deletes
+                # it with the data folder) no tick calls _update again, so the
+                # job would say suspended while it runs
+                if p.state == "suspended":
+                    p.state = self._live_job_state(p)
+                    self._emit("job.state", job=p.id, state=p.state)
                 self._changed()
             # counted (and logged) only when ps showed a member stopped before the
             # SIGCONT: a record that says suspended for a job that runs (continued

@@ -765,7 +765,9 @@ def part_spaced(root: Path, pre: Prereqs, ck_src: Path) -> None:
         s.wait_ready(120)
         wait(s, lambda: "check: recording" in s.text(), 60)
         s.submit("hello from elsewhere")
-        s.api.wait_main(1, timeout=60)
+        # pumping: Claude Code writes to its terminal synchronously, so a wait that
+        # doesn't read lets the pty fill up and stalls the session
+        wait(s, lambda: len(s.api.main_requests()) >= 1, 60)
     finally:
         s.close()
     ingest_all(Path(p.cache_path), p.data_path, home, pre.env())

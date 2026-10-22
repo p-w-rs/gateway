@@ -1663,9 +1663,11 @@ def test_a_job_left_suspended_at_an_uninstall_is_resumed_and_gated_leaves_after_
         fc = de.claude()
         a = Agent(de, fc)
         cwd = str(de.root)
-        jid = a.ok("/agent/job/start", {"argv": ["sleep", "172"], "cwd": cwd, "on_pause": "suspend",
+        n = secrets.randbelow(10**6)                   # this run's sleeps (others may run beside it)
+        w1, w2 = f"172.{n}", f"173.{n}"
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", w1], "cwd": cwd, "on_pause": "suspend",
                                         "task_ref": "t1"})["id"]
-        other = a.ok("/agent/job/start", {"argv": ["sleep", "173"], "cwd": cwd, "on_pause": "suspend",
+        other = a.ok("/agent/job/start", {"argv": ["sleep", w2], "cwd": cwd, "on_pause": "suspend",
                                           "task_ref": "t2"})["id"]
         time.sleep(0.5)
         st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t1", "reason": "x"}, mode="x")
@@ -1674,27 +1676,23 @@ def test_a_job_left_suspended_at_an_uninstall_is_resumed_and_gated_leaves_after_
         _job_wait(a, jid, ("suspended",))
         gated = de.daemon_pid()
         server = _server_pid(de)
-
-        def stats(word: str) -> list[str]:
-            return [ln.split()[1] for ln in subprocess.run(["ps", "-axo", "pid=,stat=,command="],
-                                                            capture_output=True, text=True).stdout.splitlines()
-                    if ln.split()[2:] == ["sleep", word]]
-        assert stats("172") and all(s.startswith("T") for s in stats("172"))
+        assert _stats(w1) and all(s.startswith("T") for s in _stats(w1)), _stats(w1)
         log = open(paths.gated_log(), errors="replace")        # the file goes with the folder
         data = Path(de.env.data)
         shutil.rmtree(data)
         assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
         assert not paths.contract_path().exists()
         assert _job_wait(a, jid, ("running",))["state"] == "running", "the suspended job stayed stopped"
-        assert stats("172") and not any(s.startswith("T") for s in stats("172")), stats("172")
-        ev = _events(de, ("daemon.draining",))
+        assert _stats(w1) and not any(s.startswith("T") for s in _stats(w1)), _stats(w1)
+        # the drain sets the job running as it resumes it; its event follows
+        ev = de.wait_for(lambda: _events(de, ("daemon.draining",)), 10)
         assert ev and ev[-1]["resumed"] == 1 and ev[-1]["jobs"] == 2, ev
         # a pause reaching the draining gated now is refused, and nothing is applied
         st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t2", "reason": "x"}, mode="x")
         assert st == 503 and r.get("error") == "draining" and "no new pause" in r["message"], (st, r)
         time.sleep(0.3)
         assert a.ok("/agent/job/status", {"id": other})["state"] == "running"
-        assert not any(s.startswith("T") for s in stats("173")), stats("173")
+        assert _stats(w2) and not any(s.startswith("T") for s in _stats(w2)), _stats(w2)
         time.sleep(1.0)
         assert de.daemon_pid() == gated and _alive(server), "gated left while its jobs run"
         _end_pane(de, jid)
@@ -1863,6 +1861,54 @@ def test_a_jobs_stop_is_recorded_only_when_it_holds_and_the_drain_counts_only_st
         for j in (held, loose, behind):
             _end_pane(de, j)
         assert _gone(gated, 10), "gated stayed after its jobs ended"
+        data.mkdir(parents=True)
+
+
+def test_a_job_the_drain_resumed_with_the_envs_tmux_gone_says_running():
+    """A plain uninstall deletes the env with the data folder, its tmux with
+    it, so no tick reaches list-panes again; only that mapped a job's records
+    to its state, so a job the drain resumed still said 'suspended' in
+    job_status and job_list while it ran. The drain sets the state itself
+    (as list-panes would: running here) and emits job.state."""
+    import shutil
+    with D.daemon_env(start=False, knobs={"watch_tick": 60}) as de:
+        wb = de.root / "envbin"
+        wb.mkdir()
+        wrapper = wb / "tmux"
+        wrapper.write_text(f"#!/bin/sh\nexec '{paths.tool('tmux')}' \"$@\"\n")
+        os.chmod(wrapper, 0o755)
+        de.knobs(tmux=str(wrapper))
+        de.start()
+        fc = de.claude()
+        a = Agent(de, fc)
+        w = f"189.{secrets.randbelow(10**6)}"          # this run's sleep (others may run beside it)
+        jid = a.ok("/agent/job/start", {"argv": ["sleep", w], "cwd": str(de.root), "on_pause": "suspend",
+                                        "task_ref": "t1"})["id"]
+        _job_wait(a, jid, ("running",))
+        _wait_watchdog(de)
+        gated = de.daemon_pid()
+        time.sleep(0.5)                                  # a tick has seen the pane's process
+        st, r = a.call("/v1/pause", {"session": "s-test", "task_ref": "t1", "reason": "x"}, mode="x")
+        assert st == 200 and {o["job"]: o["outcome"] for o in r["outcomes"]} == \
+            {jid: "suspended (SIGSTOP)"}, r
+        _job_wait(a, jid, ("suspended",))
+        assert _stats(w) and all(s.startswith("T") for s in _stats(w)), _stats(w)
+        wrapper.unlink()                                 # the env's tmux goes with the data folder
+        data = Path(de.env.data)
+        shutil.rmtree(data)
+        assert de.wait_for(lambda: (de.health() or {}).get("draining"), 5), de.health()
+        ev = de.wait_for(lambda: _events(de, ("daemon.draining",)), 10)
+        assert ev and ev[-1]["resumed"] == 1 and ev[-1]["jobs"] == 1, ev
+        assert _stats(w) and not any(s.startswith("T") for s in _stats(w)), _stats(w)
+        time.sleep(0.5)                                  # ticks of the blind supervisor
+        s = a.ok("/agent/job/status", {"id": jid})
+        assert s["state"] == "running" and not s.get("gone"), s
+        assert [j["state"] for j in a.ok("/agent/job/list", {})["jobs"] if j["id"] == jid] == ["running"]
+        states = [e["state"] for e in _events(de, ("job.state",)) if e.get("job") == jid]
+        assert states[-2:] == ["suspended", "running"], states
+        assert de.daemon_pid() == gated, "gated left while its job runs"
+        _end_pane(de, jid)
+        assert _gone(gated, 10), "gated stayed after its job ended"
         data.mkdir(parents=True)
 
 

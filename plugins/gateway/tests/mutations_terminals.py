@@ -288,6 +288,12 @@ MUTATIONS = [
      "            if was_stopped:\n                done.append(p.id)\n",
      "            if True:\n                done.append(p.id)\n",
      T + "test_a_jobs_stop_is_recorded_only_when_it_holds_and_the_drain_counts_only_stopped_jobs"),
+    ("a job the drain resumed with the env's tmux gone still says suspended", S,
+     '                if p.state == "suspended":\n'
+     "                    p.state = self._live_job_state(p)\n"
+     '                    self._emit("job.state", job=p.id, state=p.state)\n',
+     "",
+     T + "test_a_job_the_drain_resumed_with_the_envs_tmux_gone_says_running"),
     ("the draining gated's log goes only into the data folder an uninstall deleted",
      "src/gateway/daemon/lifecycle.py",
      '            if getattr(self, "draining", ""):\n                self._drain_note(stamped)\n',

@@ -2274,6 +2274,11 @@ the acceptance's PID0 line). 0.9.1 hadn't shipped, so the version stays.
 - The draining gated's log went only into the deleted data folder; from
   the drain on its lines also go to `~/.config/gateway/run/gated-drain.log`
   (0600, never a folder made, 64 KiB at most).
+- A later verifier low (final-gw): with the env's tmux gone (a plain
+  uninstall) a job the drain resumed still said `suspended` in job_status
+  and job_list while it ran, since only `_update` (list-panes) maps
+  `paused_as` to the state; `resume_stopped` now sets it itself (running, or
+  waiting_auth; `_live_job_state`) and emits `job.state`.
 
 ## Rejected alternatives
 

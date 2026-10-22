@@ -167,7 +167,10 @@ reboot empties: so after a reboot every record is reported gone, not forgotten.
   forever (refix-gw). A job counts as resumed (`daemon.draining`'s `resumed`, the log)
   only when ps showed a member of its group stopped just before the SIGCONT; a record
   that said suspended for a job that ran (continued behind gated's back) is corrected
-  and logged as such (fix2). A remote one is resumed through the host's live master:
+  and logged as such (fix2). Its state follows at once (running, or waiting_auth;
+  `job.state`): with the env's tmux gone no tick reaches list-panes again, which was
+  all that mapped the record to a state (final-gw). A remote one is resumed through
+  the host's live master:
   a plain uninstall deletes the env's ssh with the data folder, so a draining gated
   uses the system's ssh (`/usr/bin/ssh`, by path; `ssh_conf.allow_system_ssh`) with the
   call's generated config, never as a master (`ControlMaster=no`), and with no live

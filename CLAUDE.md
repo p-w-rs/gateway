@@ -570,7 +570,24 @@ pixi: `requires-pixi = ">=0.68.0"`, no upper bound. Tested range 0.68.0 to
 v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
 `/gate-doctor`'s verdict) and the docs; `test_packaging` keeps them in step.
 
-Last full run (2026-10-21, fix2-gateway, plugin 0.9.1: a verifier's four lows
+Last full run (2026-10-21, final-gw, plugin 0.9.1: a later verifier low, a
+job the drain resumed with the env's tmux gone still said suspended;
+DECISIONS "Verifier lows after the re-fix", its last line): 1231 passed, 0
+failed on macOS arm64 (`pixi run --locked test`, 374.4 s at 4 at a time, pixi
+0.81.0, GW_TEST_TMP in scratch; `claude plugin test .` 118 pass inside
+test_mod; new: 1 test in test_terminals, failing with the fix removed; the
+older drain test's sleeps now carry a per-run word and it waits for
+`daemon.draining`). Mutations: 1063 in all (new: 1 in mutations_terminals.py);
+`tests/run_mutations.py mutations_terminals.py` killed 83 of 83 (406 s); the
+other files weren't re-run (unchanged since 1062 of 1062). Live on macOS
+(Claude Code 2.1.301, tests/tui, scratch configs, the fake API):
+`tests/acceptance_install.py` default parts 50 of 50 (87 s; gate 0.9.1,
+check 0.7.3); its spaced part's wait after a submit, and bare sleeps after a
+submit in acceptance_terminals.py and acceptance_managed.py, now pump the
+pty (Claude Code writes to it synchronously). Not re-run: anything on the
+VM, the other TUI acceptances (their changed waits included), the headless
+e2e suite.
+Before that (2026-10-21, fix2-gateway, plugin 0.9.1: a verifier's four lows
 after the re-fix; DECISIONS "Verifier lows after the re-fix"): 1230 passed, 0
 failed on macOS arm64 (`pixi run --locked test`, 369.7 s at 4 at a time, pixi
 0.81.0, GW_TEST_TMP in scratch; `claude plugin test .` 118 pass inside
@@ -1748,6 +1765,9 @@ reads a terminal's physical rows, with values across a soft wrap masked in
 each row from the rejoined line, so a command line that filled its rows
 exactly is no longer glued to its output; and the draining gated's log lines
 also go to `~/.config/gateway/run/gated-drain.log`, which an uninstall keeps.
+Later (final-gw): a job the drain resumed says running (not suspended) even
+with the env's tmux gone (`resume_stopped` sets the state and emits
+`job.state`).
 
 Not done or not verified live (as of the 2026-10-21 acceptance; the per-phase
 notes below were written when each phase landed, and items the acceptance
