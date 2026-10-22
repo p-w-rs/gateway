@@ -26,27 +26,30 @@ Plugin `gate` (version 0.9.1) in the marketplace `gateway`
 ## Status: built and tested
 
 "Tested live" means a real Claude Code session in a terminal, driven
-automatically against a stand-in model, with the plugin installed from a git
-marketplace into a throwaway configuration, on macOS arm64 (Claude Code
-2.1.301) and a Debian 13 arm64 VM (Claude Code 2.1.304), 2026-10-21. The
-repository's own test suite (1225 tests) and its mutation checks (1050) pass
-on macOS, and the suite on the Linux VM too (plugin 0.9.1). The fixes after
-the install test from GitHub (an uninstall while a job runs, the status line's
-warning sign, `~/.bashrc` on Debian) were checked live on the VM; their
-follow-up fixes (a killed helper, a paused job at uninstall, the sweep of an
-updated version) in the suite only; the other live checks ran on 0.9.0.
+automatically against a stand-in model (never the real one), with the plugin
+installed from a git marketplace into a throwaway configuration, on macOS
+arm64 (Claude Code 2.1.301) and a Debian 13 arm64 VM (Claude Code 2.1.304),
+2026-10-21. The live checks ran on 0.9.1, except three on the Linux VM,
+which last ran before 0.9.0: the dialogs, the secrets checks and the import
+of a macOS export. The repository's own test suite (1231 tests) passes on both systems,
+and its mutation checks (1063) on macOS. The install from this GitHub
+repository was tested too: on the Linux VM, a fresh install with live
+sessions, the `/plugin marketplace add` and `/plugin install` forms, and both
+kinds of uninstall while gateway jobs and a terminal run; on macOS, from the
+command line, a fresh install, an update from 0.9.0, disable and enable, and
+both kinds of uninstall.
 
 | Area | Built | Tested |
 |---|---|---|
-| Install, first-use setup, update, disable, uninstall | yes | live (macOS, Linux VM), from a local git server rather than GitHub |
+| Install, first-use setup, update, disable, uninstall | yes | live (macOS, Linux VM) from a local git marketplace; from GitHub as described above |
 | The managed shell (Bash, background, subagents, `!`, skills) | yes | live (macOS, Linux VM) |
-| Dialogs: sudo passwords, tokens, consent, host keys, vault passphrase | yes | live in the terminal (macOS, Linux VM); desktop app **untested** |
-| Secrets kept out of transcripts, logs, process lists and telemetry | yes | live in the terminal, with test secrets and telemetry captured before encryption; desktop app untested |
+| Dialogs: sudo passwords, tokens, consent, host keys, vault passphrase | yes | live in the terminal (macOS; the Linux VM before 0.9.0); desktop app **untested** |
+| Secrets kept out of transcripts, logs, process lists and telemetry | yes | live in the terminal (macOS; the Linux VM before 0.9.0), with test secrets and telemetry captured before encryption; desktop app untested |
 | Terminals and jobs, takeover and hand back | yes | live (macOS, Linux VM) |
 | Remote terminals and jobs (the gateway's runtime on another host) | yes | against the Linux VM with a simulated Claude Code, not from a real session |
 | Hosts, workspaces, policy; `/gate-hosts`, `/gate-accounts` | yes | live (macOS, Linux VM); a policy "ask" prompt not driven |
 | GitHub, Hugging Face, Azure account checks | yes | against local stand-in services only (no real accounts) |
-| Encrypted export and import between machines | yes | live, including a macOS export imported on Linux |
+| Encrypted export and import between machines | yes | live, including a macOS export imported on Linux (that import before 0.9.0) |
 | Working with checkpoint | yes | live, both plugins installed |
 | Storing SSH key passphrases, a cookie store, native Windows | no | |
 | Browser or device-code sign-ins | removed on purpose (no web pages) | |
@@ -153,7 +156,7 @@ own tests never do ([Develop](#develop)).
 
 | | |
 |---|---|
-| macOS, Apple silicon | tested (macOS 26): everything above |
+| macOS, Apple silicon | tested (macOS 26): everything above; the install from GitHub from the command line only (see Status) |
 | Linux, ARM64 (glibc) | tested in a Debian 13 VM: the test suite and live sessions |
 | macOS Intel, Linux x86-64 | in the lock (osx-64, linux-64), expected to work, untested (no such machine was available) |
 | Windows | native Windows isn't supported (the hooks need a POSIX `sh`, the lock has no win-64, the code uses POSIX-only modules). Use WSL 2: install Claude Code and pixi inside it, and the Linux rules apply (untested) |
@@ -719,7 +722,9 @@ import FILE` on any machine, or copy the folder back to the same place.
 
 ## Upgrading
 
-**From 0.6** (the version on GitHub before this one). The first session with
+**From 0.9.0.** Update as usual; nothing is converted.
+
+**From 0.6** (the last version published before 0.9). The first session with
 this version converts the 0.6 vault automatically, offline:
 
 - **Backup first.** The 0.6 vault and its key are copied to
@@ -759,9 +764,12 @@ helper; one still running terminals or jobs is kept until they finish
 uninstalls the plugin); then `cd
 ~/.config/gateway && mv private/backups/store-v2-YYYYMMDD.age store.age && mv
 private/backups/key-v2.txt key.txt`; then `claude plugin marketplace add
-p-w-rs/gateway#accounts-phase1` (0.6.0, commit `c75fa82`) and `claude plugin
-install gate@gateway`. Anything you added after the upgrade isn't in the 0.6
-vault; upgrading again later keeps the v3 vault.
+p-w-rs/gateway#v0.6.0` (the tag of 0.6.0, commit `c75fa82`) and `claude
+plugin install gate@gateway`. Anything you added after the upgrade isn't in the 0.6
+vault; upgrading again later keeps the v3 vault. The marketplace stays on
+the tag, so to upgrade again: `claude plugin marketplace remove gateway`,
+then `claude plugin marketplace add p-w-rs/gateway` (no tag) and `claude
+plugin install gate@gateway`.
 
 ## Recovery procedures
 
