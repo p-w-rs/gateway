@@ -212,7 +212,7 @@ reviewer, and some output can't be masked (see Limits).
 |---|---|---|
 | The form, the vault and its key; backups (the 0.6 conversion, every import, `gate rotate`'s newest 5) | `~/.config/gateway/` (secrets and backups in `private/`) | until you delete them |
 | Built tools, audit log (values redacted), the helper's logs, terminal and job records | the plugin's data folder: `~/.claude/plugins/data/gate-gateway`, or under `$CLAUDE_CONFIG_DIR` | audit log 5 MB plus one older copy; records 24 h after a terminal or job ends; a job's last 256 KiB of output; all deleted on uninstall |
-| Sockets, the terminals' tmux | `/tmp/gw-<uid>/` | until the helper stops or the machine restarts |
+| Sockets, the terminals' tmux | `/tmp/gw-<uid>/` | until the machine restarts |
 | Claude's keys and runtime on your servers | `~/.ssh/authorized_keys` (lines ending in `gateway-NAME@...`), `~/.local/share/gateway-runtime/` | until you remove them |
 
 `gate forget NAME` deletes what is stored for an entry and keeps no copy;
@@ -260,7 +260,7 @@ and [docs/dev/modules/sudo.md](docs/dev/modules/sudo.md#hooks_bashpy-spec-8).
 | Update | `claude plugin marketplace update gateway`, then `claude plugin update gate@gateway`, then a new session (or `/reload-plugins`) |
 | Turn off for now | `claude plugin disable gate@gateway` (back on: `claude plugin enable gate@gateway`) |
 | Uninstall | `claude plugin uninstall gate@gateway` (`--keep-data` keeps the built tools) |
-| Forget the marketplace | `claude plugin marketplace remove gateway` |
+| Forget the marketplace | `claude plugin marketplace remove gateway` (also uninstalls the plugin and deletes its data folder) |
 
 An update keeps working on the old tools while new ones build. Uninstalling
 deletes the plugin's data folder and lets running terminals and jobs finish
@@ -284,7 +284,10 @@ changes: [CHANGELOG.md](CHANGELOG.md).
 **Rolling back.** Releases are tagged. To go back to 0.9.1: `claude plugin
 marketplace remove gateway`, `claude plugin marketplace add
 p-w-rs/gateway#v0.9.1`, `claude plugin install gate@gateway`. To return,
-do the same without the tag.
+do the same without the tag. Removing the marketplace also uninstalls the
+plugin and deletes its data folder (the built tools, the audit log and the
+terminal and job records); `~/.config/gateway` stays. While the marketplace
+is pinned to a tag, updates keep that version.
 
 ## Troubleshooting
 
