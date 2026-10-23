@@ -113,7 +113,6 @@ approves goes to Claude Code's prompt or reviewer; it is not refused.
 - Developer documentation and design history moved to `docs/dev/`.
 - New: this changelog, [SECURITY.md](SECURITY.md), and
   [docs/CONFIG.md](docs/CONFIG.md) with every setting.
-- A GitHub Actions workflow runs the test suite on Linux and macOS.
 
 ## 0.9.1 (2026-10-21)
 

@@ -172,15 +172,6 @@ claude plugin validate .        # the plugin
 claude plugin validate ../..    # the marketplace
 ```
 
-## CI
-
-`.github/workflows/test.yml` (added in 0.10.0) runs the suite on every push
-to main and every pull request: Ubuntu 24.04 (x86_64 and arm64) and macOS 15
-(arm64 and Intel) with pixi 0.81.0, plus Ubuntu with pixi 0.68.0, the oldest
-pixi the plugin accepts. It installs Claude Code 2.1.301 for `test_mod`. A
-weekly run uses the newest pixi and Claude Code instead. The mutations run
-weekly and on demand only (about an hour on a runner).
-
 ## Coverage as of 0.9.1
 
 These facts are from the README's status section at 0.9.1 (2026-10-21).
@@ -246,6 +237,6 @@ pixi 0.81.0 / 0.82.0; scratch configs and the fake model API throughout).
   real-config check performed there).
 - Not run: the headless e2e suite (it needs the real model API), the desktop
   app (by hand), real GitHub, Hugging Face and Azure accounts, an upgrade
-  from an installed 0.9.1 in a live session (unit-tested), a first CI run, an
+  from an installed 0.9.1 in a live session (unit-tested), an
   install from GitHub of the released version.
 

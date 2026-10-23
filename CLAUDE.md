@@ -71,8 +71,6 @@ has what each one added):
 
 ```
 .claude-plugin/marketplace.json     marketplace "gateway" -> ./plugins/gateway (plugin "gate")
-.github/workflows/test.yml          CI: the suite on Linux and macOS (x86_64, arm64) and the oldest pixi;
-                                    the mutations weekly
 CHANGELOG.md, SECURITY.md           what each release changed; how to report a vulnerability
 docs/
   CONFIG.md                         every gateway.toml setting (the user's reference)
@@ -601,9 +599,8 @@ pixi exec --spec python=3.12 --spec pyte python tests/acceptance_native_ui.py --
 
 More on each kind of test, and what was verified for each release:
 [docs/dev/TESTING.md](docs/dev/TESTING.md). Results of past runs:
-[docs/dev/TEST-LOG.md](docs/dev/TEST-LOG.md). CI
-(`.github/workflows/test.yml`) runs the suite on Linux and macOS, x86_64 and
-arm64, and the oldest pixi; the mutations weekly.
+[docs/dev/TEST-LOG.md](docs/dev/TEST-LOG.md). There is no CI: the suites run
+by hand before a release.
 
 `test_mod` runs the three `claude plugin` commands itself (scratch
 `CLAUDE_CONFIG_DIR` and HOME, a local recording server as
@@ -941,5 +938,7 @@ history of every phase and review round:
   settings; never run the plugin against the real `~/.config/gateway`.
 - Plain, concise docs. No license file and no license wording (don't call
   the project open source).
+- A hobby project: no CI/CD (no GitHub Actions) and no enterprise-style
+  release process.
 - Docs stay generic: no employer, work logins, emails, internal hosts,
   personal paths, pids or the user's live state.
