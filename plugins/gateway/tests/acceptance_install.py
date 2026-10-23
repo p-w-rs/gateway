@@ -616,22 +616,37 @@ def part_warm(root, pre, cfg, gdata, cdata, home, proj) -> None:
           json.dumps(SUMMARY["startup_to_prompt_s"]))
 
 
+def newer(version: str, patch: int) -> str:
+    """A version newer than the installed one: its major.minor with a large
+    patch number (gate 0.10.0 -> 0.10.1000, check 0.8.0 -> 0.8.1000), so the
+    update part publishes a real update whatever the checkouts' versions."""
+    major, minor = version.split(".")[:2]
+    return f"{major}.{minor}.{patch}"
+
+
+def vkey(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", version)[:3])
+
+
 def part_update(root, pre, h, cfg, gi, p, ck_src, gdata, cdata, home, proj) -> None:
     print("update: new versions published; after a restart, marketplace update + plugin update", flush=True)
     recs_before = len(journal(home))
     form = gi.gateway_home / "gateway.toml"
     form_before = form.read_bytes() if form.exists() else None
     genvs, cenvs = [e.name for e in ready_envs(gdata)], [e.name for e in ready_envs(cdata)]
-    gi2 = h.update_gateway_e2e(REPO, version="0.9.1000")
-    ck2 = patched_checkpoint(ck_src, root / "ck-src-0.7.1000", "0.7.1000")
+    gv, cv = newer(gi.plugin.version, 1000), newer(p.version, 1000)
+    gi2 = h.update_gateway_e2e(REPO, version=gv)
+    ck2 = patched_checkpoint(ck_src, root / f"ck-src-{cv}", cv)
     p2 = h.update_from(ck2, repo="checkpoint", plugin="check")
     hist = h.inst.history[-4:]
     check("`claude plugin marketplace update` + `claude plugin update` for both, with the normal PATH "
           "(pixi's git; no bootstrap environment)", all(r.ok for r in hist),
           "\n".join(str(r)[:300] for r in hist if not r.ok))
-    check("the new versions are installed (0.9.1000, 0.7.1000), each in its own cache folder",
-          gi2.plugin.version == "0.9.1000" and p2.version == "0.7.1000"
-          and str(gi2.plugin.cache_path).endswith("0.9.1000") and str(p2.cache_path).endswith("0.7.1000"),
+    check(f"the new versions are installed ({gv}, {cv}: newer than the installed {gi.plugin.version} and "
+          f"{p.version}), each in its own cache folder",
+          gi2.plugin.version == gv and p2.version == cv
+          and vkey(gv) > vkey(gi.plugin.version) and vkey(cv) > vkey(p.version)
+          and str(gi2.plugin.cache_path).endswith(gv) and str(p2.cache_path).endswith(cv),
           f"{gi2.plugin.version} {gi2.plugin.cache_path} {p2.version} {p2.cache_path}")
     SUMMARY["updated"] = {"gate": [gi2.plugin.version, str(gi2.plugin.cache_path)],
                           "check": [p2.version, str(p2.cache_path)],
@@ -648,8 +663,8 @@ def part_update(root, pre, h, cfg, gi, p, ck_src, gdata, cdata, home, proj) -> N
         check("session 4 runs the updated plugins on the existing environments (pixi refusing: no rebuild)",
               rec and ok, s.text()[-400:])
         dbg = s.debug_path.read_text(errors="replace") if s.debug_path and s.debug_path.exists() else ""
-        check("...the session loaded the new cache folders (debug log names 0.9.1000 and 0.7.1000)",
-              "gate/0.9.1000" in dbg and "check/0.7.1000" in dbg)
+        check(f"...the session loaded the new cache folders (debug log names {gv} and {cv})",
+              f"gate/{gv}" in dbg and f"check/{cv}" in dbg)
     finally:
         s.close()
         pre.fail_flag.unlink(missing_ok=True)
@@ -663,9 +678,10 @@ def part_update(root, pre, h, cfg, gi, p, ck_src, gdata, cdata, home, proj) -> N
     check("the gateway's form is unchanged by the update",
           (form.read_bytes() if form.exists() else None) == form_before)
     # a checkpoint update whose lock changed
-    ck3 = patched_checkpoint(ck_src, root / "ck-src-0.7.1001", "0.7.1001", lock_comment="acceptance: lock bump")
+    cv3 = newer(p.version, 1001)
+    ck3 = patched_checkpoint(ck_src, root / f"ck-src-{cv3}", cv3, lock_comment="acceptance: lock bump")
     p3 = h.update_from(ck3, repo="checkpoint", plugin="check")
-    check("a checkpoint update with a changed lock installs (0.7.1001)", p3.version == "0.7.1001")
+    check(f"a checkpoint update with a changed lock installs ({cv3})", p3.version == cv3)
     t_mark = time.time()
     s = session(root, "s5-newlock", cfg, proj, pre, replies=[bash("echo newlock > newlock.txt"), "ok"])
     samp = StatusSampler(s, [cdata])

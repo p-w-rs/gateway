@@ -5,7 +5,7 @@
 // what the Client sealed and check that nothing else carries the value.
 import { expect, mock, test } from 'claude-code/testing'
 import { b64encode, keyPairForTest, openForTest, plaintext, seal } from './seal.ts'
-import { GUARD_CLOSED_TEXT, GUARD_DROP_TEXT, GUARD_MAIN_TEXT, GUARD_TEXT, NOT_RECEIVED, UNAVAILABLE_SURFACE, guardEdit, guardPasses, guardSubmitPasses, parseNext, parsePost, queueLine, resultText } from './dialog.ts'
+import { FULLSCREEN_HINT, GUARD_CLOSED_TEXT, GUARD_DROP_TEXT, GUARD_MAIN_TEXT, GUARD_NODISPLAY_TEXT, GUARD_TEXT, MAIN_KEYS, MAIN_SCREEN, NO_DISPLAY_MAIN, NO_DISPLAY_PASTE, NOT_RECEIVED, PASTE_NOTE, UNAVAILABLE_SURFACE, guardEdit, guardPasses, guardSubmitPasses, parseNext, parsePost, queueLine, resultText } from './dialog.ts'
 import { printable } from './field.tsx'
 
 const HOME = '/Users/tester'
@@ -41,13 +41,16 @@ function secretDialog(pub: Uint8Array, extra: Dialog = {}): Dialog {
 // The engine and gated beneath the plugin. `views` are what /ui/dialog/next
 // answers in turn; after the last one the long poll never answers (gated
 // waiting for a change), so the plugin's loop parks.
+// opts.env: Claude Code's environment beyond HOME, CLAUDE_CONFIG_DIR and
+// DISPLAY=:0 (undefined unsets one); opts.paste: gated's answer to a paste.
 function world(on: any, views: Record<string, unknown>[], gated: string = daemonJson(),
-  submit?: (body: any) => Record<string, unknown>, placed = true) {
+  submit?: (body: any) => Record<string, unknown>, placed = true,
+  opts: { env?: Record<string, string | undefined>; paste?: (body: any) => Record<string, unknown> } = {}) {
   const fetches: { url: string; body: any }[] = []
   const statuses: (string | undefined)[] = []
   const opened: any[] = []
   const toasts: string[] = []
-  mock.env(on, { HOME, CLAUDE_CONFIG_DIR: CONFIG, DISPLAY: ':0' })
+  mock.env(on, { HOME, CLAUDE_CONFIG_DIR: CONFIG, DISPLAY: ':0', ...(opts.env ?? {}) })
   const clock = mock.clock(on, { now: 1_000_000 })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sess-1' }))
@@ -83,6 +86,9 @@ function world(on: any, views: Record<string, unknown>[], gated: string = daemon
       const answer = (x: Record<string, unknown>) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(x) } })
       if (v === undefined) return new Promise((resolve) => waiting.push((x) => resolve(answer(x))))
       return answer(v)
+    }
+    if (opts.paste !== undefined && String(e.url).includes('/ui/dialog/paste')) {
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(opts.paste(body)) } }
     }
     if (submit !== undefined && String(e.url).includes('/ui/dialog/submit')) {
       const r = submit(body)
@@ -296,8 +302,30 @@ test('Paste from clipboard asks gated (the value never comes through the mod), w
   const p = w.fetches.filter((f) => f.url.endsWith('/ui/dialog/paste'))
   expect(p.length).toBe(1)
   expect(p[0]!.body).toEqual({ id: ID, env: { DISPLAY: ':0' } })
+  // gated took the value and never clears the clipboard: the person is told (GW-UX-6)
+  expect(w.toasts).toContain(PASTE_NOTE)
   await ui.press({ key: 'cancel' })
   expect(w.fetches.filter((f) => f.url.endsWith('/ui/dialog/cancel')).map((f) => f.body)).toEqual([{ id: ID }])
+})
+
+test('the clipboard note shows after a pasted value failed its recheck too, never when the clipboard could not be read (review round 2)', async ($: any, on: any) => {
+  const kp = keyPairForTest()
+  const answers: Record<string, unknown>[] = [
+    { ok: false, error: 'session_gone', state: 'done', message: "gateway: the session that asked isn't running any more" },
+    { ok: false, error: 'clipboard', message: 'gateway: the clipboard is empty' },
+  ]
+  const w = world(on, [view(secretDialog(kp.publicKey))], daemonJson(), undefined, true, { paste: () => answers.shift()! })
+  await start($)
+  const ui = await mount($)
+  await ui.press({ key: 'paste' })
+  await settle()
+  // gated read the value (it failed the recheck): it is still on the clipboard
+  expect(w.toasts.filter((t) => t === PASTE_NOTE).length).toBe(1)
+  await ui.press({ key: 'paste' })
+  await settle()
+  // nothing could be read: no note
+  expect(w.toasts.filter((t) => t === PASTE_NOTE).length).toBe(1)
+  expect(w.fetches.filter((f) => f.url.endsWith('/ui/dialog/paste')).length).toBe(2)
 })
 
 test('the remember choice goes with the sealed value', async ($: any, on: any) => {
@@ -366,6 +394,18 @@ test("on the terminal's main screen (no fullscreen: no clicks) the field isn't d
   expect(w.statuses).toContain(GUARD_MAIN_TEXT)
   expect(GUARD_MAIN_TEXT).toContain('Paste from clipboard')
   expect(GUARD_MAIN_TEXT).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  // GW-UX-6: the pane says plainly that this terminal can't type into the
+  // field, that Paste leaves the value on the clipboard, and how to get the
+  // fullscreen view; one keyboard route everywhere
+  expect(t).toContain("This terminal can't type into the gateway's field")
+  expect(t).toContain(MAIN_KEYS)
+  expect(t).toContain('clear it yourself')
+  expect(t).toContain(FULLSCREEN_HINT)
+  for (const x of [MAIN_SCREEN, GUARD_MAIN_TEXT]) {
+    expect(x).toContain(MAIN_KEYS)
+    expect(x).not.toContain('ctrl+x')
+  }
+  expect(MAIN_SCREEN).toContain(PASTE_NOTE)
   // the gateway's own commands pass, so /gate-dialog can still be typed
   expect((await $.prompt.edit(edit('', '/'))).text).toBe('/')
   expect((await $.prompt.edit(edit('/gate-d', 'ialog'))).text).toBe('/gate-dialog')
@@ -374,6 +414,52 @@ test("on the terminal's main screen (no fullscreen: no clicks) the field isn't d
   expect((await $.prompt.edit(edit('', '/hunter2-not-real'))).text).toBe('')
   expect((await $.prompt.edit(edit('/gate-dialog', 'x'))).text).toBe('/gate-dialog')
 })
+
+test('on Linux without a display the main screen says neither typing nor Paste works, and what to do (review round 2)', async ($: any, on: any) => {
+  const kp = keyPairForTest()
+  const w = world(on, [view(secretDialog(kp.publicKey))], daemonJson({ platform: 'linux' }), undefined, true,
+                  { env: { DISPLAY: undefined } })
+  await start($)
+  const ui = await $.ui.mount({ plugin: 'gate', surface: 'terminal', component: 'Pane', requestId: 'gate-dialog',
+                                props: PANE_PROPS, viewport: MAIN_VIEWPORT })
+  const t = JSON.stringify(await ui.drawn())
+  expect(t).toContain('Neither typing nor Paste can work in this terminal')
+  expect(t).toContain('no DISPLAY or WAYLAND_DISPLAY')
+  expect(t).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(t).toContain("this machine's desktop")
+  expect(t).not.toContain("This terminal can't type into the gateway's field")     // MAIN_SCREEN's Paste advice
+  expect(NO_DISPLAY_MAIN).toContain("Don't type it into the prompt")
+  expect(await ui.find({ key: 'cancel' })).not.toBe(undefined)
+  // the guard says it too
+  expect((await $.prompt.edit(edit('', 'p'))).text).toBe('')
+  expect(w.statuses).toContain(GUARD_NODISPLAY_TEXT)
+  expect(w.statuses).not.toContain(GUARD_MAIN_TEXT)
+})
+
+test('on Linux without a display the fullscreen field takes keys and Paste is said not to work; with a display (or on macOS) nothing changes', async ($: any, on: any) => {
+  const kp = keyPairForTest()
+  world(on, [view(secretDialog(kp.publicKey))], daemonJson({ platform: 'linux' }), undefined, true,
+        { env: { DISPLAY: undefined, WAYLAND_DISPLAY: undefined } })
+  await start($)
+  const ui = await mount($)
+  const t = JSON.stringify(await ui.drawn())
+  expect(t).toContain('field.tsx')
+  expect(t).toContain(NO_DISPLAY_PASTE)
+})
+
+for (const [platform, env] of [['linux', { WAYLAND_DISPLAY: 'wayland-0', DISPLAY: undefined }], ['darwin', { DISPLAY: undefined }]] as const) {
+  test(`${platform} with ${JSON.stringify(env)}: the main screen offers Paste as before`, async ($: any, on: any) => {
+    const kp = keyPairForTest()
+    world(on, [view(secretDialog(kp.publicKey))], daemonJson({ platform }), undefined, true, { env })
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'gate', surface: 'terminal', component: 'Pane', requestId: 'gate-dialog',
+                                  props: PANE_PROPS, viewport: MAIN_VIEWPORT })
+    const t = JSON.stringify(await ui.drawn())
+    expect(t).toContain("This terminal can't type into the gateway's field")
+    expect(t).not.toContain('Neither typing nor Paste')
+    expect(t).not.toContain(NO_DISPLAY_PASTE)
+  })
+}
 
 test("a pane that isn't placed (too narrow, or closed by the person) keeps the guard: typing is held back and /gate-dialog passes", async ($: any, on: any) => {
   const kp = keyPairForTest()

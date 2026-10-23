@@ -96,8 +96,8 @@ JOB_TABLE = [
     ("bash -c 'gate secret box'", DENY),
     ("gate export /tmp/x.age", DENY),
     ("gate import f.age", DENY),
-    ("gate copy-to powerslabs", DENY),
-    ("env gate copy-to powerslabs", DENY),
+    ("gate copy-to example", DENY),
+    ("env gate copy-to example", DENY),
     # rights set to false (and remote sudo on a sudo = false host)
     ("ssh offhost uptime", DENY),
     ("scp offhost:/x .", DENY),
@@ -116,10 +116,10 @@ JOB_TABLE = [
     # what Bash would allow (or leave alone) gets no decision: Claude Code's
     # own permission check decides (a prompt, or the classifier in auto mode)
     ("sudo apt install htop", NONE),
-    ("ssh powerslabs df -h", NONE),
-    ("rsync -a dist/ powerslabs:/srv/app/", NONE),
+    ("ssh example df -h", NONE),
+    ("rsync -a dist/ example:/srv/app/", NONE),
     ("gate status", NONE),
-    ("gate check powerslabs", NONE),
+    ("gate check example", NONE),
     ("pixi run train", NONE),
     ("make test", NONE),
     ("python train.py --epochs 10", NONE),
@@ -179,11 +179,11 @@ def test_the_ask_deny_names_the_rights_and_the_next_step_and_is_audited():
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
         assert reason.startswith('gateway: a job can\'t use the "ask" right for ssh on askhost '
                                  "(nobody can be asked"), reason
-        out = _job({"command": "gate copy-to powerslabs"}, "auto", cwd=str(proj))
+        out = _job({"command": "gate copy-to example"}, "auto", cwd=str(proj))
         assert "as a job" in out["hookSpecificOutput"]["permissionDecisionReason"]
         # the same commands in Claude's Bash: asked about / allowed as before
         assert T._decide("ssh askhost sudo id", "default") == ASK
-        assert T._decide("gate copy-to powerslabs", "auto") == "allow"
+        assert T._decide("gate copy-to example", "auto") == "allow"
 
 
 def test_localhost_sudo_ask_in_a_job_is_denied():
@@ -224,7 +224,7 @@ def test_a_job_never_gets_allow_or_ask():
     only a deny, whatever the decision below it says."""
     with _rig() as (_, proj):
         payload = {"tool_name": JOB, "permission_mode": "auto", "cwd": str(proj)}
-        for cmd in ("ssh powerslabs df", "sudo ls", "gate status", "cat README.md"):
+        for cmd in ("ssh example df", "sudo ls", "gate status", "cat README.md"):
             assert T._decide(cmd, "auto") == "allow", cmd
             got = hooks_bash._judge(bashparse.parse(cmd), cmd, payload, "auto", str(proj),
                                     False, in_job=True)
@@ -273,7 +273,7 @@ def test_run_py_hook_bash_judges_a_job_payload():
         r = H.run_py(env, "--test", "hook-bash",
                      payload={"tool_name": JOB, "permission_mode": "auto", "cwd": str(proj),
                               "tool_input": {"name": "x", "redo_hint": "r",
-                                             "command": "ssh powerslabs df"}})
+                                             "command": "ssh example df"}})
         assert r.returncode == 0 and r.stdout.strip() == "", (r.stdout, r.stderr)
 
 

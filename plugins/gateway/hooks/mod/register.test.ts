@@ -126,6 +126,34 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
+test('/gate-doctor says whether a secret can be typed here: the main screen (and tmux) only pastes (GW-UX-6)', async ($: any, on: any) => {
+  world(on, [statusJson('ready')], undefined, {}, { TMUX: '/tmp/tmux-501/default,1,0' })
+  on('session.surfaces', () => ({ value: ['terminal'] }))
+  await start($)
+  const main: string = (await doctor($)).text
+  const line = main.split('\n').find((l) => l.startsWith('Secrets here: '))!
+  expect(line).toContain("this terminal shows Claude Code's main screen (inside tmux), so a secret can't be typed")
+  expect(line).toContain('Paste from clipboard (/gate-dialog, then Tab and Enter)')
+  expect(line).toContain('clear it yourself')
+  expect(line).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  const full: string = (await $.command.run({ command: 'gate-doctor', args: '', origin: { kind: 'composer' },
+                                              presentation: { isFullscreen: true, columns: 140 } })).text
+  expect(full).toContain("Secrets here: the fullscreen view, so the gateway dialog's field takes a click, then keys")
+  expect(full).not.toContain('main screen')
+})
+
+test('/gate-doctor on Linux without a display says neither typing nor Paste works here, and what to do (review round 2)', async ($: any, on: any) => {
+  world(on, [statusJson('ready')], [daemonJson({ parent_pid: 4242, platform: 'linux' })])
+  on('session.surfaces', () => ({ value: ['terminal'] }))
+  await start($)
+  const line = ((await doctor($)).text as string).split('\n').find((l) => l.startsWith('Secrets here: '))!
+  expect(line).toContain('neither typing nor Paste can work in this terminal')
+  expect(line).toContain('no DISPLAY or WAYLAND_DISPLAY')
+  expect(line).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(line).toContain("this machine's desktop")
+  expect(line).not.toContain('press Paste')
+})
+
 test('/gate-doctor warns about a pixi newer than the tested range and names a failed setup', async ($: any, on: any) => {
   world(on, [statusJson('failed', { pixi_version: 'pixi 0.95.1', warm: false, vault: false, form: false })])
   on('session.surfaces', () => ({ value: [] }))

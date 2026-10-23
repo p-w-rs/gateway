@@ -65,13 +65,13 @@ match strict patterns; change lines pass `form.strip_unsafe`.
   Claude Code session, so gated knows whose mod draws the dialog). No lease
   -> `unavailable` at once, with gated's reason; nothing is asked another
   way and no request is persisted.
-- Then it prints the notice (`gateway: waiting for the powerslabs sudo
+- Then it prints the notice (`gateway: waiting for the example sudo
   password in the gateway dialog in Claude Code`), double-forks a detached
   helper (own session, stdio on /dev/null, every other fd closed, no exec,
   so callbacks run in it; it inherits the lease token and proves itself with
   it on gated's lease plane), and waits at most **90 s**
   (`testing.override(popup_wait=…)`); then prints `gateway: the gateway
-  dialog for powerslabs is still open in Claude Code; tell the user once and
+  dialog for example is still open in Claude Code; tell the user once and
   carry on with other work. Retry after they answer.` and raises `StillOpen`
   (a `SystemExit`, code **75**). The helper keeps the dialog open up to
   **30 min** (`popup_lifetime`), stores the answer through the job's
@@ -142,7 +142,7 @@ match strict patterns; change lines pass `form.strip_unsafe`.
   written from Claude Code's own environment) gives ssh.py the user's
   `SSH_AUTH_SOCK` for "use my own SSH login once".
 
-What gated and the mod add (docs/modules/daemon.md "Dialogs"; hooks/mod/):
+What gated and the mod add (docs/dev/modules/daemon.md "Dialogs"; hooks/mod/):
 the pane (title, fixed lines, the field or buttons, the queue line), the
 `Client` field (bullets only; Enter seals the value with TweetNaCl's box to
 the attempt's public key and posts `{id, attempt, epk, nonce, box}`, batched
@@ -165,15 +165,41 @@ click on the field or the pane's ring
 moving onto a button starts the field over, hotkeys (y, n, digits) only on
 dialogs without a field, `/gate-dialog` to bring a waiting dialog back. On
 the terminal's main screen (no clicks) the field isn't drawn: the dialog
-says to start Claude Code with `CLAUDE_CODE_NO_FLICKER=1`, or to use Paste.
+says to start Claude Code with `CLAUDE_CODE_NO_FLICKER=1`, or to use Paste
+(`dialog.ts MAIN_SCREEN`, one key route: `/gate-dialog`, then Tab and
+Enter). Paste leaves the value on the clipboard: a toast says so whenever
+gated read it, also when the value then failed its recheck (not when the
+clipboard couldn't be read); `/gate-doctor`'s "Secrets here:" line says
+before any dialog which routes work (`lib.ts secretLine`). On Linux without
+`DISPLAY` or `WAYLAND_DISPLAY` in Claude Code's environment (the mod learns
+the platform from `gated start|status`) Paste can't work: on the main
+screen the dialog (`NO_DISPLAY_MAIN`), the guard (`GUARD_NODISPLAY_TEXT`)
+and the doctor say neither typing nor Paste works and what to do (start
+Claude Code with `CLAUDE_CODE_NO_FLICKER=1`, or set the credential from a
+Claude Code session in the machine's desktop); in the fullscreen view the
+dialog adds that Paste can't work (`NO_DISPLAY_PASTE`); the Paste button
+stays (a test override's clipboard program works anywhere); and
+SessionStart's context says it once (`hooks_session.NO_DISPLAY_NOTE`, a
+how-to line, so it survives truncation; review round 2).
 
 ## gate_setup.py (SPEC 15, 6)
 
 - `check(name|"all") -> int`, `check_one(name, *, force_signin=False)`,
   `login(name)`, `forget(name, what|None)` (`sudo`, `token`, `key`,
-  `signin`, `host-keys`, or everything; account bindings stay),
-  `rotate(host)` (→ `ssh.rotate`), `secret_removed(name)` (`gate secret`:
-  exit 2 with `SECRET_REMOVED`, where credentials are entered now).
+  `signin`, `host-keys`, or everything; account bindings stay; it keeps no
+  copy of the vault: forgetting means gone. When older copies in
+  `private/backups` may still hold the entry, `gate rotate`'s, an import's
+  backup or the 0.6 conversion's (`vault.older_copies`), its output names
+  them and how the user deletes them in their own terminal: `cd
+  ~/.config/gateway/private/backups && rm -r <globs>`; Claude's tools can't
+  reach that folder), `rotate(host)` (→ `ssh.rotate(host, before_change=)`:
+  just before the rotation first changes the vault, under its lock, a copy
+  of vault.age goes to `private/backups/rotate-<time>-<hex>.vault.age`
+  (`vault.snapshot`, 0600, the newest 5 kept), and the output names it; a
+  rotation that fails before that keeps none and prints the ssh module's
+  own message; there is no restore command: SPEC 15 says how to copy it
+  back by hand), `secret_removed(name)` (`gate secret`: exit 2 with
+  `SECRET_REMOVED`, where credentials are entered now).
 - `plan_for(...)` (requester side, no dialog): pending changes; for hosts a
   keyscan (`ssh.keyscan_host`) when nothing is pinned or an address/via
   changed; whether a key, a sudo password or an account credential is
@@ -237,7 +263,7 @@ for the consent dialog. Accounts: each state in words ("needs you to sign in
 again", "stored, not checked yet", ...), Check (`gate accounts --check NAME
 --json`) and Enter credential (`gate login NAME`, the credential dialog), and
 the note that a browser login is never an API credential. The panes never
-take a credential and never approve anything (docs/modules/policy.md).
+take a credential and never approve anything (docs/dev/modules/policy.md).
 Tests: `hooks/mod/manage.test.ts`; `register.test.ts` (seven commands).
 
 `gate host add|set`, `gate workspace add|remove`, `gate policy set`, `gate
@@ -421,7 +447,7 @@ add`), and the other reserved words are refused everywhere (acceptance
 `Server(stdin, stdout, tool=call_tool, workers=8).serve()`: initialize
 (negotiates 2025-06-18 / 2025-03-26 / 2024-11-05, `instructions`), ping,
 tools/list (`http`, `download`, `host_inspect` (PLAN-v4 phase 4:
-`managed.inspect`, the read-only host inspection; docs/modules/managed.md),
+`managed.inspect`, the read-only host inspection; docs/dev/modules/managed.md),
 each `_meta: {"anthropic/alwaysLoad": true}`),
 tools/call on a thread pool with one locked writer, notifications ignored,
 unknown methods -32601, a line that isn't JSON -32700 (id null), a JSON value
@@ -495,12 +521,17 @@ that isn't a request -32600, batches accepted, errors without exception text.
   `gateway.toml changed: box: sudo now ask; …` (`describe_changes` against the
   last seen snapshot in `run/form-seen.json`, else the approved rights) and
   the widenings waiting for the user's OK.
-- `hooks/mcp_perm.sh` (PreToolUse `mcp__plugin_gate_gw__.*`): `download` →
-  allow; `http` with no method / GET / HEAD → allow; another method with a
-  non-empty string `account` → allow; else no output. Only top-level
-  `tool_input` keys count (escapes neutralized, then an awk tokenizer tracks
-  object depth outside strings), so `method`/`account` inside headers, json
-  or a body never decide.
+- `hooks/mcp_perm.sh` (PreToolUse `mcp__plugin_gate_gw__.*`): `http` and
+  `download` get no output in every mode, for any method, with or without an
+  account (a request can carry data out or use an account's credential, so
+  Claude Code's own mode decides: a prompt in default and plan mode, the
+  reviewer in auto; `web.py` still keeps a credential to its account's sites
+  and applies the policy). It allows only `host_inspect`, the terminal and
+  job reads, a local `terminal_open`, `terminal_resize` and a
+  `host_runtime` status read (terminals.md, remote.md); else no output.
+  Only top-level keys count (escapes neutralized, then an awk tokenizer
+  tracks object depth outside strings), so a `tool_name`, `host` or
+  `action` nested in the input never decides.
 
 ## Tests and mutations
 
@@ -516,8 +547,9 @@ The native dialog path (gated's requests, leases, the sealed intake,
 clipboard, restart, pause) is `tests/test_dialogs.py`; the mod's pane, field
 and guard `hooks/mod/dialog.test.ts`; the whole path live
 `tests/acceptance_dialogs.py`. `tests/mutations_ux.py` runs through
-`mutation_check.main` (133 mutations after phase 3 removed the terminal,
-one-time-code and OS-dialog ones; `plain_local_path`'s are in
+`mutation_check.main` (134 mutations: phase 3 removed the terminal,
+one-time-code and OS-dialog ones, and since GW-SEC-1 the `mcp_perm.sh`
+ones check that `http` and `download` get no decision; `plain_local_path`'s are in
 `tests/mutations_sudo.py`, with the hook that uses it), and
 `tests/mutations_dialogs.py` covers the native dialogs. Run mutations only through `pixi run --locked mutations` (or one
 file with `--copy DIR`), which mutates scratch copies, never the checkout.
@@ -626,7 +658,7 @@ device-code sign-ins they mention; what replaced them is described above.
   keeps its exit code, so its output goes to PostToolUseFailure, where
   `hooks_post._failure_main` warns (unchanged) and nothing can be masked
   (known limit).
-- No hook requires `gate scrub` any more (docs/modules/sudo.md); `gate
+- No hook requires `gate scrub` any more (docs/dev/modules/sudo.md); `gate
   scrub` stays, optional. The prompt hook's task-notification check (round
   4, above) stays: a notice quoting a stored value or a token shape is
   held back and masked in the transcript and history; raw background output
@@ -636,7 +668,7 @@ device-code sign-ins they mention; what replaced them is described above.
   `ancestry.claude_ancestor`); the one-time code stays. Review round 5: a
   tree it can't read gets `CANT_TELL` (above), and the approval hook denies
   `gate secret` in every tool, the Terminal panel included
-  (docs/modules/sudo.md).
+  (docs/dev/modules/sudo.md).
 - Tests: `test_ux_gate_setup::test_secret_refuses_under_a_claude_code_ancestor`
   (faked process tables through the real walk: secret refused before
   anything is asked, audited, `user_terminal()` None; a user's terminal
@@ -652,7 +684,7 @@ device-code sign-ins they mention; what replaced them is described above.
 | finding | fix | tests |
 |---|---|---|
 | (MEDIUM) a tree it can't read (macOS: a shell or tmux replaced by an upgrade) refused `gate secret` and the terminal transfer path with words about, or for, Claude Code | `gate_setup.CANT_TELL`, `cant_tell()`, `tree_refusal()`; transfer `_ask` prints and audits it | `test_ux_gate_setup::test_secret_refuses_under_a_claude_code_ancestor` (an unreadable tree and an error give `CANT_TELL`; Claude Code above an unreadable process gives `FROM_CLAUDE`), `test_secret_under_a_shell_whose_executable_was_deleted_says_what_to_do`, `test_transfer_roundtrip::test_no_screen_terminal_path_with_a_tree_it_cant_read_tells_the_user_what_to_do`; 4 new mutations (3 updated) |
-| (MEDIUM) about 130-145 ms of Python and age per tool call once a vault exists, plus 66 ms of file guard | post.sh skips Python for an edit tool's response (above); hooks_post's lazy imports and `nothing_pending()`; lazy imports in `vault`, `paths`, `testing` (`Override` is a plain class); launch.sh's file guard fast path (docs/MODULES-v3.md, "Hooks"; SPEC 12), its env hash without a subshell, its folder without `dirname` | `test_ux_hooks::test_post_sh_with_a_vault_skips_python_for_edit_tools_only`, `test_post_with_a_vault_still_masks_what_claude_reads_and_leaves_edits_alone`, `test_post_hook_without_pending_files_imports_no_popup`, `test_file_guard_fast_path_passes_only_what_python_passes` (every case compared with `hooks_files.main`; under sh, dash and bash), `test_file_guard_fast_path_in_production_mode_leaves_run_dirs_and_test_roots_to_python`; 21 mutations |
+| (MEDIUM) about 130-145 ms of Python and age per tool call once a vault exists, plus 66 ms of file guard | post.sh skips Python for an edit tool's response (above); hooks_post's lazy imports and `nothing_pending()`; lazy imports in `vault`, `paths`, `testing` (`Override` is a plain class); launch.sh's file guard fast path (docs/dev/MODULES-v3.md, "Hooks"; SPEC 12), its env hash without a subshell, its folder without `dirname` | `test_ux_hooks::test_post_sh_with_a_vault_skips_python_for_edit_tools_only`, `test_post_with_a_vault_still_masks_what_claude_reads_and_leaves_edits_alone`, `test_post_hook_without_pending_files_imports_no_popup`, `test_file_guard_fast_path_passes_only_what_python_passes` (every case compared with `hooks_files.main`; under sh, dash and bash), `test_file_guard_fast_path_in_production_mode_leaves_run_dirs_and_test_roots_to_python`; 21 mutations |
 
 ### Checkpoint job results (integration review, 2026-10-19)
 

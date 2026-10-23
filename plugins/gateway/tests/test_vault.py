@@ -17,13 +17,13 @@ def test_round_trip_and_modes():
         assert vault.load() == vault.empty()
         d = vault.empty()
         vault.set_sudo(d, "localhost", "me", "pw-local-123")
-        vault.set_sudo(d, "box", "joshua", "pw-box-456")
+        vault.set_sudo(d, "box", "octo", "pw-box-456")
         d["aliases"]["github:work"] = "github-work"
         vault.save(d)
         assert vault.exists()
         back = vault.load()
         assert back["localhost"]["sudo"]["me"]["password"] == "pw-local-123"
-        assert back["hosts"]["box"]["sudo"]["joshua"]["password"] == "pw-box-456"
+        assert back["hosts"]["box"]["sudo"]["octo"]["password"] == "pw-box-456"
         assert vault.resolve(back, "github:work") == "github-work"
         assert vault.resolve({"aliases": {"hf": "hf-2"}}, "hf", entries={"hf", "hf-2"}) == "hf"
         assert stat.S_IMODE(paths.private_dir().stat().st_mode) == 0o700
@@ -201,3 +201,37 @@ def test_load_rejects_wrong_version_and_missing_key():
             assert "key" in str(e)
         else:
             raise AssertionError("missing key must fail")
+
+
+def test_the_baseline_mark_new_vaults_carry_and_every_writer_keeps():
+    """A new vault (empty(), also what a missing vault loads as) carries the
+    baseline mark and keeps it through save, load and edit; an older vault
+    (written without it) never gets it from a load, an edit or a save; export
+    leaves it out (this machine's); older_install tells them apart (no vault
+    and anything that isn't a vault document count as new)."""
+    old = {"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {}, "accounts": {},
+           "approved": {}, "form_last_good": None, "aliases": {}, "events": [],
+           "events_seen": 0, "migrated": None}
+    with H.gateway_env():
+        assert vault.empty()[vault.BASELINE_KEY] == vault.BASELINE
+        assert vault.load()[vault.BASELINE_KEY] == vault.BASELINE, "no vault loads as a new one"
+        with vault.edit() as d:
+            d["aliases"]["a"] = "b"
+        assert vault.load()[vault.BASELINE_KEY] == vault.BASELINE
+        assert not vault.older_install(vault.load())
+        assert vault.BASELINE_KEY not in vault.export_view(vault.load())
+    with H.gateway_env():
+        vault.save(json.loads(json.dumps(old)))
+        d = vault.load()
+        assert vault.BASELINE_KEY not in d and vault.older_install(d), "load adds no mark"
+        with vault.edit() as d:
+            d["aliases"]["a"] = "b"
+        d = vault.load()
+        assert d["aliases"] == {"a": "b"} and vault.BASELINE_KEY not in d
+        vault.save(d)
+        assert vault.older_install(vault.load())
+    assert not vault.older_install(None) and not vault.older_install({})
+    assert not vault.older_install({"approved": {}}), "not a vault document"
+    assert vault.older_install({**old, vault.BASELINE_KEY: 1})
+    assert vault.older_install({**old, vault.BASELINE_KEY: True})
+    assert not vault.older_install({**old, vault.BASELINE_KEY: vault.BASELINE + 1})

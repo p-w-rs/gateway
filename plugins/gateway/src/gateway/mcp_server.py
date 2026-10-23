@@ -36,7 +36,8 @@ SERVER_INFO = {"name": "gw", "version": __version__}
 MAX_WORKERS = 8
 ALWAYS = {"anthropic/alwaysLoad": True}
 INSTRUCTIONS = (
-    "The gateway's web tools. http: any http(s) request (GET/HEAD need no prompt); with "
+    "The gateway's web tools. http: any http(s) request (Claude Code's permission mode "
+    "decides whether it asks, as for any tool); with "
     "account=NAME the gateway adds that account's key or token, only for the account's own "
     "sites. download: save a file into the project (never overwrites, never executable). "
     "curl and wget are refused in Bash; use these instead. host_inspect: what this machine "

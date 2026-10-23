@@ -177,14 +177,14 @@ def test_ssh_exec_no_command_refused_at_once() -> None:
 
 def test_ssh_exec_unknown_host_refused_with_suggestion() -> None:
     with H.ssh_env() as s:
-        t = _box(s, name="powerslabs")
+        t = _box(s, name="example")
         fake = s.root / "system-ssh"
         fake.write_text("#!/bin/sh\necho \"SYSTEM-SSH $*\"\n")
         os.chmod(fake, 0o755)
         s.set(system_ssh=str(fake))
-        r = s.run("ssh", "powerlabs", "uptime")
+        r = s.run("ssh", "exmple", "uptime")
         assert r.returncode == 2 and "SYSTEM-SSH" not in r.stdout, r
-        assert ("gateway: powerlabs isn't in gateway.toml. Did you mean powerslabs? To add it, "
+        assert ("gateway: exmple isn't in gateway.toml. Did you mean example? To add it, "
                 "ask the user (Claude can import it from ~/.ssh/config)") in r.stderr, r.stderr
         r = s.run("ssh", "elsewhere.example.org", "uptime")
         assert "elsewhere.example.org isn't in gateway.toml. To add it" in r.stderr

@@ -19,8 +19,19 @@ load the gateway computes the effective rights:
 Bindings: an account credential goes only to destinations in the vault's
 `bound.hosts`; approve() adds the approved destinations there.
 
-Without any approved snapshot, the baseline is an empty form: localhost with
-sudo = true (the documented default) and others = "refuse".
+Without any approved snapshot, the baseline is an empty form under the
+install's defaults (others = "refuse"; this computer's sudo where the form
+doesn't say: form.apply_install_defaults). A new install (no vault yet, or a
+vault with the baseline mark, vault.older_install) gets sudo = "ask", the
+documented default its starter form says too. A vault an older gateway made
+(0.9.1 and before: no mark) keeps that gateway's baseline, sudo = true, which
+was already the effective right there: its old starter's `sudo = true`, a form
+without [hosts.localhost] or without its `sudo` key, and a 0.6 conversion
+next to the user's own gateway.toml stay true, with or without an approval
+stored. With no vault at all, an old starter's `sudo = true` can't be told
+from an edit of the new starter: it waits for the user's OK like any widening
+(`gate check localhost`) and runs as "ask" meanwhile. A vault that can't be
+read now gets the new defaults (the stricter ones) until it can.
 
 Ratchet contract: a narrowing is persisted (the approved snapshot lowered)
 by ratchet(), which every process that loads the form should call: SessionStart,
@@ -72,6 +83,23 @@ def job_ask_message(phrases: list[str]) -> str:
     return (f'gateway: a job can\'t use the "ask" right{s} for {what} (nobody can be asked while '
             "it runs); run it with the Bash tool as its own command, or ask the user to set "
             f"{it} to true.")
+
+
+# Said after an "ask" for sudo on this machine (the approval hook's prompt and
+# job refusal, the sudo stand-in's refusals) while the vault can't be read
+# because it is locked: the rights then come from the new install's defaults
+# (sudo "ask"), whatever the vault approved or an older install's default was.
+LOCKED_SUDO_NOTE = (' (The gateway vault is locked, so the gateway can\'t tell whether sudo here '
+                    'is approved and uses "ask" until the user unlocks it with /gate-unlock in '
+                    "Claude Code.)")
+
+
+def locked_sudo_note(form: formmod.Form) -> str:
+    """LOCKED_SUDO_NOTE when the form's sudo on this machine may be more than
+    "ask" once the vault is readable (true, or not said: an older install's
+    default is true); "" when it says "ask" or off itself."""
+    h = form.hosts.get("localhost")
+    return LOCKED_SUDO_NOTE if h is not None and (h.sudo_default or h.sudo is True) else ""
 
 
 def pane_ask_message(phrases: list[str]) -> str:
@@ -157,9 +185,20 @@ def snapshot(form: formmod.Form) -> dict[str, Any]:
             "accounts": {n: account_snapshot(a) for n, a in form.accounts.items()}}
 
 
-def baseline() -> dict[str, Any]:
+def older_install(data: dict[str, Any] | None) -> bool:
+    """Was the vault made by an older gateway (vault.older_install: no
+    baseline mark)? Its install keeps the old defaults (sudo true here)."""
+    from . import vault
+    return vault.older_install(data)
+
+
+def baseline(older: bool = False) -> dict[str, Any]:
+    """The rights of an empty form under the install's defaults (older: a
+    vault an older gateway made, whose default was sudo = true here)."""
     from pathlib import Path
-    return snapshot(formmod.parse_text("", Path("gateway.toml")))
+    f = formmod.parse_text("", Path("gateway.toml"))
+    formmod.apply_install_defaults(f, older)
+    return snapshot(f)
 
 
 def imported_rights(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -174,7 +213,7 @@ def imported_rights(data: dict[str, Any] | None) -> dict[str, Any]:
 def approved_rights(data: dict[str, Any] | None) -> dict[str, Any]:
     ap = ((data or {}).get("approved") or {}).get("rights")
     if not isinstance(ap, dict):
-        return baseline()
+        return baseline(older_install(data))
     ap = copy.deepcopy(ap)
     ap.setdefault("settings", {"others": "refuse"})
     ap.setdefault("hosts", {})
@@ -605,7 +644,11 @@ def _account(name: str, a: formmod.Account, ap: dict[str, Any] | None,
 
 
 def compute(form: formmod.Form, data: dict[str, Any] | None = None) -> Effective:
-    """Effective rights for a validated form against the vault's approvals."""
+    """Effective rights for a validated form against the vault's approvals.
+    First sets the form's install-dependent defaults from the vault
+    (form.apply_install_defaults), so the form's own rights read after this
+    (the approval hook's stricter-of rule, snapshots, approve) agree."""
+    formmod.apply_install_defaults(form, older_install(data))
     ap = approved_rights(data)
     eff = Effective(form=form, approved=ap)
     widen: list[Change] = []

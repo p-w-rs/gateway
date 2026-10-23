@@ -10,7 +10,7 @@ ssh-agent, ssh-add, ssh-keygen, ssh-keyscan), never from PATH, except
 
 | function | does |
 |---|---|
-| `main(tool, argv) -> int` | the stand-in for `ssh`, `scp`, `sftp` (run.py `shim`). Exit codes: ssh's own; 2 = refused by the gateway; 75 = a pop-up is still open / no screen; 1 = a pop-up was cancelled, a sudo password was rejected, or an unexpected error (one `gateway:` line naming the exception type, never a traceback). |
+| `main(tool, argv) -> int` | the stand-in for `ssh`, `scp`, `sftp` (run.py `shim`). Exit codes: ssh's own; 2 = refused by the gateway; 75 = a pop-up is still open / no screen; 1 = a pop-up was cancelled, a sudo password was rejected, or an unexpected error (one `gateway:` line naming the exception type, never a traceback). A run folder it can't use (`paths.PathError`) says what is wrong and the remedy: `gateway: TOOL can't run: <paths.explain(e)>. Tell the user.` (review round 2). |
 | `resolve(argv, form=None) -> dict` | where an ssh command line goes, without connecting: `{kind, name, user, addr, port, by, suggest, error}`; kind is `host` (name = form host, by = `name`/`address`), `endpoint` (an account ssh endpoint; name = the host), `unknown` (suggest = a close form name), `local`, `disabled`, `error` or `refused` (a refused option; error = the reason). Every string is safe to render (`form.safe`): a typed host or user that isn't comes back as `None` (and an endpoint's `addr` then too). Cross-checked with `ssh -G` against a fresh private config per call. For hooks and `gate`. |
 | `keyscan_host(name) -> [str]` | the host keys (`"type base64"`) at the chosen address (probe, no pins needed: gate check runs it before consent); behind `via`, read through the jump chain (ssh with an empty accept-new known_hosts per key type, no authentication offered). Raises `SshError`. |
 | `install_key(name, method, password=None) -> str` | `show`: returns the public key line (generates and stores the host's key if it has none). `my-login`: the system ssh with the user's own agent and config, once, appending the key to `~/.ssh/authorized_keys` idempotently; the host key is still checked against the gateway's pins (`HostKeyAlias` + pinned known_hosts + `StrictHostKeyChecking yes`); behind `via` the jump goes through the gateway's own config. `password`: `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force`, the askpass reads a one-shot FIFO (unlinked right after the first write); the password comes from the caller or, if `None`, from `popup.secret("login password")` (its dialog names the host's ssh right for gated's recheck: `host_check(name, "ssh")`; a request that joined another call's pop-up gets "typed into another call's pop-up and isn't kept; run gate check NAME again"); never stored, never in argv or env. Both then run `test_login`. Returns a status line; raises `SshError`. |
@@ -19,7 +19,7 @@ ssh-agent, ssh-add, ssh-keygen, ssh-keyscan), never from PATH, except
 | `probe_remote_nopasswd(name, user) -> bool` | `sudo -n true` over the master, cached 10 min per (host, user) in the run dir (`rsudo-NAME@USER`); also keeps `hosts[NAME].probe.nopasswd[USER]` in the vault (written only when it changes). Audited when it connects (not on a cache hit). |
 | `run(name, command, input=None, timeout=120) -> (rc, stdout, stderr)` | the gate process's own runner (requested by ux for `gate copy-to`): one remote command on a form host with the gateway's key and config, output captured (bytes), audited (`use`, tool `gate`). No ancestry check (it is called in-process after the user's typed confirmation); the host must be approved and its ssh right not false. Raises `SshError` (also for an ssh-level failure it can explain). |
 | `close_masters(name) -> int` | `-O exit` for every master recorded for the host and for the hosts reached through it (via chains), removes the sockets and the host's address and sudo caches. Never raises. consent.ratchet calls it on narrowing. |
-| `rotate(name) -> str` | new key stored as a second live key, appended with the current key, verified alone on a fresh connection, old `authorized_keys` lines removed (with the new key), old keys marked `retired`, masters closed. Any failure before the verification (a failed check, a raising one, an interrupted append: round 1) removes only the new key's line again over the old key (best effort), drops the new key and keeps the old one; once the new key is verified, a failure removing the old lines keeps it (reported as "removing the old one failed"). Audited before it connects (`use`, argv `ssh NAME rotate`) and after (`rotate`). Raises `SshError`. |
+| `rotate(name, before_change=None) -> str` | `before_change()` runs once, under the vault's lock, just before the first vault write (`gate rotate` keeps its copy of the vault there), never when the rotation fails before (no key, an unusable link); then the new key stored as a second live key, appended with the current key, verified alone on a fresh connection, old `authorized_keys` lines removed (with the new key), old keys marked `retired`, masters closed. Any failure before the verification (a failed check, a raising one, an interrupted append: round 1) removes only the new key's line again over the old key (best effort), drops the new key and keeps the old one; once the new key is verified, a failure removing the old lines keeps it (reported as "removing the old one failed"). Audited before it connects (`use`, argv `ssh NAME rotate`) and after (`rotate`). Raises `SshError`. |
 | `SshError(message, code=2, fix=None, printed=False)` | `message` starts with `gateway:`. |
 
 Every helper above that logs in with Claude's key (`install_key`,
@@ -299,7 +299,7 @@ timeout, xargs, ...) and redirections (`</dev/null sudo`, `2>&1 sudo`).
    after an answer only drop the verification cache, so the next call
    verifies again.
 
-Residual risk (decided in phase C, docs/phaseB-requests/RESOLUTION.md):
+Residual risk (decided in phase C, docs/dev/phaseB-requests/RESOLUTION.md):
 while a call runs, anything running as the login user on the remote can
 find the staging dir (`$XDG_RUNTIME_DIR`, `/dev/shm`, `/tmp`) and read
 `$d/p` directly, or run real sudo with its own askpass that execs `$d/a`
@@ -478,7 +478,7 @@ copy so concurrent test runs never see a mutated file; all killed).
 ## PLAN-v4 phase 7: policy and forwarding (2026-10-20)
 
 - `_policy_gate(name, a, st)`: after the rights, every action of the call
-  is decided by `policy.decide` (docs/modules/policy.md):
+  is decided by `policy.decide` (docs/dev/modules/policy.md):
   `ssh_args.ssh_actions` names them (a remote command: exec; `scp -t` /
   `rsync --server` / `git-receive-pack`: write; `scp -f` / `rsync --server
   --sender` / `git-upload-pack`: read; the sftp subsystem: read and write
@@ -497,7 +497,7 @@ copy so concurrent test runs never see a mutated file; all killed).
   option parser reads options after the `.` too: `. --remove-source-files /x`
   removes /x, verified with rsync 3.5). Every path named is decided
   (`ssh_args.decide_path`), in the workspace that holds it and in every
-  workspace it may reach (`workspaces_for`, docs/modules/policy.md
+  workspace it may reach (`workspaces_for`, docs/dev/modules/policy.md
   "Workspaces"): the strictest decision applies. A deny refuses with the
   rule (and, for a workspace the path only may reach, why); an "ask"
   passes only for a command Claude typed. Remote sudo is decided as

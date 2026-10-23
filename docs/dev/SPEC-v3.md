@@ -1,3 +1,5 @@
+> Design history: the v3 build contract, kept for its section numbers (code comments cite them) and its reasoning. Not a user guide: see the [README](../../README.md), and [CONFIG.md](../CONFIG.md) for every setting.
+
 # Gateway v3 build spec
 
 The contract for building v3 (plugin version 0.7.0). **[PLAN-v4.md](PLAN-v4.md)
@@ -8,7 +10,7 @@ Claude's commands run in the managed shell, the vault key can be
 passphrase-wrapped and held by the daemon, sudo never gets a sudoers rule,
 export is format 3, and policy and workspaces narrow the rights; the module
 docs ([modules/](modules/)) describe the code as it is. User guide:
-[../README.md](../README.md); the plan this came from:
+[../README.md](../../README.md); the plan this came from:
 [history/REDESIGN-v3.md](history/REDESIGN-v3.md). Decisions taken by the user on 2026-10-18:
 unlisted machines and git servers are **refused** (with an offer to add);
 credentials go to **direct** commands only (opt-in `scripts = true`);
@@ -20,8 +22,8 @@ in [DECISIONS.md](DECISIONS.md); how the parts fit is in
 [ARCHITECTURE.md](ARCHITECTURE.md). Platform facts relied on:
 
 - A plugin PreToolUse `allow` skips the auto-mode classifier (Bash and MCP).
-  `ask` always becomes a human prompt. Settings ask/deny rules (the org's
-  managed `Bash(curl *)`, `Bash(wget *)`, `Bash(security *)`) still win.
+  `ask` always becomes a human prompt. Settings ask/deny rules (such as an
+  organization's managed `Bash(curl *)` or `Bash(wget *)`) still win.
 - SessionStart may write `$CLAUDE_ENV_FILE`; its content runs before every
   Bash command, including background commands and subagents. The same file
   is reused on resume/compact/clear: replace its whole content (a temp file
@@ -77,7 +79,9 @@ in [DECISIONS.md](DECISIONS.md); how the parts fit is in
     vault.age                      vault v3
     cache.age                      short-lived tokens (safe to delete)
     .lock                          flock for every read-modify-write
-    backups/                       store-v2-YYYYMMDD.age (+ its key) from migration
+    backups/                       store-v2-YYYYMMDD.age (+ its key) from migration; import-<time>-<hex>/
+                                   (the form and vault before an import); rotate-<time>-<hex>.vault.age
+                                   (the vault just before a gate rotate changed it, the newest 5; section 15)
     pending/                       pop-up broker state (one file per pending secret; one-time codes, cancel markers)
     sessions/                      per-session records (<sid>.env: start, display variables) and shown markers
 $CLAUDE_PLUGIN_DATA/               survives plugin updates, deleted on uninstall
@@ -86,7 +90,11 @@ $CLAUDE_PLUGIN_DATA/               survives plugin updates, deleted on uninstall
   git/config                       generated git include file
   ssh/                             generated per-call configs live in run dir, not here
   audit.jsonl                      audit log
-/tmp/gw-$UID/                      run dir, 0700, owner-checked (sockets: mux, agent, askpass FIFOs)
+/tmp/gw-$UID/                      run dir, 0700, owner-checked (sockets: mux, agent, askpass FIFOs,
+                                   gated.sock); refused with a remedy otherwise: one others could write
+                                   to is removed and made again, never chmod'ed back (what they put
+                                   there would stay); clients connect only to a gated.sock that is the
+                                   user's own, 0600, in that folder (modules/daemon.md)
 ```
 
 `paths.py` is the only place these are computed. The Python code never
@@ -139,12 +147,17 @@ characters, newlines and bidi overrides refused.
 | `also` | list of `"[user@]host[:port]"` or `{at = "...", when = "CIDR"}` | `[]` | further addresses, tried after `address`; a user part must equal `address`'s user |
 | `via` | host name | none | jump host (form host only; chain ≤ 3; no loops; jump host must not have `ssh = false`) |
 | `ssh` | `true`\|`"ask"`\|`false` | `true` | ssh, scp, sftp, rsync to this host, and use as a jump host |
-| `sudo` | `true`\|`"ask"`\|`false` | `true` | root commands (local for localhost; remote over ssh otherwise) |
+| `sudo` | `true`\|`"ask"`\|`false` | `true` (localhost: below) | root commands (local for localhost; remote over ssh otherwise) |
 | `scripts` | bool | `false` | credentials also reach programs started by Claude's commands (make, npm, …) |
 | `note` | string ≤ 200 | | shown in status |
 
-`[hosts.localhost]` takes only `sudo`, `scripts`, `note`; it is implicit
-(sudo = true) when absent.
+`[hosts.localhost]` takes only `sudo`, `scripts`, `note` (and, since
+PLAN-v4 phase 7, `policy` and `workspaces`); it is implicit when absent.
+Where the form doesn't say this computer's `sudo` (no table, or a table
+without the key) it is `"ask"` on a new install and `true` on an older one
+(0.10.0: the vault's baseline mark decides, section 3;
+`form.apply_install_defaults`). The starter a new install writes says
+`sudo = "ask"`.
 
 ### `[accounts.NAME]`, common keys
 
@@ -167,7 +180,7 @@ characters, newlines and bidi overrides refused.
 | `github` | `host` (default `github.com`), `packages` (bool, default true on github.com) | `host`, `api.<host>` (github.com and `*.ghe.com`), `ghcr.io` if packages; ssh endpoint `git@host` |
 | `huggingface` | | `huggingface.co`, `hf.co`; ssh endpoint `git@hf.co` |
 | `azure` | `tenant` (required), `client_id` (default Azure CLI public client), `databricks` [workspace hosts], `storage` [account names], `registries` [`x.azurecr.io`], `sites` [hosts needing an explicit scope] | `management.azure.com`, `graph.microsoft.com`, listed workspaces, `<storage>.{blob,dfs,file,queue,table}.core.windows.net`, listed registries, listed sites |
-| `ml-catalog` | `host` (default `app-dev-ai-mlreg.azurewebsites.net`) | `host` (tenant/client/scope pinned at sign-in, never re-read from a changed host) |
+| `ml-catalog` | `host` (required: the catalog's address; no default, an account without it is off) | `host` (tenant/client/scope pinned at sign-in, never re-read from a changed host) |
 | `pijul` | `host` (default `nest.pijul.com`), `remote_pijul` (abs path) | `host` over ssh (Nest host key built in; others pinned) |
 | `registry` | `host` (required) | `host` |
 | `api-key` | `sites` (required list; `api.x.com` exact, `.x.com` any subdomain), `auth` (`bearer` default \| `header:NAME` \| `header:NAME:PREFIX` \| `query:PARAM` \| `basic`) | `sites` |
@@ -184,7 +197,10 @@ for. Claude edits the form with its own Edit tool.
 ## 3. Vault v3 (`private/vault.age`)
 
 age-encrypted JSON, same crypto/locking as v2 (`age -r`, stdin/stdout only,
-atomic replace, `.lock` flock).
+atomic replace, `.lock` flock). The replace is durable (GW-DUR-1): a temp
+file beside it, flushed (on macOS `F_FULLFSYNC`, else fsync), renamed, then
+the folder flushed (`vault.write_private`); cache.age and key.recipient
+likewise.
 
 ```json
 {"version": 3,
@@ -207,8 +223,17 @@ atomic replace, `.lock` flock).
  "aliases": {"github:work": "github-work", "OPENAI_API_KEY": "openai-api-key"},
  "events": [{"at": "...", "what": "widen|bind|export|copy|import|migrate|reject", "detail": "..."}],
  "migrated": {"from": "v2", "store_sha256": "...", "at": "...", "report": "..."},
- "sudo_choice": {"localhost": {"USER": "ask"}, "NAME": {"USER": "password"}}}
+ "sudo_choice": {"localhost": {"USER": "ask"}, "NAME": {"USER": "password"}},
+ "baseline": 2}
 ```
+
+- `baseline` (0.10.0): the mark of a vault made by 0.10.0 or later
+  (`vault.BASELINE_KEY`). A vault without it is an older install
+  (`vault.older_install`), which keeps the old default `sudo = true` for
+  this computer where the form doesn't say it (section 2). The broker's
+  merge keeps the mark as the vault has it, a 0.6 conversion writes none,
+  and an export leaves it out (it describes this machine). While the vault
+  can't be read the new defaults apply.
 
 - Host secrets are tied to the host's pinned host keys, so a rename or an
   address change with the same key needs nothing.
@@ -355,9 +380,9 @@ modules/ux.md and modules/daemon.md "Dialogs".)
   holds a lock + state file. A second requester waits on the same one.
 - The requesting process prints to stderr, when the helper opens a dialog
   (a job that needs none prints nothing), e.g. `gateway: waiting
-  for the powerslabs sudo password in a pop-up on your screen`, waits at
+  for the example sudo password in a pop-up on your screen`, waits at
   most 90 s, then exits with code 75 (EX_TEMPFAIL) and the message
-  `gateway: the pop-up for powerslabs is still open; tell the user once and
+  `gateway: the pop-up for example is still open; tell the user once and
   carry on with other work. Retry after they answer.` A detached helper
   (double fork, own session) keeps the pop-up open up to 30 min and stores
   the answer when given.
@@ -393,7 +418,7 @@ modules/ux.md and modules/daemon.md "Dialogs".)
   (max 3), never stores a failing value.
 - A credential rejected later is marked `stale`, never retried, and one
   re-entry pop-up opens; the command fails with `gateway: the saved sudo
-  password for powerslabs was rejected; a pop-up is open; don't retry` (or,
+  password for example was rejected; a pop-up is open; don't retry` (or,
   when no pop-up can open, the terminal command the user was shown; or that
   the user cancelled the re-entry pop-up earlier). A rejected account token
   (git's `erase` after a 401, the http tool, gh, hf, `gate with`) opens no
@@ -633,7 +658,8 @@ Decision, in order:
        gateway's folders, no file Python runs at startup;
      - sftp only as the first stage of its pipeline (it would read commands,
        `!cmd` among them, from a pipe);
-   - `gate status|check|login|forget|rotate|why|log|export|import|copy-to|migrate …`
+   - `gate status|check|login|rotate|why|log|export|import|copy-to|migrate …`
+     (never `gate forget`, 0.10.0: it deletes stored secrets)
      (`rotate` and `copy-to` only to a host whose effective ssh right is
      `true`; `gate check|rotate|copy-to HOST` log in with Claude's key, so
      they are denied when the host's ssh is `false` and asked about when it
@@ -644,7 +670,13 @@ Decision, in order:
      `printf`, `true`, `test`/`[`, `ls`, `cat FILE`, `head`, `tail`, `wc`,
      `grep`, `sort`, `uniq`, `date` (only `+FORMAT` and display options:
      never `-s`/`--set`, `-f`/`--file` or a BSD clock-setting operand),
-     `sleep N` (N ≤ 5).
+     `sleep N` (N ≤ 5). Since 0.10.0 the ones that read (`pwd`, `test`/`[`,
+     `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `sort`, `uniq`) qualify only
+     when everything they may read is a plain file of the project or a temp
+     folder: no hidden or credential-like name, nothing in a credential
+     folder, not under a wrapper's `env -C` or `sudo -D`, a recursive grep's
+     whole tree included; the same under sudo (docs/dev/modules/sudo.md,
+     hooks_bash.py, step 5).
 6. Otherwise no decision: Claude Code's mode decides (auto mode's
    classifier, or the normal prompt).
 
@@ -773,7 +805,7 @@ host name ssh would use; the stand-in maps it to (a) a form host (by name,
 `address`, `also`, or `user@address`), (b) an account ssh endpoint (`git@
 github.com`, `git@hf.co`, a GHES host, `nest.pijul.com`), or (c) unknown →
 `others = refuse`: `gateway: X isn't in gateway.toml. Did you mean
-powerslabs? To add it, ask the user (Claude can import it from
+example? To add it, ask the user (Claude can import it from
 ~/.ssh/config)` (the suggestion is a close spelling of a host's name or DNS
 address; an IP address only when it is one of a host's addresses; for
 github.com, hf.co and nest.pijul.com the message asks for an account of that
@@ -819,12 +851,12 @@ kind instead); `others = mine`: exec the system ssh unchanged.
   none` for that hop), so only a lock holder ever starts a master there
   and the master a holder sees is its own. scp/sftp (`ControlMaster=no`)
   wait but don't keep the lock, and then reach every hop on their own.
-- Failures: auth failure → `gateway: powerslabs refused Claude's key
-  (installed? run gate check powerslabs)`, and the host's `installed` mark is
+- Failures: auth failure → `gateway: example refused Claude's key
+  (installed? run gate check example)`, and the host's `installed` mark is
   dropped (status stops saying "key installed"; the next `gate check`
   installs the key again); never retry auth; a
   `kex_exchange_identification`/reset right after an auth failure →
-  `gateway: powerslabs is rate-limiting after failed logins; wait a minute`
+  `gateway: example is rate-limiting after failed logins; wait a minute`
   (not a failover trigger). No command and no `-N` → refuse at once: `pass
   a command; interactive ssh can't work here`.
 - `scp`/`sftp` stand-ins exec the pixi scp/sftp with `-S <bin/ssh>` (they
@@ -897,9 +929,9 @@ it was typed for, or an `elevation` policy; section 15.)
 [url "https://github.com/"]         # when every account for the host has a token and no ssh key
 	insteadOf = git@github.com:
 	insteadOf = ssh://git@github.com/
-[includeIf "hasconfig:remote.*.url:https://github.com/asirobots/**"]
+[includeIf "hasconfig:remote.*.url:https://github.com/example-org/**"]
 	path = /…/git/identity-github-work
-[includeIf "hasconfig:remote.*.url:git@github.com:asirobots/**"]
+[includeIf "hasconfig:remote.*.url:git@github.com:example-org/**"]
 	path = /…/git/identity-github-work
 ```
 
@@ -1103,8 +1135,8 @@ reveal them); they never pass through output paths the gateway controls.
   neither: Claude Code shows it the one-line result, the file guard denies
   transcripts, and the session readers' results are masked). For Edit/Write of
   the form: validate and return `additionalContext` with the result
-  (`gateway: form OK; powerslabs: new address needs the user's OK — run gate
-  check powerslabs`; a narrowing it persisted is named too: `homelab: sudo
+  (`gateway: form OK; example: new address needs the user's OK — run gate
+  check example`; a narrowing it persisted is named too: `homelab: sudo
   true -> "ask" (applied at once)`), so Claude fixes mistakes in the same
   turn.
 - **PostToolUseFailure** (same matcher, same `post.sh`; round 3): a failed
@@ -1120,6 +1152,10 @@ reveal them); they never pass through output paths the gateway controls.
   key "remove its public key from the account, then gate forget NAME key and
   gate check NAME"; a token, API key or sign-in "replace it where it comes
   from, then gate login NAME" (gate check alone keeps a stored credential).
+  `gate forget` keeps no copy, but older copies of the vault in
+  `private/backups` (`gate rotate`'s, an import's backup, the 0.6
+  conversion's) may still hold the old secret, encrypted; its output names
+  them and how the user deletes them (section 15).
   An audit `leak` event is written. Pending no-screen notices (section 6) are shown here
   too.
 - **PreToolUse file guard** (Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit),
@@ -1182,7 +1218,7 @@ reveal them); they never pass through output paths the gateway controls.
   matcher would add a watch on a same-named file in the working directory)
   and the hook ignores any other `file_path`. Verified headless on Claude
   Code 2.1.301. Validate; `systemMessage` to the user with errors or with what
-  changed (`powerslabs: sudo now ask`) since the version the user last saw
+  changed (`example: sudo now ask`) since the version the user last saw
   (SessionStart records the form it loaded, so a narrowing PostToolUse
   persisted first is still reported). A deleted form: until it's back only
   this computer's defaults apply (approvals are kept; the next session
@@ -1195,8 +1231,8 @@ plus how-to:
 
 ```
 Gateway (plugin): you have these machines and accounts. Use normal commands; the gateway supplies passwords, keys and tokens. Never ask the user for a password, token or key in chat.
-Hosts: localhost (sudo: yes, no password needed); powerslabs (ssh, sudo; reach as `ssh powerslabs CMD`); builder (ssh via powerslabs; sudo: off).
-Accounts: github-personal (p-w-rs, default), github-work (jpowers-asi; asirobots/*), hf, azure (use the http tool with account "azure"), catalog (asiml CLI), openai (api-key for api.openai.com; http tool account "openai"; `gate with openai -- CMD` for programs).
+Hosts: localhost (sudo: yes, no password needed); example (ssh, sudo; reach as `ssh example CMD`); builder (ssh via example; sudo: off).
+Accounts: github-personal (octocat, default), github-work (octo-work; example-org/*), hf, azure (use the http tool with account "azure"), catalog (asiml CLI), openai (api-key for api.openai.com; http tool account "openai"; `gate with openai -- CMD` for programs).
 - sudo/ssh/scp/rsync work as usual. Run them as their own command (optionally after cd) so the gateway can approve them without a prompt.
 - Web: the gateway's http and download tools (curl/wget are refused). WebFetch reads pages.
 - Choose an account with GATE_ACCOUNT=NAME before the command if the gateway says two fit.
@@ -1253,9 +1289,10 @@ Tools (each with `_meta: {"anthropic/alwaysLoad": true}`):
   config dir, the gateway home or the plugin; never sets the exec bit;
   returns path, size, sha256.
 
-Hook decisions for these tools (perm.sh replacement, sh only): `download`
-and `http` with method GET/HEAD → allow (all modes); `http` with another
-method and an `account` → allow; otherwise no decision.
+Hook decisions for these tools (`mcp_perm.sh`, sh only): since 0.10.0
+`download` and `http` get no decision in any mode, for any method, with or
+without an account (Claude Code's mode decides). Until 0.9.1 GET/HEAD, a
+download and an `http` call naming an account were allowed.
 
 ## 15. `gate` CLI
 
@@ -1315,6 +1352,29 @@ password (`sudo -n true`) is used as it is and nothing is asked. A stored
 password is kept as it is. The answer is remembered per (host, user) in the
 vault (`sudo_choice`, not exported); `gate forget NAME sudo` forgets it.
 
+`gate forget` and `gate rotate` and the vault's copies (GW-DUR-1; the
+lead's decision, review round 2): `gate forget` keeps no copy of the vault
+(forgetting means gone). When older copies in `private/backups` may still
+hold the entry (`rotate-*.vault.age`, `import-*/vault.age`,
+`store-v2-*.age`), its output names them and how to delete them: in the
+user's own terminal (Claude's tools can't reach that folder), `cd
+~/.config/gateway/private/backups && rm -r` with the globs of the kinds
+there. `gate rotate HOST` keeps a copy of vault.age taken just before the
+rotation first changes the vault (under the vault's lock; a rotation that
+fails before that, the host not set up for it (no gateway key, not
+approved), keeps none and prints the ssh module's own message; one that
+fails later, at the server, has its copy and puts the vault back itself), as
+`private/backups/rotate-<YYYYmmdd-HHMMSS>-<hex>.vault.age` (0600, folder
+0700, encrypted with the same key; the newest 5 kept), and its output names
+the file. There is no restore command. To go back to such a copy by hand:
+stop the gateway daemon first (quit every Claude Code session, or `pkill -f
+"run.py gated serve"`), then `cp
+~/.config/gateway/private/backups/rotate-….vault.age
+~/.config/gateway/private/vault.age`. That undoes everything stored since
+the copy, and for that host it brings back the old key, which the rotation
+already removed from the server's `authorized_keys` when it said so: run
+`gate check HOST` afterwards to install a key again.
+
 `gate secret NAME` is the user's: it refuses (exit 2) when a Claude Code
 session variable is set (`CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID`,
 `CLAUDE_PID`), and, as defence in depth since a command can drop variables,
@@ -1340,7 +1400,9 @@ whose executable can't be read (root's sshd, login or sudo on Linux) isn't
 Claude Code, which runs as the user; the walk goes on above it. The
 one-time code stays the guard: a process detached from Claude's tree (a
 double fork, a terminal window Claude opens), an npm install of Claude Code
-(its executable is `node`) without `CLAUDE_PID`, and the desktop app's
+(its executable was `node`; since 0.10.0 npm installs are recognized, by
+`bin/claude.exe` or node running the package's `cli.js`) without
+`CLAUDE_PID`, and the desktop app's
 Terminal panel (its shells run under the app's helper) aren't seen by this
 check. A shell whose parent is outside its PID namespace (`docker exec`)
 can't be read, so `gate secret` refuses there. The terminal path of `gate
@@ -1388,7 +1450,8 @@ form's own hosts.
   machine id; else ask) → the matching host becomes localhost (its sudo
   moves to `localhost.sudo`), the source machine's localhost becomes a host
   named after its `name` with `address = user@hostname` and `ssh = false`
-  until the user turns it on → consent pop-up (adds, replaces, keeps, host
+  until the user turns it on (its sudo as the file's form says, else
+  `"ask"`, 0.10.0) → consent pop-up (adds, replaces, keeps, host
   key differences) → merge under the lock (append tables to the form).
 - `gate copy-to HOST`: only to a form host whose host key was pinned
   before this session; the user types the host name in the consent pop-up;

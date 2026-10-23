@@ -1,4 +1,4 @@
-"""Account adapters and their states (PLAN-v4 phase 7, docs/modules/accounts.md).
+"""Account adapters and their states (PLAN-v4 phase 7, docs/dev/modules/accounts.md).
 
 Each service the gateway holds credentials for has an adapter that names the
 credential methods it supports and checks a stored credential with one cheap

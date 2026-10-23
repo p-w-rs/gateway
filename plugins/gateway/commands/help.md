@@ -12,8 +12,9 @@ chat, and don't run commands for this.
 Reference:
 
 - **What it is.** Claude uses this computer's sudo, the user's other machines
-  over ssh, and their accounts (GitHub, Hugging Face, Azure / Databricks, the
-  ML Catalog, Pijul, container registries, API keys) with ordinary commands.
+  over ssh, and their accounts (GitHub, Hugging Face, Azure / Databricks, an
+  ML model catalog behind Microsoft Entra ID with its `asiml` CLI, Pijul,
+  container registries, API keys) with ordinary commands.
   The gateway puts the password, key or token into that one command, sends it
   only where the user allowed, and keeps the values in an encrypted vault
   Claude can't read.
@@ -32,7 +33,12 @@ Reference:
   `gh`, `hf`, `databricks`, `crane`, `pijul`, `asiml`; the `http` and
   `download` tools for the web (curl and wget are refused). In auto mode,
   sudo, ssh and the gateway's own commands for what the form allows run with
-  no prompt; everything else goes through auto mode as usual.
+  no prompt (not `gate forget`, which deletes stored secrets), and so do
+  simple read-only commands (`cat`, `grep`, `ls`, ...) on the project's or a
+  temp folder's plain files — the same rule under sudo (`sudo cat` of a
+  credential file is not, nor is any read under `env -C` or `sudo -D`, even
+  inside the project); everything else, the `http` and `download` tools
+  included, goes through Claude Code's mode as usual.
 - **Where Claude's commands run.** In the gateway's own bash (no login
   profile, aliases or tokens; PATH: the gateway's stand-ins, bash, pixi, the
   system folders). The user's own tools come in only as imports they approve:
@@ -50,12 +56,20 @@ Reference:
   policy turns it on. This is the gateway's own policy, separate from Claude
   Code's permission modes. `/gate-hosts` and `/gate-accounts` show hosts,
   workspaces, accounts and their state, and edit them.
-- **sudo.** The gateway never changes the machine's sudo rules: sudo that is
-  already passwordless is used as it is; otherwise the password is stored or
-  asked for each time in the gateway's dialog ("Remember it" unticked: used
-  once). The approval shows whom sudo runs as, and where.
+- **sudo.** On this computer sudo starts as `"ask"` (`[hosts.localhost]
+  sudo = "ask"` in a new install's form; an install an older gateway set up
+  keeps its `true`): Claude Code asks each time Claude runs it, and sudo in
+  a gateway terminal, a job (gateway or checkpoint) or a script is refused,
+  since nobody can be asked there; the user can set it to `true` (no prompt,
+  after their OK in the dialog; while the vault is locked it asks until
+  `/gate-unlock`). The gateway never changes the machine's
+  sudo rules: sudo that is already passwordless is used as it is; otherwise
+  the password is stored or asked for each time in the gateway's dialog
+  ("Remember it" unticked: used once). The approval shows whom sudo runs as,
+  and where.
 - **Examples to ask for.** "Add my server homelab at 192.168.1.20, user alex,
-  with sudo." "Ask me before sudo on homelab." "Add my work GitHub for the
+  with sudo." "Ask me before sudo on homelab." "Let Claude use sudo here
+  without asking." "Add my work GitHub for the
   acme-corp repos." "Add my OpenAI key." "Import my servers from
   ~/.ssh/config." "Add a workspace app on homelab at /srv/app." "Don't let
   Claude write to homelab." "Export my gateway (only the GitHub account)."

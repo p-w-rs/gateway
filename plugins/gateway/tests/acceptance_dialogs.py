@@ -23,7 +23,10 @@ and test_ux_dialog's grep covers calls by absolute path.
 Scripted, with synthetic canaries generated here (never printed, never in a
 prompt; the fake sudo's password and the fake clipboard are canaries too):
 
-  sudo     gate check localhost: the sudo-method choice, then the private
+  sudo     gate check localhost: the form's sudo = true was written before
+           any vault existed, and a new install's sudo here is "ask" (0.10.0),
+           so the consent dialog asks for that change first (Approve, as a
+           user would); then the sudo-method choice, then the private
            field. Typing before the click goes to the prompt box (the guard
            holds it back); a wrong canary typed (click, type, Enter) reopens
            the dialog with "That didn't work"; a partial value typed, then
@@ -470,8 +473,17 @@ def run(root: Path, env: dict, PY: str, canaries: list[scan.Canary], watcher: Wa
 
 
 def step_sudo(s, gi, right, wrong, partial, guard_c) -> None:
-    print("sudo: choice, guard, wrong value, focus change, right value", flush=True)
+    print("sudo: consent for sudo = true, choice, guard, wrong value, focus change, right value", flush=True)
     s.submit("please set up sudo on this machine")
+    # 0.10.0: a new install's sudo on this computer is "ask"; the form's sudo = true (FORM, written
+    # before any vault existed) is a widening, so gate check localhost asks for the OK first
+    ok = wait(s, lambda: "Approve" in screen(s) and "localhost" in screen(s), 120)
+    check("sudo: the form's sudo = true waits for the OK on a new install (its default is \"ask\"): gate "
+          "check localhost opens the consent dialog first, naming the change (sudo \"ask\" -> true)",
+          ok and '"ask" -> true' in screen(s) and "Decline" in screen(s), s.dump(30))
+    if not ok:
+        return
+    press(s, "Approve", lambda: "Store the sudo password" in screen(s))
     ok = wait(s, lambda: "Store the sudo password" in screen(s), 120)
     check("sudo: the sudo-method choice opens as a native pane (no OS dialog)", ok, s.dump(30))
     if not ok:

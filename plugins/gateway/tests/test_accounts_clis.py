@@ -18,8 +18,8 @@ GHTOK = "ghp_WORKtoken0123456789abcdefg"
 PTOK = "gho_PERSONALtoken0123456789abc"
 HFTOK = "hf_TESTtoken0123456789abcdefgh"
 
-TWO_GH = ('[accounts.github-personal]\nkind = "github"\nlogin = "p-w-rs"\ndefault = true\n'
-          '[accounts.github-work]\nkind = "github"\nlogin = "jpowers-asi"\nowners = ["asirobots"]\n')
+TWO_GH = ('[accounts.github-personal]\nkind = "github"\nlogin = "octocat"\ndefault = true\n'
+          '[accounts.github-work]\nkind = "github"\nlogin = "octo-work"\nowners = ["example-org"]\n')
 
 
 def _fakes(env, **names):
@@ -42,7 +42,7 @@ def test_gh_routes_by_owner_and_hides_token():
         HA.set_direct((True, ""))
         _fakes(env, gh="gh")
         HA.build_vault(env, TWO_GH, tokens={"github-personal": PTOK, "github-work": GHTOK})
-        rc, out, err = HA.run_cli("gh", ["pr", "list", "-R", "asirobots/thing"])
+        rc, out, err = HA.run_cli("gh", ["pr", "list", "-R", "example-org/thing"])
         assert rc == 0, err
         j = _first_json(out)
         assert j["env"].get("GH_HOST") == "github.com"
@@ -191,7 +191,7 @@ def test_hf_forces_endpoint_and_token():
     with H.gateway_env() as env:
         HA.set_direct((True, ""))
         _fakes(env, hf="hf")
-        HA.build_vault(env, '[accounts.hf]\nkind = "huggingface"\nlogin = "pwrs"\n',
+        HA.build_vault(env, '[accounts.hf]\nkind = "huggingface"\nlogin = "octocat"\n',
                        tokens={"hf": HFTOK})
         rc, out, err = HA.run_cli("hf", ["download", "org/model"])
         assert rc == 0, err
@@ -209,7 +209,7 @@ def test_hf_refusals():
     with H.gateway_env() as env:
         HA.set_direct((True, ""))
         _fakes(env, hf="hf")
-        HA.build_vault(env, '[accounts.hf]\nkind = "huggingface"\nlogin = "pwrs"\n',
+        HA.build_vault(env, '[accounts.hf]\nkind = "huggingface"\nlogin = "octocat"\n',
                        tokens={"hf": HFTOK})
         for argv, needle in [(["auth", "login"], "sign-in"), (["auth", "token"], "sign-in"),
                              (["download", "x/y", "--token", "z"], "--token"), (["env"], "env")]:
@@ -277,7 +277,7 @@ def test_crane_ghcr_uses_github_token():
         HA.set_direct((True, ""))
         _fakes(env, crane="crane")
         HA.build_vault(env, TWO_GH, tokens={"github-personal": PTOK, "github-work": GHTOK})
-        rc, out, err = HA.run_cli("crane", ["ls", "ghcr.io/asirobots/img"])
+        rc, out, err = HA.run_cli("crane", ["ls", "ghcr.io/example-org/img"])
         assert rc == 0, err
         j = _first_json(out)
         assert "DOCKER_CONFIG" in j["env"]
@@ -312,7 +312,7 @@ def test_crane_refuses_auth():
 # pijul
 # ---------------------------------------------------------------------------
 
-PIJUL = '[accounts.pijul]\nkind = "pijul"\nlogin = "pwrs"\nname = "P"\nemail = "p@x.io"\n'
+PIJUL = '[accounts.pijul]\nkind = "pijul"\nlogin = "octocat"\nname = "P"\nemail = "p@x.io"\n'
 
 
 def test_pijul_runs_with_identity_and_agent():
@@ -399,7 +399,7 @@ def test_az_account_show_and_get_token():
         rc, out, err = HA.run_cli("az", ["account", "show"])
         assert rc == 0, err
         who = json.loads(out)
-        assert who["user"]["name"] == "jpowers-asi" or who["tenantId"]
+        assert who["user"]["name"] == "octo-work" or who["tenantId"]
         HA.set_direct((False, "python3.12"))     # an Azure SDK Claude's command started
         rc, out, err = HA.run_cli("az", ["account", "get-access-token", "-o", "json"])
         assert rc == 0, err
@@ -607,7 +607,7 @@ def test_gh_with_a_stale_token_names_gate_check_not_a_pop_up():
         HA.build_vault(env, TWO_GH, tokens={"github-personal": PTOK, "github-work": GHTOK})
         with vault.edit() as d:
             vault.mark_stale(d, "github-work", "token")
-        rc, out, err = HA.run_cli("gh", ["pr", "list", "-R", "asirobots/thing"])
+        rc, out, err = HA.run_cli("gh", ["pr", "list", "-R", "example-org/thing"])
         assert rc != 0 and popup.pending() == []
         assert "pop-up" not in err, err
         assert ("github-work's token was rejected; don't retry. Run gate check github-work while "

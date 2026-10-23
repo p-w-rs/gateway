@@ -1,10 +1,12 @@
+> Design history: the plan for the v4 upgrade (plugin 0.7.0 to 0.9.0), with its requirements matrix. Developer documentation, not a user guide (see the [README](../../README.md)).
+
 # Gateway v4 plan (authoritative from 2026-10-19)
 
 This plan implements the upgrade brief for the gateway (`gate@gateway`) and its side of the
 integration with checkpoint (`check@checkpoint`). It supersedes SPEC-v3 where they conflict;
 SPEC-v3 stays the reference for everything this plan keeps (form, vault format, consent,
-stand-ins, ssh, sudo, scrubbing, transfer). Checkpoint's half is
-`../checkpoint/docs/PLAN-v4.md`. The contract between them is [CONTRACT-v1.md](CONTRACT-v1.md).
+stand-ins, ssh, sudo, scrubbing, transfer). Checkpoint's half is the
+PLAN-v4.md in the checkpoint repository. The contract between them is [CONTRACT-v1.md](../CONTRACT-v1.md).
 Evidence for every platform claim below is in [FEASIBILITY-v4.md](FEASIBILITY-v4.md).
 
 Versions this plan was checked against: Claude Code CLI 2.1.301 and desktop 2.1.299
@@ -101,7 +103,7 @@ Unknown shapes or an unready runtime are reported, never silently run in the log
 Without mods (switched off, old Claude Code) the classic Bash hook reports "managed shell
 unavailable" in managed mode (deny with the reason, or the form's `managed = "warn"` to run
 in the host shell with a visible notice).
-As built (phase 4, docs/modules/managed.md): the mod also sets `CLAUDE_CODE_SHELL` to the
+As built (phase 4, docs/dev/modules/managed.md): the mod also sets `CLAUDE_CODE_SHELL` to the
 managed bash once the env is built (Claude Code then starts gate-sh from it rather than the
 login shell); gate-sh replaces only the snapshot's `source` and keeps the rest of the script
 byte for byte (other plugins' env files arrive inline in it); its settings (`conf`,
@@ -133,7 +135,7 @@ cached under plugin data. Staging over the gateway's own ssh/sftp to
 checked, unpacked with the static `pixi-unpack`, readiness probe, old versions removed. No
 elevation, no remote rc changes, no remote pixi install. Unsupported platforms or a full disk
 are reported with the remedy.
-As built (phase 6, docs/modules/remote.md): the runtime is its own workspace
+As built (phase 6, docs/dev/modules/remote.md): the runtime is its own workspace
 (`runtime/pixi.toml` + lock: bash 5 and tmux 3, no Python; version = the lock's sha256
 prefix), packed by the gateway env's pixi-pack on first need; the target's pixi-unpack
 (not static: it brings openssl and libgcc_s by rpath) comes out of its conda packages
@@ -164,11 +166,11 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
 | 2 | Normal marketplace install, update, disable, uninstall; dev route documented | implemented | `../.claude-plugin/marketplace.json` (`gateway` → `gate`), `.claude-plugin/plugin.json`; README "Install", "Update, disable, uninstall" | live TUI (macOS, VM): `tests/acceptance_install.py` 50/50 each after the fixes (add, install, first use, update after a restart, `--keep-data`, uninstall); the VM's plain install (no e2e marker) 13/13 before them | the `/plugin` slash forms weren't driven (shell forms only); blocked: the real GitHub marketplace (the tree is uncommitted; GitHub's `main` is 0.6.0), so a local smart-HTTP git server served the working tree |
 | 2 | Pinned deps (committed pixi.toml + pixi.lock), `--locked`, tested pixi range | implemented | `pixi.toml` (`requires-pixi = ">=0.68.0"`, no upper bound), `pixi.lock` (v7), `hooks/launch.sh` (`pixi install --locked --manifest-path`), `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`) | automated (`test_packaging`: lock vs manifest offline, bounds, no `--frozen`); probe (0.68.0-0.82.0 install the lock unchanged, 0.61-0.67 refuse; macOS only); live TUI with pixi 0.81.0 (macOS), 0.82.0 (VM) | the range was probed on macOS only |
 | 2 | Launcher needs only Claude Code + pixi; no undeclared bootstrap shell or interpreter | implemented (macOS, Linux) | `hooks/launch.sh` (POSIX `sh`, the OS's own), `.mcp.json`, `hooks/hooks.json` (exec form), the mod's `$.process.spawn` argv (`hooks/mod/register.tsx`) | live TUI (macOS, VM): recording shims for python3/python/node/npm/npx/uv saw 0 plugin calls; the VM had no git and no system tool beyond the OS | native Windows has no POSIX `sh`: deferred (WSL 2; row "Targets") |
-| 2 | Git for git marketplaces: a verified pixi-assisted route | implemented (docs) | README "Before you install" | live (macOS, VM): `pixi global install git` (scratch PIXI_HOME) 2.1 s / 1.2 s; marketplace add/install/update with only that git | it lands in `~/.pixi/bin`; the VM's pixi installer hadn't put that on PATH, so `marketplace add/update` needed it (remedy in README "Known limitations") |
+| 2 | Git for git marketplaces: a verified pixi-assisted route | implemented (docs) | README "Requirements" | live (macOS, VM): `pixi global install git` (scratch PIXI_HOME) 2.1 s / 1.2 s; marketplace add/install/update with only that git | it lands in `~/.pixi/bin`; the VM's pixi installer hadn't put that on PATH, so `marketplace add/update` needed it (remedy in README "Requirements") |
 | 2 | Idempotent, concurrency-safe first-use provisioning with progress; interrupted-setup recovery; cold-start timeouts | implemented | `hooks/launch.sh` (`ensure-env`, the build lock `<env>.building` with builder and pixi pids + start times, `status`, managed settings written before the warm step), `src/gateway/warm.py`, `hooks/mod/lib.ts` + `register.tsx` (status line `setting up…`, `finishing setup…`, `ready`) | automated (`test_packaging` kills a build halfway); live TUI (macOS, VM): cold pixi cache (428 MB), `pixi install` SIGKILLed 0.2 s in, the next session took over and finished in 4.6 s / 2.3 s, never two installs; the first Bash after "gate: ready" ran first try (after the fix; before it, exit 75 for 8.5-10.2 s on macOS) | none open |
 | 2 | A cold or timed-out bootstrap never disables security controls | partial | `hooks/launch.sh` degraded file guard and `degraded_bash` (byte-identical to `src/gateway/envfile.py`), `hooks/gate-sh` exit 75 until the managed settings exist; SessionStart writes its files first (`pre_session`) | automated (+ mutations); live TUI (macOS: the cold-start denies; `-p` with pixi hidden) | until the very first build finishes, output masking and the rights checks are off; only the sh text guard holds (documented; wait for "gate: ready") |
 | 2 | Offline warm start; cwd honoured; spaces and non-ASCII paths; concurrent sessions | implemented | `hooks/launch.sh`, `src/gateway/paths.py`, `hooks/gate-sh` (Claude Code's cwd tracker kept byte for byte) | live TUI (macOS, VM): pixi refusing every call + a dead proxy: 0 pixi calls over 3 sessions; project `proj dir ü/sub dir ö`, config `cfg dir ü`; two concurrent sessions (checkpoint's `acceptance_durability.py`) | none |
-| 2 | Versioned content separate from mutable state; uninstall behaviour; retention and backup | implemented | `-X pycache_prefix` (`envfile.py_flags`, `daemon/lifecycle.daemon_argv`), state in `$CLAUDE_PLUGIN_DATA` and `~/.config/gateway`, `audit.py` rotation, `transfer.py` import backups; README "Data, retention, backup" | automated; live TUI (macOS, VM): update kept the env folder (0 pixi calls), uninstall removed the data folder and kept `~/.config/gateway`, `--keep-data` kept the env | none (backup = `gate export` or a copy of `~/.config/gateway`) |
+| 2 | Versioned content separate from mutable state; uninstall behaviour; retention and backup | implemented | `-X pycache_prefix` (`envfile.py_flags`, `daemon/lifecycle.daemon_argv`), state in `$CLAUDE_PLUGIN_DATA` and `~/.config/gateway`, `audit.py` rotation, `transfer.py` import backups; README "Security and privacy" | automated; live TUI (macOS, VM): update kept the env folder (0 pixi calls), uninstall removed the data folder and kept `~/.config/gateway`, `--keep-data` kept the env | none (backup = `gate export` or a copy of `~/.config/gateway`) |
 | 2 | Targets: macOS, Linux, Windows; WSL distinct | partial | lock platforms osx-arm64, osx-64, linux-64, linux-aarch64 (`pixi.toml`, `runtime/pixi.toml`) | macOS arm64: everything; Linux arm64: VM Linux + live TUI (VM); x86-64: untested | blocked: no x86-64 machine (Intel Mac, Linux x86-64) here; native Windows deferred (POSIX `sh` hooks, no win-64 in the lock, POSIX-only modules: use WSL 2); WSL 2 blocked: no Windows machine |
 | 2 | The gateway provisions its remote runtime | implemented | `runtime/pixi.toml` + lock (bash 5, tmux 3), `src/gateway/runtime_pack.py`, `src/gateway/daemon/remote.py` | automated (`test_remote`: real sshds on 127.0.0.1); synthetic e2e (`tests/acceptance_remote.py` 39/39: staged on the VM, which has no tmux, in 3.1 s) | not driven from a Claude Code session; linux-64 and osx-64 hosts blocked (none available) |
 | 3 | Smallest native component set; capability matrix; minimum versions | implemented | `hooks/hooks.json` (classic hooks + `modules`), `hooks/mod/`, `.mcp.json` (`gw`, `alwaysLoad`), `commands/`, `skills/gateway/`; `docs/CAPABILITIES.md` = `hooks/mod/lib.ts` `CAPABILITIES` | automated (`test_mod`: the two tables equal; `claude plugin validate`, `claude plugin test` 108 pass); live TUI | the doctor's cells are conservative after the 2026-10-21 runs (CAPABILITIES notes) |
@@ -176,12 +178,12 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
 | 3 | Secret entry verified per surface and transport | partial | `hooks/mod/field.tsx` (Client), `seal.ts` (TweetNaCl box), `daemon/dialogs.py` (PyNaCl, recheck), `daemon/clipboard.py`, the guard (`dialog.ts guardEdit`, `register.tsx`) | live TUI terminal (macOS, VM): `acceptance_canaries.py` 71/71, `acceptance_dialogs.py` 62/62 each after the fixes | desktop app blocked: the TUI harness can't drive it (FEASIBILITY-v4 P4); manual checklist in the completion report. VS Code, mobile, Remote Control, `-p`: no `Client` surface (P1), so entry is reported unavailable by design. Terminal main screen: no clicks reach plugins, Paste only |
 | 3 | Gateway is the default execution route (Bash, background, subagents, `!`, skills) | implemented | `hooks/gate-sh`, `src/gateway/managed.py`, the mod's `managedSetup` (`CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_CODE_SHELL`, `GW_MANAGED_DIR`) | automated (`test_managed` + mutations); live TUI (macOS, VM): `acceptance_managed.py` 38/38 each (the VM's 34/38 before were test assumptions) | Monitor: code evidence only (not offered against the fake API: a server-side gate) |
 | 3 | Interception keeps permissions, hooks, cancellation, results | implemented | `hooks/gate-sh` (one exec, the script byte for byte but the snapshot's `source`) | live TUI against a baseline session without the gateway (macOS, VM): permission dialog and "don't ask again" on the original command, Pre/PostToolUse payloads, results, exit codes, Escape, timeouts | none |
-| 3 | Paths that can't be enforced are reported or restricted | implemented, with stated limits | `src/gateway/hooks_bash.py` (`managed shell unavailable`, `warn`; alternate routes `_route_changes`, `_route_text`), `docs/modules/managed.md` "Alternate routes" | automated (+ mutations); live TUI (macOS): without the mod, the deny and the warn notice | without mods the user's `!` and skills' injection reach no hook (run unmanaged, documented); a script that runs `/usr/bin/ssh` itself gets the user's own credentials, never the gateway's; the desktop Terminal panel is the user's shell |
+| 3 | Paths that can't be enforced are reported or restricted | implemented, with stated limits | `src/gateway/hooks_bash.py` (`managed shell unavailable`, `warn`; alternate routes `_route_changes`, `_route_text`), `docs/dev/modules/managed.md` "Alternate routes" | automated (+ mutations); live TUI (macOS): without the mod, the deny and the warn notice | without mods the user's `!` and skills' injection reach no hook (run unmanaged, documented); a script that runs `/usr/bin/ssh` itself gets the user's own credentials, never the gateway's; the desktop Terminal panel is the user's shell |
 | 4 | Versioned contract: discovery, sanitized events, snapshots, job control | implemented | `daemon/server.py` (`/v1/*`), `daemon/lifecycle.py` (contract.json), `daemon/events.py`, `daemon/terminals.py`; `docs/CONTRACT-v1.md` (byte-identical in checkpoint, `test_workspaces`) | automated; live TUI (macOS, VM): checkpoint's `acceptance_gateway.py` 27/27, `acceptance_independence.py` 49/49 | none |
 | 4 | Stable ids; correlation; duplicates; reconnects; schema evolution | implemented | `m_`/`w_`/`t_`/`j_`/`o_` ids, seq per epoch, idempotency keys (24 h), `pause_id` replay (`daemon/terminals.py`, `server.py`) | automated (`test_daemon`, `test_terminals`, `test_workspaces`); live TUI via checkpoint's delegation | a gateway listing versions [1, 2] wasn't tested (only [2] and [1]) |
 | 4 | No secrets on cross-plugin channels | implemented | `events.clean` (allowlisted keys and values), scrubbed commands and tails | automated (canaries in events, snapshot, capabilities, health, contract.json, the registry, the log; + mutations); live TUI: canary scans of checkpoint's state 0 hits | checkpoint's own-runner job logs (used only without the gateway) keep raw output |
 | 4 | Works alone, with checkpoint, either disabled, incompatible versions | implemented | the gateway keeps its own job records; `daemon/lifecycle.py` exits when its plugin folder is removed or orphaned and no session uses it | live TUI (macOS, VM): `acceptance_independence.py` 49/49 after the fixes; daemon gone 0.7 s after `claude plugin uninstall` | a merely disabled gateway's daemon lives until its idle exit (30 min) but refuses that session's calls (checkpoint 0.7.1 says so) |
-| 4 | Authenticated local control channels bound to user and session | implemented | `daemon/peers.py` (LOCAL_PEERPID + LOCAL_PEERCRED, SO_PEERCRED), `daemon/planes.py` (UI, agent, contract, lease, local) | automated (+ `mutations_daemon.py`); VM Linux | a guardrail against same-user code, not a boundary (`docs/modules/daemon.md`) |
+| 4 | Authenticated local control channels bound to user and session | implemented | `daemon/peers.py` (LOCAL_PEERPID + LOCAL_PEERCRED, SO_PEERCRED), `daemon/planes.py` (UI, agent, contract, lease, local) | automated (+ `mutations_daemon.py`); VM Linux | a guardrail against same-user code, not a boundary (`docs/dev/modules/daemon.md`) |
 | 8 | Own bash locally and remotely; no login rc, aliases, PATH or credentials | implemented | `hooks/gate-sh` (`env -u`, no value on a command line), `managed.py`; remote: `daemon/remote.py`, `daemon/terminals.py` (`env -i` start file, `--noprofile`) | live TUI local (macOS, VM): a credential canary in Claude Code's environment never reached a command; synthetic e2e remote: a `~/.bashrc` probe on the VM never reached the managed shell | none |
 | 8 | Permissioned host inspection; selective imports with origin | implemented | `managed.inspect` (`host_inspect`), `[shell] import_path`/`import_env` (`form.py`, `consent.py`), remote `RemoteHost.inspect`, `[hosts.NAME.shell]` | automated (`test_managed`, `test_workspaces`); live TUI local (macOS, VM) | remote inspection and imports ran against a local sshd only, not the VM |
 | 8 | Managed remote runtime: stage, verify, start, update, clean, report | implemented | `daemon/remote.py`, `runtime_pack.py`, the gw tool `host_runtime` | automated; synthetic e2e (VM) | noexec mounts and a full disk only in the suite (no such mount or filled disk on the VM) |
@@ -199,7 +201,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
 | 11 | Adapters with configured, connected, expired, revoked, reauthentication states | implemented | `adapters.py` (GitHub, Hugging Face, Azure secret / certificate / refresh token) | automated (local API servers); live TUI: the accounts pane, "stored, not checked yet", Check | blocked: no authorized GitHub, Hugging Face or Azure test accounts, so no real-service run |
 | 11 | Native setup and entry; secure unlock; lock, revoke | implemented | `/gate-unlock`, `/gate-lock`, `gate lock`, `[vault] lock_after` (`daemon/lifecycle.py`, `daemon/dialogs.py`) | automated; live TUI (macOS, VM): set a passphrase (two fields), lock, wrong then right unlock | `lock_after` isn't under the widening rule (bounded to a day) |
 | 11 | No secrets in args, transcripts, history, logs, checkpoints, argv, exports | implemented, with stated exceptions | `scrub.py`, gate-sh `env -u`, values on stdin/FIFOs, `audit._redact`, the paste guard | live TUI (macOS, VM): canaries (raw, base64, hex, URL, JSON, UTF-16, gzip) in transcripts, history, `--debug-file`, fake-API and proxied telemetry payloads, observer records, gateway and checkpoint state, the export, 648 argv samples, PTY output: 0 hits | gh, databricks, dvc and `gate with` hold their token in their environment (`ps eww`, same user); a failed command's, Monitor's and background output can't be masked (Claude Code passes it to no rewriting hook) |
-| 11 | Isolation boundary documented and tested on alternate paths | implemented (a guardrail, documented) | `hooks_files.py`, `hooks_bash.py` routes, the wrapped key (`daemon/broker.py`), `daemon/planes.py` | automated (+ mutations); live TUI: `cat` of the vault refused, Read of `key.wrapped` refused, a probe run by the system python got 403 and only ciphertext | not a sandbox against code running as the user (README "Security, honestly") |
+| 11 | Isolation boundary documented and tested on alternate paths | implemented (a guardrail, documented) | `hooks_files.py`, `hooks_bash.py` routes, the wrapped key (`daemon/broker.py`), `daemon/planes.py` | automated (+ mutations); live TUI: `cat` of the vault refused, Read of `key.wrapped` refused, a probe run by the system python got 403 and only ciphertext | not a sandbox against code running as the user (README "Security and privacy") |
 | 11 | Sudo: passwordless, prompts, TTY, expiry; no blanket rule | implemented | `sudo.py`, `ssh_sudo.py`; `test_sudo_nopasswd` scans code and docs | automated (fake sudo); VM Linux (real sudo of a test user in a gateway terminal); live TUI (fake sudo, private field) | the real macOS sudo with a password was never run (only `sudo -n true` allowed here); a sudoers file from 0.8 or earlier isn't removed (README) |
 | 11 | No browser fallback; unavailable flows labelled | implemented | `gate_setup.py`, `logins.py` (PAT, API key, service principal only) | automated (+ `mutations_dialogs.py`); live static scan | none |
 | 11.1 | Native dialog naming host/account/purpose; masked; private from the first key | implemented | `hooks/mod/field.tsx`, `dialog.ts` (the guard), `register.tsx` | automated (mod tests, mutations); live TUI (macOS, VM): 62/62 and 71/71 each after the guard fix (2.1.304 had kept 1-3 typed characters before it) | stray keys typed before the click reach other plugins' `prompt.edit` hooks and are painted for a frame (FEASIBILITY-v4 P1, documented); the guard's `.catch` layer has no mutation (the test kit can't make that hook fail) |
@@ -227,7 +229,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
 2. **Daemon and broker.** `gated` (socket, peer auth, lifecycle, health, event log,
    contract v1), passphrase-wrapped vault key and migration, lock/unlock, stand-ins through
    the broker. Landed 2026-10-19 (uncommitted): `src/gateway/daemon/`, `agepass.py`,
-   docs/modules/daemon.md, DECISIONS "PLAN-v4 phase 2"; the passphrase was set and the
+   docs/dev/modules/daemon.md, DECISIONS "PLAN-v4 phase 2"; the passphrase was set and the
    vault unlocked only through test routes until phase 3's native dialog (now
    `/gate-unlock`); job/terminal contract calls wait for phase 5.
 3. **Native dialogs.** Credential dialog (Client + TweetNaCl + clipboard intake + guard),
@@ -244,7 +246,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
    form and its consent, the mod's `managedSetup`, the classic hook's
    "managed shell unavailable", the gw tool `host_inspect`, bash in pixi.toml;
    `tests/test_managed.py`, `tests/mutations_managed.py`,
-   `tests/acceptance_managed.py`; docs/modules/managed.md, DECISIONS "PLAN-v4
+   `tests/acceptance_managed.py`; docs/dev/modules/managed.md, DECISIONS "PLAN-v4
    phase 4". Found live: Claude Code honours a `CLAUDE_CODE_SHELL` set at
    session start, so the managed bash also starts gate-sh; exec-form hooks are
    never prefixed; other plugins' env files arrive inline in the script.
@@ -255,7 +257,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
    `/gate-terminal`, the sudo stand-in's terminal route, the hook's judging of
    `job_start`/`terminal_send`, tmux in pixi.toml; `tests/test_terminals.py`,
    `tests/mutations_terminals.py`, `tests/acceptance_terminals.py`,
-   `hooks/mod/terminal.test.ts`; docs/modules/terminals.md, DECISIONS "PLAN-v4 phase 5".
+   `hooks/mod/terminal.test.ts`; docs/dev/modules/terminals.md, DECISIONS "PLAN-v4 phase 5".
    Found live: the space bar reaches a Client as the key `space`; tmux resumes a pane
    stopped by SIGSTOP; Linux's tmux names a dead pane's signal by number.
 6. **Remote runtime.** pixi-pack artifacts, staging, verification, remote terminals and jobs,
@@ -264,7 +266,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
    panes in `daemon/terminals.py`, gated-owned confirm/info dialogs, the gw tool
    `host_runtime` and `host` on `terminal_open`, the form's `runtime` key under consent,
    pixi-pack and zstd in pixi.toml; `tests/test_remote.py`, `tests/harness_remote.py`,
-   `tests/mutations_remote.py`, `tests/acceptance_remote.py`; docs/modules/remote.md,
+   `tests/mutations_remote.py`, `tests/acceptance_remote.py`; docs/dev/modules/remote.md,
    DECISIONS "PLAN-v4 phase 6". Found live: the conda pixi-unpack needs its openssl and libgcc
    libraries next to it; the local pixi-unpack refuses another platform's pack; Debian's bash
    reads `~/.bashrc` for ssh commands (outside the managed shell).
@@ -276,7 +278,7 @@ scenario numbers (14.x) are the brief's; their results are in the completion rep
    elevation notice, `hooks/mod/manage.ts` and `/gate-hosts`/`/gate-accounts`, the pause
    binding and `pause_id`; `tests/test_policy.py`, `test_workspaces.py`,
    `test_accounts_states.py`, `test_portability.py`, `mutations_policy.py`,
-   `hooks/mod/manage.test.ts`; docs/modules/policy.md, DECISIONS "PLAN-v4 phase 7",
+   `hooks/mod/manage.test.ts`; docs/dev/modules/policy.md, DECISIONS "PLAN-v4 phase 7",
    CONTRACT-v1 (additive). Found while building: snapshot reads that counted as vault uses
    kept an idle vault unlocked; a stderr target notice broke merged-output commands (now a
    hook systemMessage).

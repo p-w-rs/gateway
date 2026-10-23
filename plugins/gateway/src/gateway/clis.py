@@ -1033,7 +1033,7 @@ def _az(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any]) -> 
                "expires_on": int(time.time()) + 3600}
         audit.use("az", tok_scope, a.name,
                   argv=["account", "get-access-token"], secrets=[token])
-        # Phase C decision (docs/phaseB-requests/RESOLUTION.md), narrowed in
+        # Phase C decision (docs/dev/phaseB-requests/RESOLUTION.md), narrowed in
         # review round 2: the raw token is printed only to a program started
         # by Claude's command (an SDK's AzureCliCredential parses accessToken,
         # so *** would break exactly the case az is for), and only with

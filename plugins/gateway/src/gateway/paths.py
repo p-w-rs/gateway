@@ -33,7 +33,19 @@ PLUGIN_DATA_NAME = "gate-gateway"
 
 
 class PathError(Exception):
-    """A location exists but is unsafe to use (wrong owner or mode)."""
+    """A location exists but is unsafe to use (wrong owner or mode). Its
+    message says what is wrong; `remedy` what the person can do about it
+    (the stand-ins, `gate status` and /gate-doctor show both: explain())."""
+
+    def __init__(self, message: str, remedy: str = ""):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def explain(e: BaseException) -> str:
+    """A PathError's message and remedy as one line, without "gateway:"."""
+    r = getattr(e, "remedy", "")
+    return f"{e}; {r}" if r else str(e)
 
 
 def _override(name: str) -> Path | None:
@@ -271,7 +283,10 @@ def audit_path() -> Path:
 
 def run_dir(create: bool = True) -> Path:
     """/tmp/gw-$UID: created 0700; refused if it isn't a directory owned by
-    this user with mode 0700 (someone else could read sockets and FIFOs)."""
+    this user with mode 0700 (someone else could read sockets and FIFOs).
+    Each refusal carries its remedy (PathError.remedy): one others could
+    write to is never to be chmod'ed back (what they put there would stay),
+    only removed and made again."""
     d = _override("run") or Path("/tmp") / f"gw-{os.getuid()}"
     if create:
         try:
@@ -284,13 +299,38 @@ def run_dir(create: bool = True) -> Path:
         if create:
             raise
         return d
+    # Each refusal says why and what to do (GW-ROB-1): the name is fixed, so
+    # another local user can take it first (a denial of service, never a
+    # leak: nothing is used from a folder that fails these checks).
+    later = ("until then the gateway can't start its daemon, so no dialog, terminal or "
+             "wrapped-vault read works")
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise PathError(f"{d} is not a directory; the gateway won't use it")
+        raise PathError(f"the gateway's run folder {d} is not a folder of its own (a link or a "
+                        "file); the gateway won't use it",
+                        f"remove it (rm {d}) and try again; if it isn't yours, only its owner or "
+                        f"the machine's administrator can (restarting the machine empties /tmp); "
+                        f"{later}")
     if st.st_uid != os.getuid():
-        raise PathError(f"{d} belongs to another user; the gateway won't use it")
+        raise PathError(f"the gateway's run folder {d} belongs to another user; the gateway "
+                        "won't use it",
+                        "only that user or the machine's administrator can remove it (restarting "
+                        f"the machine empties /tmp); {later}")
+    if st.st_mode & 0o022:
+        # Others could write into it: they may have left a socket or lock
+        # there (a gated.sock of their own would be talked to; an ssh
+        # ControlMaster socket would carry the user's connections), and a
+        # chmod would keep it. Only a new folder is safe (review round 2).
+        raise PathError(f"the gateway's run folder {d} is writable by other users (mode "
+                        f"{stat.S_IMODE(st.st_mode):o}), so they may have put files in it; "
+                        "the gateway won't use it",
+                        "don't just chmod it: once no Claude Code session and no gateway daemon "
+                        f"(gated) uses it, remove it (rm -rf {d}); the gateway makes a new one; "
+                        f"{later}")
     if st.st_mode & 0o077:
-        raise PathError(f"{d} is readable by others (mode {stat.S_IMODE(st.st_mode):o}); "
-                        "the gateway won't use it")
+        # readable or searchable only: nothing could be put in it
+        raise PathError(f"the gateway's run folder {d} is open to other users (mode "
+                        f"{stat.S_IMODE(st.st_mode):o}); the gateway won't use it",
+                        f"run chmod 700 {d}, then try again")
     return d
 
 

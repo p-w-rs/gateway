@@ -9,7 +9,7 @@ in `sudo.py`, the approval hook's judging of `job_start`/`terminal_send` in
 `tests/test_terminals.py`, `hooks/mod/terminal.test.ts`; mutations:
 `tests/mutations_terminals.py`; live: `tests/acceptance_terminals.py` (the TUI harness).
 Why it is built this way: [DECISIONS.md](../DECISIONS.md), "PLAN-v4 phase 5: terminals
-and jobs". The contract side is [CONTRACT-v1.md](../CONTRACT-v1.md) ("Calls").
+and jobs". The contract side is [CONTRACT-v1.md](../../CONTRACT-v1.md) ("Calls").
 
 ## What it is
 
@@ -441,7 +441,7 @@ extra tmux call had widened; that call now runs beside the start, on a thread).
 ## Workspaces and policy (phase 7)
 
 Every terminal and job is bound to host + workspace (`Supervisor._bind`,
-docs/modules/policy.md): `workspace` (a `w_` id or the workspace's name on
+docs/dev/modules/policy.md): `workspace` (a `w_` id or the workspace's name on
 that host) on `terminal_open`, `job_start`, `POST /v1/jobs` and
 `/ui/term/open`; `cwd` defaults to its root and must lie inside it (a remote
 `~/...` cwd is expanded on the host); a path under its `local` folder maps

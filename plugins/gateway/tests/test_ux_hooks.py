@@ -210,6 +210,16 @@ def test_prompt_sh_patterns_match_python():
         assert pat in m.group(1), pat
 
 
+def test_prompt_sh_block_text_is_pythons():
+    """GW-POL-1: the sh paste guard's refusal (Python can't run) said "Claude
+    can open a pop-up for it", which phase 3 removed; it is BLOCK_REASON now,
+    word for word."""
+    with U.ux_env() as env:
+        r = U.run_sh(env, "prompt.sh", {"prompt": f"x {GHP}", "session_id": "s"})
+        out = json.loads(r.stdout)
+        assert out == hooks_prompt.block(), out
+
+
 def test_prompt_sh_fails_closed_and_passes_ordinary_prompts():
     with U.ux_env() as env:
         # no env built: a paste-guard hit is blocked by sh alone
@@ -304,11 +314,15 @@ def test_sh_hooks_run_under_every_shell():
     with H.gateway_env() as env:
         for sh in dict.fromkeys(shells):
             import subprocess
+            p = {"tool_name": "mcp__plugin_gate_gw__terminal_open", "tool_input": {"host": "localhost"}}
+            r = subprocess.run([sh, str(H.PLUGIN / "hooks" / "mcp_perm.sh")], input=json.dumps(p),
+                               capture_output=True, text=True, env=env.subprocess_env(), timeout=30)
+            assert '"allow"' in r.stdout, (sh, r.stderr)
             p = {"tool_name": "mcp__plugin_gate_gw__http", "tool_input": {"url": "u", "method": "POST",
                                                                          "account": "a"}}
             r = subprocess.run([sh, str(H.PLUGIN / "hooks" / "mcp_perm.sh")], input=json.dumps(p),
                                capture_output=True, text=True, env=env.subprocess_env(), timeout=30)
-            assert '"allow"' in r.stdout, (sh, r.stderr)
+            assert r.returncode == 0 and r.stdout == "", (sh, r.stdout, r.stderr)
             r = subprocess.run([sh, str(H.PLUGIN / "hooks" / "prompt.sh"), "--test"],
                                input=json.dumps({"prompt": f"t {GHP}", "session_id": "s"}),
                                capture_output=True, text=True, env=env.subprocess_env(), timeout=30)
@@ -493,7 +507,7 @@ def test_each_leak_warning_names_commands_that_really_replace_the_secret():
         cmds = advice(hpriv.strip().splitlines()[-2])
         assert cmds == [["gate", "rotate", "box"]], cmds
         assert not env.form().hosts["box"].is_local, "gate rotate works on a remote host"
-        with U.patch(ssh, "rotate", lambda n: f"gateway: {n} has a new key"):
+        with U.patch(ssh, "rotate", lambda n, before_change=None: f"gateway: {n} has a new key"):
             rc, out, err = G._run(gate_setup.rotate, "box")
         assert rc == 0 and "new key" in out, err
 

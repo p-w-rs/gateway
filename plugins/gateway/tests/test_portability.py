@@ -37,7 +37,7 @@ sudo = true
 root = "~/notes"
 
 [hosts.lab]
-address = "joshua@10.0.0.5"
+address = "octo@10.0.0.5"
 
 [hosts.lab.workspaces.app]
 root = "/srv/app"
@@ -78,7 +78,7 @@ def _machine_a(env, tok: str) -> None:
         lab = vault.host_record(d, "lab")
         lab["keys"] = [vault.key_record(k, pub)]
         lab["host_keys"] = [vault.norm_host_key(H.fake_host_key("labkey"))]
-        vault.set_sudo(d, "lab", "joshua", "lab-sudo-" + secrets.token_hex(6))
+        vault.set_sudo(d, "lab", "octo", "lab-sudo-" + secrets.token_hex(6))
         vault.set_sudo(d, "localhost", "alice", "mac-sudo-" + secrets.token_hex(6))
     U.set_token("gh", "github", tok)
 
@@ -236,7 +236,7 @@ def test_conflicts_are_decided_per_item():
     with U.ux_env(local_user="alice", machine_id="MACHINE-A") as env:
         _machine_a(env, "ghp_" + secrets.token_hex(18))
         inc = _incoming(env, {"host:lab", "host-secrets:lab", "account:gh", "account-secrets:gh"})
-    mine = ('[hosts.lab]\naddress = "joshua@10.9.9.9"\n'
+    mine = ('[hosts.lab]\naddress = "octo@10.9.9.9"\n'
             '[accounts.gh]\nkind = "github"\nlogin = "octo"\n')
     with U.ux_env(local_user="bob", machine_id="MACHINE-B") as env:
         U.setup(env, mine)
@@ -245,7 +245,7 @@ def test_conflicts_are_decided_per_item():
         p = transfer.plan_import(inc, form, data, None, "")
         names = {c.name: c for c in p.conflicts}
         assert set(names) == {"lab", "gh"}, names
-        assert any("address joshua@10.0.0.5 (yours joshua@10.9.9.9)" in d for d in names["lab"].diffs)
+        assert any("address octo@10.0.0.5 (yours octo@10.9.9.9)" in d for d in names["lab"].diffs)
         assert [o for o, _l in names["lab"].options] == ["keep", "replace", "rename"]
         assert "lab" in p.keep and "gh" in p.keep and not p.replace
         # decided: lab replaced by the file's, gh added under another name
@@ -267,7 +267,7 @@ def test_a_changed_host_key_is_kept_unless_the_person_trusts_the_files():
         _machine_a(env, "ghp_" + secrets.token_hex(18))
         inc = _incoming(env, {"host:lab"})
     with U.ux_env(local_user="bob", machine_id="MACHINE-B") as env:
-        U.setup(env, '[hosts.lab]\naddress = "joshua@10.0.0.5"\n')
+        U.setup(env, '[hosts.lab]\naddress = "octo@10.0.0.5"\n')
         mypin = vault.norm_host_key(H.fake_host_key("my-own-pin"))
         with vault.edit() as d:
             vault.host_record(d, "lab")["host_keys"] = [mypin]
@@ -308,7 +308,7 @@ def test_an_exported_localhost_never_becomes_this_machine_and_identity_decides()
         with vault.edit() as d:
             d["hosts"]["lab"]["machine_id"] = machine_token("MACHINE-LAB")
         inc = _incoming(env, {"hosts", "accounts"})
-    with U.ux_env(local_user="joshua", machine_id="MACHINE-LAB") as env:
+    with U.ux_env(local_user="octo", machine_id="MACHINE-LAB") as env:
         env.o.extra["etc_ssh"] = str(env.root / "no-etc-ssh")
         U.setup(env, "")
         form, _e, data = transfer._load()
@@ -318,7 +318,7 @@ def test_an_exported_localhost_never_becomes_this_machine_and_identity_decides()
         assert "lab" not in p.add_hosts and p.localhost_sudo is True
         transfer.apply_import(inc, p, "the file", peer=False)
         assert "lab" not in env.form().hosts
-        assert vault.load()["localhost"]["sudo"]["joshua"]["password"].startswith("lab-sudo-")
+        assert vault.load()["localhost"]["sudo"]["octo"]["password"].startswith("lab-sudo-")
 
 
 def test_imported_credentials_are_checked_and_session_state_needs_a_fresh_sign_in():
@@ -353,3 +353,37 @@ def test_imported_credentials_are_checked_and_session_state_needs_a_fresh_sign_i
     finally:
         api.close()
         srv.close()
+
+
+def test_the_source_machines_unsaid_sudo_comes_over_as_ask_and_the_mark_stays_this_machines():
+    """The machine a file came from becomes a host here (ssh off) with its
+    sudo as the file's form says it for localhost, else "ask" (this
+    computer's default; a remote host's own default, true, would widen it).
+    An export of this version never carries its localhost table, so that is
+    "ask" whatever the source's form says (a 0.6 export's explicit true:
+    test_transfer_roundtrip::test_import_of_a_v2_export). The file carries no
+    baseline mark (export_view), and the importing vault keeps its own: an
+    older one stays older, a new one new."""
+    for said in ("sudo = true\n", ""):
+        with U.ux_env(local_user="alice", machine_id="MACHINE-A") as env:
+            _machine_a(env, "ghp_" + secrets.token_hex(18))
+            env.write_form(A_FORM.replace("sudo = true\n", said, 1))
+            form, _e, data = transfer._load()
+            c = transfer.export_content(form, data, {"hosts", "accounts"})
+            assert vault.BASELINE_KEY not in c["vault"], "the mark is this machine's"
+            inc = transfer.parse_incoming(json.loads(json.dumps(c)))
+        for older in (False, True):
+            with U.ux_env(local_user="bob", machine_id="MACHINE-B") as env:
+                env.o.extra["etc_ssh"] = str(env.root / "no-etc-ssh")
+                U.setup(env, "")
+                if older:
+                    with vault.edit() as d:
+                        del d[vault.BASELINE_KEY]
+                form, _e, data = transfer._load()
+                this, how = transfer.find_this_machine(inc, data)
+                p = transfer.plan_import(inc, form, data, this, how)
+                transfer.apply_import(inc, p, "the file", peer=False)
+                f2 = env.form()
+                assert p.source_host and f2.hosts[p.source_host].sudo == "ask", (said, p.source_host)
+                assert f2.hosts[p.source_host].ssh is False
+                assert vault.older_install(vault.load()) is older

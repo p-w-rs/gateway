@@ -1,6 +1,6 @@
 """Terminals and jobs: gated's tmux supervisor (PLAN-v4 phase 5).
 
-docs/modules/terminals.md has the whole picture; in short:
+docs/dev/modules/terminals.md has the whole picture; in short:
 
 - **One tmux server per user**, started by gated from the gateway env's tmux
   on a private socket in the run dir (<run>/tmux.sock) with the gateway's own
@@ -11,7 +11,7 @@ docs/modules/terminals.md has the whole picture; in short:
 - **A terminal** (`t_<ulid>`) is a tmux session with one window running the
   gateway env's interactive bash (no profile, no user rc) with the managed
   environment: the managed shell's PATH and rc (stand-ins first,
-  docs/modules/managed.md), the platform variables and approved imports
+  docs/dev/modules/managed.md), the platform variables and approved imports
   from the caller's environment, never a credential-looking name. **A job**
   (`j_<ulid>`) is the same with a command (argv, or a bash command string)
   run once. Values reach the pane through a 0600 start file in the run dir

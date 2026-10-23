@@ -1,4 +1,4 @@
-"""Managed execution (PLAN-v4 phase 4, docs/modules/managed.md): hooks/gate-sh
+"""Managed execution (PLAN-v4 phase 4, docs/dev/modules/managed.md): hooks/gate-sh
 (the CLAUDE_CODE_SHELL_PREFIX the mod sets), managed.py (its settings, rc,
 state and the host inspection), the [shell] form section and its consent,
 the classic Bash hook's "managed shell unavailable" path, and the session
@@ -578,11 +578,118 @@ def test_an_unready_managed_shell_refuses_and_never_falls_back():
         check(w.launch_env(), "haven't been written yet")
         managed.conf_path().write_text(conf.replace(f"bash={BASH.parent}", "bash=/nowhere")
                                        .replace(f"bash={paths.env_bin()}", "bash=/nowhere"))
-        check(w.launch_env(), "still being set up")
+        check(w.launch_env(), "environment isn't built")
         managed.conf_path().write_text(conf)
         managed.rc_path().unlink()
         check(w.launch_env(), "its rc file is missing")
         w.sync()
+        r = through_prefix(script, w.launch_env(), w.work)
+        assert r.returncode == 0 and done.exists(), r
+
+
+def _launch_sh_sentence(name: str) -> str:
+    """One of launch.sh's not-ready texts for the stand-ins, without its
+    "gateway: " (NOPIXI, or the failed one with LOG for the log's path)."""
+    src = (H.PLUGIN / "hooks" / "launch.sh").read_text()
+    if name == "nopixi":
+        m = re.search(r'^NOPIXI="gateway: ([^"]+)"$', src, re.M)
+    else:
+        m = re.search(r'''printf '%s' "gateway: (the gateway's setup failed \(log: \$ENVD/install\.log\)[^"]*)"''', src)
+    assert m, name
+    return m.group(1).replace("$ENVD/install.log", "LOG")
+
+
+def test_an_unready_managed_shell_says_what_is_wrong():
+    """GW-UX-1b: the 75 named "a first run, about a minute" in every state:
+    also with pixi missing, after a failed build and with the data folder
+    gone. gate-sh tells them apart by file tests; the failed and
+    pixi-missing sentences are launch.sh's own."""
+    with world() as w:
+        snap = w.snapshot()
+        done = w.env.root / "ran"
+        script = tool_script(f": > {sq(str(done))}", snap=str(snap),
+                             cwdfile=str(w.tmp / "claude-ab12-cwd"))
+        fakepixi = w.env.root / "pixi-bin"
+        fakepixi.mkdir()
+        (fakepixi / "pixi").write_text("#!/bin/sh\nexit 0\n")
+        (fakepixi / "pixi").chmod(0o755)
+        withpixi = {"PATH": f"/usr/bin:/bin:/usr/sbin:/sbin:{fakepixi}"}
+        conf = managed.conf_path().read_text()
+        envs = paths.envs_dir()
+
+        def refused(env, prefix=GATE_SH):
+            done.unlink(missing_ok=True)
+            r = through_prefix(script, env, w.work, prefix=prefix)
+            assert r.returncode == 75 and "isn't ready" in r.stderr, r
+            assert not done.exists() and not w.marker.exists()
+            return r.stderr
+        # still setting up: no settings yet, nothing failed, pixi there
+        managed.conf_path().unlink()
+        err = refused(w.launch_env(withpixi))
+        assert "still setting up" in err and "/gate-doctor" in err, err
+        assert "failed" not in err and "pixi isn't installed" not in err, err
+        # setup failed: an env folder with its log and no .ready
+        bad = envs / "0123456789ab"
+        bad.mkdir(parents=True)
+        (bad / "install.log").write_text("pixi: lock format v7 is not supported\n")
+        err = refused(w.launch_env(withpixi))
+        want = _launch_sh_sentence("failed").replace("LOG", str(bad / "install.log"))
+        assert want[0].upper() + want[1:] in err and "/gate-doctor" in err, (want, err)
+        assert "still setting up" not in err, err
+        # ... unless a build runs now (its lock; one without an owner file yet
+        # counts as live, as in launch.sh)
+        lock = envs / "0123456789ab.building"
+        lock.mkdir()
+        err = refused(w.launch_env(withpixi))
+        assert "still setting up" in err and "failed" not in err, err
+        # review round 2: a lock whose builder and pixi child are gone (a
+        # build killed at ensure-env's timeout) is stale: setup failed, not
+        # "still setting up" for the rest of the session
+        gone = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        gone.wait()
+        gone2 = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        gone2.wait()
+        (lock / "owner").write_text(f"pid={gone.pid}\nstart=Thu Oct 22 10:00:00 2026\nhost=x\n"
+                                    f"child={gone2.pid}\ncstart=Thu Oct 22 10:00:01 2026\n")
+        err = refused(w.launch_env(withpixi))
+        assert want[0].upper() + want[1:] in err and "still setting up" not in err, (want, err)
+        # the builder alive (or only its pixi child): still setting up
+        for owner in (f"pid={os.getpid()}\nstart=x\nhost=x\n",
+                      f"pid={gone.pid}\nstart=x\nhost=x\nchild={os.getpid()}\ncstart=x\n"):
+            (lock / "owner").write_text(owner)
+            err = refused(w.launch_env(withpixi))
+            assert "still setting up" in err and "failed" not in err, (owner, err)
+        shutil.rmtree(lock)
+        # the settings name an env that isn't built: that env's log decides
+        managed.conf_path().write_text(conf.replace(f"bash={BASH.parent}", f"bash={bad}/.pixi/envs/default/bin")
+                                       .replace(f"bash={paths.env_bin()}", f"bash={bad}/.pixi/envs/default/bin"))
+        err = refused(w.launch_env(withpixi))
+        assert "environment isn't built" in err and str(bad / "install.log") in err, err
+        (bad / ".ready").write_text("")
+        err = refused(w.launch_env(withpixi))
+        assert "still setting up" in err, err
+        shutil.rmtree(bad)
+        managed.conf_path().unlink()
+        # pixi missing: launch.sh's places (a copy of gate-sh with the system
+        # folders this machine may keep a real pixi in renamed away) and PATH
+        nopixi = w.env.root / "gate-sh-nopixi"
+        txt = GATE_SH.read_text()
+        for d in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/home/linuxbrew/.linuxbrew/bin"):
+            assert f" {d}" in txt, d
+            txt = txt.replace(f" {d}", f" /nonexistent{d}", 1)
+        nopixi.write_text(txt)
+        nopixi.chmod(0o755)
+        err = refused(w.launch_env(), prefix=nopixi)
+        want = _launch_sh_sentence("nopixi")
+        assert want[0].upper() + want[1:] + "." in err, (want, err)
+        err = refused(w.launch_env(withpixi), prefix=nopixi)
+        assert "still setting up" in err, err
+        # the data folder gone (uninstalled, or removed by hand)
+        gone = w.env.root / "gone-data" / "managed"
+        err = refused(w.launch_env({**withpixi, "GW_MANAGED_DIR": str(gone)}))
+        assert f"data folder ({gone.parent}) is gone" in err and "restart Claude Code" in err \
+            and "reinstall" in err, err
+        managed.conf_path().write_text(conf)
         r = through_prefix(script, w.launch_env(), w.work)
         assert r.returncode == 0 and done.exists(), r
 
@@ -1030,6 +1137,67 @@ def test_the_session_context_tells_claude_where_its_commands_run():
         form, eff, data = hooks_session.prepare([], write=False)
         assert hooks_session.MANAGED_HOWTO not in hooks_session.context_text(form, eff, {})
         assert len(hooks_session.context_text(form, eff, {})) <= hooks_session.CONTEXT_MAX
+
+
+def test_tool_folders_found_but_not_imported_are_offered_and_listed_never_imported():
+    """GW-UX-2b: a fresh install drops Homebrew, cargo, nvm and the like from
+    Claude's PATH with no word about it. While the form has no [shell]
+    import_path, Claude's context names the tool folders this machine has
+    and says to propose importing them (one form edit, then the consent
+    dialog); /gate-doctor (state.json) and `gate status` list them. Nothing
+    is imported by finding them."""
+    from gateway import hooks_session
+    with world() as w:
+        h = w.env.user_home
+        for d, tool in ((".cargo/bin", "cargo"), (".nvm/versions/node/v20.11.1/bin", "npm"),
+                        ("tools/bin", "mytool")):
+            (h / d).mkdir(parents=True)
+            (h / d / tool).write_text("")
+        (h / "go" / "bin").mkdir(parents=True)                         # no programs in it
+        (h / "evil folder" / "bin").mkdir(parents=True)                # not plain characters
+        (h / "evil folder" / "bin" / "x").write_text("")
+        (h / ".zshrc").write_text('export PATH="$HOME/tools/bin:$HOME/evil folder/bin:$PATH"\n')
+        form, eff, data = hooks_session.prepare([], write=False)
+        found = managed.found_not_imported(eff)
+        for d in ("~/tools/bin", "~/.cargo/bin", "~/.nvm/versions/node/v20.11.1/bin"):
+            assert d in found, (d, found)
+        assert found.index("~/tools/bin") < found.index("~/.cargo/bin"), "the login PATH first"
+        assert "~/go/bin" not in found and not any("evil" in d for d in found), found
+        assert not set(found) & set(managed.SYSTEM_DIRS) and len(found) <= managed.FOUND_MAX
+        ctx = hooks_session.context_text(form, eff, {})
+        offer = next(ln for ln in ctx.splitlines() if ln.startswith("- Tool folders here"))
+        assert "~/.cargo/bin" in offer and "propose importing" in offer and "gate check" in offer \
+            and "Never import without that OK" in offer and len(ctx) <= hooks_session.CONTEXT_MAX, offer
+        assert eff.shell.import_path == [] and str(h / ".cargo" / "bin") not in \
+            [d for d, _ in managed.path_plan(eff)], "finding imports nothing"
+        # the hosts and accounts come first: no room, no offer
+        w.env.write_form("".join(f'[hosts.h{i:02d}]\naddress = "u@h{i:02d}.example.com"\n'
+                                 for i in range(60)))
+        form, eff, data = hooks_session.prepare([], write=False)
+        ctx = hooks_session.context_text(form, eff, {})
+        assert len(ctx) <= hooks_session.CONTEXT_MAX and "- Tool folders here" not in ctx and "h00" in ctx
+        w.env.write_form("")
+        form, eff, data = hooks_session.prepare([], write=False)
+        w.sync()
+        st = json.loads(managed.state_path().read_text())
+        assert "~/.cargo/bin" in st["found"], st["found"]
+        lines = managed.status_lines(eff)
+        assert any(ln.startswith("  found here but not imported: ") and "~/.cargo/bin" in ln for ln in lines), lines
+        # an import_path in the form (approved or not, even empty): no offer, and
+        # what is imported isn't listed as missing
+        w.env.write_form('[shell]\nimport_path = ["~/.cargo/bin"]\n')
+        consent.approve("settings", form=w.env.form())
+        form, eff, data = hooks_session.prepare([], write=False)
+        assert "~/.cargo/bin" not in managed.found_not_imported(eff)
+        assert "- Tool folders here" not in hooks_session.context_text(form, eff, {})
+        w.env.write_form('[shell]\nimport_path = []\n')
+        form, eff, data = hooks_session.prepare([], write=False)
+        assert "- Tool folders here" not in hooks_session.context_text(form, eff, {})
+        # managed "off": no offer either (Claude Code's own shell has the login PATH)
+        w.env.write_form('[shell]\nmanaged = "off"\n')
+        consent.approve("settings", form=w.env.form())
+        form, eff, data = hooks_session.prepare([], write=False)
+        assert "- Tool folders here" not in hooks_session.context_text(form, eff, {})
 
 
 def test_gate_status_shows_the_managed_shell_with_every_origin():

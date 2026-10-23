@@ -17,14 +17,14 @@ from gateway import paths
 
 TWO_GH = '''[accounts.github-personal]
 kind = "github"
-login = "p-w-rs"
+login = "octocat"
 host = "{host}"
 default = true
 [accounts.github-work]
 kind = "github"
-login = "jpowers-asi"
+login = "octo-work"
 host = "{host}"
-owners = ["asirobots"]
+owners = ["example-org"]
 '''
 PTOK = "gho_PERSONALtoken0123456789abc"
 WTOK = "ghp_WORKtoken0123456789abcdefg"
@@ -57,14 +57,14 @@ def test_clone_chooses_account_by_owner():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
-            srv.make_repo("p-w-rs", "proj")
-            r1 = _clone(env, srv, git, "asirobots", "work")
-            r2 = _clone(env, srv, git, "p-w-rs", "proj")
+            srv.make_repo("example-org", "work")
+            srv.make_repo("octocat", "proj")
+            r1 = _clone(env, srv, git, "example-org", "work")
+            r2 = _clone(env, srv, git, "octocat", "proj")
             assert r1.returncode == 0 and r2.returncode == 0, (r1.stderr, r2.stderr)
             pw = {c["path"].split("/")[1]: c["password"] for c in srv.auths()}
-            assert any(c["password"] == WTOK for c in srv.auths() if "asirobots" in c["path"])
-            assert any(c["password"] == PTOK for c in srv.auths() if "p-w-rs" in c["path"])
+            assert any(c["password"] == WTOK for c in srv.auths() if "example-org" in c["path"])
+            assert any(c["password"] == PTOK for c in srv.auths() if "octocat" in c["path"])
         finally:
             srv.close()
 
@@ -76,10 +76,10 @@ def test_push_and_fetch_authenticate():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
-            r = _clone(env, srv, git, "asirobots", "work")
+            srv.make_repo("example-org", "work")
+            r = _clone(env, srv, git, "example-org", "work")
             assert r.returncode == 0, r.stderr
-            wd = Path(env.root) / "wd-asirobots-work" / "work"
+            wd = Path(env.root) / "wd-example-org-work" / "work"
             ge = HA.git_env(env, {"CLAUDE_PID": str(os.getpid())})
             for k, v in (("user.email", "a@b.c"), ("user.name", "A"), ("commit.gpgsign", "false")):
                 HA.git_run(git, ["config", k, v], ge, cwd=str(wd))
@@ -101,12 +101,12 @@ def test_gate_account_override_beats_owner():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
-            r = _clone(env, srv, git, "asirobots", "work",
+            srv.make_repo("example-org", "work")
+            r = _clone(env, srv, git, "example-org", "work",
                        extra_env={"GATE_ACCOUNT": "github-personal"})
             assert r.returncode == 0, r.stderr
-            assert any(c["password"] == PTOK for c in srv.auths() if "asirobots" in c["path"]), \
-                "GATE_ACCOUNT=github-personal should win over the asirobots owner"
+            assert any(c["password"] == PTOK for c in srv.auths() if "example-org" in c["path"]), \
+                "GATE_ACCOUNT=github-personal should win over the example-org owner"
             assert not any(c["password"] == WTOK for c in srv.auths())
         finally:
             srv.close()
@@ -136,8 +136,8 @@ def test_insteadof_rewrites_ssh_remote_to_https():
 def test_identity_includeif_selects_commit_identity():
     with H.gateway_env() as env:
         git = HA.system_git_path()
-        form = ('[accounts.github-work]\nkind = "github"\nlogin = "jpowers-asi"\n'
-                'owners = ["asirobots"]\nname = "J Powers"\nemail = "jp@asirobots.com"\n')
+        form = ('[accounts.github-work]\nkind = "github"\nlogin = "octo-work"\n'
+                'owners = ["example-org"]\nname = "Octo Cat"\nemail = "work@example.com"\n')
         HA.build_vault(env, form, tokens={"github-work": WTOK})
         data = vault.load()
         envfile.write_git_config(form=env.form(), vault_meta=vault.meta(data), others="refuse")
@@ -145,14 +145,14 @@ def test_identity_includeif_selects_commit_identity():
         repo.mkdir()
         ge = HA.git_env(env, {"CLAUDE_PID": str(os.getpid())})
         HA.git_run(git, ["init", "-q", "."], ge, cwd=str(repo))
-        HA.git_run(git, ["remote", "add", "origin", "https://github.com/asirobots/x.git"], ge,
+        HA.git_run(git, ["remote", "add", "origin", "https://github.com/example-org/x.git"], ge,
                    cwd=str(repo))
         r = HA.git_run(git, ["config", "user.email"], ge, cwd=str(repo))
-        assert r.stdout.strip() == "jp@asirobots.com", (r.stdout, r.stderr)
+        assert r.stdout.strip() == "work@example.com", (r.stdout, r.stderr)
         HA.git_run(git, ["remote", "set-url", "origin", "https://github.com/other/y.git"], ge,
                    cwd=str(repo))
         r2 = HA.git_run(git, ["config", "user.email"], ge, cwd=str(repo))
-        assert r2.stdout.strip() != "jp@asirobots.com", "other owners must not get the work identity"
+        assert r2.stdout.strip() != "work@example.com", "other owners must not get the work identity"
 
 
 def test_user_helper_not_consulted_but_other_hosts_left_alone():
@@ -162,7 +162,7 @@ def test_user_helper_not_consulted_but_other_hosts_left_alone():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
+            srv.make_repo("example-org", "work")
             # a user global credential helper that would hand out a token for ANY host
             home = Path(env.root) / "githome"
             home.mkdir(exist_ok=True)
@@ -172,7 +172,7 @@ def test_user_helper_not_consulted_but_other_hosts_left_alone():
             (home / ".gitconfig").write_text(f"[credential]\n\thelper = {leak}\n")
             # github host: the global reset means the user helper is not consulted;
             # the gateway helper serves it instead.
-            r = _clone(env, srv, git, "asirobots", "work")
+            r = _clone(env, srv, git, "example-org", "work")
             assert r.returncode == 0, r.stderr
             assert not any(c["password"] == "USERLEAK" for c in srv.auths()), \
                 "the user's own helper must not be consulted for a gateway host"
@@ -189,7 +189,7 @@ def test_git_credential_fill_typed_directly_is_refused():
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
             ge = HA.git_env(env, {"CLAUDE_PID": str(os.getpid())})
-            req = f"protocol=http\nhost={srv.host}\npath=asirobots/work.git\n\n"
+            req = f"protocol=http\nhost={srv.host}\npath=example-org/work.git\n\n"
             r = subprocess.run([git, "credential", "fill"], input=req, env=ge,
                                capture_output=True, text=True, timeout=30)
             assert WTOK not in r.stdout and PTOK not in r.stdout, \
@@ -205,8 +205,8 @@ def test_git_trace_redact_off_is_refused():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
-            r = _clone(env, srv, git, "asirobots", "work",
+            srv.make_repo("example-org", "work")
+            r = _clone(env, srv, git, "example-org", "work",
                        extra_env={"GIT_TRACE_REDACT": "0"})
             # the helper refuses, so no token reaches the server
             assert not any(c["password"] in (WTOK, PTOK) for c in srv.auths()), \
@@ -478,18 +478,18 @@ def test_url_scoped_ssl_verify_false_refused_through_real_git():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
+            srv.make_repo("example-org", "work")
             ge = HA.git_env(env, {"CLAUDE_PID": str(os.getpid())})
             wd = Path(env.root) / "wd-ssl"
             wd.mkdir()
             r = HA.git_run(git, ["-c", f"http.http://{srv.host}/.sslVerify=false", "clone",
-                                 f"http://{srv.host}/asirobots/work.git"], ge, cwd=str(wd))
+                                 f"http://{srv.host}/example-org/work.git"], ge, cwd=str(wd))
             assert r.returncode != 0
             assert "sslVerify is false" in r.stderr, r.stderr
             assert not any(c["password"] in (WTOK, PTOK) for c in srv.auths()), \
                 "a URL-scoped http.sslVerify=false must keep the token back"
             # control: the same clone without it authenticates
-            r2 = HA.git_run(git, ["clone", f"http://{srv.host}/asirobots/work.git", "ok"], ge,
+            r2 = HA.git_run(git, ["clone", f"http://{srv.host}/example-org/work.git", "ok"], ge,
                             cwd=str(wd))
             assert r2.returncode == 0, r2.stderr
             assert any(c["password"] == WTOK for c in srv.auths())
@@ -504,13 +504,13 @@ def test_url_scoped_ssl_verify_false_refused_through_real_git():
 
 TWO_GH_NO_DEFAULT = '''[accounts.github-personal]
 kind = "github"
-login = "p-w-rs"
+login = "octocat"
 host = "{host}"
 [accounts.github-work]
 kind = "github"
-login = "jpowers-asi"
+login = "octo-work"
 host = "{host}"
-owners = ["asirobots"]
+owners = ["example-org"]
 '''
 
 
@@ -520,7 +520,7 @@ def _stale(name: str) -> bool:
 
 
 def test_a_401_marks_the_account_whose_token_was_rejected_not_the_default():
-    """github-personal is the default, github-work owns asirobots/*. The
+    """github-personal is the default, github-work owns example-org/*. The
     server rejects the work token (revoked): git erases it, and the work
     account (not the default) becomes stale; the personal account keeps
     working, and the revoked token isn't sent again on a retry."""
@@ -530,16 +530,16 @@ def test_a_401_marks_the_account_whose_token_was_rejected_not_the_default():
         try:
             _setup(env, srv, TWO_GH.format(host=srv.host),
                    {"github-personal": PTOK, "github-work": WTOK})
-            srv.make_repo("asirobots", "work")
-            srv.make_repo("p-w-rs", "proj")
+            srv.make_repo("example-org", "work")
+            srv.make_repo("octocat", "proj")
             srv.rejected.add(WTOK)
-            r1 = _clone(env, srv, git, "asirobots", "work")
+            r1 = _clone(env, srv, git, "example-org", "work")
             assert r1.returncode != 0
             assert _stale("github-work") and not _stale("github-personal")
-            r2 = _clone(env, srv, git, "p-w-rs", "proj")
+            r2 = _clone(env, srv, git, "octocat", "proj")
             assert r2.returncode == 0, r2.stderr
             sent = sum(1 for c in srv.calls if c["password"] == WTOK)
-            r3 = _clone(env, srv, git, "asirobots", "work")
+            r3 = _clone(env, srv, git, "example-org", "work")
             assert r3.returncode != 0
             assert sum(1 for c in srv.calls if c["password"] == WTOK) == sent, \
                 "the revoked token was sent again"
@@ -558,7 +558,7 @@ def test_erase_without_a_default_marks_the_rejected_account():
     with H.gateway_env() as env:
         HA.build_vault(env, TWO_GH_NO_DEFAULT.format(host="github.com"),
                        tokens={"github-personal": PTOK, "github-work": WTOK})
-        _helper_get({"protocol": "https", "host": "github.com", "path": "asirobots/work.git",
+        _helper_get({"protocol": "https", "host": "github.com", "path": "example-org/work.git",
                      "username": "x-access-token", "password": WTOK}, op="erase")
         assert _stale("github-work") and not _stale("github-personal")
 
@@ -567,7 +567,7 @@ def test_erase_with_an_unknown_password_marks_nothing_and_no_password_follows_th
     with H.gateway_env() as env:
         HA.build_vault(env, TWO_GH.format(host="github.com"),
                        tokens={"github-personal": PTOK, "github-work": WTOK})
-        _helper_get({"protocol": "https", "host": "github.com", "path": "asirobots/work.git",
+        _helper_get({"protocol": "https", "host": "github.com", "path": "example-org/work.git",
                      "username": "x-access-token", "password": "ghp_somebodyElsesToken0123456789"},
                     op="erase")
         assert not _stale("github-work") and not _stale("github-personal")
@@ -576,7 +576,7 @@ def test_erase_with_an_unknown_password_marks_nothing_and_no_password_follows_th
                      "username": "x", "password": WTOK}, op="erase")
         assert not _stale("github-work")
         # no password: the account `get` would choose for that path (the owner's)
-        _helper_get({"protocol": "https", "host": "github.com", "path": "asirobots/work.git"},
+        _helper_get({"protocol": "https", "host": "github.com", "path": "example-org/work.git"},
                     op="erase")
         assert _stale("github-work") and not _stale("github-personal")
 

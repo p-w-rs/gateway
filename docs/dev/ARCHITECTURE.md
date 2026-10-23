@@ -1,3 +1,5 @@
+> Developer documentation: how the plugin's parts fit together, for people changing the code. To use the plugin, read the [README](../../README.md).
+
 # Architecture (v3)
 
 How the gateway's parts fit together. The exact rules are in
@@ -193,8 +195,10 @@ when the form changed since the last context.
   notice when it quotes a stored value or a token shape). `gate scrub` is an
   optional masking filter Claude may pipe them through.
 
-`mcp_perm.sh` (sh + awk) allows the gateway's `download` and `http` GET/HEAD,
-and `http` with another method when it names an account, in every mode. The
+`mcp_perm.sh` (sh + awk) allows `host_inspect`, the terminal and job reads, a
+local `terminal_open`, `terminal_resize` and `host_runtime`'s status, in every
+mode; `http` and `download` get no decision (since 0.10.0), so Claude Code's
+mode decides. The
 file guard (`hooks_files`, `onFailure: "block"`) denies Read/Grep/Glob/Edit/
 Write/NotebookEdit inside the protected places and on session transcripts
 (a Workflow run's `journal.jsonl`, which Claude Code's Workflow tool tells
@@ -274,8 +278,8 @@ Per family:
   command line naming another host is refused), temp config dirs,
   subcommands that print or replace tokens refused.
 - **asiml** (and `dvc` inside an asiml workspace): the gateway's own client
-  for the ML Catalog with the pinned Entra scope; storage passes go to dvc in
-  an isolated config.
+  for an ML model catalog (the ml-catalog account's `host`, required) with the
+  pinned Entra scope; storage passes go to dvc in an isolated config.
 - **az** (only when an azure account has an approved `env`): `account
   get-access-token` and `account show`, for Azure SDKs; the token is printed
   as is, only to a program Claude's command started and only with `scripts =
@@ -321,7 +325,7 @@ file, a dotfile or a config folder, with a check-then-write race closed.
 
 `popup.py` is the only way to ask the user, and every question is the
 gateway's native dialog inside Claude Code (PLAN-v4 phase 3; DECISIONS
-"PLAN-v4 phase 3"; docs/modules/daemon.md "Dialogs"). A request is keyed by
+"PLAN-v4 phase 3"; docs/dev/modules/daemon.md "Dialogs"). A request is keyed by
 entry and subject; `private/pending/` holds its lock and state, so all
 processes asking for the same thing share one dialog. The requesting
 process takes a dialog lease from gated (it runs below the Claude Code
@@ -513,5 +517,5 @@ or a token for code it didn't run directly; secrets ending up in output,
 logs or the transcript. Not a sandbox: Claude's commands run as the user, so
 a determined program can read the vault key; the Bash checks are text checks
 and the ancestry check trusts executable names. Commands the form sets to
-`true` skip auto mode's reviewer by design. README's "Security, honestly"
-lists the limits as the user sees them.
+`true` skip auto mode's reviewer by design. README's "Security and privacy"
+and "Limits" list the limits as the user sees them.

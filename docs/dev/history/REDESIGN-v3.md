@@ -5,7 +5,7 @@
 > build (for example passwordless sudo in `gate check`, the `az` stand-in, and
 > what the http tool does with proxies). What was built:
 > [../SPEC-v3.md](../SPEC-v3.md) (contract), [../MODULES-v3.md](../MODULES-v3.md)
-> (code), [../../README.md](../../README.md) (user guide),
+> (code), [../../README.md](../../../README.md) (user guide),
 > [../DECISIONS.md](../DECISIONS.md) (why).
 
 Plan, 2026-10-18 (revised after four independent critiques and prototypes).
@@ -19,8 +19,8 @@ job shrinks to:
 
 1. keep passwords, tokens and keys out of chat and the transcript,
 2. send each one only where it belongs,
-3. give web access its own route (your org's policy makes `curl` and `wget`
-   prompt anyway).
+3. give web access its own route (an organization's managed settings may make
+   `curl` and `wget` prompt anyway).
 
 Two ideas cover everything: **hosts** (this machine plus named machines,
 and what Claude may do on each) and **accounts** (GitHub, Hugging Face,
@@ -47,35 +47,35 @@ into `~/.config/gateway/private/`, which Claude can't read.
 [hosts.localhost]                  # this computer, whichever one you're on
 sudo = true
 
-[hosts.powerslabs]
-address = "joshua@10.0.0.5"
+[hosts.example]
+address = "octo@10.0.0.5"
 when    = "10.0.0.0/24"            # only try that address on the home network
-also    = ["joshua@lab.example.com:2222"]
+also    = ["octo@lab.example.com:2222"]
 ssh  = true
 sudo = true
 
 [hosts.builder]
 address = "ci@builder.internal"
-via  = "powerslabs"                # reached through powerslabs
+via  = "example"                # reached through example
 sudo = false
 
 [accounts.github-personal]
 kind  = "github"
-login = "p-w-rs"
+login = "octocat"
 default = true                     # used when nothing else decides
 
 [accounts.github-work]
 kind   = "github"
-login  = "jpowers-asi"
-owners = ["asirobots"]             # repos under these owners use this account
-email  = "jpowers@asirobots.com"   # commits in those repos use this identity
+login  = "octo-work"
+owners = ["example-org"]             # repos under these owners use this account
+email  = "work@example.com"   # commits in those repos use this identity
 
 [accounts.hf]
 kind = "huggingface"
 
 [accounts.azure]
 kind       = "azure"
-tenant     = "asirobots.com"
+tenant     = "example.com"
 databricks = ["adb-1234567890.7.azuredatabricks.net"]
 
 [accounts.catalog]
@@ -98,11 +98,11 @@ live state and never a value:
 ```
 Hosts
   localhost    sudo ✓ (no password needed)
-  powerslabs   ssh ✓ via 10.0.0.5, key installed   sudo ✓ password saved
-  builder      ssh ✓ via powerslabs                sudo ✗
+  example   ssh ✓ via 10.0.0.5, key installed   sudo ✓ password saved
+  builder      ssh ✓ via example                sudo ✗
 Accounts
-  github-personal  p-w-rs (default)       signed in
-  github-work      jpowers-asi  asirobots signed in
+  github-personal  octocat (default)       signed in
+  github-work      octo-work  example-org signed in
   openai           api.openai.com         key saved
 File: ~/.config/gateway/gateway.toml   Just ask: "add a server", "turn off sudo on builder"
 ```
@@ -114,8 +114,8 @@ behind the scenes:
 
 ```
 sudo apt install htop
-ssh powerslabs 'df -h'         ssh powerslabs sudo systemctl restart nginx
-rsync -a dist/ powerslabs:/srv/app/       scp powerslabs:/var/log/app.log .
+ssh example 'df -h'         ssh example sudo systemctl restart nginx
+rsync -a dist/ example:/srv/app/       scp example:/var/log/app.log .
 git push       gh pr create       hf upload me/model ./out
 databricks jobs list       pijul push       asiml push
 ```
@@ -137,7 +137,7 @@ untouched), and gives git a credential helper for your accounts' hosts only.
 - **git**: the account is picked by host and owner; `git@github.com:`
   remotes are switched to https inside Claude's terminal so tokens from
   browser sign-in work. Your git config and hooks keep working; commits in
-  `asirobots` repos use the work identity if you set one.
+  `example-org` repos use the work identity if you set one.
 - **gh, hf, databricks, crane, pijul, asiml**: the right token in that one
   process, output scrubbed, and commands that would print a token refused.
 - **Azure**: no `az` CLI; Claude uses the `http` tool with `account:
@@ -169,15 +169,15 @@ pop-up is waiting. It refreshes when the form changes.
 
 You talk to Claude, or edit the form.
 
-- "Add my server powerslabs at 10.0.0.5, user joshua, with sudo." Claude
-  adds a few lines and runs `gate check powerslabs` right away, while
+- "Add my server example at 10.0.0.5, user octo, with sudo." Claude
+  adds a few lines and runs `gate check example` right away, while
   you're there. One pop-up shows what was added (address, host-key
   fingerprint, ssh, sudo) and asks how to install Claude's key: using your
-  own SSH login once, or by typing joshua's password once. It then asks
+  own SSH login once, or by typing octo's password once. It then asks
   for the sudo password if that machine needs one, and checks it works.
 - "Add my work GitHub": one pop-up to sign in in the browser (SSO works)
   or paste a token; the gateway checks you signed in as the right login.
-- "Turn off sudo on builder" or "ask me before sudo on powerslabs": one
+- "Turn off sudo on builder" or "ask me before sudo on example": one
   word changes. Taking rights away never needs a pop-up.
 
 When Claude adds a host or gives itself more rights (a new host, false to
@@ -187,7 +187,7 @@ or README from talking Claude into widening its own access.
 
 Secrets are only typed in the gateway's pop-up. On a machine with no
 screen, the gateway shows you (not Claude) one short command to run in a
-terminal there: `~/.config/gateway/gate secret powerslabs`.
+terminal there: `~/.config/gateway/gate secret example`.
 
 If a secret is needed while you're away, Claude says once that a pop-up is
 waiting and carries on with other work; the pop-up stays until you answer.
@@ -196,7 +196,7 @@ pop-up to re-enter it.
 
 ## Moving to another machine
 
-- **"Copy my gateway to powerslabs"**: powerslabs is already a host, so the
+- **"Copy my gateway to example"**: example is already a host, so the
   gateway sends it over ssh, encrypted to that machine's own key, after you
   OK the list in a pop-up. Claude can install pixi, Claude Code and the
   plugin there first, since it already has ssh and sudo.
@@ -212,8 +212,8 @@ left out unless you tick it.
 ## Your existing vault
 
 The first v3 session converts today's vault automatically, offline, with a
-backup kept: `github:work` becomes `github-work`, `ssh:powerslabs` becomes
-host `powerslabs` with its keys, routes and pins, sudo entries join their
+backup kept: `github:work` becomes `github-work`, `ssh:example` becomes
+host `example` with its keys, routes and pins, sudo entries join their
 hosts, secrets become `api-key` accounts. Old names keep working as
 aliases. You get a one-time report of what changed. Hosts where sudo or
 ssh used to ask become `true` (that's the point), and the report says so.

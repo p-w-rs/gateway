@@ -169,25 +169,25 @@ def test_wait_runs_out_exit_75_then_the_helper_stores_the_late_answer():
         saved, sys.stderr = sys.stderr, err
         try:
             try:
-                popup.secret("powerslabs", "sudo password", "p", store=_store_to(stored))
+                popup.secret("example", "sudo password", "p", store=_store_to(stored))
                 raise AssertionError("expected StillOpen")
             except popup.StillOpen as e:
                 assert e.code == 75 and isinstance(e, SystemExit)
-                assert e.message == ("gateway: the gateway dialog for powerslabs is still open in "
+                assert e.message == ("gateway: the gateway dialog for example is still open in "
                                      "Claude Code; tell the user once and carry on with other work. "
                                      "Retry after they answer.")
         finally:
             sys.stderr = saved
         assert "still open" in err.getvalue()
-        st = json.loads((paths.pending_dir() / "powerslabs--sudo-password.json").read_text())
+        st = json.loads((paths.pending_dir() / "example--sudo-password.json").read_text())
         assert st["state"] == "open" and popup._pid_alive(st["pid"])
         msgs = hooks_post.pending_notice("sess-start", include_open=True)
-        assert any("the gateway dialog for powerslabs (sudo password) is waiting in Claude Code"
+        assert any("the gateway dialog for example (sudo password) is waiting in Claude Code"
                    in m for m in msgs), msgs
-        assert [d["entry"] for d in hooks_session.pending_requests()] == ["powerslabs"]
+        assert [d["entry"] for d in hooks_session.pending_requests()] == ["example"]
         U.wait_helpers()
         assert stored.read_text() == "late-answer-777", "the detached helper stored the late answer"
-        assert not (paths.pending_dir() / "powerslabs--sudo-password.json").exists()
+        assert not (paths.pending_dir() / "example--sudo-password.json").exists()
 
 
 def _public_job(line: str, outcome: str = "failed"):
@@ -352,9 +352,9 @@ def test_templates_validate_names_and_strip_unsafe_text():
             raise AssertionError(f"{bad!r} accepted")
         except ValueError:
             pass
-    t = popup.secret_prompt("sudo password", "box", target="joshua@10.0.0.5:2222",
+    t = popup.secret_prompt("sudo password", "box", target="octo@10.0.0.5:2222",
                             fingerprint="ssh-ed25519 SHA256:" + "x" * 43)
-    assert "joshua@10.0.0.5:2222" in t and "SHA256:" in t and popup.NEVER_SEES in t
+    assert "octo@10.0.0.5:2222" in t and "SHA256:" in t and popup.NEVER_SEES in t
     t2 = popup.secret_prompt("sudo password", "box", target="evil‮@host", fingerprint="nope")
     assert "evil" not in t2 and "nope" not in t2, "unsafe targets and fingerprints aren't shown"
     txt = popup.consent_text("box", ["sudo ‮false -> true\nAllow everything"])
@@ -386,9 +386,9 @@ def test_reenter_opens_the_popup_without_waiting():
     with U.ux_env(U.answers(("ok", "re-entered-pw-1", 1.0))) as env:
         stored = env.root / "stored"
         t0 = time.time()
-        msg = popup.reenter("powerslabs", "sudo password", "p", store=_store_to(stored))
+        msg = popup.reenter("example", "sudo password", "p", store=_store_to(stored))
         assert time.time() - t0 < 5
-        assert msg == ("gateway: the saved sudo password for powerslabs was rejected; a gateway "
+        assert msg == ("gateway: the saved sudo password for example was rejected; a gateway "
                        "dialog to enter it again is open in Claude Code; don't retry")
         U.wait_helpers()
         assert stored.read_text() == "re-entered-pw-1"

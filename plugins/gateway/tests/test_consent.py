@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import harness as H
-from gateway import consent, vault
+from gateway import consent, migrate, vault
 from gateway import form as F
 
 
@@ -146,7 +146,12 @@ def test_unchanged_form_has_no_changes_and_full_rights():
 
 def test_baseline_without_approvals():
     e = consent.compute(parse(""), None)
-    assert not e.pending and e.hosts["localhost"].sudo is True
+    assert not e.pending and e.hosts["localhost"].sudo == "ask", \
+        "with nothing approved, sudo on this computer asks each time"
+    assert consent.baseline()["hosts"]["localhost"]["sudo"] == "ask"
+    e = consent.compute(parse(migrate.STARTER), None)
+    assert not e.pending and e.hosts["localhost"].sudo == "ask", \
+        "a new install's starter form needs no OK and asks for sudo each time"
     e = consent.compute(parse(HOST), {})
     assert e.pending_names() == ["box"]
 
@@ -393,3 +398,25 @@ def test_a_stored_credential_never_outlives_its_entry_into_a_new_account():
         assert not consent.drops_credential(vault.load(), form.accounts["key"])
         consent.approve("key", consent.compute(form, vault.load()).pending_for("key"), form=form)
         assert vault.load()["accounts"]["key"]["token"]["value"] == "SECRETVALUE-123456"
+
+
+def test_a_catalog_account_without_host_is_off_until_named_and_keeps_its_approval():
+    """No default catalog host any more: an existing ml-catalog account that
+    relied on it is off (a named error) until `host` is added; meanwhile its
+    approval, binding and sign-in are kept (a disabled entry never ratchets),
+    so naming the same host again needs no new OK and drops nothing."""
+    host = "catalog.example.com"
+    with_host = f'[accounts.catalog]\nkind = "ml-catalog"\nhost = "{host}"\n'
+    data = {"approved": {"rights": consent.snapshot(parse(with_host))},
+            "accounts": {"catalog": {"kind": "ml-catalog", "bound": {"hosts": [host]},
+                                     "entra": {"refresh_token": "rt-not-real-123"}}}}
+    f = parse('[accounts.catalog]\nkind = "ml-catalog"\n')
+    assert f.is_disabled("catalog", "accounts") and "catalog" not in f.accounts
+    assert not consent.sync_narrowing(data, f)
+    assert data["approved"]["rights"]["accounts"]["catalog"]["destinations"] == [host]
+    assert data["accounts"]["catalog"]["bound"]["hosts"] == [host]
+    f2 = parse(with_host)
+    e = consent.compute(f2, data)
+    assert not e.pending and e.accounts["catalog"].use is True
+    assert consent.bound_ok(data, "catalog", host)
+    assert not consent.drops_credential(data, f2.accounts["catalog"])

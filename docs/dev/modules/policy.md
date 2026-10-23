@@ -86,7 +86,7 @@ install (provision), elevation or credential use (tests:
 A transfer program on the host counts as a read or a write only by its exact
 bare name and its own known options (an `rsync` named by a path, or with an
 option that writes logs, temp or backup files elsewhere, is exec; see
-docs/modules/ssh.md, phase 7), so a read grant doesn't run other programs.
+docs/dev/modules/ssh.md, phase 7), so a read grant doesn't run other programs.
 The stated limit: a write grant on a host can lead to exec there through
 the host's own files (an uploaded `~/.ssh/rc`, a shell profile, a program
 in a folder on the host's PATH, which the login shell then runs); keep

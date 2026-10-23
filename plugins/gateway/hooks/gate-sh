@@ -1,5 +1,5 @@
 #!/bin/sh
-# gate-sh: the gateway's CLAUDE_CODE_SHELL_PREFIX (PLAN-v4 phase 4; docs/modules/managed.md).
+# gate-sh: the gateway's CLAUDE_CODE_SHELL_PREFIX (PLAN-v4 phase 4; docs/dev/modules/managed.md).
 # POSIX sh. The gateway mod sets the prefix to this file at session start in
 # managed mode ([shell] managed = "on", the default, or "warn"), with
 # GW_MANAGED_DIR naming the folder Python writes the managed shell's files to.
@@ -71,17 +71,84 @@ if ! gw_tool_shape "$1"; then
   exec /bin/sh -c "$1"
 fi
 
+GW_PATH0=${PATH-}                    # Claude Code's PATH: only to look for pixi (gw_setup_state)
 PATH=/usr/bin:/bin:/usr/sbin:/sbin   # this file's own helpers (sed, env); not the command's
 GW_SCRIPT=$1
+GW_BASH=
 
 gw_unknown() {
   printf '%s\n' "gateway: the managed shell doesn't recognize how Claude Code asked to run this command ($1); it was not run, and the gateway never falls back to your own shell. /gate-doctor shows the managed shell's state; the user can switch it off with [shell] managed = \"off\" in gateway.toml (that needs their OK in the gateway's dialog)." >&2
   exit 126
 }
 
+# Is the build lock $1 (launch.sh's $ENVD.building) held by a live builder?
+# Builtins only: its `owner` file read with `read`, the builder's and its pixi
+# child's pids tested with `kill -0`. A lock with no owner file yet (the
+# instant after mkdir) counts as live. launch.sh's lock_live also compares
+# start times and the machine id (ps, ioreg); without them a reused pid looks
+# alive here (still setting up, as before), never the other way round.
+gw_lock_live() {
+  [ -f "$1/owner" ] || return 0
+  _pid= _child=
+  while IFS='=' read -r _k _v; do
+    case $_k in pid) _pid=$_v ;; child) _child=$_v ;; esac
+  done < "$1/owner"
+  case $_pid in ''|*[!0-9]*) ;; *) kill -0 "$_pid" 2>/dev/null && return 0 ;; esac
+  case $_child in ''|*[!0-9]*) ;; *) kill -0 "$_child" 2>/dev/null && return 0 ;; esac
+  return 1
+}
+
+# Why the gateway can't run commands yet, from file tests alone (no process
+# is started): its data folder gone (uninstalled, or the folder removed), its
+# setup failed (an env folder with install.log and no .ready, no live build
+# lock: gw_lock_live), pixi missing (launch.sh's find_pixi places), or else
+# still setting up.
+# launch.sh's not_ready_text tells the stand-ins the same states apart; the
+# failed and pixi-missing sentences are its own (tests/test_managed.py
+# compares them).
+gw_setup_state() {
+  set +f
+  _data=${GW_MANAGED_DIR%/managed}
+  if [ ! -d "$_data" ]; then
+    printf '%s' "The gateway's data folder ($_data) is gone: the gateway was uninstalled or its folder removed. Tell the user to restart Claude Code (quit every open session and start a new one) to work without it, or to reinstall it (/plugin install gate@gateway) and start a new session."
+    return 0
+  fi
+  # the env the settings name, else every env (an update's new one among them)
+  case $GW_BASH in
+  /*/.pixi/envs/default/bin/bash) set -- "${GW_BASH%/.pixi/envs/default/bin/bash}" ;;
+  *) set -- "$_data"/envs/* ;;
+  esac
+  _log=
+  for _d in "$@"; do
+    # a build is running (a stale lock, its builder gone, doesn't count:
+    # launch.sh's next start takes it over)
+    if [ -d "$_d.building" ] && gw_lock_live "$_d.building"; then _log=; break; fi
+    if [ -z "$_log" ] && [ -f "$_d/install.log" ] && [ ! -e "$_d/.ready" ]; then _log=$_d/install.log; fi
+  done
+  if [ -n "$_log" ]; then
+    printf '%s' "The gateway's setup failed (log: $_log); it is retried at the next session start; tell the user (/gate-doctor shows why)."
+    return 0
+  fi
+  _pixi=
+  _ifs=$IFS
+  IFS=:
+  set -f
+  for _d in $GW_PATH0 "${PIXI_HOME:-${HOME:-}/.pixi}/bin" "${HOME:-}/.local/bin" /opt/homebrew/bin \
+            /usr/local/bin /opt/local/bin /home/linuxbrew/.linuxbrew/bin; do
+    if [ -n "$_d" ] && [ -x "$_d/pixi" ] && [ ! -d "$_d/pixi" ]; then _pixi=$_d/pixi; break; fi
+  done
+  set +f
+  IFS=$_ifs
+  if [ -z "$_pixi" ]; then
+    printf '%s' "The gateway can't set itself up: pixi isn't installed; tell the user to install it from https://pixi.sh and start a new session."
+    return 0
+  fi
+  printf '%s' "The gateway is still setting up (on a first run, about a minute); /gate-doctor shows its progress. Try the command again then."
+}
+
 gw_notready() {
   _todo=${2-}
-  [ -n "$_todo" ] || _todo="/gate-doctor shows the gateway's setup; on a first run, setup takes about a minute."
+  [ -n "$_todo" ] || _todo=$(gw_setup_state)
   printf '%s\n' "gateway: the managed shell isn't ready ($1); the command was not run (the gateway never falls back to your own shell). $_todo" >&2
   exit 75
 }
@@ -174,7 +241,7 @@ if { [ -n "$GW_FORM" ] && [ "$GW_FORM" -nt "$GW_CONF" ]; } ||
 fi
 case $GW_BASH in /*) ;; *) gw_notready "no managed bash yet" ;; esac
 case $GW_BASH in *=*) gw_notready "the managed bash's path holds '='" ;; esac
-[ -x "$GW_BASH" ] || gw_notready "the gateway's environment is still being set up"
+[ -x "$GW_BASH" ] || gw_notready "the gateway's environment isn't built"
 case $GW_RC in /*) ;; *) gw_notready "no rc file yet" ;; esac
 [ -f "$GW_RC" ] && [ -r "$GW_RC" ] || gw_notready "its rc file is missing"
 case $GW_PATH in /*) ;; *) gw_notready "no PATH yet" ;; esac

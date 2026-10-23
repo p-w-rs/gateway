@@ -38,39 +38,59 @@ def case(cid: str, text: str):
 def _(f):
     assert f.ok and list(f.hosts) == ["localhost"]
     h = f.hosts["localhost"]
-    assert h.sudo is True and not h.explicit and h.ssh is False
+    assert h.sudo == "ask" and not h.explicit and h.ssh is False, \
+        "no [hosts.localhost]: sudo on this computer asks each time (the default)"
+
+
+@case("localhost_table_without_sudo_asks", "[hosts.localhost]\nscripts = true\n")
+def _(f):
+    h = f.hosts["localhost"]
+    assert f.ok and h.explicit and h.scripts is True
+    assert h.sudo == "ask", "a [hosts.localhost] that doesn't say sudo asks each time"
+
+
+@case("localhost_says_sudo_true_keeps_it", "[hosts.localhost]\nsudo = true\n")
+def _(f):
+    assert f.ok and f.hosts["localhost"].sudo is True, "a form that says sudo = true keeps it"
+
+
+@case("remote_host_sudo_still_defaults_true", '[hosts.box]\naddress = "u@box.example.com"\n')
+def _(f):
+    assert f.ok and f.hosts["box"].sudo is True and f.hosts["box"].ssh is True, \
+        "only this computer's sudo default changed"
 
 
 @case("readme_example_valid", '''
 [hosts.localhost]
 sudo = true
-[hosts.powerslabs]
-address = "joshua@10.0.0.5"
+[hosts.example]
+address = "octo@10.0.0.5"
 when    = "10.0.0.0/24"
-also    = ["joshua@lab.example.com:2222"]
+also    = ["octo@lab.example.com:2222"]
 ssh  = true
 sudo = true
 [hosts.builder]
 address = "ci@builder.internal"
-via  = "powerslabs"
+via  = "example"
 sudo = false
 [accounts.github-personal]
 kind  = "github"
-login = "p-w-rs"
+login = "octocat"
 default = true
 [accounts.github-work]
 kind   = "github"
-login  = "jpowers-asi"
-owners = ["asirobots"]
-email  = "jpowers@asirobots.com"
+login  = "octo-work"
+owners = ["example-org"]
+email  = "work@example.com"
 [accounts.hf]
 kind = "huggingface"
 [accounts.azure]
 kind       = "azure"
-tenant     = "asirobots.com"
+tenant     = "example.com"
 databricks = ["adb-1234567890.7.azuredatabricks.net"]
 [accounts.catalog]
 kind = "ml-catalog"
+host = "catalog.example.com"
 [accounts.openai]
 kind  = "api-key"
 sites = ["api.openai.com"]
@@ -79,14 +99,14 @@ env   = "OPENAI_API_KEY"
 ''')
 def _(f):
     assert f.ok, f.report_lines()
-    assert set(f.hosts) == {"localhost", "powerslabs", "builder"}
-    p = f.hosts["powerslabs"]
-    assert p.address.user == "joshua" and p.address.host == "10.0.0.5" and p.address.port == 22
+    assert set(f.hosts) == {"localhost", "example", "builder"}
+    p = f.hosts["example"]
+    assert p.address.user == "octo" and p.address.host == "10.0.0.5" and p.address.port == 22
     assert p.address.when == "10.0.0.0/24" and p.also[0].port == 2222
-    assert f.hosts["builder"].via == "powerslabs" and f.hosts["builder"].sudo is False
-    assert f.accounts["github-work"].owners == ["asirobots"]
+    assert f.hosts["builder"].via == "example" and f.hosts["builder"].sudo is False
+    assert f.accounts["github-work"].owners == ["example-org"]
     assert f.accounts["azure"].client_id == F.AZURE_CLI_CLIENT_ID
-    assert f.accounts["catalog"].host == "app-dev-ai-mlreg.azurewebsites.net"
+    assert f.accounts["catalog"].host == "catalog.example.com"
     assert f.accounts["openai"].env == "OPENAI_API_KEY"
 
 
@@ -347,12 +367,12 @@ def _(f):
     assert "az" in f.disabled and any("tenant is required" in m for m in errs(f, "az"))
 
 
-@case("azure_destinations", '[accounts.az]\nkind = "azure"\ntenant = "11111111-2222-3333-4444-555555555555"\nclient_id = "99999999-8888-7777-6666-555555555555"\nstorage = ["asistore"]\nregistries = ["asicr.azurecr.io"]\nsites = ["custom.example.com"]\ndatabricks = ["adb-1.7.azuredatabricks.net"]\n')
+@case("azure_destinations", '[accounts.az]\nkind = "azure"\ntenant = "11111111-2222-3333-4444-555555555555"\nclient_id = "99999999-8888-7777-6666-555555555555"\nstorage = ["examplestore"]\nregistries = ["examplecr.azurecr.io"]\nsites = ["custom.example.com"]\ndatabricks = ["adb-1.7.azuredatabricks.net"]\n')
 def _(f):
     assert f.ok, f.report_lines()
     d = f.accounts["az"].destinations()
     assert d[:2] == ["management.azure.com", "graph.microsoft.com"]
-    assert "asistore.dfs.core.windows.net" in d and "asicr.azurecr.io" in d
+    assert "examplestore.dfs.core.windows.net" in d and "examplecr.azurecr.io" in d
     assert "custom.example.com" in d and "adb-1.7.azuredatabricks.net" in d
     assert f.accounts["az"].client_id == "99999999-8888-7777-6666-555555555555"
 
@@ -400,6 +420,18 @@ def _(f):
 @case("identity_only_some_kinds", '[accounts.r]\nkind = "registry"\nhost = "docker.io"\nemail = "me@example.com"\n')
 def _(f):
     assert f.ok and any("commit identity" in m for m in warns(f, "r"))
+
+
+@case("ml_catalog_requires_host", '[accounts.cat]\nkind = "ml-catalog"\n'
+      '[accounts.cat2]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n')
+def _(f):
+    # the gateway has no default catalog: the account names its host
+    assert "cat" in f.disabled and "cat" not in f.accounts
+    assert any("host is required for ml-catalog accounts" in m and 'host = "' in m
+               for m in errs(f, "cat")), errs(f, "cat")
+    assert f.accounts["cat2"].host == "catalog.example.com"
+    assert f.accounts["cat2"].destinations() == ["catalog.example.com"]
+    assert "ml-catalog" not in F.DEFAULT_HOSTS
 
 
 @case("registry_requires_host", '[accounts.r]\nkind = "registry"\n')
@@ -607,7 +639,7 @@ def test_writer_rolls_back_when_another_entry_would_change():
 def test_writer_append_table_round_trip():
     with H.gateway_env() as env:
         env.write_form(BASE)
-        F.append_table("hosts.lab", {"address": "joshua@10.0.0.5", "also": [{"at": "joshua@lab.example.com:2222", "when": "10.1.0.0/16"}], "sudo": True},
+        F.append_table("hosts.lab", {"address": "octo@10.0.0.5", "also": [{"at": "octo@lab.example.com:2222", "when": "10.1.0.0/16"}], "sudo": True},
                        comment=["added by gate import", "second line"])
         text = env.form_path.read_text()
         assert text.startswith(BASE)

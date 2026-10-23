@@ -14,7 +14,7 @@ from gateway import logins
 
 
 class FakeGitHub:
-    def __init__(self, token="gho_devflowtoken0123456789abc", login="jpowers-asi",
+    def __init__(self, token="gho_devflowtoken0123456789abc", login="octo-work",
                  sso=False, pending_once=True):
         self.token, self.login, self.sso = token, login, sso
         self.pending_once = pending_once
@@ -79,10 +79,10 @@ def test_verify_login_rejects_a_token_of_another_login():
         with H.gateway_env() as env:
             env.o.extra["github_base"] = gh.bases()
             try:
-                logins.verify_login("github.com", "ghp_some_token_value_01234567", expected="jpowers-asi")
+                logins.verify_login("github.com", "ghp_some_token_value_01234567", expected="octo-work")
                 raise AssertionError("a login mismatch must raise")
             except logins.LoginError as e:
-                assert "someoneelse" in str(e) and "jpowers-asi" in str(e)
+                assert "someoneelse" in str(e) and "octo-work" in str(e)
     finally:
         gh.close()
 

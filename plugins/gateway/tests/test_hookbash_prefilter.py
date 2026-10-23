@@ -83,7 +83,7 @@ def test_trigger_words_fire_and_reach_python():
     base = Path(H.tmp_base())
     with tempfile.TemporaryDirectory(dir=base) as td:
         pre, marker = _rig(Path(td) / "rig")
-        for cmd in ("sudo apt install x", "ssh powerslabs df", "scp a b:/c",
+        for cmd in ("sudo apt install x", "ssh example df", "scp a b:/c",
                     "sftp h:/x", "rsync -a a h:/b", "curl http://x", "wget http://x",
                     "gate status", "age -d f", "git credential fill",
                     "GIT_TRACE_REDACT=0 git push", "cat ~/.config/gateway/private/key.txt",

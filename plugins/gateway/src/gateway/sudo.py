@@ -500,8 +500,11 @@ def _rights_now(fresh: bool = False) -> tuple[dict[str, Any] | None, str | None,
     if fresh:
         from . import form as formmod
         formmod.clear_cache()
+    locked = False
     try:
         data = vault.load() if vault.exists() else None
+    except vault.VaultLocked:
+        data, locked = None, True
     except Exception:  # noqa: BLE001
         data = None
     form = consent.load_form(data)
@@ -521,8 +524,10 @@ def _rights_now(fresh: bool = False) -> tuple[dict[str, Any] | None, str | None,
     if right == "ask" or d.word == "ask":
         typed, by = _typed_by_claude()
         if not typed:
+            # a locked vault: say how sudo's own right comes back (consent.LOCKED_SUDO_NOTE)
+            note = consent.locked_sudo_note(form) if locked and right == "ask" else ""
             return data, (ASK_JOB if by == ancestry.CHECKPOINT else
-                          ASK_PANE if by == ancestry.TERMINAL else ASK_INDIRECT), scripts
+                          ASK_PANE if by == ancestry.TERMINAL else ASK_INDIRECT) + note, scripts
     return data, None, scripts
 
 

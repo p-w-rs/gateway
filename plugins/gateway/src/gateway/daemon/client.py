@@ -5,6 +5,10 @@
     vault_read() / vault_write(data)            the scoped vault (a wrapped key only)
     cache_read() / cache_write(c) / open_own(blob)
 
+Before connecting, the socket and its folder must be this user's own and
+closed to others (foreign_socket); anything else is ForeignSocket (counted
+as unreachable, never talked to).
+
 The vault calls start the daemon when it isn't running (lifecycle.ensure_running)
 and turn its refusals into vault errors: "locked" into vault.VaultLocked
 with the daemon's wording, anything else into vault.VaultError. A daemon that
@@ -30,6 +34,7 @@ import http.client
 import json
 import os
 import socket
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -65,12 +70,54 @@ class Refused(vault.VaultLocked):
     same as locked for this program, with the daemon's reason."""
 
 
+class ForeignSocket(Unreachable):
+    """The socket at the daemon's path, or its folder, isn't this user's own
+    (another owner, open to others, not a socket): nothing is sent to it.
+    It counts as unreachable, so a start replaces it (gated's bind removes
+    a stale socket from the run folder, which is this user's)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.code = "foreign_socket"
+
+
+def foreign_socket(sock_path: str) -> str:
+    """Why the socket at sock_path mustn't be talked to, or "" (also when
+    nothing is there: connect() then fails as unreachable). The folder and
+    the socket must be this user's own and closed to others (gated makes
+    them 0700 and 0600): a socket another user bound while the folder was
+    open to them would get the vault data a stand-in sends, the values the
+    mod seals and the answers to consent dialogs (review round 2). Only
+    this user can change a 0700 folder, so nothing can be swapped in
+    between this check and the connect."""
+    uid = os.getuid()
+    folder = os.path.dirname(sock_path) or "."
+    for p, want in ((folder, stat.S_ISDIR), (sock_path, stat.S_ISSOCK)):
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            return ""
+        except OSError as e:
+            return f"{p} can't be checked ({type(e).__name__})"
+        if not want(st.st_mode):
+            return f"{p} isn't a {'folder' if want is stat.S_ISDIR else 'socket'} of its own"
+        if st.st_uid != uid:
+            return f"{p} belongs to another user (uid {st.st_uid})"
+        if st.st_mode & 0o077:
+            return f"{p} is open to other users (mode {stat.S_IMODE(st.st_mode):o})"
+    return ""
+
+
 class _UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, sock_path: str, timeout: float):
         super().__init__("gated", timeout=timeout)
         self._sock_path = sock_path
 
     def connect(self) -> None:
+        why = foreign_socket(self._sock_path)
+        if why:
+            raise ForeignSocket(f"gateway: the gateway daemon's socket isn't this user's own ({why}), "
+                                "so the gateway didn't connect to it")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(self.timeout)
         try:
@@ -313,6 +360,9 @@ def dialog_lease() -> dict[str, Any]:
                         "message": e2.message.removeprefix("gateway: ")}
             started = True
         except DaemonError as e:
+            if e.code == "other_config":           # another configuration's daemon (GW-ROB-2)
+                return {"available": False, "reason": e.code,
+                        "message": e.message.removeprefix("gateway: ")}
             if e.status == 403:
                 return {"available": False, "reason": "no_session",
                         "message": "this program isn't running inside a Claude Code session "

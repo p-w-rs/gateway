@@ -4,7 +4,7 @@
     "name": "p-w-rs"
   },
   "metadata": {
-    "description": "Local marketplace for internal Claude Code plugins."
+    "description": "Marketplace for the gateway plugin (github.com/p-w-rs/gateway)."
   },
   "plugins": [
     {

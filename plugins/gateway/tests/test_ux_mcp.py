@@ -102,8 +102,9 @@ def test_mcp_through_run_py_with_a_real_http_call():
 # hooks/mcp_perm.sh
 # ---------------------------------------------------------------------------
 
-HTTP = "mcp__plugin_gate_gw__http"
-DL = "mcp__plugin_gate_gw__download"
+GW = "mcp__plugin_gate_gw__"
+HTTP = GW + "http"
+DL = GW + "download"
 
 
 def _decide(env, payload) -> str | None:
@@ -120,50 +121,66 @@ def _p(tool, tin) -> dict:
 
 
 def test_mcp_perm_decisions():
+    """GW-SEC-1 / GW-UX-3: the hook gives no decision for the http and
+    download tools, in any mode, for any method, with or without an account
+    (a request can carry project data out, a download fetches anything, and
+    an account's credential reaches its service), so Claude Code's own mode
+    decides: a prompt in default and plan mode, the reviewer in auto. Only
+    top-level keys decide the tools it does allow."""
     with H.gateway_env() as env:
-        must_allow = [
+        never = [
             _p(DL, {"url": "https://x.example.com/f.tgz"}),
-            _p(DL, {"url": "https://x.example.com/f.tgz", "account": "pkg", "save_to": "a/b"}),
+            _p(DL, {"url": "https://x.example.com/payload.sh", "account": "pkg", "save_to": "a/b"}),
             _p(HTTP, {"url": "https://x.example.com/"}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "GET"}),
+            _p(HTTP, {"url": "https://x.example.com/?d=PROJECTDATA", "method": "GET"}),
             _p(HTTP, {"url": "https://x.example.com/", "method": "head"}),
             _p(HTTP, {"url": "https://x.example.com/", "method": "get", "account": "openai"}),
             _p(HTTP, {"url": "https://api.openai.com/v1/x", "method": "POST", "account": "openai",
                       "json": {"q": 1}}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "DELETE", "account": "github-work"}),
+            _p(HTTP, {"url": "https://api.github.com/repos/o/r", "method": "DELETE",
+                      "account": "github-work"}),
             _p(HTTP, {"url": "https://x.example.com/", "headers": {"method": "POST"}}),
-        ]
-        must_not = [
             _p(HTTP, {"url": "https://x.example.com/", "method": "POST", "body": "data"}),
             _p(HTTP, {"url": "https://x.example.com/", "method": "PUT", "json": {"account": "openai"}}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "POST", "headers": {"account": "a"}}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "POST",
-                      "body": "{\"method\": \"GET\", \"account\": \"x\"}"}),
             _p(HTTP, {"url": "https://x.example.com/", "method": "POST", "account": ""}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "POST", "account": None}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "POST", "account": 5}),
-            _p(HTTP, {"url": "https://x.example.com/", "method": "PATCH",
-                      "json": {"tool_input": {"account": "x", "method": "GET"}}}),
             _p(HTTP, {"url": "https://x.example.com/", "method": ["GET"]}),
             _p("mcp__plugin_other_gw__http", {"url": "https://x.example.com/"}),
             _p("Bash", {"command": "curl x"}),
-            {"tool_name": HTTP, "tool_input": {"method": "POST"}, "extra": {"tool_name": DL}},
+            {"tool_name": HTTP, "tool_input": {"method": "POST", "account": "x"},
+             "extra": {"tool_name": DL}},
         ]
-        must_allow.append({"tool_name": HTTP, "tool_input": {"method": "POST", "account": "x"},
-                           "extra": {"tool_name": DL}})
-        for p in must_allow:
-            assert _decide(env, p) == "allow", p
-        for p in must_not:
-            assert _decide(env, p) is None, p
+        for mode in (None, "default", "plan", "acceptEdits", "auto", "bypassPermissions"):
+            for p in never:
+                q = dict(p, permission_mode=mode) if mode else p
+                assert _decide(env, q) is None, (mode, p)
         # pretty-printed payloads (newlines, spaces) decide the same
         pretty = json.dumps(_p(HTTP, {"url": "u", "method": "POST", "account": "openai"}), indent=2)
-        assert _decide(env, pretty) == "allow"
-        pretty = json.dumps(_p(HTTP, {"url": "u", "method": "POST", "json": {"account": "a"}}), indent=2)
         assert _decide(env, pretty) is None
-        # a nested top-level-looking tool_name doesn't count
-        tricky = '{"tool_input": {"url": "u", "method": "POST"}, "x": {"tool_name": "%s"}, "tool_name": "Bash"}' % DL
+        pretty = json.dumps(_p(GW + "terminal_read", {"id": "t_x"}), indent=2)
+        assert _decide(env, pretty) == "allow"
+        # only the top-level tool_name counts: one nested in the input (after the
+        # real one) or elsewhere (before it) never decides
+        send = GW + "terminal_send"
+        tricky = json.dumps({"tool_name": send, "tool_input": {
+            "id": "t_x", "text": "id\n", "meta": {"tool_name": GW + "terminal_read"}}})
         assert _decide(env, tricky) is None
+        tricky = '{"tool_input": {"url": "u"}, "x": {"tool_name": "%s"}, "tool_name": "%s"}' % (
+            GW + "host_inspect", HTTP)
+        assert _decide(env, tricky) is None
+        assert _decide(env, _p(GW + "host_inspect", {})) == "allow"
         assert _decide(env, "garbage {") is None
+
+
+def test_claude_facing_texts_dont_promise_web_tools_without_a_prompt():
+    """GW-SEC-1 / GW-UX-3 round 2: mcp_perm.sh no longer allows http or
+    download, so the MCP instructions and the curl refusal must not tell
+    Claude they "need no prompt": Claude Code's own mode decides."""
+    from gateway import hooks_bash
+    assert "no prompt" not in mcp_server.INSTRUCTIONS
+    assert "permission mode decides" in mcp_server.INSTRUCTIONS
+    with H.gateway_env():
+        why = hooks_bash._deny_curl("curl")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "no prompt" not in why and "permission mode decides" in why, why
 
 
 def test_this_machines_own_host_id_is_localhost_for_terminals_and_jobs():

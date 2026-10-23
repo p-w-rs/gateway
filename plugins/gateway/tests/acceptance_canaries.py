@@ -18,7 +18,9 @@ here, never printed and never in a prompt.
 
 Steps (acceptance_dialogs.py's steps reused, with checkpoint recording every
 tool call):
-  sudo      the sudo dialog: typing BEFORE the click (held back by the guard),
+  sudo      the consent for the form's sudo = true first (a new install's sudo
+            here is "ask" since 0.10.0: Approve), then
+            the sudo dialog: typing BEFORE the click (held back by the guard),
             a wrong value (validation: "That didn't work"), a partial value
             then the focus moved away (Escape: dropped), the right value (Enter)
   paste     a canary PASTED (bracketed paste) into the prompt box while a

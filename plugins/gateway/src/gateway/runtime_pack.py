@@ -1,4 +1,4 @@
-"""The managed remote runtime's artifacts (PLAN-v4 phase 6, docs/modules/remote.md).
+"""The managed remote runtime's artifacts (PLAN-v4 phase 6, docs/dev/modules/remote.md).
 
 The runtime is the workspace in the plugin's `runtime/` folder (bash and
 tmux, locked for linux-64, linux-aarch64, osx-arm64 and osx-64; no Python:

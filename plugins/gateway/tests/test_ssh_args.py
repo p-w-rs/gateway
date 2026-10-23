@@ -112,8 +112,8 @@ def test_ssh_args_scp_sftp_refused() -> None:
 
 
 def test_ssh_args_destinations() -> None:
-    d = A.parse_destination("joshua@10.0.0.5")
-    assert (d.user, d.host, d.port) == ("joshua", "10.0.0.5", None)
+    d = A.parse_destination("octo@10.0.0.5")
+    assert (d.user, d.host, d.port) == ("octo", "10.0.0.5", None)
     d = A.parse_destination("ssh://u@Lab.Example.com:2222/")
     assert (d.user, d.host, d.port) == ("u", "lab.example.com", 2222)
     d = A.parse_destination("ssh://u@[::1]:2200")

@@ -48,7 +48,7 @@ that host (ssh is on), so what is copied is within reach of Claude's commands
 there, and show the remote's recipient for the user to compare with `gate
 pubkey` on that machine. (The recipient comes from the remote itself: a
 machine where Claude has a shell can't be made to prove anything about its own
-gate; see docs/modules/ux.md.) --from-peer reads only an age stream for this machine's
+gate; see docs/dev/modules/ux.md.) --from-peer reads only an age stream for this machine's
 own key, only when started by the system's sshd (the first non-shell ancestor
 is a root-owned sshd/sshd-session binary, by executable path, whose session
 monitor runs as root: an sshd a user started, a renamed shell or a symlink
@@ -1086,9 +1086,10 @@ def plan_import(inc: Incoming, local_form: formmod.Form, local_data: dict[str, A
                            for src in inc.vault["hosts"].values()) if inc.source.get("ssh_host_keys") else False
         if ok and not known_by_key:
             src_lh = (inc.raw.get("hosts") or {}).get("localhost") or {}
-            t: dict[str, Any] = {"address": addr, "ssh": False}
-            if "sudo" in src_lh:
-                t["sudo"] = src_lh["sudo"]
+            # its sudo as the source's form says, else "ask" (this computer's
+            # default; a remote host's own default, true, would widen it)
+            t: dict[str, Any] = {"address": addr, "ssh": False,
+                                 "sudo": src_lh.get("sudo", formmod.LOCALHOST_SUDO)}
             p.source_host = name
             p.add_hosts.append(name)
             taken.add(name)
@@ -1341,11 +1342,7 @@ def _restore(bk: Path, had_form: bool) -> None:
     elif not had_form and form.exists():
         form.unlink()
     if (bk / "vault.age").exists():
-        tmp = paths.vault_path().with_name(f".vault.age.{os.getpid()}.restore")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write((bk / "vault.age").read_bytes())
-        os.replace(tmp, paths.vault_path())
+        vault.write_private(paths.vault_path(), (bk / "vault.age").read_bytes())
     formmod.clear_cache()
 
 

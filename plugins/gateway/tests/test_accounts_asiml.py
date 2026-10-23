@@ -323,3 +323,54 @@ def test_asiml_ignores_proxy_variables():
     finally:
         cat.close()
         evil.close()
+
+
+def test_asiml_names_a_catalog_account_that_is_off_instead_of_saying_there_is_none():
+    """A catalog account that is off because of a mistake (a converted 0.6
+    catalog without host) is named with its problem, so Claude fixes it
+    instead of adding a second catalog account; with none at all the message
+    says what to add (kind and host)."""
+    with H.gateway_env() as env:
+        HA.build_vault(env, '[accounts.catalog]\nkind = "ml-catalog"\nlogin = "w@example.com"\n')
+        HA.set_direct((True, ""))
+        wd = Path(env.root) / "off"
+        wd.mkdir()
+        rc, out, err = HA.run_asiml(["search", "x"], str(wd))
+        assert rc == 2, err
+        assert "the ml-catalog account catalog is off" in err and "host is required" in err, err
+        assert "ask the user to fix [accounts.catalog]" in err, err
+        assert "rather than adding another" in err and "no ml-catalog account" not in err, err
+    with H.gateway_env() as env:
+        HA.build_vault(env, '[hosts.localhost]\nsudo = true\n')
+        HA.set_direct((True, ""))
+        wd = Path(env.root) / "none"
+        wd.mkdir()
+        rc, out, err = HA.run_asiml(["search", "x"], str(wd))
+        assert rc == 2 and "no ml-catalog account" in err, err
+        assert 'kind = "ml-catalog" with host = the catalog\'s address' in err, err
+
+
+SITE_DVC = '''#!{py}
+import os, sys
+sys.stdout.write("SITE=" + os.environ.get("DVC_SITE_CACHE_DIR", "") + "\\n")
+sys.exit(0)
+'''
+
+
+def test_dvc_runs_with_a_site_cache_in_a_folder_of_its_own():
+    """dvc's site cache (its repo index and locks) is the user's
+    ~/.local/share/asiml/site-cache, a folder of the gateway's asiml's own."""
+    from gateway import asiml, paths
+    with H.gateway_env() as env:
+        d = Path(env.root) / "fakebin"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "dvc"
+        p.write_text(SITE_DVC.format(py=HA.PY))
+        os.chmod(p, 0o755)
+        HA.build_vault(env, '[hosts.localhost]\nsudo = true\n')
+        HA.install_fakes(env, dvc=str(p))
+        wd = Path(env.root) / "site"
+        wd.mkdir()
+        rc, out, err = asiml._run_dvc(wd, ["status"], None)
+        want = paths.user_home() / ".local" / "share" / "asiml" / "site-cache"
+        assert rc == 0 and f"SITE={want}" in out, (out, err)

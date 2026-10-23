@@ -1,0 +1,69 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "29 6 * * 1"   # weekly, with the newest pixi and Claude Code
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}${{ matrix.pixi == 'v0.68.0' && ' (oldest pixi)' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        pixi: [v0.81.0]
+        include:
+          - os: ubuntu-24.04
+            pixi: v0.68.0      # requires-pixi's floor
+    env:
+      # The tested Claude Code for test_mod (`claude plugin validate` / `test`); the weekly run takes the newest.
+      CLAUDE_VERSION: ${{ github.event_name == 'schedule' && 'latest' || '2.1.301' }}
+    defaults:
+      run:
+        working-directory: plugins/gateway
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514  # v0.11.0
+        with:
+          pixi-version: ${{ github.event_name == 'schedule' && 'latest' || matrix.pixi }}
+          manifest-path: plugins/gateway/pixi.toml
+          locked: true
+      - name: Claude Code (for test_mod; no sign-in needed)
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Suite
+        run: |
+          export GW_TEST_TMP="$RUNNER_TEMP/gw-test"
+          mkdir -p "$GW_TEST_TMP"
+          pixi run --locked test
+
+  mutations:
+    # Every mutation must make a named test fail. Long (about an hour on a runner): weekly and on demand.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: plugins/gateway
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514  # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          manifest-path: plugins/gateway/pixi.toml
+          locked: true
+      - name: Mutations
+        run: |
+          export GW_TEST_TMP="$RUNNER_TEMP/gw-test"
+          mkdir -p "$GW_TEST_TMP"
+          pixi run --locked mutations

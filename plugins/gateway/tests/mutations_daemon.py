@@ -10,7 +10,8 @@ lock), the wrap's checks (age outside the flock, the passphrase bounded in
 UTF-8 bytes, key.recipient at unlock), the test routes, nothing secret in
 events or logs, the daemon's lifecycle (single instance, stale state, file
 modes, idle exit, version skew reported by status, the log rotated while
-running), and the two phase-1 findings (the test guard never stats the
+running), the client's check of whose socket it talks to and the run
+folder's remedy (review round 2), and the two phase-1 findings (the test guard never stats the
 gateway home; web's path rules under a symlinked temp root). Same format and runner as tests/mutation_check.py: each mutation
 removes or weakens one property; the named test must then FAIL.
 
@@ -139,6 +140,28 @@ MUTATIONS = [
      "    if not reg.claude_ok(claimed):\n",
      "    if False:\n",
      TD + "test_a_hook_cannot_register_a_process_that_isnt_claude_code"),
+    # --- npm's Claude Code (GW-COMPAT-1) ---------------------------------------
+    ("node running any script counts as Claude Code", S + "ancestry.py",
+     "    return real.endswith(NPM_CLI) and os.path.isfile(real)\n",
+     "    return os.path.isfile(real)\n",
+     TD + "test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script"),
+    ("any program running npm's cli.js counts as Claude Code", S + "ancestry.py",
+     "    if not _NODE_EXE.match(os.path.basename(exe)) or not argv or len(argv) < 2:\n",
+     "    if not argv or len(argv) < 2:\n",
+     TD + "test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script"),
+    ("node's options before cli.js are skipped (another script can be the program)", S + "ancestry.py",
+     "    script = argv[1]\n    if not os.path.isabs(script):\n",
+     "    script = next((a for a in argv[1:] if not a.startswith(\"-\")), \"\")\n"
+     "    if not os.path.isabs(script):\n",
+     TD + "test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script"),
+    ("any executable named claude.exe counts as Claude Code", S + "ancestry.py",
+     "    if os.path.basename(exe) == CLAUDE_EXE or exe.endswith(NPM_NATIVE):\n",
+     "    if os.path.basename(exe) in (CLAUDE_EXE, \"claude.exe\"):\n",
+     "test_ancestry_trees::test_npms_claude_code_counts_as_claude_code_and_no_other_node_script"),
+    ("npm's cli.js counts by a relative path (resolved in the current folder)", S + "ancestry.py",
+     "    if not os.path.isabs(script):\n        return False\n",
+     "    script = os.path.join(os.getcwd(), script) if not os.path.isabs(script) else script\n",
+     TD + "test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script"),
     # --- sessions: pid + start time; the executable only at registration -----------------
     ("pid reuse: the start time is ignored", DS + "peers.py",
      "    return now is not None and abs(now - start) < 0.05\n",
@@ -321,12 +344,12 @@ MUTATIONS = [
      "    if False:\n",
      TD + "test_version_skew_a_busy_older_daemon_is_kept_and_reported"),
     ("gated status (what /gate-doctor runs) drops the version skew", DS + "lifecycle.py",
-     "        print(json.dumps(_skew(h, plugin_version(), older=True) if h is not None\n",
-     "        print(json.dumps(h if h is not None\n",
+     "            out = (_skew(h, plugin_version(), older=True) if h is not None\n",
+     "            out = (h if h is not None\n",
      TD + "test_version_skew_a_busy_older_daemon_is_kept_and_reported"),
     ("gate status drops the version skew", S + "gate.py",
-     '            + (f"; {skew}" if skew else ""))\n',
-     "            )\n",
+     '            + (f"; {skew}" if skew else "") + (f"; {other}" if other else ""))\n',
+     '            + (f"; {other}" if other else ""))\n',
      TD + "test_version_skew_a_busy_older_daemon_is_kept_and_reported"),
     ("the log is rotated only at start", DS + "lifecycle.py",
      "                self._drain_note(stamped)\n            self._rotate_if_big()\n",
@@ -398,6 +421,27 @@ MUTATIONS = [
      "            if hook:\n                _clear_unresponsive()\n            return r\n",
      "            return r\n",
      TD + "test_a_hung_daemon_costs_a_hook_one_short_wait_and_is_never_started_twice"),
+    # --- whose socket the client talks to; the run folder's remedy (review round 2) ---
+    ("the client connects to any socket at the daemon's path", DS + "client.py",
+     "        why = foreign_socket(self._sock_path)\n",
+     '        why = ""\n',
+     TD + "test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to"),
+    ("the client talks to another user's socket", DS + "client.py",
+     "        if st.st_uid != uid:\n",
+     "        if False:\n",
+     TD + "test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to"),
+    ("the client talks to a socket (or in a folder) open to others", DS + "client.py",
+     "        if st.st_mode & 0o077:\n            return f\"{p} is open to other users",
+     "        if False:\n            return f\"{p} is open to other users",
+     TD + "test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to"),
+    ("the client follows a link at the daemon's path", DS + "client.py",
+     "        if not want(st.st_mode):\n",
+     "        if False:\n",
+     TD + "test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to"),
+    ("a run folder others could write to is advised chmod 700 again", S + "paths.py",
+     "    if st.st_mode & 0o022:\n",
+     "    if False:\n",
+     "test_paths_audit::test_a_run_dir_others_could_write_to_is_removed_never_chmodded"),
 ]
 
 

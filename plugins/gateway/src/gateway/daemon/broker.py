@@ -185,7 +185,12 @@ def merge(new: dict[str, Any], current: dict[str, Any], scope: frozenset[str], k
           entry_ok: EntryOk = lambda s, n: True) -> dict[str, Any]:
     """The document to save for a writer that saw make_view(current, ...):
     its sentinels swapped back for their values. Conflict when the result
-    adds, changes, moves or drops a value the writer couldn't see."""
+    adds, changes, moves or drops a value the writer couldn't see. The
+    vault's baseline mark (vault.BASELINE_KEY) stays as `current` has it: a
+    writer can neither drop it (that would give a new install an older one's
+    defaults) nor add it to an older vault. (With no vault yet, `current` is
+    empty(), which has it; a 0.6 conversion never writes through here: it
+    puts its key.txt in place first.)"""
     by_sentinel = {sentinel(key, d[k]): d[k] for _c, _e, d, k in slots(current)}
     out = copy.deepcopy(new)
     for _cls, _entry, d, k in list(slots(out)):
@@ -197,6 +202,9 @@ def merge(new: dict[str, Any], current: dict[str, Any], scope: frozenset[str], k
     if _hidden(out, scope, entry_ok) != _hidden(current, scope, entry_ok):
         raise Conflict("gateway: refused a vault change that would add, change or drop a "
                        "credential this program can't see")
+    out.pop(vault.BASELINE_KEY, None)
+    if vault.BASELINE_KEY in current:
+        out[vault.BASELINE_KEY] = current[vault.BASELINE_KEY]
     return out
 
 
@@ -283,30 +291,10 @@ def read_identity(text: str) -> str:
     raise BrokerError("gateway: the vault key file holds no age identity")
 
 
-def _write_private(path: Path, data: bytes) -> None:
-    """Write whole (temp file, fsync, rename), mode 0600."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    _fsync_dir(path.parent)
-
-
-def _fsync_dir(d: Path) -> None:
-    try:
-        fd = os.open(d, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+# Write whole (temp file, fsync, rename, fsync the folder), mode 0600: the
+# vault's own durable write (vault.age and the cache use it too).
+_write_private = vault.write_private
+_fsync_dir = vault.fsync_dir
 
 
 # ---------------------------------------------------------------------------

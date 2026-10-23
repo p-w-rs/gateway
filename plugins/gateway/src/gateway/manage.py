@@ -1,5 +1,5 @@
 """Managing hosts, workspaces, policy and accounts from the native panes
-(PLAN-v4 phase 7; /gate-hosts and /gate-accounts in hooks/mod, docs/modules/ux.md).
+(PLAN-v4 phase 7; /gate-hosts and /gate-accounts in hooks/mod, docs/dev/modules/ux.md).
 
     gate host add NAME USER@ADDRESS[:PORT] [ssh=..] [sudo=..]
     gate host set NAME KEY VALUE        address, ssh, sudo, scripts, note, runtime, via

@@ -197,6 +197,13 @@ identity otherwise. **No fallback is needed.**
   doesn't follow with the sign-in token`), proxies and CA overrides ignored.
 - `dvc_main(argv)`: inside an `.asiml` workspace, `dvc pull|push` → `asiml
   pull|push` (gated as `dvc`); everything else refused.
+- The account is the form's ml-catalog entry, whose `host` (the catalog's
+  address) is required: there is no default catalog. With none, the refusal
+  says what to add (`kind = "ml-catalog"` with `host`); with one that is off
+  because of a mistake (a converted 0.6 catalog without `host`, say), it names
+  that entry and its problem (`Form.disabled_kinds`), so Claude fixes it
+  instead of adding another. dvc's site cache (repo index and locks, nothing
+  secret) is `~/.local/share/asiml/site-cache`.
 
 ## entra.py (SPEC 9.5, 14)
 
@@ -282,7 +289,7 @@ because the dialog says `pem`: `clipboard.accept(multiline=True)` keeps line
 breaks only for such a dialog, every other control character is still
 refused).
 
-Account policy (docs/modules/policy.md): `[accounts.NAME.policy]`
+Account policy (docs/dev/modules/policy.md): `[accounts.NAME.policy]`
 `credential`, `write`, `network`; `accounts.select` refuses an account whose
 credential the policy doesn't allow (an "ask" only for a typed command), and
 `web.http` refuses a non-GET request with an account whose `write` isn't
@@ -307,7 +314,7 @@ allow.
 - `gate with` and hf: a rejected token says to run `gate check NAME` while
   the user is here.
 
-## Known residual limits (the "determined program" class, README "Security, honestly")
+## Known residual limits (the "determined program" class, README "Security and privacy")
 - The helper's parent check (like ancestry) compares the **basename** of the
   parent's executable path. A program that copies a binary to a file named
   `git-remote-https` (or `git-lfs`) and runs the helper from it passes. Only

@@ -74,7 +74,7 @@ def test_wrappers_cannot_hide_a_destructive_command():
             ("sudo env make install", "allow"),
             ("sudo nohup systemctl restart nginx", "allow"),
             ("sudo systemctl restart nginx", "allow"),
-            ("sudo cat /etc/passwd", "allow"),        # a data path, not the passwd program
+            ("sudo cp /etc/passwd /tmp/passwd.bak", "allow"),   # a data path, not the passwd program
         ])
 
 

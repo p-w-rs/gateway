@@ -784,7 +784,7 @@ def test_the_hook_refuses_routes_it_cant_follow_in_managed_mode():
 
 def test_the_target_of_sudo_is_named_before_it_runs():
     with H.gateway_env() as env:
-        env.write_form(HOST + "sudo = true\n")
+        env.write_form("[hosts.localhost]\nsudo = true\n" + HOST + "sudo = true\n")
         consent.approve_all(env.form())
         out = _hook("sudo -n true")
         assert _dec(out) == "allow" and "sudo runs as root on this machine (" in out["systemMessage"], out

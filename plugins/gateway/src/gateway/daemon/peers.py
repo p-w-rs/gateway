@@ -28,7 +28,7 @@ This is a guardrail, not a boundary: argv is set by whoever starts a
 process, and code already running as the user can run the env's python on
 the real run.py with any arguments, or read the daemon's memory. The checks
 keep a cooperative model's ad-hoc scripts and other programs from reaching
-the vault plane by accident or by a casual attempt (docs/modules/daemon.md).
+the vault plane by accident or by a casual attempt (docs/dev/modules/daemon.md).
 """
 from __future__ import annotations
 
@@ -124,24 +124,48 @@ def chain(pid: int) -> list[int]:
     return out
 
 
-def exe_is_claude(e: str) -> bool:
-    """Is executable path `e` Claude Code's? Named `claude`, or in the native
-    install's versions folder or the desktop app's copy under the person's
-    home (the password database's: a test or e2e override moves the gateway's
-    home, never where Claude Code is installed; the live e2e check found the
-    native install's `versions/2.1.301` refused under the override's home)."""
+def _homes() -> list:
     homes: list = [testing.real_user_home()]
     try:
         homes.append(paths.user_home())
     except Exception:  # noqa: BLE001
         pass
-    return any(ancestry.is_claude_exe(e, h) for h in homes)
+    return homes
+
+
+def exe_is_claude(e: str) -> bool:
+    """Is executable path `e` Claude Code's? Named `claude`, npm's native
+    binary (`.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`), or
+    in the native install's versions folder or the desktop app's copy under
+    the person's home (the password database's: a test or e2e override moves
+    the gateway's home, never where Claude Code is installed; the live e2e
+    check found the native install's `versions/2.1.301` refused under the
+    override's home)."""
+    return any(ancestry.is_claude_exe(e, h) for h in _homes())
 
 
 def is_claude(pid: int) -> bool:
-    """Is `pid` a Claude Code process (by executable path)?"""
+    """Is `pid` a Claude Code process: by executable path, or node running
+    npm's cli.js (an npm install before 2.1.113; by its argv, read from the
+    kernel: ancestry.is_claude_node)?"""
     e = exe(pid)
-    return bool(e) and exe_is_claude(e)
+    if not e:
+        return False
+    return exe_is_claude(e) or ancestry.is_claude_node(e, argv(pid))
+
+
+def claude_install(pid: int) -> str:
+    """How the Claude Code process `pid` was installed, in words for
+    /gate-doctor ("" when it isn't recognized as Claude Code)."""
+    e = exe(pid)
+    if not e or not is_claude(pid):
+        return ""
+    av = argv(pid)
+    for h in _homes():
+        kind = ancestry.claude_install(e, av, h)
+        if kind and not kind.startswith("an executable named"):
+            return kind
+    return ancestry.claude_install(e, av)
 
 
 # ---------------------------------------------------------------------------
@@ -321,3 +345,38 @@ def entry_of(pid: int) -> Entry | None:
             return None
         mode = f"shim {rest[1]}"
     return Entry(mode, script, e)
+
+
+def foreign_data(pid: int) -> Path | None:
+    """When `pid` is refused as an entry point only because it belongs to
+    another plugin data folder (a second Claude Code configuration, its own
+    CLAUDE_CONFIG_DIR: one gated per user serves one data folder, the one
+    its python is in): that folder, so the refusal can say so (GW-ROB-2).
+    It must otherwise look like a gateway entry point: a python of a data
+    folder's env, the launchers' options, a run.py whose plugin.json names
+    "gate", a gateway mode. None for anything else (no new trust: the caller
+    is refused either way)."""
+    e = exe(pid)
+    av = argv(pid)
+    if not e or not av:
+        return None
+    other = paths.data_from_executable(_real(e))
+    if other is None:
+        return None
+    try:
+        if _real(str(other)) == _real(str(paths.data_dir())):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    k = _script_index(av)
+    if k is None or not launcher_options_ok(av[1:k]):
+        return None
+    script = av[k]
+    if not os.path.isabs(script) or os.path.basename(script) != "run.py" or \
+            _plugin_name(os.path.dirname(_real(script))) != "gate":
+        return None
+    rest = av[k + 1:]
+    if rest[:1] == ["--test"]:
+        rest = rest[1:]
+    return other if rest and rest[0] in ENTRY_MODES else None
+

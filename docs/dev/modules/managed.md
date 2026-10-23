@@ -116,8 +116,8 @@ Claude Code's `/bin/sh -c` is one, so gate-sh gives one back (dash leaves
 (`test_hook_strings_run_exactly_as_claude_code_runs_them_without_a_prefix`)
 and live (a probe plugin's hook wrote the same `$0` and environment as
 without the gateway, but for the mod's three variables). Exec-form hooks
-(`command` + `args`, like the gateway's own) and the organization's hooks are
-never prefixed by Claude Code; MCP servers started after session start are
+(`command` + `args`, like the gateway's own) and an organization's managed
+hooks are never prefixed by Claude Code; MCP servers started after session start are
 (their quoted argv runs through `/bin/sh -c` here, which is the same command).
 
 **Bash-tool scripts** are recognised by their whole shape: Claude Code's cwd
@@ -149,7 +149,19 @@ kill it (verified: Escape and a Bash `timeout` stop the command as without
 the gateway).
 
 **Not ready** (exit 75, nothing run): `GW_MANAGED_DIR` missing or relative,
-no `conf`, no managed bash yet (the env is building), no `rc.bash`. So the
+no `conf`, no managed bash yet (the env is building), no `rc.bash`. The
+message says why, from file tests only (`gw_setup_state`, no process
+started): the data folder gone (uninstalled or removed: restart Claude Code,
+or reinstall), setup failed (an env folder with `install.log` and no
+`.ready`, no live `.building` lock: the log and `/gate-doctor`; a lock whose
+`owner` names a builder and pixi child that are gone, read with `read` and
+tested with `kill -0`, both builtins, is stale, as after ensure-env's
+timeout killed a build: `gw_lock_live`; a lock with no owner file yet counts
+as live, and without ps a reused pid looks alive, so the doubt is always
+"still setting up"), pixi missing
+(launch.sh's `find_pixi` places and Claude Code's PATH: https://pixi.sh), else
+still setting up; the failed and pixi-missing sentences are launch.sh's
+`not_ready_text` ones (test_managed compares them). So the
 mod's status line says `ready` only once `conf` exists too (`launch.sh
 status` reports `"managed"`, by existence; until then `finishing setup…`,
 lib.ts `setupReady`): acceptance 2026-10-21 found Bash refused with 75 for
@@ -278,6 +290,19 @@ machine's `read` policy, and a remote host is inspected through gated
 (remote.md, "Policy, inspection and imports"). `mcp_perm.sh` allows it in
 every mode.
 
+**Found but not imported** (GW-UX-2b, `managed.found_not_imported`): the
+same reading (the login PATH folders, then the toolchain folders) gives the
+folders that hold programs and that the managed PATH lacks (not the system
+folders, `/System/`, `/Library/Apple/`, `/usr/libexec/`, what is imported or
+the gateway's own; at most 8, plain characters only). While the form has no
+`[shell] import_path` key at all (an explicit `import_path = []` says no) and
+the mode isn't "off", Claude's session context names them and says to
+propose importing them (`hooks_session.IMPORT_OFFER`: one form edit, then
+`gate check settings` and the consent dialog; only when it fits the
+context's 2500 characters, after the hosts and accounts); `state.json` carries them as
+`found`, so `/gate-doctor` lists them, and so does `gate status`. Nothing is
+imported by finding them.
+
 Imports (`[shell] import_path` / `import_env`) apply only while this
 machine's `env_import` policy is allow (`managed.imports_allowed`;
 `path_plan`, `env_plan` and the conf follow it), so `env_import = "deny"`
@@ -321,20 +346,62 @@ every permission mode (never left to Claude Code's own mode):
   applies);
 - a command the parser can't split (an assignment statement, a function,
   `eval`, `exec`, a command substitution) or a stage that runs code its words
-  don't show (`sh -c`/`bash -c` strings, `| sh`, `find -exec`, `xargs`,
-  `env -S`, a loop): the text scan (`_route_text`) refuses a credential
-  tool named by any path but the stand-in's, a variable or a command's
-  output as the program (`$(which -a ssh) box`; a computed folder with a
-  named program, `$(git rev-parse --show-toplevel)/x.sh`, passes; assignments
-  before the program are skipped), a PATH/transport change, `unset PATH`,
-  `hash -p`, `command -p` or `env -i`/`-u`/`-S` with a tool named after it
-  (`sudo env -i make` is sudo's own business), an alias or a function named
-  after a tool, and git's ssh setting with git anywhere. Here-documents that
-  are data (`cat > f <<EOF`) aren't read; one a shell reads (`bash <<EOF`,
-  `| sh`) is. An ssh stage's remote command is never scanned (it runs on the
-  host, where remote sudo has its own rules). The scan is deliberately broad
-  (`bash -c 'ls -l /usr/bin/ssh'` is refused too: run it without the shell
-  string).
+  don't show (`sh -c`/`bash -c` strings, `| sh`, a `<<<` here-string into a
+  shell, `find -exec`, `xargs`, `env -S`, a loop): the text scan
+  (`_route_text`) refuses a credential tool named by a path other than the
+  stand-in's where it can run as a program (`_text_runs`). A path whose
+  parent is a `…bin` folder and whose basename is a tool is a program
+  **anywhere** except as a plain operand of a command that never runs it (so
+  `sudo cat /etc/ssh/sshd_config`, `sudo tee -a /etc/ssh/sshd_config.d/x.conf`,
+  `sudo cp x /etc/pam.d/sudo` and `sudo rm /usr/local/bin/gh` pass, but
+  `bash -c 'ls -l /usr/bin/ssh'` passes too — `ls` only reads it). A non-bin
+  path (`/opt/x/ssh`, `./ssh`, `/etc/ssh`) is a program only in a program
+  position — the first word, after a separator, a reserved word, a wrapper
+  (env, nohup, sudo, timeout, xargs incl. `-a`, nice, macOS's arch, ...), a
+  shell's or su's `-c` string, su's `-s` shell, find's `-exec`, a known
+  runner (sshpass, strace, ltrace, dtruss, flock, script, unbuffer, chroot,
+  tmux, screen, ssh-agent, ...), or GNU sed's `e` command (also glued to its
+  path, `1e/x/ssh`) — or as a transport option's value (rsync `-e`, scp
+  `-S`, tar `-I`, `--rsh`, ProxyCommand), glued to `=` (`--rsh=`, `GIT_SSH=`),
+  or anywhere in a text piped into a shell or in a shell's `<<<` here-string.
+  Only a shell's or su's `-c` (sh, bash, zsh, dash, ..., su, runuser) takes a
+  command string; any other program's `-c` is its own option, so `for f in
+  *.c; do gcc -c "$f"; done` and `psql -c "$QUERY"` get no decision. The
+  runners count as one only as the program itself (after the wrappers, or
+  named by a path): `sudo apt install tmux strace` names them as data. awk's,
+  vi/vim's and less's script text counts only for a bin-folder path (they
+  aren't data commands, so such a path anywhere in their words is a program);
+  a non-bin path in it is a limit (below). The commands that never run an
+  operand are `_TEXT_DATA` (cat, cp, mv, rm, ls, grep, sed without an `e`,
+  chmod, tar/rsync/scp as a local copy, head, tail, wc, echo, printf, test,
+  ...; `less` isn't one — it runs `!`). Also refused: a variable or a
+  command's output as the program (`$(which -a ssh) box`; a computed folder
+  with a named program, `$(git rev-parse --show-toplevel)/x.sh`, passes;
+  assignments before the program are skipped), a shell's or su's `-c` string
+  that is a variable or a command's output (`bash -c "$CMD"`: whatever it
+  holds runs unseen; the refusal says to write the command in the string, or
+  run it as its own command), a PATH/transport change,
+  `unset PATH`, `hash -p`, `command -p` or `env -i`/`-u`/`-S` with a tool
+  named after it (`sudo env -i make` is sudo's own business), an alias or a
+  function named after a tool, and git's ssh setting with git anywhere.
+  Here-documents that are data (`cat > f <<EOF`) aren't read; one a shell
+  reads (`bash <<EOF`, `| sh`, `bash <<< '…'`) is. An ssh stage's remote
+  command is never scanned (it runs on the host, where remote sudo has its
+  own rules). A plain `sudo CMD ARGS` reaches the scan (sudo is a runner),
+  but a tool path CMD only reads is data there, so `sudo restorecon /etc/ssh`,
+  `sudo tar czf x /etc/ssh` and `sudo make -C ops/ssh install` pass.
+  Known misses of the scan (a guardrail's limits; a bin-folder path is still
+  refused in each): a non-bin path in awk's, vi/vim's or less's script text
+  (`awk 'BEGIN{"/opt/x/ssh h" | getline}'`, vim's `!`); a path after tmux's
+  options that follow its subcommand (`tmux new -d /opt/x/ssh`) or after a
+  strace option whose value the scan misreads (`strace -s 100 /opt/x/ssh`;
+  its table also counts `-A`, `-z`, `-r`, `-x` as taking one); `watch` with
+  an option value, `expect`, `entr` and `docker run` running a non-bin path;
+  a here-string into a shell nested in another shell string. The other way,
+  a bin-folder path as the operand of a program the scan doesn't know is
+  refused (`sudo dpkg -S /usr/bin/ssh`, `sudo setcap ... /usr/local/bin/gh`),
+  and so is a here-string to a reader (`cat <<< /usr/bin/ssh`) inside hidden
+  text.
 
 git and rsync by a path still pass: the gateway's env file routes their
 transport through `GIT_SSH_COMMAND` / `RSYNC_RSH`, which reach the stand-in
@@ -352,7 +419,7 @@ decrypts) and go only to the stand-ins' children after their checks. What it
 can do is use the user's own credentials outside the gateway (their own
 `~/.ssh` keys and agent, a `gh` login, a cached sudo timestamp), exactly as
 any program the user runs could. The hook's checks are guardrails against a
-cooperative model, not a sandbox (README "Security, honestly").
+cooperative model, not a sandbox (README "Security and privacy").
 
 ## Cost
 

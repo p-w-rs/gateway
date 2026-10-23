@@ -9,6 +9,7 @@ import io
 import json
 import os
 import select
+import stat
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ import harness_ux as U
 from gateway import consent, gate_setup, hooks_prompt, hooks_session, paths, popup, vault
 from gateway import form as formmod
 
-HOSTFORM = '[hosts.box]\naddress = "joshua@box.example.com"\n'
+HOSTFORM = '[hosts.box]\naddress = "octo@box.example.com"\n'
 HKEY = H.fake_host_key("boxkey")
 GOOD_SUDO = "pw-right-123"
 
@@ -81,7 +82,7 @@ def test_check_new_host_end_to_end_then_idempotent():
         assert rc == 0, (out, err)
         # review round 4: what the setup did follows the status, without a
         # second "gateway: " prefix inside its parentheses
-        assert out.strip() == ("gateway: box ready: ssh ✓ (joshua@box.example.com, key installed), "
+        assert out.strip() == ("gateway: box ready: ssh ✓ (octo@box.example.com, key installed), "
                                "sudo ✓ (password saved); installed via my-login"), out
         assert out.count("gateway: ") == 1
         d = env.dialog.calls()
@@ -89,13 +90,13 @@ def test_check_new_host_end_to_end_then_idempotent():
         assert d[0]["default"] == "Decline" and "new host" in d[0]["message"] and "SHA256:" in d[0]["message"]
         # the sudo choice: store the password or be asked each time (never a sudoers rule)
         assert d[2]["default"].splitlines() == [gate_setup.SUDO_STORE, gate_setup.SUDO_ASK], d[2]
-        assert "joshua@box.example.com" in d[3]["message"] and popup.NEVER_SEES in d[3]["message"]
+        assert "octo@box.example.com" in d[3]["message"] and popup.NEVER_SEES in d[3]["message"]
         data = vault.load()
         assert "box" in data["approved"]["rights"]["hosts"]
         h = data["hosts"]["box"]
         assert h["host_keys"] == [vault.norm_host_key(HKEY)] and h.get("pinned_at")
         assert len(vault.live_keys(h)) == 1 and h.get("installed")
-        assert h["sudo"]["joshua"]["password"] == GOOD_SUDO
+        assert h["sudo"]["octo"]["password"] == GOOD_SUDO
         assert [c[0] for c in calls()] == ["keyscan", "test_login", "install", "test_login", "verify"]
         assert ["install", "box", "my-login"] in calls()
         # idempotent: nothing to do, no pop-up
@@ -124,7 +125,7 @@ def test_check_approves_exactly_what_was_shown():
 
         def widen():
             time.sleep(0.6)
-            env.write_form(HOSTFORM + 'also = ["joshua@203.0.113.9"]\n')
+            env.write_form(HOSTFORM + 'also = ["octo@203.0.113.9"]\n')
         t = threading.Thread(target=widen)
         t.start()
         rc, out, err = _run(gate_setup.check, "box")
@@ -171,7 +172,7 @@ def test_check_unreachable_host_and_no_screen():
         U.setup(env, HOSTFORM)
         with vault.edit() as d:
             vault.host_record(d, "box")["host_keys"] = [vault.norm_host_key(HKEY)]
-        env.write_form(HOSTFORM + 'also = ["joshua@10.0.0.7"]\n')
+        env.write_form(HOSTFORM + 'also = ["octo@10.0.0.7"]\n')
         rc, out, err = _run(gate_setup.check, "box")
         assert rc == 1 and "nothing was asked" in err and env.dialog.calls() == [], err
         env.write_form(HOSTFORM.replace("box.example.com\"", "box.example.com\"\nsudo = false"))
@@ -206,11 +207,51 @@ def test_check_localhost_sudo_with_verification():
         assert rc == 0 and env.dialog.calls() == [], "NOPASSWD: nothing asked"
 
 
+def test_check_localhost_on_a_new_install_asks_nothing_to_approve_and_keeps_ask():
+    """A new install's starter (sudo = "ask"): gate check localhost has
+    nothing to approve (no consent dialog), sets up the password choice as
+    for any sudo right, and reports sudo as "ask"; the form is untouched."""
+    from gateway import hooks_session, migrate, sudo
+    with U.ux_env(U.answers(("ok", gate_setup.SUDO_ASK))) as env:
+        hooks_session.session_main({"session_id": "new", "source": "startup"})
+        assert paths.form_path().read_text() == migrate.STARTER
+        with U.patch(sudo, "probe_nopasswd", lambda user=None: False):
+            rc, out, err = _run(gate_setup.check, "localhost")
+        assert rc == 0 and out.startswith("gateway: localhost ready: sudo ask"), (out, err)
+        d = env.dialog.calls()
+        assert len(d) == 1 and d[0]["kind"] == "choice", d
+        assert not any("Approve" in c.get("title", "") or "->" in c["message"] for c in d), d
+        assert paths.form_path().read_text() == migrate.STARTER
+        eff = consent.compute(env.form(), vault.load() if vault.exists() else None)
+        assert eff.hosts["localhost"].sudo == "ask" and not eff.pending
+
+
+def test_check_localhost_approves_an_old_starters_sudo_true_without_a_vault():
+    """An install from before the "ask" default with no vault (nothing ever
+    stored): its form's sudo = true waits for the OK; one gate check
+    localhost (the consent dialog) makes it true, with no form change."""
+    from gateway import migrate, sudo
+    old = migrate.HEADER + "\n[hosts.localhost]\nsudo = true\n"
+    with U.ux_env(U.answers(("ok",))) as env:
+        env.write_form(old)
+        assert not vault.exists()
+        eff = consent.compute(env.form(), None)
+        assert eff.hosts["localhost"].sudo == "ask" and eff.pending_names() == ["localhost"]
+        with U.patch(sudo, "probe_nopasswd", lambda user=None: True):
+            rc, out, err = _run(gate_setup.check, "localhost")
+        assert rc == 0 and out.startswith("gateway: localhost ready: sudo ✓"), (out, err)
+        d = env.dialog.calls()
+        assert len(d) == 1 and 'sudo "ask" -> true' in d[0]["message"], d
+        eff = consent.compute(env.form(), vault.load())
+        assert eff.hosts["localhost"].sudo is True and not eff.pending
+        assert paths.form_path().read_text() == old
+
+
 def _github_api():
     def user(h, u, b):
         auth = h.headers.get("Authorization", "")
-        logins = {"Bearer good-token-123456789": "jpowers", "Bearer other-person-token-1": "someone-else",
-                  "Bearer gho_browserTOKEN1234567890": "jpowers"}
+        logins = {"Bearer good-token-123456789": "octocat", "Bearer other-person-token-1": "someone-else",
+                  "Bearer gho_browserTOKEN1234567890": "octocat"}
         if auth in logins:
             return 200, {"Content-Type": "application/json"}, json.dumps({"login": logins[auth]})
         return 401, {}, "{}"
@@ -221,18 +262,18 @@ def _github_api():
 
 
 def test_github_token_paste_with_login_check():
-    form = '[accounts.gh]\nkind = "github"\nlogin = "jpowers"\nowners = ["acme"]\n'
+    form = '[accounts.gh]\nkind = "github"\nlogin = "octocat"\nowners = ["acme"]\n'
     ans = U.answers(("ok",), ("ok", "other-person-token-1"), ("ok", "good-token-123456789"))
     with U.ux_env(ans) as env, U.servers(_github_api()) as (api,):
         env.o.extra["github_api"] = api.url("").rstrip("/")
         U.setup(env, form, approve=False)
         rc, out, err = _run(gate_setup.check, "gh")
         assert rc == 0, (out, err)
-        assert "token saved as jpowers" in out and "acme uses SSO" in out, out
+        assert "token saved as octocat" in out and "acme uses SSO" in out, out
         d = env.dialog.calls()
         assert [c["kind"] for c in d] == ["confirm", "secret", "secret"], d
         assert "personal access token" in d[1]["message"]
-        assert "belongs to someone-else, not jpowers" in d[2]["message"]
+        assert "belongs to someone-else, not octocat" in d[2]["message"]
         rec = vault.load()["accounts"]["gh"]
         assert rec["token"]["value"] == "good-token-123456789" and rec["token"]["source"] == "pasted"
         assert "github.com" in rec["bound"]["hosts"]
@@ -248,8 +289,9 @@ def test_browser_and_device_code_signins_are_unavailable_and_say_what_works():
     from gateway import entra
     assert not hasattr(entra, "login_browser") and not hasattr(entra, "login_device")
     for form, kind, instead in (
-            ('[accounts.az]\nkind = "azure"\ntenant = "asirobots.com"\n', "azure", "service principal"),
-            ('[accounts.cat]\nkind = "ml-catalog"\n', "ml-catalog", "keeps working")):
+            ('[accounts.az]\nkind = "azure"\ntenant = "example.com"\n', "azure", "service principal"),
+            ('[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n', "ml-catalog",
+             "keeps working")):
         with U.ux_env(U.answers(("ok",))) as env:
             U.setup(env, form, approve=False)
             name = "az" if kind == "azure" else "cat"
@@ -261,7 +303,7 @@ def test_browser_and_device_code_signins_are_unavailable_and_say_what_works():
             assert rc == 1 and "isn't available" in err, err
     # an existing refresh token keeps working: no sign-in asked
     with U.ux_env() as env:
-        U.setup(env, '[accounts.az]\nkind = "azure"\ntenant = "asirobots.com"\n')
+        U.setup(env, '[accounts.az]\nkind = "azure"\ntenant = "example.com"\n')
         with vault.edit() as d:
             vault.account_record(d, "az", "azure")["entra"] = {
                 "refresh_token": "rt-existing-123456", "client_id": formmod.AZURE_CLI_CLIENT_ID,
@@ -333,7 +375,7 @@ def test_forget_and_rotate():
     with U.ux_env() as env:
         U.setup(env, HOSTFORM + '[accounts.k]\nkind = "api-key"\nsites = ["api.x.com"]\n')
         with vault.edit() as d:
-            vault.set_sudo(d, "box", "joshua", "box-sudo-pw-1")
+            vault.set_sudo(d, "box", "octo", "box-sudo-pw-1")
             vault.host_record(d, "box")["host_keys"] = [vault.norm_host_key(HKEY)]
         U.set_token("k", "api-key", "api-key-value-123")
         rc, out, _ = _run(gate_setup.forget, "box", "sudo")
@@ -348,11 +390,135 @@ def test_forget_and_rotate():
         rc, out, err = _run(gate_setup.forget, "box", "everything")
         assert rc == 2
         assert any(e["what"] == "forget" for e in vault.load()["events"])
-        with U.patch(ssh, "rotate", lambda n: f"gateway: {n} has a new key (old one retired)"):
+        with U.patch(ssh, "rotate", lambda n, before_change=None: f"gateway: {n} has a new key (old one retired)"):
             rc, out, err = _run(gate_setup.rotate, "box")
         assert rc == 0 and "new key" in out
         rc, out, err = _run(gate_setup.rotate, "k")
         assert rc == 2
+
+
+def test_forget_keeps_no_copy_and_names_older_ones_rotate_keeps_one_when_it_changes_the_vault():
+    """GW-DUR-1's copies, as the lead decided (review round 2): `gate forget`
+    keeps no copy of the vault (forgetting means gone) and says when older
+    copies in private/backups (gate rotate's, an import's backup, the 0.6
+    conversion's) may still hold what it forgot, and how to delete them.
+    `gate rotate` keeps the vault from just before it changes it (0600, the
+    folder 0700, still encrypted), names the file, keeps the newest 5, and
+    keeps nothing when it fails before changing the vault."""
+    from gateway import ssh
+    with U.ux_env() as env:
+        U.setup(env, HOSTFORM + '[accounts.k]\nkind = "api-key"\nsites = ["api.x.com"]\n')
+        U.set_token("k", "api-key", "api-key-value-123")
+        bk = paths.backups_dir()
+
+        def copies() -> list[str]:
+            return sorted(f.name for f in bk.iterdir()) if bk.is_dir() else []
+        rc, out, _ = _run(gate_setup.forget, "k", "token")
+        assert rc == 0 and "token" not in vault.load()["accounts"]["k"], out
+        assert copies() == [], "forget keeps no copy"
+        assert out.strip() == "gateway: forgot its token for k", out
+        # rotate failing before it changes the vault: nothing kept, its own words
+        def fails(n, before_change=None):
+            raise ssh.SshError(f"gateway: {n} has no key of the gateway's yet; run gate check {n}", 2)
+        with U.patch(ssh, "rotate", fails):
+            rc, out, err = _run(gate_setup.rotate, "box")
+        assert rc == 2 and "has no key of the gateway's yet" in err and "failed (SshError)" not in err, err
+        assert copies() == [], "a rotation that failed first keeps no copy"
+
+        def rotates(n, before_change=None):
+            before_change()
+            with vault.edit() as d:
+                vault.add_event(d, "rotate", f"{n}: a new key")
+            return f"gateway: {n} has a new key (old one retired)"
+        before = paths.vault_path().read_bytes()
+        with U.patch(ssh, "rotate", rotates):
+            rc, out, err = _run(gate_setup.rotate, "box")
+        snaps = sorted(bk.glob("rotate-*.vault.age"))
+        assert rc == 0 and len(snaps) == 1 and snaps[0].read_bytes() == before, (out, err)
+        assert paths.vault_path().read_bytes() != before
+        assert f"the vault from before is kept in {paths.describe(snaps[0])}" in out, out
+        assert oct(snaps[0].stat().st_mode & 0o777) == oct(0o600)
+        assert oct(bk.stat().st_mode & 0o777) == oct(0o700)
+        assert json.loads(vault._decrypt(snaps[0]).decode())["accounts"]["k"].get("token") is None
+        # forget now names the older copies that may still hold the entry
+        imp = bk / "import-20260101-000000-abcdef"
+        imp.mkdir()
+        (imp / "vault.age").write_bytes(b"an import's backup")
+        (bk / "store-v2-20260101.age").write_bytes(b"the 0.6 store")
+        U.set_token("k", "api-key", "api-key-value-456")
+        have = copies()
+        rc, out, _ = _run(gate_setup.forget, "k", "token")
+        assert rc == 0 and copies() == have, "still no copy of its own"
+        d = paths.describe(bk)
+        assert d == "~/.config/gateway/private/backups", d
+        assert f"Older copies of the vault in {d} (" in out and snaps[0].name in out \
+            and imp.name in out and "store-v2-20260101.age" in out and "may still hold it" in out, out
+        assert f"the user deletes them in their own terminal: cd {d} && rm -r *.vault.age import-* " \
+            "store-v2-*.age" in out, out
+        # rotate's copies: the newest 5
+        for i in range(6):
+            time.sleep(0.01)
+            with U.patch(ssh, "rotate", rotates):
+                rc, out, _ = _run(gate_setup.rotate, "box")
+            assert rc == 0, out
+        left = sorted(bk.glob("rotate-*.vault.age"))
+        assert len(left) == vault.SNAPSHOT_KEEP == 5 and snaps[0] not in left, left
+        assert imp.is_dir() and (bk / "store-v2-20260101.age").exists(), "others' copies stay"
+
+
+def test_vault_writes_are_durable_temp_file_fsync_rename_fsync_folder():
+    """GW-DUR-1: vault.age and cache.age were renamed into place without an
+    fsync, so a power loss soon after a write could leave the vault empty.
+    The file is flushed before the rename, and its folder after. On macOS
+    the flush is F_FULLFSYNC (fsync there leaves the data in the drive's
+    cache), with fsync when the file system refuses it (review round 2)."""
+    import fcntl
+    with U.ux_env() as env:
+        U.setup(env, HOSTFORM)
+        seen: list[tuple[str, int, bool]] = []
+        real_fsync, real_replace, real_fcntl = os.fsync, os.replace, fcntl.fcntl
+        refuse_full = [False]
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            seen.append(("fsync", st.st_ino, stat.S_ISDIR(st.st_mode)))
+            return real_fsync(fd)
+
+        def fcntl_(fd, cmd, *a):
+            if cmd == getattr(fcntl, "F_FULLFSYNC", object()):
+                st = os.fstat(fd)
+                seen.append(("full", st.st_ino, stat.S_ISDIR(st.st_mode)))
+                if refuse_full[0]:
+                    raise OSError(45, "Operation not supported")
+            return real_fcntl(fd, cmd, *a)
+
+        def replace(a, b):
+            seen.append(("replace", os.stat(a).st_ino, False))
+            return real_replace(a, b)
+        darwin = sys.platform == "darwin"
+        assert vault._DARWIN == darwin
+        flush = "full" if darwin else "fsync"
+        for refuse in ((False, True) if darwin else (False,)):
+            refuse_full[0] = refuse
+            for write, target in ((lambda: vault.save(vault.load()), paths.vault_path()),
+                                  (lambda: vault.cache_save({"tokens": {"a|b": {"value": "x" * 12,
+                                                                                 "expires": time.time() + 600}}}),
+                                   paths.cache_path())):
+                seen.clear()
+                with U.patch(os, "fsync", fsync), U.patch(os, "replace", replace), \
+                        U.patch(fcntl, "fcntl", fcntl_):
+                    write()
+                ino = target.stat().st_ino
+                folder = target.parent.stat().st_ino
+                rep = seen.index(("replace", ino, False))
+                assert (flush, ino, False) in seen[:rep], (refuse, seen)
+                assert (flush, folder, True) in seen[rep:], (refuse, seen)
+                if darwin and not refuse:
+                    assert ("fsync", ino, False) not in seen, ("F_FULLFSYNC, not fsync", seen)
+                if refuse:      # F_FULLFSYNC refused: fsync instead, file and folder
+                    assert ("fsync", ino, False) in seen[:rep] and ("fsync", folder, True) in seen[rep:], seen
+                assert oct(target.stat().st_mode & 0o777) == oct(0o600)
+                assert not list(target.parent.glob(f".{target.name}.*.tmp")), "no temp file left"
 
 
 # ---------------------------------------------------------------------------
@@ -431,11 +597,11 @@ def test_token_checks_ignore_proxy_and_ca_settings_from_the_environment():
         with U.env_vars(HTTP_PROXY=purl, http_proxy=purl, HTTPS_PROXY=purl, https_proxy=purl,
                         ALL_PROXY=purl, all_proxy=purl, NO_PROXY=None, no_proxy=None):
             code, body, _h = gate_setup.http_json(api.url("/user"), "good-token-123456789")
-            assert (code, body) == (200, {"login": "jpowers"}), (code, body)
+            assert (code, body) == (200, {"login": "octocat"}), (code, body)
             assert proxy.rec.requests == [], "the token never went to the proxy"
             assert api.rec.last()["headers"]["Authorization"] == "Bearer good-token-123456789"
             a = __import__("gateway.form", fromlist=["x"]).parse_text(
-                '[accounts.gh]\nkind = "github"\nlogin = "jpowers"\n').accounts["gh"]
+                '[accounts.gh]\nkind = "github"\nlogin = "octocat"\n').accounts["gh"]
             env.o.extra["github_api"] = api.url("").rstrip("/")
             found: dict = {}
             assert gate_setup.github_verify(a, found)("good-token-123456789") == (True, "")
@@ -456,7 +622,7 @@ def test_token_checks_ignore_proxy_and_ca_settings_from_the_environment():
 
 
 def test_an_entry_named_settings_is_refused():
-    form = '[hosts.settings]\naddress = "joshua@settings.example.com"\nsudo = false\n'
+    form = '[hosts.settings]\naddress = "octo@settings.example.com"\nsudo = false\n'
     with U.ux_env(session=None) as env, ssh_mocks(env):
         U.setup(env, form, approve=False)
         rc, out, err = _run(gate_setup.check, "settings")
@@ -471,10 +637,11 @@ def test_an_entry_named_settings_is_refused():
 
 
 def test_forgetting_host_keys_doesnt_turn_a_changed_key_into_a_first_pin():
-    """`gate forget box host-keys` (hook-allowed) then `gate check box` with a
-    different key: still a host-key change pop-up (old and new), not a plain
-    first pin. The same key as before pins quietly in the consent pop-up."""
-    form = '[hosts.box]\naddress = "joshua@box.example.com"\nsudo = false\n'
+    """`gate forget box host-keys` (no longer hook-allowed: GW-DATA-1) then
+    `gate check box` with a different key: still a host-key change pop-up
+    (old and new), not a plain first pin. The same key as before pins
+    quietly in the consent pop-up."""
+    form = '[hosts.box]\naddress = "octo@box.example.com"\nsudo = false\n'
     other = H.fake_host_key("attacker-key")
     k, pub = H.ssh_keypair("box")
     with U.ux_env(U.answers(("cancelled",), ("ok",))) as env:

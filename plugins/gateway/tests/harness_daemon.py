@@ -89,12 +89,18 @@ def py_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 class FakeClaude:
     def __init__(self, de: "DaemonEnv", *, register: bool = True, surface: str | None = "terminal",
-                 session: str = "s-test", exe: Path | None = None):
+                 session: str = "s-test", exe: Path | None = None, argv: list[str] | None = None,
+                 cwd: Path | None = None):
+        """argv: the fake's whole command line instead of `<exe> -S -s
+        fake_claude.py` (npm's `node <prefix>/bin/claude`: a copy of python
+        named node running a copy of fake_claude.py as cli.js)."""
         self.de = de
-        self.exe = exe or named_python("claude")
-        self.p = subprocess.Popen([str(self.exe), "-S", "-s", str(TESTS / "fakes" / "fake_claude.py")],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                                  env=py_env(), start_new_session=True)
+        self.exe = Path(argv[0]) if argv else (exe or named_python("claude"))
+        cmd = [str(a) for a in argv] if argv else \
+            [str(self.exe), "-S", "-s", str(TESTS / "fakes" / "fake_claude.py")]
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                  env=py_env({"PYTHONNOUSERSITE": "1"} if argv else None),
+                                  start_new_session=True, cwd=str(cwd) if cwd else None)
         line = self.p.stdout.readline()
         self.pid = int(json.loads(line)["pid"])
         de.claudes.append(self)

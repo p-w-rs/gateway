@@ -881,7 +881,12 @@ def test_sudo_typed_in_a_gateway_terminal_asks_on_its_tty_and_the_dialogs_value_
     asks on its tty with echo off, as sudo does); gated sees the prompt and
     opens the credential dialog; the sealed answer reaches that tty only."""
     from test_dialogs import Mod, seal
+    from gateway import consent
     with D.daemon_env() as de:
+        # sudo on this computer is "ask" by default, which a terminal can't use
+        de.env.write_form("[hosts.localhost]\nsudo = true\n")
+        vault.save(vault.empty())
+        consent.approve_all(de.env.form())
         right = canary("sudo")
         fs = de.root / "fake-sudo"
         fs.mkdir()

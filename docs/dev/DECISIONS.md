@@ -1,3 +1,5 @@
+> Design history: why the gateway works the way it does, and what was tried and rejected. Developer documentation, not a user guide (see the [README](../../README.md)).
+
 # Decisions (and what was tried and rejected)
 
 Read this before redesigning anything. Most "obvious" alternatives were tried
@@ -28,7 +30,7 @@ access has its own route.
 |---|---|---|
 | A plugin PreToolUse `allow` skips the auto-mode classifier, for Bash and MCP tools, in subagents too. | Debug log: "Hook approved tool use for Bash, bypassing permission prompt", decided in 4 ms against 331 ms through the classifier; the same for an MCP tool (1 ms against 418 ms). | `allow` is powerful: the gateway answers it only for strictly parsed command shapes (SPEC 8). |
 | A hook `ask` always becomes a human prompt, even in auto mode; it never reaches the classifier (headless it is a denial), and PermissionRequest hooks aren't called for it. | Spike runs with a hook answering `ask` for `echo hello`: denied with the hook's reason, no classifier latency. | Never answer `ask` except for an `"ask"` right. This is why v2 prompted. |
-| Settings ask/deny rules beat a hook `allow`. The org's managed settings ask on `Bash(curl *)`, `Bash(wget *)` and `Bash(security *)`. | `curl --version` with a hook answering allow: "an ask rule ... requires the full permission pipeline", denied. A PermissionRequest hook could allow it, but that would sidestep the org's policy. | Web access goes through the gateway's `http` and `download` tools; curl and wget are denied with a pointer to them. |
+| Settings ask/deny rules beat a hook `allow`. An organization's managed settings can ask on `Bash(curl *)`, `Bash(wget *)` or `Bash(security *)`, for example. | `curl --version` with a hook answering allow: "an ask rule ... requires the full permission pipeline", denied. A PermissionRequest hook could allow it, but that would sidestep such a policy. | Web access goes through the gateway's `http` and `download` tools; curl and wget are denied with a pointer to them. |
 | Auto mode drops broad allow rules such as `Bash(sudo *)` and `Bash(ssh *)`, and plugins can't ship permission rules or env anyway (only `agent` and `subagentStatusLine` from a plugin's settings). | Binary strings (the dropped-prefix list includes ssh and sudo); Claude Code docs, plugin components. | Every rule is a hook decision. |
 | A SessionStart hook may write `$CLAUDE_ENV_FILE`; its content runs before every Bash command, in the foreground, in the background and in subagents, and a PATH entry there shadows system binaries. The file is per hook (`sessionstart-hook-N.sh`) and is reused, not truncated, on resume and compact. `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA` and `CLAUDE_ENV_FILE` are not in the Bash environment; `CLAUDE_PID` and `CLAUDE_CODE_SESSION_ID` are. | Probes: a shim shadowed `/bin/hostname`; a function and an export applied in all three places; one file held four appended blocks after startup, resume, resume, compact. | The env file is written with truncation and is static and idempotent (guarded PATH and `GIT_CONFIG_COUNT` additions, `set -u` safe). Stubs carry absolute paths; stand-ins derive the data folder from the Python running them. |
 | A plugin's `bin/` is appended last on PATH, so it can't shadow `sudo`, `ssh` or `git`; claude.ai and Cowork refuse plugins with a top-level `bin/`. | Claude Code docs (plugin manifest, executables); probe. | No `bin/`; the stand-ins live in `$CLAUDE_PLUGIN_DATA/bin`, put first by the env file. |
@@ -38,7 +40,7 @@ access has its own route.
 | FileChanged fires for a SessionStart `watchPaths` entry when the FileChanged group has no matcher (a matcher would also watch a same-named file in the working directory). | Headless probe with a standalone plugin (phase C). | `watchPaths: [gateway.toml]`; the hook ignores other paths. |
 | Hook output, systemMessages included, is recorded in the session transcript (`hook_success` attachments carry the hook's stdout). | Transcripts on this machine. | The one-time codes of the no-screen path could be read there, so the file guard and the Bash hook deny reading `<config>/projects/*/*.jsonl` (phase C). |
 | Claude Code's Workflow tool keeps each run in `<project>/<session>/subagents/workflows/<run>/`: `journal.jsonl` (the agents' results) next to the run's `agent-<id>.jsonl` transcripts, and tells Claude to read the journal to diagnose a run. | Names and link counts on this machine (2.1.301; contents not read); the Workflow tool's instructions. | The journal, by exact name and place, is not a transcript; the run folder still holds transcripts (see "Rolled back"). |
-| Claude Code keeps raw copies of large or background output (`tool-results/*.txt`, `tasks/*.output`) even when a PostToolUse `updatedToolOutput` scrubs what the model sees and the transcript. | A scrubbed fake secret: 0 copies in the transcript, 1 in each raw file. Round 4 (2.1.301): the `tool-results/` copy holds the masked text; task output files are raw. | Stated in README's "Security, honestly". |
+| Claude Code keeps raw copies of large or background output (`tool-results/*.txt`, `tasks/*.output`) even when a PostToolUse `updatedToolOutput` scrubs what the model sees and the transcript. | A scrubbed fake secret: 0 copies in the transcript, 1 in each raw file. Round 4 (2.1.301): the `tool-results/` copy holds the masked text; task output files are raw. | Stated in README's "Limits". |
 | A command's `!` injection runs through the Bash tool (the env file applies), PreToolUse hooks don't see it, outside auto mode it needs the command's `allowed-tools`, and a non-zero exit aborts the whole command. | Probe plugin, 2026-10-19: with `allowed-tools: Bash(gate status *) Bash(true)` the injected `gate status \|\| true` ran in default mode, found the env-file PATH, and passed "still setting up" (exit 75) through; without `allowed-tools` it failed the permission check; without `\|\| true` exit 75 aborted the command. | `/gate:status` injects `gate status \|\| true` with that `allowed-tools` line, which also covers Claude's own `gate status NAME` in that turn. |
 | The desktop app (and `claude -p`) auto-cancels MCP elicitation without showing it. | Live test, 2026-10-15. | Pop-ups are native dialogs from the gateway's own process. |
 | `includeIf "hasconfig:remote.*.url:..."` works from an include file supplied through `GIT_CONFIG_COUNT`/`include.path`. | MacPorts git 2.55 and Apple git 2.54, https and ssh remotes. | Per-owner commit identities without touching the user's git config. |
@@ -466,7 +468,7 @@ commands behave (`gate secret` is the gateway's own command, for the user).
   install names its binary by its version (comm `2.1.301`) and auto-update
   can remove old versions while sessions still run on them, so exactly those
   sessions would pass. Linux reads a deleted executable's path (`... (deleted)`),
-  so this is macOS only. docs/modules/sudo.md had said every macOS path is
+  so this is macOS only. docs/dev/modules/sudo.md had said every macOS path is
   readable; corrected.
 - **`gate secret` is denied in every tool.** The desktop app's Terminal panel
   runs its shells under the app's helper, which the process-tree check
@@ -732,7 +734,7 @@ Two findings from the verification of the integration lows:
 
 ## PLAN-v4 phase 2: the daemon and the broker (2026-10-19)
 
-The per-user daemon `gated` and its broker (docs/modules/daemon.md). Built
+The per-user daemon `gated` and its broker (docs/dev/modules/daemon.md). Built
 from the phase-2 notes; where the code showed a better way, or the notes left
 a choice open, this is what was chosen and why.
 
@@ -886,7 +888,7 @@ and now covered by a test and a mutation (`tests/mutations_daemon.py`).
   closed, and not closable here: code running as the user can run the env's
   python on the real run.py with any mode, or write a folder into the plugin
   cache; the checks keep a cooperative model's scripts off the vault plane,
-  they are not a boundary (docs/modules/daemon.md "Known limits"). The
+  they are not a boundary (docs/dev/modules/daemon.md "Known limits"). The
   daemon tests that need a production-like entry run the daemon from a
   plugin copy in a cache layout (`harness_daemon.plugin_copy`), and probes
   in the test root are test entries (the test root before the mode) only
@@ -922,7 +924,7 @@ and now covered by a test and a mutation (`tests/mutations_daemon.py`).
 ## PLAN-v4 phase 3: native dialogs (2026-10-20)
 
 Every question the gateway asks is a native pane inside Claude Code
-(docs/modules/ux.md "popup.py" and "dialog.py", docs/modules/daemon.md
+(docs/dev/modules/ux.md "popup.py" and "dialog.py", docs/dev/modules/daemon.md
 "Dialogs"). The OS
 dialogs (osascript, zenity, kdialog), the `gate secret` terminal path with
 its one-time codes, the terminal export/import/copy-to path and the browser
@@ -1099,7 +1101,8 @@ The verifier's findings on the native dialogs, and what changed.
   One part of the evidence didn't hold: a form without `[hosts.localhost]`
   doesn't remove localhost; it gets the implicit localhost with `sudo =
   true` (form.py), so sudo running after that edit is right (a fresh `sudo`
-  runs too). The test uses an entry with a bad value instead, which
+  runs too). (Since 0.10.0 the implicit localhost's sudo is `"ask"` on a
+  new install and `true` only on an older one: "0.10.0 decisions" below.) The test uses an entry with a bad value instead, which
   disables localhost.
 - **"Remember it" is offered where the docs said (medium).** No production
   dialog passed `remember`, so the box was never drawn and every sudo
@@ -1152,7 +1155,7 @@ The verifier's findings on the native dialogs, and what changed.
 ## PLAN-v4 phase 4: managed execution (2026-10-20)
 
 Claude's Bash now runs in the gateway's own bash by default
-(docs/modules/managed.md). This reverses "Rolled back" (2026-10-19, the
+(docs/dev/modules/managed.md). This reverses "Rolled back" (2026-10-19, the
 lead's decision that the gateway must not change how Claude's ordinary
 commands behave): the brief (sections 3 and 8) makes the gateway the default
 execution route with its own environment, and PLAN-v4 says so. What stays
@@ -1187,7 +1190,7 @@ FEASIBILITY-v4 P2; where probing 2.1.301 showed more, this is what was chosen.
   `/bin/sh` counts the extra shell); gate-sh decrements it when `/bin/sh` is
   bash, and the env, `$0`, stdin, stdout, stderr and status then match case
   by case (and live, through a probe plugin). Exec-form hooks (the
-  gateway's own) and the organization's hooks are never prefixed by Claude
+  gateway's own) and an organization's managed hooks are never prefixed by Claude
   Code; MCP servers started later are, and their quoted argv through
   `/bin/sh -c` is the same command.
 - **`CLAUDE_CODE_SHELL` too.** Claude Code picks its shell (and makes its
@@ -1427,7 +1430,7 @@ mutation (`tests/test_managed.py`, `tests/mutations_managed.py`, the mod's
 
 Persistent PTYs and jobs owned by gated, shared with the person in a native
 pane, one writer at a time, password prompts through the credential dialog
-(docs/modules/terminals.md). Built from PLAN-v4 "Terminals and jobs" and
+(docs/dev/modules/terminals.md). Built from PLAN-v4 "Terminals and jobs" and
 FEASIBILITY-v4 P3/P3b; what probing tmux 3.8 and Claude Code 2.1.301 showed,
 and what the tests found, is what was chosen.
 
@@ -1530,7 +1533,7 @@ and what the tests found, is what was chosen.
 ## PLAN-v4 phase 6: the managed remote runtime (2026-10-20)
 
 Remote terminals and jobs in the gateway's own runtime on the host
-(docs/modules/remote.md), from PLAN-v4 "Remote runtime", FEASIBILITY-v4 P5
+(docs/dev/modules/remote.md), from PLAN-v4 "Remote runtime", FEASIBILITY-v4 P5
 and the brief (8, 9, 10, 14.6, 14.8). What probing pixi-pack 0.7.11,
 pixi-unpack 0.7.11, the Debian 13 arm64 VM and the local sshd showed is what
 was chosen.
@@ -1656,7 +1659,7 @@ was chosen.
 ## PLAN-v4 phase 6 review fixes (2026-10-20)
 
 A review reproduced seven findings against the real harness; all are fixed
-with tests and mutations (docs/modules/remote.md).
+with tests and mutations (docs/dev/modules/remote.md).
 
 - **A lost answer is never "not run".** A job_start whose answer was lost
   after `new-session` ran (an ssh wrapper running the real ssh, then exiting
@@ -1728,7 +1731,7 @@ with tests and mutations (docs/modules/remote.md).
 
 ## PLAN-v4 phase 7: hosts, policy, accounts, portability (2026-10-20)
 
-Plugin 0.9.0. docs/modules/policy.md, accounts.md ("adapters.py"), ux.md
+Plugin 0.9.0. docs/dev/modules/policy.md, accounts.md ("adapters.py"), ux.md
 (the panes, transfer format 3), sudo.md and managed.md ("Alternate routes").
 
 - **Policy is a layer of restrictions on the rights, not a second rights
@@ -2280,6 +2283,51 @@ the acceptance's PID0 line). 0.9.1 hadn't shipped, so the version stays.
   `paused_as` to the state; `resume_stopped` now sets it itself (running, or
   waiting_auth; `_live_job_state`) and emits `job.state`.
 
+## 0.10.0 decisions (2026-10-22)
+
+What the 0.10.0 fix rounds decided, and why. The details are in the module
+docs (sudo.md, managed.md, daemon.md, accounts.md) and CLAUDE.md's
+invariants 3, 5, 11, 14 and 17.
+
+- **This computer's sudo starts as "ask" on new installs; existing installs
+  keep `true`.** A new user shouldn't find sudo approved before they chose
+  it. An upgrade must change nobody's rights, so the install's kind is
+  recorded as a mark inside the encrypted vault (`"baseline": 2`). A vault
+  without it is an older install. Rejected: keeping the old `true` baseline
+  and creating a vault at every new install's first session. Without a
+  stored record, an old starter's `true` can't be told apart from Claude
+  editing the new starter. Consequences accepted: a machine
+  that never had a vault counts as new, so a `sudo = true` an older starter
+  wrote waits for one `gate check localhost`; a locked or damaged vault
+  gives the stricter new defaults until it is readable (the refusals say to
+  unlock); starting a fresh vault makes an older install a new one;
+  exports leave the mark out, and an imported source machine gets "ask".
+- **No work-specific defaults in the shipped plugin.** The `ml-catalog`
+  kind needs an explicit `host` (no default). A converted 0.6 catalog
+  account without one keeps its approval snapshot, so once the host is
+  added and approved its sign-in is kept. The identity check in `test_packaging` holds only sha256
+  digests of the words it keeps out, so the test never publishes them.
+- **The gateway doesn't approve the web tools.** `http` and `download` can
+  carry data out or use an account, which is Claude Code's permission
+  mode's call, not the gateway's.
+- **Plain reads are approved only for plain project or temp files.**
+  Approving `cat` anywhere let auto mode read credential files without the
+  reviewer. Reads elsewhere go to Claude Code (prompt or reviewer), not to a
+  refusal. `gate forget` lost its approval too: it deletes stored secrets.
+- **`gate forget` keeps no copy; `gate rotate` keeps one.** Forgetting means
+  gone, so forget names the older copies that may still hold the secret and
+  how to delete them; rotate's copy lets the person put the old vault back
+  by hand (SPEC 15).
+- **The managed-mode text scan counts a tool path as run only where it
+  would run.** The earlier rule refused ordinary admin commands (`sudo rm
+  /usr/local/bin/gh`, `sudo cat /etc/ssh/sshd_config`). Only a shell's or
+  su's `-c` takes a command string; tracers and sandboxes count only as the
+  program; `arch` is a wrapper. A shell string that is a variable (`bash -c
+  "$CMD"`) is refused, since the hook can't see what it runs; the refusal
+  says to write the command out. The scan's known misses are listed in
+  managed.md; it is a guardrail, the stand-ins and the vault are the
+  boundary.
+
 ## Rejected alternatives
 
 - **MCP tools first** (v2's design): every git, gh, ssh and sudo action
@@ -2289,7 +2337,7 @@ the acceptance's PID0 line). 0.9.1 hadn't shipped, so the version stays.
   and `download`.
 - **Rewriting commands with `updatedInput`**: see the platform table.
 - **A PermissionRequest hook to allow curl or wget**: it would get around the
-  organization's managed rules.
+  an organization's managed rules.
 - **Settings allow rules** (`Bash(sudo *)`): auto mode drops them, and plugins
   can't ship them.
 - **Plugin `bin/` for the stand-ins**: appended last on PATH.

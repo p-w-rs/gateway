@@ -1,6 +1,7 @@
 """Registered Claude Code sessions and the plane checks.
 
-A session is a live Claude Code process (by executable path) that registered:
+A session is a live Claude Code process (by executable path, or node running
+npm's cli.js by its argv: peers.is_claude) that registered:
 
 - the mod, from inside that process (`POST /ui/register`: the peer pid must
   be the claimed claude_pid and its executable Claude Code's): a UI session;
@@ -41,6 +42,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import paths
 from . import peers
 
 
@@ -273,13 +275,63 @@ def check_contract(reg: Registry, peer: peers.Peer) -> Session:
     return s
 
 
+OTHER_CONFIG = ("the gateway daemon running now serves another Claude Code configuration (its "
+                "data folder is {theirs}; this one's is {mine}): one gateway daemon per user "
+                "serves one Claude Code configuration (CLAUDE_CONFIG_DIR) at a time, so this "
+                "session gets no dialogs (credentials, consent, sudo), terminals or jobs from it, "
+                "and no secrets while the vault has a passphrase (without one the stand-ins "
+                "still read the vault themselves). Tell the user: quit the other "
+                "configuration's Claude Code sessions and let its gateway terminals and jobs "
+                "end (the daemon stays while any of them runs and leaves 30 minutes after the "
+                "last one; once nothing runs, pkill -f \"run.py gated serve\" stops it at "
+                "once), then start a new session here; or do gateway work in one configuration")
+
+
+def other_config_message(other: Path) -> str:
+    """The refusal for a gateway program of another plugin data folder (a
+    second Claude Code configuration, CLAUDE_CONFIG_DIR; GW-ROB-2). An
+    unwrapped vault is still read locally by the stand-ins; only a wrapped
+    key's reads, dialogs, terminals and jobs need this daemon (review round
+    2). `gated status` in that configuration says the same (lifecycle)."""
+    return "gateway: " + OTHER_CONFIG.format(theirs=paths.describe(paths.data_dir()),
+                                             mine=paths.describe(other))
+
+
+def other_config_note(h: dict[str, Any]) -> str:
+    """For `gated status|start` and `gate status` in another configuration:
+    OTHER_CONFIG when the daemon's /health names a data folder (`data`)
+    that isn't this process's, else "" (also for an older daemon without
+    it). The daemon itself never refuses /health, so without this the
+    doctor showed it running with no hint (review round 2)."""
+    theirs = h.get("data") if isinstance(h, dict) else None
+    if not isinstance(theirs, str) or not os.path.isabs(theirs):
+        return ""
+    try:
+        mine = paths.data_dir()
+        if os.path.realpath(theirs) == os.path.realpath(mine):
+            return ""
+        return OTHER_CONFIG.format(theirs=paths.describe(Path(theirs)), mine=paths.describe(mine))
+    except Exception:  # noqa: BLE001 - a status line, never a failure
+        return ""
+
+
+def _refused(peer: peers.Peer, entry: peers.Entry | None, code: str, message: str) -> Denied:
+    """The refusal for a peer that isn't one of this daemon's entry points
+    (or not in a mode the route takes): its own words when it is the gateway
+    of another data folder (peers.foreign_data)."""
+    other = peers.foreign_data(peer.pid) if entry is None else None
+    if other is not None:
+        return Denied(403, "other_config", other_config_message(other))
+    return Denied(403, code, message)
+
+
 def check_agent(reg: Registry, peer: peers.Peer,
                 allowed: tuple[str, ...] = VAULT_MODES) -> tuple[Session, peers.Entry]:
     entry = peers.entry_of(peer.pid)
     if entry is None or not mode_allowed(entry.mode, allowed):
-        raise Denied(403, "peer", "gateway: the gateway daemon gives vault data only to the "
-                     "gateway's own programs (its stand-ins, git helper, gate, MCP server and "
-                     "hooks)")
+        raise _refused(peer, entry, "peer", "gateway: the gateway daemon gives vault data only to "
+                       "the gateway's own programs (its stand-ins, git helper, gate, MCP server "
+                       "and hooks)")
     s = reg.ancestor_session(peer.pid)
     if s is None:
         raise Denied(403, "not_registered", "gateway: this program isn't running inside a Claude "
@@ -296,8 +348,8 @@ TERM_MODES = ("mcp",)
 def check_term(reg: Registry, peer: peers.Peer) -> tuple[Session, peers.Entry]:
     entry = peers.entry_of(peer.pid)
     if entry is None or not mode_allowed(entry.mode, TERM_MODES):
-        raise Denied(403, "peer", "gateway: terminals and jobs are reached through the gateway's "
-                     "own tools (the gw MCP server's terminal_* and job_* tools)")
+        raise _refused(peer, entry, "peer", "gateway: terminals and jobs are reached through the "
+                       "gateway's own tools (the gw MCP server's terminal_* and job_* tools)")
     s = reg.ancestor_session(peer.pid)
     if s is None:
         raise Denied(403, "not_registered", "gateway: this program isn't running inside a Claude "
@@ -308,8 +360,8 @@ def check_term(reg: Registry, peer: peers.Peer) -> tuple[Session, peers.Entry]:
 def check_local(peer: peers.Peer) -> peers.Entry:
     entry = peers.entry_of(peer.pid)
     if entry is None:
-        raise Denied(403, "peer", "gateway: only the gateway's own programs may stop or restart "
-                     "the gateway daemon")
+        raise _refused(peer, entry, "peer", "gateway: only the gateway's own programs may stop or "
+                       "restart the gateway daemon")
     return entry
 
 
@@ -335,7 +387,7 @@ def register_agent(reg: Registry, peer: peers.Peer, body: dict[str, Any]) -> Ses
     """A gateway hook's registration of the Claude Code process above it."""
     entry = peers.entry_of(peer.pid)
     if entry is None or not mode_allowed(entry.mode, REGISTER_MODES):
-        raise Denied(403, "peer", "gateway: only the gateway's hooks register a session")
+        raise _refused(peer, entry, "peer", "gateway: only the gateway's hooks register a session")
     claimed = body.get("claude_pid")
     up = peers.chain(peer.pid)[1:]
     if claimed is None:

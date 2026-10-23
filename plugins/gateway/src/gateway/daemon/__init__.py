@@ -20,7 +20,7 @@ events (event log), broker (the vault key, scoped vault data), dialogs (the
 native dialogs: requests, queue, sealed delivery), clipboard (the dialog's
 paste), server (HTTP),
 lifecycle (start, daemonize, single instance, contract.json, idle exit),
-client (what the other gateway processes call). docs/modules/daemon.md.
+client (what the other gateway processes call). docs/dev/modules/daemon.md.
 """
 from __future__ import annotations
 

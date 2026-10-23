@@ -42,7 +42,7 @@ Sections (a baseline config has only the probe plugin, for comparison):
 
 Monitor isn't offered by Claude Code 2.1.301 against the fake API (a
 server-side feature gate); its commands use the same shell path (code
-evidence in docs/modules/managed.md). Prints one line per check and a JSON
+evidence in docs/dev/modules/managed.md). Prints one line per check and a JSON
 summary to --tmp/acceptance-managed.json; exits non-zero on any failure.
 """
 from __future__ import annotations

@@ -1,4 +1,4 @@
-# The gateway's managed remote runtime (PLAN-v4 phase 6, docs/modules/remote.md).
+# The gateway's managed remote runtime (PLAN-v4 phase 6, docs/dev/modules/remote.md).
 # Not an environment the gateway installs here: gated packs it with pixi-pack
 # for each remote host's platform (into its plugin data folder, from this
 # manifest and pixi.lock exactly as committed) and stages the pack on the

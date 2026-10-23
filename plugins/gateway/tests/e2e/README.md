@@ -85,7 +85,7 @@ any doubt stops the run. The pixi env is then built into `ROOT/data` with
   machine can't prepare them in the shared temp folder.
 - **No new power for code already running as the user.** Such code could
   equally edit the plugin's own files, or read `private/key.txt` directly
-  (the threat model in SPEC 1 and docs/modules/sudo.md says so). The one
+  (the threat model in SPEC 1 and docs/dev/modules/sudo.md says so). The one
   thing a marker could add is a pop-up asking the user for a secret that
   then lands in a vault the marker's author can read; that needs the user
   to run a session from the planted temp copy, and that session says

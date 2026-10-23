@@ -109,8 +109,9 @@ def too_broad_site(bare: str) -> bool:
     return len(labels) == 2 and len(labels[1]) == 2 and labels[0] in SECOND_LEVEL
 
 AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
-DEFAULT_HOSTS = {"github": "github.com", "ml-catalog": "app-dev-ai-mlreg.azurewebsites.net",
-                 "pijul": "nest.pijul.com"}
+# A kind's host when the account doesn't say. ml-catalog has none: every
+# catalog is its own service, so its account names it (`host`, required).
+DEFAULT_HOSTS = {"github": "github.com", "pijul": "nest.pijul.com"}
 
 HOST_KEYS = ("address", "when", "also", "via", "ssh", "sudo", "scripts", "note", "runtime",
              "policy", "workspaces", "shell")
@@ -136,6 +137,13 @@ def git_server_note(host: str) -> str | None:
     return (f"{h} is a git server, not a machine, and the gateway has no account kind for it: use "
             "https for a public repository, or ask the user about others = \"mine\" in [settings]")
 LOCALHOST_KEYS = ("sudo", "scripts", "note", "policy", "workspaces")
+# sudo on this computer when the form doesn't say (no [hosts.localhost], or one
+# without sudo): "ask", Claude Code asks each time, on a new install. An
+# install whose vault an older gateway made (vault.older_install) keeps that
+# gateway's default, true (apply_install_defaults). A remote host's ssh and
+# sudo default to true.
+LOCALHOST_SUDO = "ask"
+LOCALHOST_SUDO_OLDER = True
 # a host's `runtime` (PLAN-v4 phase 6): where the gateway stages its managed
 # remote runtime on that host (daemon/remote.py base_ok says the same)
 RUNTIME_RE = re.compile(r"(?:~/|/)[A-Za-z0-9._/@+-]{0,200}")
@@ -156,7 +164,7 @@ SETTINGS_KEYS = ("others",)
 VAULT_KEYS = ("lock_after",)
 SHELL_KEYS = ("managed", "import_path", "import_env")
 TOP_KEYS = ("settings", "vault", "shell", "policy", "hosts", "accounts")
-# Policy (PLAN-v4 phase 7, docs/modules/policy.md): allow / ask / deny per
+# Policy (PLAN-v4 phase 7, docs/dev/modules/policy.md): allow / ask / deny per
 # action, layered on the rights above (ssh, sudo, an account's use) and never
 # above them. Restrictions (the first list) default to what the right gives
 # and can only lower it, at every scope: [policy] for every host and account,
@@ -182,7 +190,7 @@ WORKSPACES_MAX = 32
 # managed shell there (the gateway's runtime): folders on that host for its
 # PATH, and names whose values come from that host's own login environment.
 HOST_SHELL_KEYS = ("import_path", "import_env")
-# [shell] (PLAN-v4 phase 4, docs/modules/managed.md): how Claude's Bash runs.
+# [shell] (PLAN-v4 phase 4, docs/dev/modules/managed.md): how Claude's Bash runs.
 # managed = "on" (the default: the gateway's managed bash, a curated
 # environment, never the login shell), "warn" (managed while Claude Code's
 # mods run; without them, the user's own shell with a notice each session) or
@@ -330,6 +338,9 @@ class Host:
     note: str = ""
     runtime: str = ""                # the managed remote runtime's folder (PLAN-v4 phase 6; "" default)
     explicit: bool = True            # False: the implicit [hosts.localhost]
+    # localhost only: the form doesn't say sudo (no table, or no key). Its
+    # value then depends on the install (apply_install_defaults).
+    sudo_default: bool = False
     # PLAN-v4 phase 7: [hosts.NAME.policy] (key -> True | "ask" | False; None
     # when the host has no policy table), its lines, the workspaces, and a
     # remote host's [hosts.NAME.shell] imports
@@ -433,6 +444,9 @@ class Form:
     # the other section: {name: "hosts"|"accounts"} (the section that is off;
     # the earlier entry stays valid in the other section)
     dup_disabled: dict[str, str] = field(default_factory=dict)
+    # disabled accounts whose kind could be read: {name: kind} (a stand-in
+    # names the entry that is off instead of saying there is none)
+    disabled_kinds: dict[str, str] = field(default_factory=dict)
     unnamed_off: int = 0           # entries whose name can't even be shown (unsafe text)
     problems: list[Problem] = field(default_factory=list)
     syntax_error: Problem | None = None
@@ -914,6 +928,8 @@ def _host_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Host:
     sect = ("hosts", name)
     local = name == "localhost"
     h = Host(name=name, line=ctx.line(*sect))
+    if local:
+        h.sudo, h.sudo_default = LOCALHOST_SUDO, "sudo" not in raw
     allowed = LOCALHOST_KEYS if local else HOST_KEYS
     for k in raw:
         if k in allowed:
@@ -1141,6 +1157,9 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
         elif kind == "registry":
             errs.append(("host is required for registry accounts, like host = \"docker.io\"",
                          None))
+        elif kind == "ml-catalog":
+            errs.append(("host is required for ml-catalog accounts (the catalog's address), like "
+                         "host = \"catalog.example.com\"", None))
         else:
             a.host = DEFAULT_HOSTS[kind]
     if kind == "github":
@@ -1411,10 +1430,13 @@ def validate(doc: dict[str, Any], form: Form, idx: dict[tuple[str, ...], int]) -
             form.accounts[name] = _account_entry(ctx, name, raw)
         except _EntryErrors as e:
             form.disabled[name] = str(e)
+            if raw.get("kind") in KINDS:
+                form.disabled_kinds[name] = raw["kind"]
     _chain_ok(form, ctx)
     _endpoint_hosts(form, ctx)
     if "localhost" not in form.hosts and "localhost" not in form.disabled:
-        form.hosts["localhost"] = Host(name="localhost", sudo=True, ssh=False, explicit=False)
+        form.hosts["localhost"] = Host(name="localhost", sudo=LOCALHOST_SUDO, ssh=False,
+                                       explicit=False, sudo_default=True)
     # default: at most one per kind+host
     groups: dict[tuple[str, str], list[Account]] = {}
     for a in form.accounts.values():
@@ -1627,6 +1649,19 @@ def _not_utf8(p: Path, raw: bytes, err: UnicodeDecodeError, last_good: str | Non
     f.syntax_error = Problem("error", "the form can't be read: it isn't UTF-8 text (save it as "
                              "UTF-8)", line)
     return f
+
+
+def apply_install_defaults(form: Form, older_install: bool) -> None:
+    """Set the defaults that depend on the install (review round 3): sudo on
+    this computer where the form doesn't say (Host.sudo_default) is "ask" on a
+    new install and true on one whose vault an older gateway made (its
+    default then, so that install keeps its rights). consent.compute calls
+    this with the vault before it reads the form's rights, so every reader
+    after it (the approval hook's form right, snapshots, approvals) sees the
+    same value; each call sets it again (a cached form follows the vault)."""
+    h = form.hosts.get("localhost")
+    if h is not None and h.sudo_default:
+        h.sudo = LOCALHOST_SUDO_OLDER if older_install else LOCALHOST_SUDO
 
 
 _CACHE: dict[str, tuple[int, int, str | None, Form]] = {}

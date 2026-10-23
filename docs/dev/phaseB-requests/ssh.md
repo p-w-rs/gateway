@@ -3,7 +3,7 @@
 > Historical record (phase B, 2026-10-19). Its sudo advice is superseded: PLAN-v4
 > phase 7 removed the passwordless sudo setup and every recommendation of a
 > NOPASSWD rule; the gateway never writes or recommends a sudoers rule
-> (docs/DECISIONS.md "No sudoers rule, ever", docs/modules/sudo.md).
+> (docs/dev/DECISIONS.md "No sudoers rule, ever", docs/dev/modules/sudo.md).
 
 ## 1. tests/test_consent.py (phase A) — blocks the full suite
 
@@ -96,7 +96,7 @@ Verification showed that SPEC 9.3 as written hands the staged sudo password
 to anything in the remote command (SUDO_ASKPASS exported, the askpass
 answering any caller, the password file readable by the login user), and
 scrubbing can't hide transformed or short values. ssh_sudo now hardens it
-within SPEC 9.3's structure (docs/modules/ssh.md, "Remote sudo"): the
+within SPEC 9.3's structure (docs/dev/modules/ssh.md, "Remote sudo"): the
 askpass answers only a root parent (real sudo), once per sudo process, at
 most 6 times per call, never after a rejection; under scripts = false the
 askpass is a shell function for `sudo` in command position only (nothing

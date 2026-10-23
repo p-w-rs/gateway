@@ -1,6 +1,6 @@
 // The gateway mod (PLAN-v4 phases 1-4): the setup status line, provisioning at
 // session start, managed execution (CLAUDE_CODE_SHELL_PREFIX -> hooks/gate-sh,
-// so Claude's Bash runs in the gateway's managed bash; docs/modules/managed.md),
+// so Claude's Bash runs in the gateway's managed bash; docs/dev/modules/managed.md),
 // the gateway daemon started and this session registered on
 // its UI plane, the immediate /gate-doctor, /gate-dialog, /gate-unlock and
 // /gate-lock commands, and the gateway's dialogs: a native pane for every
@@ -22,6 +22,7 @@ import {
   gateShPaths,
   locate,
   managedPlan,
+  noDisplayHere,
   parseDaemon,
   parseManagedState,
   parseStatus,
@@ -37,8 +38,11 @@ import {
 } from './lib.ts'
 import {
   MAIN_SCREEN,
+  NO_DISPLAY_MAIN,
+  NO_DISPLAY_PASTE,
   NOT_RECEIVED,
   PANE,
+  PASTE_NOTE,
   UNAVAILABLE_SURFACE,
   attemptLine,
   clientSurface,
@@ -112,6 +116,7 @@ const S = {
   opened: '',                    // the dialog id the pane was opened for
   placed: false,
   fieldUsable: true,             // the private field can take keys here (a fullscreen terminal, the desktop app)
+  noDisplay: false,              // Linux without DISPLAY or WAYLAND_DISPLAY: Paste can't work (noDisplayHere)
   remember: {} as Record<string, boolean>,
   picks: {} as Record<string, string[]>,
   toasted: new Set<string>(),
@@ -272,7 +277,7 @@ export const register: Register = (on) => {
     return r
   })
 
-  on('command.run', { command: 'gate-doctor' }, async ($) => {
+  on('command.run', { command: 'gate-doctor' }, async ($, e) => {
     const located = await where($)
     const [pluginVersion, claude, surfaces, st] = await Promise.all([
       $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)
@@ -287,7 +292,12 @@ export const register: Register = (on) => {
     ])
     const daemon = st?.state === 'ready' ? await daemonRun($, located, 'status') : undefined
     const managed = await managedNow($, located, st)
-    return { text: doctorText({ pluginVersion, claude, surfaces, located, status: st, daemon, managed }) }
+    // can a secret be typed here (GW-UX-6): the terminal says whether it is
+    // in the fullscreen layout, fixed for the session
+    const fullscreen = e.presentation?.isFullscreen
+    const tmux = ((await $.env.get('TMUX').catch(() => undefined)) ?? '') !== ''
+    const noDisplay = await displayless($, daemon?.platform ?? '')
+    return { text: doctorText({ pluginVersion, claude, surfaces, located, status: st, daemon, managed, fullscreen, tmux, noDisplay }) }
   })
 
   // /gate-dialog: show the dialog that waits (an open the person asked for is
@@ -504,10 +514,12 @@ export const register: Register = (on) => {
           <Client key={fieldKey(d)} module="./field.tsx" width="100%" height={(d.fields > 1 ? 2 : 1) + 1}
             props={fieldProps(d, S.epoch, S.acked[fieldKey(d)] ?? 0)} />,
         )
+        if (d.paste && S.noDisplay) rows.push(<Text key="nopaste" dimColor>{NO_DISPLAY_PASTE}</Text>)
         if (d.paste) buttons.push(<Button key="paste" onPress={() => void paste($, d)}>Paste from clipboard</Button>)
         if (d.remember !== null) buttons.push(remember())
       } else if (clientSurface(e.surface)) {
-        rows.push(<Text key="nofield">{MAIN_SCREEN}</Text>)
+        // on Linux without a display Paste can't work either: say so and what to do
+        rows.push(<Text key="nofield">{S.noDisplay ? NO_DISPLAY_MAIN : MAIN_SCREEN}</Text>)
         if (d.paste) buttons.push(<Button key="paste" onPress={() => void paste($, d)}>Paste from clipboard</Button>)
         if (d.paste && d.remember !== null) buttons.push(remember())
       } else {
@@ -624,7 +636,7 @@ export const register: Register = (on) => {
     const g = guardEdit(e, S.guardBox)
     S.guardBox = g.text
     if (g.pass) return next(e)
-    guardStatus($, guardText(S.placed, S.fieldUsable))
+    guardStatus($, guardText(S.placed, S.fieldUsable, S.noDisplay))
     sweepSoon($)
     return { text: g.text, cursor: g.cursor }
   }).catch(($, e, next) => {
@@ -643,7 +655,7 @@ export const register: Register = (on) => {
     const ok = guardSubmitPasses(e.text, S.guardBox)
     S.guardBox = ''                              // Enter empties the box
     if (ok) return next(e)
-    guardStatus($, guardText(S.placed, S.fieldUsable))
+    guardStatus($, guardText(S.placed, S.fieldUsable, S.noDisplay))
     return { drop: GUARD_DROP_TEXT }
   }).catch(($, e, next) => {
     if (next.called) return next(e)
@@ -883,7 +895,22 @@ async function paste($: Engine, d: DialogView): Promise<void> {
   })
   const body: Record<string, unknown> = { id: d.id, env }
   if (d.remember !== null) body.remember = S.remember[d.id] ?? d.remember
-  await ui($, 'POST', '/ui/dialog/paste', body)
+  const r = await ui($, 'POST', '/ui/dialog/paste', body)
+  // gated read the clipboard (whether the value then passed its recheck or
+  // not); it never clears it (GW-UX-6). Only a clipboard it couldn't read
+  // (error "clipboard": empty, unavailable) gets no note.
+  if (r !== undefined && r.error !== 'clipboard') $.ui.toast(PASTE_NOTE)
+}
+
+// Linux without DISPLAY or WAYLAND_DISPLAY in Claude Code's environment
+// (gated's `platform`): Paste can't work there (review round 2).
+async function displayless($: Engine, platform: string): Promise<boolean> {
+  if (!platform.startsWith('linux')) return false
+  const [x, w] = await Promise.all([
+    $.env.get('DISPLAY').catch(() => undefined),
+    $.env.get('WAYLAND_DISPLAY').catch(() => undefined),
+  ])
+  return noDisplayHere(platform, x, w)
 }
 
 // What gated said changed: the pane opens, redraws or closes; a dialog that
@@ -971,6 +998,7 @@ async function daemonRun($: Engine, located: Located, sub: 'status' | 'start'): 
 // it. An interactive session then runs the dialog loop.
 async function registerSession($: Engine, located: Located, first = true): Promise<void> {
   const d = await daemonRun($, located, 'start')
+  if (d !== undefined) S.noDisplay = await displayless($, d.platform)
   if (d === undefined || !d.running || d.socket === '') return
   S.socket = d.socket
   if (first && d.skew !== '' && !S.skewShown) {

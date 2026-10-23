@@ -16,7 +16,7 @@ its command line (`…/checkpoint/…/run.py server`), and only when the process
 executable (by path) is a python interpreter and that run.py exists. A command
 line is set by whoever starts the process, so code already running as the user
 can still imitate the runner; this recognition is a convenience for checkpoint
-jobs, not a boundary against such code (docs/modules/sudo.md).
+jobs, not a boundary against such code (docs/dev/modules/sudo.md).
 
 Not direct and the entry has `scripts = true` → allowed. Otherwise the caller
 runs the real program with no credential and prints one line.
@@ -61,8 +61,10 @@ wording (consent.pane_ask_message).
 other terminal paths behind a one-time code): walks the whole parent chain
 and names why this process counts as started from Claude Code: an ancestor
 whose executable (by path) is Claude Code's (basename `claude`, under
-`~/.local/share/claude/versions/`, or the desktop app's bundled copy under
-`~/Library/Application Support/Claude/claude-code/`), or whose pid is
+`~/.local/share/claude/versions/`, the desktop app's bundled copy under
+`~/Library/Application Support/Claude/claude-code/`, npm's
+`.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`, or node running
+npm's `.../@anthropic-ai/claude-code/cli.js` as its script), or whose pid is
 `CLAUDE_PID`, or a chain that can't be read (a parent pid that can't be
 read, a loop, too deep; a process of the user's own whose executable can't
 be read, except OpenSSH's session process under a root sshd, which Linux
@@ -362,7 +364,7 @@ def _is_checkpoint_runner(pid: int) -> bool:
     path) running an existing `/…/checkpoint/…/run.py` with a later `server`
     argument. argv is caller-controlled, so this only raises the bar: code
     already running as the user can still dress up as the runner (see
-    docs/modules/sudo.md); it can't do so by renaming a shell or with a
+    docs/dev/modules/sudo.md); it can't do so by renaming a shell or with a
     made-up path."""
     if not _PY_EXE.match(_exe_name(pid)):
         return False
@@ -494,13 +496,23 @@ def _typed_walk() -> tuple[bool, str]:
 CLAUDE_EXE = "claude"
 CLAUDE_VERSIONS = (".local", "share", "claude", "versions")
 DESKTOP_CLAUDE = ("Library", "Application Support", "Claude", "claude-code")
+# npm's @anthropic-ai/claude-code (any prefix: npm, pnpm, yarn, bun). From
+# 2.1.113 its bin is bin/claude.exe, the platform package's native binary
+# that the postinstall links or copies over a placeholder (npm view: the
+# "bin" field; 2.1.308 checked 2026-10-22); its fallback launcher runs the
+# platform package's binary, named claude. Before that, bin was cli.js, run
+# by node: `node <...>/bin/claude ARGS`, the script a link to cli.js.
+NPM_PACKAGE = "/node_modules/@anthropic-ai/claude-code/"
+NPM_NATIVE = NPM_PACKAGE + "bin/claude.exe"
+NPM_CLI = NPM_PACKAGE + "cli.js"
+_NODE_EXE = re.compile(r"^node(?:js)?[0-9]*$")
 SSHD_COMMS = frozenset({"sshd", "sshd-session"})
 UNREADABLE = "a process tree that can't be read"
 
 
 def is_claude_exe(exe: str, home: str | os.PathLike[str] | None = None) -> bool:
     """Is `exe` (an executable path from the kernel) Claude Code's binary?"""
-    if os.path.basename(exe) == CLAUDE_EXE:
+    if os.path.basename(exe) == CLAUDE_EXE or exe.endswith(NPM_NATIVE):
         return True
     if home is None:
         return False
@@ -511,6 +523,50 @@ def is_claude_exe(exe: str, home: str | os.PathLike[str] | None = None) -> bool:
             if exe.startswith(d + os.sep):
                 return True
     return False
+
+
+def is_claude_node(exe: str, argv: list[str] | None) -> bool:
+    """Is this an npm install of Claude Code before 2.1.113: an executable
+    named node (nodejs, node22, ...) whose first argument, with no node
+    option before it, is an absolute path that resolves to an existing
+    .../node_modules/@anthropic-ai/claude-code/cli.js? (npm's shim runs
+    `node <prefix>/bin/claude`, a link to cli.js. Options before the script
+    could make another script the program, so they aren't accepted.)"""
+    if not _NODE_EXE.match(os.path.basename(exe)) or not argv or len(argv) < 2:
+        return False
+    script = argv[1]
+    if not os.path.isabs(script):
+        return False
+    try:
+        real = os.path.realpath(script)
+    except (OSError, ValueError):
+        return False
+    return real.endswith(NPM_CLI) and os.path.isfile(real)
+
+
+def is_claude_process(pid: int, exe: str, home: str | os.PathLike[str] | None = None) -> bool:
+    """Is `pid` (whose executable path is `exe`) Claude Code: its binary
+    (is_claude_exe), or node running npm's cli.js (is_claude_node)?"""
+    return is_claude_exe(exe, home) or is_claude_node(exe, _argv(pid))
+
+
+def claude_install(exe: str, argv: list[str] | None = None,
+                   home: str | os.PathLike[str] | None = None) -> str:
+    """How the Claude Code whose executable is `exe` was installed, in words
+    for /gate-doctor ("" when it isn't recognized as Claude Code)."""
+    if is_claude_node(exe, argv):
+        return "npm (node and cli.js, a version before 2.1.113)"
+    if exe.endswith(NPM_NATIVE) or "/node_modules/@anthropic-ai/claude-code-" in exe:
+        return "npm (its native binary)"
+    if home is not None:
+        for b in {os.fspath(home), os.path.realpath(home)}:
+            if exe.startswith(os.path.join(b, *CLAUDE_VERSIONS) + os.sep):
+                return "the native installer (~/.local/share/claude/versions)"
+            if exe.startswith(os.path.join(b, *DESKTOP_CLAUDE) + os.sep):
+                return "the desktop app's own copy"
+    if os.path.basename(exe) == CLAUDE_EXE:
+        return "an executable named claude (" + exe + ")"
+    return ""
 
 
 def _owner(pid: int) -> tuple[int | None, str]:
@@ -558,7 +614,7 @@ def claude_ancestor(home: str | os.PathLike[str] | None = None) -> str | None:
             return "CLAUDE_PID"
         exe = _exe_path(pid)
         if exe:
-            if is_claude_exe(exe, home):
+            if is_claude_process(pid, exe, home):
                 return exe
         else:
             uid, comm = _owner(pid)

@@ -195,9 +195,15 @@ def run_shim(tool: str, args: list) -> int:
 def _failed(tool: str, e: BaseException) -> int:
     """One gateway line for an unexpected error, never a traceback: a stand-in
     may hold a credential, and a traceback's locals and messages could show
-    it (or a path or value Claude then repeats)."""
-    print(f"gateway: {tool} failed unexpectedly ({type(e).__name__}); try again, or run gate "
-          "status", file=sys.stderr)
+    it (or a path or value Claude then repeats). A PathError (the run folder
+    another user's, a link, open to others) isn't unexpected: its own words
+    and remedy, which hold only a path (GW-ROB-1)."""
+    from gateway import paths
+    if isinstance(e, paths.PathError):
+        print(f"gateway: {tool} can't run: {paths.explain(e)}. Tell the user.", file=sys.stderr)
+    else:
+        print(f"gateway: {tool} failed unexpectedly ({type(e).__name__}); try again, or run gate "
+              "status", file=sys.stderr)
     try:
         from gateway import audit
         audit.log("error", tool=tool, error=type(e).__name__)

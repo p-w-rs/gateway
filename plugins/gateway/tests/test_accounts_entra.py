@@ -15,7 +15,7 @@ from gateway import entra, vault
 from gateway import form as formmod
 
 AZ = ('[accounts.azure]\nkind = "azure"\ntenant = "contoso.onmicrosoft.com"\n'
-      'databricks = ["adb-123.7.azuredatabricks.net"]\nstorage = ["asistore"]\n'
+      'databricks = ["adb-123.7.azuredatabricks.net"]\nstorage = ["examplestore"]\n'
       'sites = ["custom.example.com"]\n')
 ENTRA = {"azure": {"refresh_token": "SEED-REFRESH-0", "client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
                    "tenant_id": "11111111-2222-3333-4444-555555555555", "refreshed": "x"}}
@@ -69,8 +69,8 @@ def test_scope_for_host_mapping():
     assert entra.scope_for_host(a, "graph.microsoft.com") == entra.SCOPES["graph"]
     assert entra.scope_for_host(a, "adb-123.7.azuredatabricks.net") == entra.SCOPES["databricks"]
     assert entra.SCOPES["databricks"].startswith("2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/")
-    assert entra.scope_for_host(a, "asistore.blob.core.windows.net") == entra.SCOPES["storage"]
-    assert entra.scope_for_host(a, "asistore.dfs.core.windows.net") == entra.SCOPES["storage"]
+    assert entra.scope_for_host(a, "examplestore.blob.core.windows.net") == entra.SCOPES["storage"]
+    assert entra.scope_for_host(a, "examplestore.dfs.core.windows.net") == entra.SCOPES["storage"]
     # a listed site needs an explicit scope
     try:
         entra.scope_for_host(a, "custom.example.com")

@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,8 @@ INTRO = ("Gateway (plugin): you have these machines and accounts. Use normal com
          "or key in chat.")
 HOWTO = [
     "- sudo/ssh/scp/rsync work as usual. Run them as their own command (optionally after cd) so "
-    "the gateway can approve them without a prompt.",
+    "the gateway can approve them (without a prompt where the right is true; \"ask\" asks the "
+    "user).",
     "- Web: the gateway's http and download tools (curl/wget are refused). WebFetch reads pages.",
     "- Choose an account with GATE_ACCOUNT=NAME before the command if the gateway says two fit.",
     "- To add or change a host or account, edit ~/.config/gateway/gateway.toml (only when the "
@@ -61,6 +63,58 @@ MANAGED_HOWTO = ("- Your Bash commands run in the gateway's managed bash (bash 5
                  "/usr/bin:/bin:/usr/sbin:/sbin). For another host tool, look with the gw "
                  "host_inspect tool and suggest a [shell] import_path entry, which the user "
                  "approves (gate check settings).")
+
+
+# Added in managed mode while the form has no [shell] import_path at all
+# (GW-UX-2b): the tool folders this machine has that Claude's commands can't
+# reach yet (managed.found_not_imported), and how to offer them. Only when it
+# fits in CONTEXT_MAX: the hosts and accounts come first.
+IMPORT_OFFER = ("- Tool folders here your commands can't use yet (not imported): {dirs}. When "
+                "the work needs one (brew, npm, cargo, ...), propose importing it: add it to "
+                "[shell] import_path in ~/.config/gateway/gateway.toml, then `gate check "
+                "settings`, and the user approves in the gateway's dialog. Never import "
+                "without that OK.")
+
+
+def _import_offer(eff: consent.Effective, form: formmod.Form) -> str | None:
+    """IMPORT_OFFER for this machine, or None: managed mode, no import_path
+    key in the form (`import_path = []` says no) and folders found."""
+    if getattr(eff, "shell", None) is None or eff.shell.managed == "off" \
+            or form.shell.path_line is not None:
+        return None
+    from . import managed
+    found = managed.found_not_imported(eff)
+    return IMPORT_OFFER.format(dirs=", ".join(found)) if found else None
+
+
+# Added on Linux without a graphical display (neither DISPLAY nor
+# WAYLAND_DISPLAY in Claude Code's environment, which the hook inherits): the
+# dialog's Paste can't read a clipboard there (daemon/clipboard.py), and on
+# Claude Code's main screen nothing can be typed into its field either
+# (review round 2). Said once, in the context, after the hosts and accounts
+# (NO_DISPLAY_SHORT when it doesn't fit); the dialog and /gate-doctor say it too
+# (hooks/mod/dialog.ts NO_DISPLAY_MAIN, lib.ts secretLine).
+NO_DISPLAY_NOTE = ("- No graphical display here (Linux, no DISPLAY or WAYLAND_DISPLAY): the "
+                   "gateway dialog's Paste from clipboard can't work, nor typing on Claude Code's "
+                   "main screen. If a credential is needed, tell the user: restart Claude Code "
+                   "with CLAUDE_CODE_NO_FLICKER=1 to type it, or set it from this machine's desktop.")
+# What stays when the whole note doesn't fit beside the hosts and accounts:
+# the note never takes a host's or an account's place (on a headless Linux
+# server those matter more, and the dialog and /gate-doctor say it in full).
+NO_DISPLAY_SHORT = ("- No graphical display here: the gateway dialog's Paste and typing on the main "
+                    "screen can't work (/gate-doctor says what to do).")
+
+
+def _platform() -> str:
+    return sys.platform
+
+
+def _no_display_note() -> str | None:
+    """NO_DISPLAY_NOTE on Linux without DISPLAY and WAYLAND_DISPLAY, else None."""
+    if not _platform().startswith("linux") or os.environ.get("DISPLAY") \
+            or os.environ.get("WAYLAND_DISPLAY"):
+        return None
+    return NO_DISPLAY_NOTE
 
 
 def _howto(eff: consent.Effective | None = None) -> list[str]:
@@ -229,7 +283,21 @@ def context_text(form: formmod.Form, eff: consent.Effective, meta: dict[str, Any
         lines.append("Machines and git servers not listed are refused (the user can add them).")
     howto = _howto(eff)
     text = "\n".join(lines + howto)
+    note = _no_display_note()
+    if note is not None:
+        # after the details: whole when it fits, else short; when not even that
+        # fits, the short one joins the how-to lines the cut form keeps
+        for n in (note, NO_DISPLAY_SHORT):
+            if len(text) + 1 + len(n) <= CONTEXT_MAX:
+                text += "\n" + n
+                break
+        else:
+            howto = [*howto, NO_DISPLAY_SHORT]
+            text = "\n".join(lines + howto)
     if len(text) <= CONTEXT_MAX:
+        offer = _import_offer(eff, form)
+        if offer is not None and len(text) + 1 + len(offer) <= CONTEXT_MAX:
+            text += "\n" + offer
         return text
     # Too long: the intro and every how-to line stay; then as many names as fit.
     tail = ["(Details: `gate status`.)", *howto]
@@ -347,8 +415,9 @@ def write_session_record(session_id: str) -> None:
 
 
 VAULT_LOCKED = ("gateway: the gateway vault is locked (its key has a passphrase), so stored "
-                "credentials are unavailable and rights waiting in the vault don't apply until the "
-                "user unlocks it (/gate-unlock in Claude Code); /gate-doctor shows its state.")
+                "credentials are unavailable, sudo on this machine asks at most, and rights "
+                "waiting in the vault don't apply until the user unlocks it (/gate-unlock in "
+                "Claude Code); /gate-doctor shows its state.")
 
 
 def _load_vault(msgs: list[str]) -> dict[str, Any] | None:
@@ -358,6 +427,10 @@ def _load_vault(msgs: list[str]) -> dict[str, Any] | None:
         return vault.load()
     except vault.VaultLocked:
         msgs.append(VAULT_LOCKED)
+        return None
+    except paths.PathError as e:
+        # a wrapped key's reads go to the daemon, at the run folder (GW-ROB-1)
+        msgs.append(f"gateway: the vault can't be read: {paths.explain(e)}")
         return None
     except vault.VaultError as e:
         msgs.append(f"gateway: the vault can't be read ({e}); stored secrets are unavailable until it "
@@ -418,7 +491,8 @@ def _missing_form(msgs: list[str], data: dict[str, Any] | None, write: bool) -> 
     with a last good form: restore that (never the starter, which would read as
     "every entry removed" and wipe approvals and bindings). A vault with
     approvals but no copy: leave it missing (nothing ratchets on a missing
-    form). Nothing stored: write the starter form."""
+    form). Nothing stored: write the starter form (an older install's: its
+    sudo = true, migrate.starter)."""
     if paths.v2_store_path().exists():
         return
     if data is None and vault.exists():
@@ -435,7 +509,7 @@ def _missing_form(msgs: list[str], data: dict[str, Any] | None, write: bool) -> 
                     "write a new one.")
         return
     if write:
-        _create_form(migrate.STARTER)
+        _create_form(migrate.starter(data))
 
 
 def prepare(msgs: list[str], *, write: bool) -> tuple[formmod.Form, consent.Effective,

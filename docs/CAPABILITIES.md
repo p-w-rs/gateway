@@ -17,10 +17,10 @@ Cells: **yes** works, and was exercised on macOS arm64 with Claude Code
 2.1.301 (2026-10-19: repo suites, the e2e suite, or a real interactive session
 driven in a PTY against a local fake API); **untested** expected to work, not
 exercised; **no** not available on that surface; **planned** a later
-[PLAN-v4](PLAN-v4.md) phase. "-p / SDK" is `claude -p` and SDK hosts (no
+[PLAN-v4](dev/PLAN-v4.md) phase. "-p / SDK" is `claude -p` and SDK hosts (no
 surface draws); "Remote Control" a session driven from another device.
-The cells are the doctor's own table as shipped in plugin 0.9.0 (they change
-only with the code). The live acceptance of 2026-10-21 (installed copies,
+The cells are the doctor's own table as shipped in plugin 0.9.0, unchanged
+in 0.10.0 (they change only with the code). The live acceptance of 2026-10-21 (installed copies,
 macOS 2.1.301 and the Debian 13 arm64 VM's 2.1.304; PLAN-v4's matrix) later
 exercised more on the terminal surface than the cells claim: the stand-ins
 and the http tool (`acceptance_canaries.py`), the policy and export/import
@@ -53,7 +53,7 @@ app needs a manual check).
   (PLAN-v4 phase 7).** Enforced where the work happens: the ssh and sudo
   stand-ins, the approval hook, gated's terminals, jobs, remote runtime and
   host inspection, the managed shell's imports, the http tool and account
-  selection (docs/modules/policy.md), so it holds without mods. A rule
+  selection (docs/dev/modules/policy.md), so it holds without mods. A rule
   waiting for the person's OK, a credential re-entered from `/gate-accounts`
   and an import's passphrase and conflicts need the gateway's dialogs
   (terminal and desktop app). Exercised by the repo suites (`test_policy`,
@@ -75,7 +75,7 @@ app needs a manual check).
   host|workspace|policy` and `gate check` in a terminal.
 
 - **Remote terminals and jobs (PLAN-v4 phase 6).** gated and the gw tools do
-  the work (docs/modules/remote.md), so the surface matters only for what the
+  the work (docs/dev/modules/remote.md), so the surface matters only for what the
   person is asked: a changed host key or machine, a refused key, a password
   prompt in a remote terminal are the gateway's dialogs (terminal and desktop
   app only; elsewhere, and without mods, they are reported as unavailable and
@@ -88,7 +88,7 @@ app needs a manual check).
 - **Gateway daemon (PLAN-v4 phase 2).** Started on demand by the mod at
   session start, by the async SessionStart hook `hook-daemon` (so also
   without mods and in `-p`) and, for a passphrase-protected vault, by every
-  gateway program that needs it; docs/modules/daemon.md. The terminal cell:
+  gateway program that needs it; docs/dev/modules/daemon.md. The terminal cell:
   a real interactive session driven by the TUI harness (scratch config, fake
   API, the e2e install; 2026-10-19): the mod's `$.http.fetch` over the
   socket reached the daemon from the Claude Code process itself (the kernel's
@@ -98,6 +98,14 @@ app needs a manual check).
   cell: the hook route is covered by the repo tests, not a live `-p` run.
   The daemon's own tests also ran on Linux (Debian 13 arm64, SO_PEERCRED).
   The UI plane needs the mod; everything else works without it.
+  Since 0.10.0 it recognizes a Claude Code installed with npm
+  (`@anthropic-ai/claude-code`: its `bin/claude.exe`, or `node` running its
+  `cli.js`) besides the native installer and the desktop app; `/gate-doctor`
+  names the install it found (the repo tests use a fake npm layout; no real
+  npm install was driven). One daemon per user serves one Claude Code
+  configuration (`CLAUDE_CONFIG_DIR`) at a time: sessions of another
+  configuration get no dialogs, terminals or jobs from it and are told so
+  (an unwrapped vault is still read by the stand-ins themselves).
 
 - **Classic hooks.** Exec-form command hooks (`sh` + args) from
   `hooks/hooks.json`. The terminal row was exercised in an interactive
@@ -110,7 +118,10 @@ app needs a manual check).
   hooks and env file; on the terminal surface the http tool (a stored key
   sent to a local service, `Bearer ***` in the result) and the sudo
   stand-in's dialog were exercised live on 2026-10-21
-  (`tests/acceptance_canaries.py`, macOS and the VM).
+  (`tests/acceptance_canaries.py`, macOS and the VM). Since 0.10.0 the
+  gateway gives the `http` and `download` tools no permission decision in
+  any mode: Claude Code's mode decides (a prompt in default and plan mode,
+  the reviewer in auto mode).
 - **Cold-start guard.** While no env can run Python, launch.sh's
   `degraded_bash` denies, by text: anything naming the gateway's private
   folder or `~/.config/gateway` other than `gateway.toml`, session
@@ -135,7 +146,7 @@ app needs a manual check).
   classic SessionStart hook builds the env (it always runs, mods or not).
 - **Native gateway dialogs (PLAN-v4 phase 3).** Every question the
   gateway asks is a pane inside Claude Code, drawn by the mod from requests
-  the gateway daemon holds (docs/modules/daemon.md, "Dialogs"); no OS
+  the gateway daemon holds (docs/dev/modules/daemon.md, "Dialogs"); no OS
   dialog, terminal prompt or browser opens. A secret is typed into a
   `Client` field (keys reach only it, after a click; bullets drawn) and
   leaves it sealed to the request's own key (TweetNaCl box; gated opens it
@@ -150,6 +161,11 @@ app needs a manual check).
   screen (`CLAUDE_CODE_NO_FLICKER=0`, tmux) the field isn't drawn: the
   dialog says to start with `CLAUDE_CODE_NO_FLICKER=1` or to use Paste from
   clipboard, which works from the keyboard (`/gate-dialog`, Tab, Enter).
+  Paste leaves the value on the clipboard (the main-screen dialog, a toast
+  after each Paste and `/gate-doctor` say so).
+  On Linux without `DISPLAY` or `WAYLAND_DISPLAY` Paste can't work, so on the
+  main screen neither route does: the dialog, the typing guard and
+  `/gate-doctor`'s "Secrets here" line say so (since 0.10.0).
   Desktop: the field should work there (the `Client` relay is local), not
   exercised. VS Code, mobile (and Remote Control, whose clients attach as
   mobile), `-p` and the SDK: credential entry is reported as unavailable,
@@ -158,7 +174,7 @@ app needs a manual check).
 - **Managed shell (PLAN-v4 phase 4).** The mod sets
   `CLAUDE_CODE_SHELL_PREFIX` to the shipped `hooks/gate-sh` (and
   `CLAUDE_CODE_SHELL` to the gateway env's bash) at session start
-  ([FEASIBILITY-v4](FEASIBILITY-v4.md) P2, docs/modules/managed.md): every
+  ([FEASIBILITY-v4](dev/FEASIBILITY-v4.md) P2, docs/dev/modules/managed.md): every
   command Claude Code starts through its shell runs in the gateway's bash 5
   with the gateway rc and a curated environment, never the login shell or its
   snapshot; classic hook strings and MCP server commands pass through gate-sh
@@ -191,7 +207,7 @@ app needs a manual check).
   (the env's tmux 3.8, a private socket, its own config) with the managed
   shell's environment; the gw MCP server's `terminal_*` and `job_*` tools and
   checkpoint's contract calls reach them over gated's socket
-  (docs/modules/terminals.md). The terminal cell: `tests/acceptance_terminals.py`
+  (docs/dev/modules/terminals.md). The terminal cell: `tests/acceptance_terminals.py`
   (real interactive sessions through the TUI harness, telemetry on behind the
   record-only proxy, 73 of 73, 2026-10-21): a full-screen program, an input
   prompt, resize, signals, user takeover with Claude's input queued, hand back

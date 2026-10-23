@@ -1268,8 +1268,9 @@ def _lossy_ssh(d: Path) -> tuple[Path, Path, Path]:
     real = S.sq(S.ENV_BIN / "ssh")
     w.write_text(f"""#!/bin/sh
 [ -f {S.sq(down)} ] && exit 255
-if [ -f {S.sq(flag)} ]; then
-  read -r word mode < {S.sq(flag)}
+# an empty word (the flag file caught between its creation and its write)
+# matches nothing: `*""*` would match every call
+if [ -f {S.sq(flag)} ] && read -r word mode < {S.sq(flag)} && [ -n "$word" ]; then
   case "$*" in
     *"$word"*)
       rm -f {S.sq(flag)}

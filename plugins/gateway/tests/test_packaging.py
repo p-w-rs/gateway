@@ -628,3 +628,86 @@ def test_the_lock_matches_the_manifest_offline():
         assert (d / "pixi.lock").read_bytes() == (H.PLUGIN / "pixi.lock").read_bytes()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# The work identities that once sat in the code, tests and fixtures (the
+# user's decision: the plugin is generic; examples are octocat, octo-work,
+# example-org, example.com). Only sha256 digests of their lowercased spelling
+# are kept, so neither this file nor its reader learns them. A line's words
+# are its runs of [a-z0-9] once lowercased; a part matches anywhere inside a
+# word (a login inside an e-mail address, a host name with or without a
+# plural s), a word only whole.
+_ID_PARTS = frozenset({
+    "308a82f5f946aca1dcb1b16988011b33cefe0236c06e724507698810137db490",
+    "89410f7bed69b303e288baca579e3423dd825db8ecb2577bc6b11820cf09d2f6",
+    "0dbca8257fda00aff7b27e31992460c571124c7a86d0d05f8387f967ae103636",
+    "673f5e2f4fb52ec6f67a73fd4531bafeed31734e3f9240f18cc985349326a4e3",
+    "5847f83c2b0d4ac6237ccc2f8372e83fc4df509f4ca65cd1116675fb0ccb8778",
+    "fc52fabe94c0e037d2df4498e87481a6438960c9f73d517584a7a5c564535ac4",
+})
+_ID_WORDS = frozenset({
+    "eda19aa5dfb1070a54f70edd633f1639020376b130bb2f3a57988776352b89d7",
+    "774bcfea8336aaf9fd000447b251bb9f3f10d9fc973420be999135e5806f8300",
+    "faefe5601415d892a580f14d100962c13a528c46879102963e0375d7fd2eae2e",
+})
+_ID_LENS = (5, 6, 7, 8, 9)          # the parts' lengths
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_NOT_SHIPPED = {".pixi", "logs", "quarantine", "__pycache__", "types", ".git"}
+
+
+def _sha(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _identity_word(w: str, parts=_ID_PARTS, words=_ID_WORDS, lens=_ID_LENS,
+                   seen: dict | None = None) -> bool:
+    if seen is not None and w in seen:
+        return seen[w]
+    hit = _sha(w) in words or (len(w) <= 64 and any(
+        _sha(w[i:i + n]) in parts for n in lens for i in range(len(w) - n + 1)))
+    if seen is not None:
+        seen[w] = hit
+    return hit
+
+
+def _identity_hits(rel: Path, text: str, parts=_ID_PARTS, words=_ID_WORDS, lens=_ID_LENS,
+                   seen: dict | None = None) -> list[str]:
+    """`file:line: word N` for every line naming an identity (the word's
+    position, never its spelling)."""
+    out = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for i, w in enumerate(_WORD_RE.findall(line.lower()), 1):
+            if _identity_word(w, parts, words, lens, seen):
+                out.append(f"{rel}:{n}: word {i}")
+    return out
+
+
+def test_the_shipped_plugin_names_no_work_identity():
+    """Nothing in the plugin folder (code, hooks, the mod, skills, commands,
+    tests and fixtures) names the employer, its people, domain, tenant or
+    hosts: the ML catalog is described generically and has no default host.
+    `asiml` stays as the CLI's name. The scan itself is checked first on
+    made-up digests: case, a part inside a longer word, a whole word."""
+    parts, words = frozenset({_sha("canary")}), frozenset({_sha("zq")})
+    probe = "Host CaNaRy.example.com\nx = 'xcanaryz'\nmlcat:zq\nzqx canar zq-q\nnothing here"
+    assert _identity_hits(Path("p"), probe, parts, words, (6,)) == \
+        ["p:1: word 2", "p:2: word 2", "p:3: word 2", "p:4: word 3"], "the scan finds them"
+    found, seen, cache = [], 0, {}
+    for top, dirs, names in os.walk(H.PLUGIN):
+        dirs[:] = sorted(d for d in dirs if d not in _NOT_SHIPPED)
+        for name in sorted(names):
+            p = Path(top) / name
+            rel = p.relative_to(H.PLUGIN)
+            if rel.as_posix() == "tsconfig.json" or p.is_symlink():
+                continue
+            try:
+                text = p.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            seen += 1
+            found += _identity_hits(rel, text, seen=cache)
+    assert seen > 100, seen
+    assert not found, "\n".join(found[:40])
+    from gateway import form as F
+    assert "ml-catalog" not in F.DEFAULT_HOSTS, "no default catalog host"

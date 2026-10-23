@@ -227,7 +227,7 @@ def test_stand_ins_conditional():
         base = set(envfile.stand_ins())
         assert base == {"sudo", "ssh", "scp", "sftp", "gh", "hf", "databricks", "crane", "pijul",
                         "asiml", "gate", "git-credential-gateway", "gate-askpass"}
-        f = F.parse_text('[accounts.cat]\nkind = "ml-catalog"\n[accounts.az]\nkind = "azure"\n'
+        f = F.parse_text('[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n[accounts.az]\nkind = "azure"\n'
                          'tenant = "t.example.com"\nenv = "AZ_TOKEN"\n')
         s = envfile.stand_ins(f)
         assert "dvc" in s and "az" in s

@@ -249,9 +249,12 @@ def web(e: Any, C: Checks) -> None:
           first_line(ec.result if ec else "not called", 300))
     C.add(g, "no denial for the http tool calls", not any(x.denied for x in http),
           [x.id for x in http if x.denied])
-    appr = [_approved_by_hook(s, x) for x in http]
-    C.add(g, "the http tool calls were approved by the gateway's mcp_perm hook (no prompt, "
-             "no classifier)", bool(appr) and all(ok for ok, _ in appr), [d for _, d in appr])
+    # GW-SEC-1: mcp_perm.sh gives the http tool no decision (auto mode's reviewer decides)
+    hook_allow = [x.id for x in http if any('"permissionDecision": "allow"' in o
+                                            or '"permissionDecision":"allow"' in o
+                                            for o in x.hook_outputs)]
+    C.add(g, "the gateway's mcp_perm hook gave the http tool calls no decision (Claude Code's "
+             "mode decides)", bool(http) and not hook_allow, hook_allow)
 
 
 def refuse(e: Any, C: Checks) -> None:

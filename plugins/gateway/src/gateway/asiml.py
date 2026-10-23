@@ -1,9 +1,11 @@
-"""The gateway's own asiml (ASI ML Catalog) and the dvc delegation (SPEC 9.5).
+"""The gateway's own asiml and the dvc delegation (SPEC 9.5).
 
-asiml is the gateway's implementation of the catalog CLI: it reads the
-catalog over its API (search / show / files) and manages a DVC-backed
-workspace (init / clone / pull / push / status) in the same `.asiml` format
-the real asiml uses. Transfers ask the catalog for a short-lived, role-limited
+The ml-catalog account kind is an ML model catalog behind Microsoft Entra ID,
+with its asiml CLI; the account's `host` (required) names the catalog. asiml
+here is the gateway's implementation of that CLI: it reads the catalog over
+its API (search / show / files) and manages a DVC-backed workspace (init /
+clone / pull / push / status) in the same `.asiml` format the catalog's own
+asiml uses. Transfers ask the catalog for a short-lived, role-limited
 storage pass and hand it to `dvc` (the gateway's dvc feature env) through an
 isolated config; the pass is scrubbed from all output.
 
@@ -82,13 +84,13 @@ def _account(form: formmod.Form, eff: Any, data: dict[str, Any], *, cred: bool =
     token or a storage pass) also checks ancestry (SPEC 10)."""
     cats = [a for a in form.accounts.values() if a.kind == "ml-catalog"]
     if not cats:
-        raise _g("gateway: no ml-catalog account; ask the user to add one")
-    host = cats[0].host if cats else formmod.DEFAULT_HOSTS["ml-catalog"]
+        raise _g(_no_catalog(form))
+    host = cats[0].host
     sel = acctmod.select("ml-catalog", host, None, form, effective=eff, vault=data, env=os.environ)
     if sel.error:
         raise _g(sel.error)
     if sel.account is None:
-        raise _g(sel.note or "gateway: no ml-catalog account; ask the user to add one")
+        raise _g(sel.note or _no_catalog(form))
     a = sel.account
     if not consent.bound_ok(data, a.name, a.host or host):
         raise _g(f"gateway: {a.name} isn't bound to {a.host or host}; run gate check {a.name} "
@@ -96,6 +98,22 @@ def _account(form: formmod.Form, eff: Any, data: dict[str, Any], *, cred: bool =
     if cred:
         _check_direct(tool, a, eff)
     return a
+
+
+def _no_catalog(form: formmod.Form) -> str:
+    """No usable ml-catalog account. One that is off because of a mistake in
+    the form (a converted catalog without `host`, say) is named with its
+    problem, so Claude fixes that entry instead of adding a second one."""
+    off = [n for n, k in form.disabled_kinds.items()
+           if k == "ml-catalog" and form.is_disabled(n, "accounts")]
+    if off:
+        n = off[0]
+        errs = [p.render() for p in form.problems_for(n) if p.level == "error"]
+        return (f"gateway: the ml-catalog account {n} is off because of a mistake in gateway.toml"
+                + (f" ({errs[0]})" if errs else "") + f"; ask the user to fix [accounts.{n}] "
+                "(gate status shows it) rather than adding another ml-catalog account")
+    return ("gateway: no ml-catalog account; ask the user to add one (kind = \"ml-catalog\" "
+            "with host = the catalog's address)")
 
 
 def _check_direct(tool: str, account: formmod.Account, eff: Any) -> None:
@@ -145,7 +163,7 @@ def api_scope(account: formmod.Account, data: dict[str, Any]) -> str:
     pinned = (rec.get("bound") or {}).get("scope")
     if pinned:
         return pinned
-    cfg = catalog_config(account.host or formmod.DEFAULT_HOSTS["ml-catalog"])
+    cfg = catalog_config(account.host)
     return f"api://{cfg['clientId']}/access_as_user"
 
 
@@ -156,7 +174,7 @@ def api_token(account: formmod.Account, data: dict[str, Any]) -> str:
 def _api(account: formmod.Account, data: dict[str, Any], method: str, path: str,
          body: dict[str, Any] | None = None) -> Any:
     token = api_token(account, data)
-    host = account.host or formmod.DEFAULT_HOSTS["ml-catalog"]
+    host = account.host
     req = urllib.request.Request(base_url(host) + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {token}",
@@ -243,7 +261,9 @@ def _dvc_bin() -> str:
 
 
 def _site_cache() -> str:
-    return str(paths.user_home() / ".local" / "share" / "ASI" / "asiml" / "site-cache")
+    """DVC's site cache (its repo index and locks; nothing secret), in a
+    folder of the user's own."""
+    return str(paths.user_home() / ".local" / "share" / "asiml" / "site-cache")
 
 
 def _run_dvc(root: Path, args: list[str], access: dict[str, Any] | None) -> tuple[int, str, str]:
@@ -430,7 +450,7 @@ def _cmd_init(rest: list[str], cwd: Path, form, eff, data) -> int:
     if not FOLDER_RE.match(data_dir) or data_dir in (".dvc", ".git", ".asiml"):
         raise _g("gateway: --data-dir must be a simple child folder name")
     a = _account(form, eff, data, cred=False)
-    _init(cwd, kind, folder, a.host or formmod.DEFAULT_HOSTS["ml-catalog"], data_dir)
+    _init(cwd, kind, folder, a.host, data_dir)
     readme = cwd / data_dir / "README.md"
     if not readme.exists():
         readme.write_text(f"---\nname: {folder}\n---\n# {folder}\n\nDescribe this {kind} here.\n")
@@ -450,7 +470,7 @@ def _cmd_clone(rest: list[str], cwd: Path, form, eff, data, tool: str = "asiml")
     a = _account(form, eff, data, tool=tool)
     access = _api(a, data, "POST", "/api/transfers/pull",
                   {"kind": kind, "folder": folder, "revision": rev})
-    _init(root, kind, folder, a.host or formmod.DEFAULT_HOSTS["ml-catalog"], "data")
+    _init(root, kind, folder, a.host, "data")
     msg = _pull(root, a, data, access["md5"], access)
     audit.log("asiml", tool="asiml", action="clone", account=a.name)
     print(msg)

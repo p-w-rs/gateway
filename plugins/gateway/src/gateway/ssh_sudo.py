@@ -30,7 +30,7 @@
    never on the command's own output. sudo's own `Sorry, try again.` lines
    after an answer only drop the verification cache (the next call verifies).
 
-Residual risk (accepted in phase C, SPEC 9.3 and docs/phaseB-requests/RESOLUTION.md
+Residual risk (accepted in phase C, SPEC 9.3 and docs/dev/phaseB-requests/RESOLUTION.md
 #7; since PLAN-v4 phase 7 the gateway no longer offers to install a passwordless
 sudoers rule: passwordless sudo is used only where the host already has it, and
 the dialog's "Remember it" unticked uses a password for one call): while

@@ -10,7 +10,7 @@ Code: `plugins/gateway/src/gateway/daemon/` (`__init__`, `peers`, `planes`,
 `tests/fakes/fake_claude.py`); mutations: `tests/mutations_daemon.py`,
 `tests/mutations_dialogs.py`. Why it is built this way, and where it departs
 from the phase notes: [DECISIONS.md](../DECISIONS.md), "PLAN-v4 phase 2: the
-daemon and the broker" and "PLAN-v4 phase 3: native dialogs". The checkpoint side of the socket is [CONTRACT-v1.md](../CONTRACT-v1.md).
+daemon and the broker" and "PLAN-v4 phase 3: native dialogs". The checkpoint side of the socket is [CONTRACT-v1.md](../../CONTRACT-v1.md).
 
 ## What it is
 
@@ -65,6 +65,20 @@ Who starts it: the mod at `session.start` (`$.process.run(["sh", launch.sh,
 runs without mods and in `claude -p`), and with a wrapped key every vault read
 (`client.py`): stand-ins, the git helper, the MCP server, gate and hooks.
 
+Whose socket the client talks to (review round 2): before every connect,
+`client.foreign_socket(path)` checks the socket and its folder: both this
+user's own (`st_uid`), closed to others (`mode & 0o077 == 0`; gated makes
+them 0600 and 0700), the folder a folder and the socket a socket (`lstat`:
+a link isn't followed). Anything else is `client.ForeignSocket` (code
+`foreign_socket`, a kind of `Unreachable`): nothing is sent, so a socket
+another user bound while the folder was open to them never gets a vault
+request, a sealed value or a dialog's answer. Being unreachable, it makes
+`ensure_running` start a daemon, whose `bind()` removes the stale socket
+from the run folder (this user's, so it may) and binds its own. Only this
+user can change a 0700 folder, so nothing can be swapped in between the
+check and the connect. The mod connects to the socket `gated start` named
+after this check passed.
+
 - `ensure_running(wait=10)`: GET /health; the same or a newer version is
   used (a newer daemon serving an older plugin is reported in the answer's
   `skew`). An older version is asked to restart (`/local/restart`): it stops
@@ -83,7 +97,13 @@ runs without mods and in `claude -p`), and with a wrapped key every vault read
   (never starts or restarts the daemon; what /gate-doctor runs) adds it for
   any version difference with the plugin copy that runs it, newer or older
   (`daemon.skew_text`), and `gate status` adds the same words to its daemon
-  line.
+  line. /health names the data folder the daemon serves (`data`); `gated
+  start|status` run from another data folder (a second Claude Code
+  configuration) add `other_config`, the words `/gate-doctor` appends to its
+  daemon line, and `gate status` appends them too
+  (`planes.other_config_note`; review round 2). `gated start|status` also
+  carry `platform` (sys.platform), from which the mod knows it is on Linux,
+  where Paste needs `DISPLAY` or `WAYLAND_DISPLAY`.
 - `serve(detach)`: flock `gated.lock` without waiting (a second daemon prints
   "already running" and exits 0), then fork, setsid, fork (the daemon is not a
   session leader, so it can't get a terminal), stdio to the log, umask 077,
@@ -247,8 +267,15 @@ Sessions: `Registry` keeps `Session(pid, start, exe, session_id, ui, surface,
 surfaces, version, via)` (`surfaces`: the drawing surfaces the mod reports at
 registration and at `session.attach`/`detach`; only a terminal or the
 desktop app has the private field). The executable is checked when a process registers: it must
-be Claude Code's (`ancestry.is_claude_exe`: named `claude`, the native
-install's versions folder, the desktop app's copy). Afterwards a session is
+be Claude Code's (`peers.is_claude`: `ancestry.is_claude_exe`, named
+`claude`, npm's native binary `.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+(the package's `bin` since 2.1.113), the native install's versions folder,
+the desktop app's copy; or `ancestry.is_claude_node`, node whose first
+argument, with no node option before it, is an absolute path resolving to an
+existing `.../node_modules/@anthropic-ai/claude-code/cli.js`: npm before
+2.1.113). `gated start|status` name how the Claude Code that ran them was
+installed (`claude_install`, or `parent_exe` when it isn't recognized), and
+`/gate-doctor` shows it. Afterwards a session is
 valid while its pid lives with the start time it registered with (a reused
 pid has another), whatever its executable path says then: an upgrade deletes
 or replaces the binary of a Claude Code that keeps running (the native
@@ -296,7 +323,7 @@ command); `pause.applied` gains `replayed` for a repeated `pause_id`.
   terminals, jobs}` (since phase 7: hosts carry `rights`, the effective
   allow/ask/deny per action from `policy.rights`; `workspaces` are `{workspace:
   w_..., name, host, host_name, root, local?}`; `accounts` are `{account, kind,
-  state, checked_at?, rights}` from the adapters' last checks, docs/modules/policy.md
+  state, checked_at?, rights}` from the adapters' last checks, docs/dev/modules/policy.md
   and accounts.md; a locked vault gives `state: "unknown"`. Snapshot reads use
   `broker.read(touch=False)` and `Daemon.effective(touch=False)`, so polling
   never keeps an idle vault unlocked) (terminals and jobs: terminals.md, "Routes"); a host is `{host: m_<26 base32>, name, local, address,
@@ -373,7 +400,7 @@ made before this phase), `wrapped` (key.wrapped + key.recipient, no key.txt).
   against key.recipient (a mismatch leaves it locked), keeps the identity in
   memory, and touches `<run>/gated-unlocked`, after which the managed shell's
   next command renews its settings (approved imports are in the vault;
-  docs/modules/managed.md).
+  docs/dev/modules/managed.md).
   `lock(reason)` forgets it (explicit `/ui/vault/lock`, `/agent/vault/lock`,
   `gate lock`; `idle` after the form's `[vault] lock_after`, default 8h,
   "1m" to "1d"; `exit`). Each vault read or write counts as a use. Python
@@ -412,7 +439,9 @@ nothing about the value); `vault.is_redacted` recognizes one and
 mode names) also gets sentinels for every entry without an effective
 `scripts = true` (consent, computed by the daemon). `merge` swaps sentinels
 back for their values and raises `Conflict` (409) when the written document
-adds, changes, moves or drops a value the writer couldn't see. The token
+adds, changes, moves or drops a value the writer couldn't see; the vault's
+baseline mark stays as the vault has it (a writer can neither drop nor add
+it: vault.older_install). The token
 cache: `cache_view`/`cache_merge` (no cache class: empty view, writes
 refused; withheld accounts kept as they are). The client (`client.vault_read`)
 asks the daemon on every read and keeps nothing between reads, so a lock (or
@@ -572,8 +601,39 @@ nothing to lock).
   lives (`Registry.pane_session`, terminals.md), and gets nothing after.
 - A handed-over secret is a Python string in gated and in the helper for as
   long as they use it (it can't be wiped; the box's plaintext bytes are).
-- An npm-installed Claude Code runs as `node`: it isn't recognized as Claude
-  Code, so it can't register (nothing changes for an unwrapped vault).
+- An npm-installed Claude Code is recognized (since GW-COMPAT-1): npm's
+  native binary by its path, an older node one by its argv (node and cli.js,
+  nothing before the script). Before that it couldn't register, and without
+  a registered session no gateway dialog can open (every dialog goes through
+  gated, wrapped vault or not). A Claude Code run some other way (a copy
+  renamed, node with options before cli.js, a bundler's own runtime) still
+  can't register: `/gate-doctor` says "not recognized" and names what asked.
+- One gated per user (one socket, `/tmp/gw-<uid>/gated.sock`) serves one
+  plugin data folder: the one its python belongs to. A second Claude Code
+  configuration (its own `CLAUDE_CONFIG_DIR`, so its own data folder) gets
+  nothing from it while it runs: its gateway programs (an env python of
+  another data folder, the launchers' options, a run.py whose plugin.json
+  names "gate", a gateway mode: `peers.foreign_data`) are refused with
+  `other_config`, a message naming both data folders, what this session
+  lacks (dialogs, terminals and jobs, and secrets only while the vault has a
+  passphrase: an unwrapped vault the stand-ins still read themselves) and
+  what to do (quit the other configuration's sessions and let its terminals
+  and jobs end: the daemon stays while any runs and leaves 30 minutes after
+  the last), also as the dialog lease's reason (GW-ROB-2); `/gate-doctor`
+  and `gate status` in that configuration say the same (`/health`'s `data`,
+  above). Not changed: the
+  version-skew restart compares versions only, so configurations on
+  different plugin versions can still replace each other's idle daemon.
+- The run folder is a fixed name (`/tmp/gw-<uid>`): another local user can
+  make it first. Nothing is used from a folder that is another user's, a
+  link or open to others (`paths.run_dir`: `PathError`, with a remedy), and
+  the stand-ins (run.py `_failed`, the ssh/scp/sftp `ssh.main`), `gate
+  status`, SessionStart and `gated start|status` (so `/gate-doctor`) say what
+  is wrong and what to do (GW-ROB-1); until it is fixed no daemon starts. One
+  others could write to is to be removed (`rm -rf`, once no Claude Code
+  session or gated uses it; the gateway makes a new one), never chmod'ed
+  back: a socket they bound there would stay (review round 2; the client's
+  socket check above refuses one anyway).
 - Remote host ids are assigned (stable); their machine identity is verified
   since phase 6 (remote.md) and shown beside the id.
 - `lock_after` isn't under the widening rule yet (bounded to one day).
@@ -581,7 +641,8 @@ nothing to lock).
   `socketPath`) was verified in a live interactive session (TUI harness,
   scratch config, fake API, 2.1.301 on macOS: the kernel's peer pid was the
   claude pid); the desktop app and `claude -p` (the hook route) weren't run
-  live. Recognising Claude Code by executable: named `claude`, or under the
+  live. Recognising Claude Code by executable: named `claude`, npm's
+  `bin/claude.exe` (or node running npm's cli.js, by argv), or under the
   person's own `~/.local/share/claude/versions/` or the desktop app's
   folder, whatever home a test or e2e override gives the gateway (the live
   run found the native install's `versions/2.1.301` refused under the e2e

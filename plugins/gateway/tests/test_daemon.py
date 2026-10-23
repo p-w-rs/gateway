@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -132,6 +133,109 @@ def test_a_stale_socket_file_without_a_daemon_is_replaced():
         assert de.sock.exists() and de.health() is None
         h = de.start()
         assert h["ok"] and de.health()["pid"] == h["pid"]
+
+
+class _Impostor:
+    """A listener at a socket path that answers every request like gated
+    would, counting the connections it gets."""
+
+    def __init__(self, path: Path):
+        self.n = 0
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.bind(str(path))
+        self.s.listen(8)
+        self.t = threading.Thread(target=self._serve, daemon=True)
+        self.t.start()
+
+    def _serve(self) -> None:
+        body = b'{"ok": true, "pid": 4242, "version": "0.0.1"}'
+        while True:
+            try:
+                c, _ = self.s.accept()
+            except OSError:
+                return
+            self.n += 1
+            with c:
+                c.settimeout(2)
+                try:
+                    c.recv(65536)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                              b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body))
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        try:
+            self.s.shutdown(socket.SHUT_RDWR)       # wakes a blocked accept() on Linux
+        except OSError:
+            pass
+        self.s.close()
+        self.t.join(5)
+
+
+def test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to():
+    """Review round 2 (must-fix): the client connected to whatever gated.sock
+    the run folder held. Another user who bound one there while the folder
+    was open to them (and it was chmod'ed back) would get the vault data a
+    stand-in sends, the values the mod seals and the dialogs' answers. The
+    socket and its folder must be this user's own and closed to others
+    (gated makes them 0600 and 0700): anything else is never connected to,
+    counts as unreachable, and a start replaces it."""
+    from gateway.daemon import client
+    with D.daemon_env(start=False) as de:
+        imp = _Impostor(de.sock)
+        real_lstat = os.lstat
+        try:
+            os.chmod(de.sock, 0o600)
+            # this user's own 0600 socket in a 0700 folder is talked to
+            assert client.health(sock=de.sock)["pid"] == 4242 and imp.n == 1
+
+            def refused(sock: Path, why: str) -> None:
+                try:
+                    client.call("GET", "/health", sock=sock)
+                except client.ForeignSocket as e:
+                    assert e.code == "foreign_socket" and why in e.message \
+                        and "didn't connect" in e.message, e.message
+                else:
+                    raise AssertionError(f"talked to {sock} ({why})")
+                assert client.health(sock=sock) is None
+            # another user's socket (no other user's can be made here: lstat
+            # reports this one's owner as someone else, the folder as it is)
+
+            def lstat(p, *a, **k):
+                st = real_lstat(p, *a, **k)
+                if os.fspath(p) == str(de.sock):
+                    t = list(st)
+                    t[4] = st.st_uid + 1
+                    return os.stat_result(t)
+                return st
+            os.lstat = lstat
+            try:
+                refused(de.sock, "belongs to another user")
+            finally:
+                os.lstat = real_lstat
+            # open to others: the socket, or its folder
+            os.chmod(de.sock, 0o666)
+            refused(de.sock, "is open to other users (mode 666)")
+            os.chmod(de.sock, 0o600)
+            os.chmod(de.run, 0o711)
+            refused(de.sock, f"{de.run} is open to other users")
+            os.chmod(de.run, 0o700)
+            # a link to it isn't a socket of its own
+            link = de.run / "link.sock"
+            link.symlink_to(de.sock)
+            refused(link, "isn't a socket of its own")
+            assert imp.n == 1, "nothing reached the impostor"
+            # a start replaces what isn't this user's own: the daemon binds anew
+            os.chmod(de.sock, 0o666)
+            h = de.start()
+            assert h["ok"] and h["pid"] != 4242 and h["version"] == D.plugin_version(), h
+            st = os.lstat(de.sock)
+            assert stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600
+            assert de.health()["pid"] == h["pid"] and imp.n == 1
+        finally:
+            os.lstat = real_lstat
+            imp.close()
 
 
 def test_idle_exit_without_live_sessions_and_not_while_one_lives():
@@ -548,6 +652,94 @@ def test_only_the_daemons_own_data_folder_env_pythons_are_gateway_pythons():
         assert peers.python_ok(str(mine)) and not peers.python_ok(str(theirs))
 
 
+def test_another_configurations_gateway_is_refused_in_words_that_say_so():
+    """GW-ROB-2: one gated per user serves one Claude Code configuration (its
+    data folder); a second CLAUDE_CONFIG_DIR's gateway programs were refused
+    with "vault data only to the gateway's own programs", which says nothing
+    of why. The refusal now names both data folders and what to do; anything
+    else is refused as before."""
+    with D.daemon_env() as de:
+        fc = de.claude()
+        gate = D.probe_root(de.root)
+        layout = Path("envs") / "0123456789ab" / ".pixi" / "envs" / "default"
+        theirs = D.python_at(de.root / "other-cfg" / "plugins" / "data" / "gate-gateway" / layout)
+        mine = D.python_at(paths.data_dir() / layout)
+        other = de.root / "other-cfg" / "plugins" / "data" / "gate-gateway"
+        for mode, path in ((["shim", "gh"], "/agent/vault/read"), (["hook-session"], "/agent/register"),
+                           (["mcp"], "/agent/term/list"), (["gate"], "/agent/dialog/lease"),
+                           (["gated", "stop"], "/local/stop")):
+            st, body = de.probe(fc, gate / "run.py", mode, path, body={}, python=theirs,
+                                test_entry=False)             # production argv
+            assert st == 403 and body["error"] == "other_config", (mode, body)
+            msg = body["message"]
+            assert "another Claude Code configuration" in msg and paths.describe(other) in msg \
+                and paths.describe(paths.data_dir()) in msg and "one gateway daemon per user" in msg \
+                and "quit the other configuration's" in msg, msg
+            # review round 2: true for an unwrapped vault (the stand-ins read
+            # it themselves) and for terminals and jobs keeping gated there
+            assert "gets no vault data" not in msg and "no secrets while the vault has a passphrase" \
+                in msg and "still read the vault themselves" in msg, msg
+            assert "terminals and jobs end" in msg and "stays while any of them runs" in msg \
+                and "leaves 30 minutes after its last session" not in msg, msg
+        # /gate-doctor there: `gated status` from the other configuration's
+        # data folder (another test root, the same run folder) says the daemon
+        # serves another configuration; this one's says nothing of it
+        theirs_root = de.root / "other-root"
+        theirs_root.mkdir()
+        for sub in ("status", "start"):
+            r = H.run_py(de.env, "--test", "gated", sub,
+                         extra_env={**de.extra_env(), "GATEWAY_TEST_ROOT": str(theirs_root)})
+            out = json.loads(r.stdout)
+            assert r.returncode == 0 and out["ok"] is True, (r.stdout, r.stderr)
+            note = out.get("other_config", "")
+            assert note.startswith("the gateway daemon running now serves another Claude Code "
+                                   "configuration") and paths.describe(paths.data_dir()) in note \
+                and str(theirs_root) in note and "Tell the user" in note, out
+        assert de.health()["data"] == str(paths.data_dir())
+        out = json.loads(de.gated("status").stdout)
+        assert out["ok"] is True and "other_config" not in out, out
+        assert planes.other_config_note({"ok": True}) == "", "an older daemon without data: nothing"
+        # gate status there says it too
+        from gateway import gate as gatecli
+        from gateway.daemon import client as cl
+        h = {**de.health(), "data": str(theirs_root / "data")}
+        old_health = cl.health
+        cl.health = lambda *a, **k: h
+        try:
+            line = gatecli.daemon_line()
+        finally:
+            cl.health = old_health
+        assert line.startswith("Gateway daemon: running (") and \
+            "; the gateway daemon running now serves another Claude Code configuration" in line, line
+        # not another configuration's gateway: refused as before
+        not_run = de.root / "probe-gate" / "other.py"
+        not_run.write_text((gate / "run.py").read_text())
+        for python, script, mode in ((mine, gate / "run.py", ["shim", "gh"]),       # this folder's python
+                                     (theirs, not_run, ["shim", "gh"]),            # not a run.py
+                                     (theirs, gate / "run.py", ["nonsense"])):     # not a gateway mode
+            st, body = de.probe(fc, script, mode, "/agent/vault/read", body={}, python=python,
+                                test_entry=False)
+            assert st == 403 and body["error"] == "peer", (python, script, mode, body)
+        # not the launchers' options
+        st, body = de.probe(fc, gate / "run.py", ["shim", "gh"], "/agent/vault/read", body={},
+                            python=theirs, options=("-S",), test_entry=False)
+        assert st == 403 and body["error"] == "peer", body
+        # the dialog's lease says it in the same words (popup reports it as unavailable)
+        from gateway.daemon import client
+
+        def refuse(*_a, **_k):
+            raise client.DaemonError(403, "other_config", "gateway: the gateway daemon running now "
+                                     "serves another Claude Code configuration (...)")
+        old = client.call
+        client.call = refuse
+        try:
+            r = client.dialog_lease()
+        finally:
+            client.call = old
+        assert r["available"] is False and r["reason"] == "other_config" \
+            and r["message"].startswith("the gateway daemon running now serves another"), r
+
+
 def test_a_hook_cannot_register_a_process_that_isnt_claude_code():
     """A gateway hook may register only a Claude Code process above it: one
     that names its parent shell (or any other program between it and
@@ -940,3 +1132,64 @@ def test_claude_codes_native_install_is_recognised_under_a_test_override():
         assert peers.exe_is_claude("/opt/anything/bin/claude")
         assert not peers.exe_is_claude(str(real / ".local" / "share" / "other" / "versions" / "2.1.301"))
         assert not peers.exe_is_claude("/usr/bin/python3")
+
+
+def _npm_layout(base: Path) -> tuple[Path, Path, Path]:
+    """npm's global layout under `base` (as `npm i -g @anthropic-ai/claude-code`
+    makes it): (the package folder, <prefix>/bin/claude -> the package's
+    cli.js, which is a copy of fake_claude.py, and a copy of python named node)."""
+    pkg = base / "lib" / "node_modules" / "@anthropic-ai" / "claude-code"
+    pkg.mkdir(parents=True)
+    shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", pkg / "cli.js")
+    (base / "bin").mkdir()
+    (base / "bin" / "claude").symlink_to("../lib/node_modules/@anthropic-ai/claude-code/cli.js")
+    return pkg, base / "bin" / "claude", D.named_python("node")
+
+
+def test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script():
+    """GW-COMPAT-1: an npm-installed Claude Code was never recognized, so no
+    session registered and no gateway dialog could open. npm's package runs
+    its native binary as .../@anthropic-ai/claude-code/bin/claude.exe since
+    2.1.113, and node with cli.js before that: both register on the UI plane
+    and their gateway programs get the agent plane; node running any other
+    script, an option before cli.js, or another program running cli.js, don't."""
+    with D.daemon_env() as de:
+        pkg, shim, node = _npm_layout(de.root / "npm")
+        gate = D.probe_root(de.root)
+        # before 2.1.113: `node <prefix>/bin/claude` (npm's shim; the script a link to cli.js)
+        fc = de.claude(argv=[str(node), str(shim)], session="s-npm-node")
+        st, body = de.probe(fc, gate / "run.py", ["shim", "sudo"], "/agent/vault/status")
+        assert st == 200, body
+        env = de.env.subprocess_env(de.extra_env())
+        r = fc.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "gated", "status"], env=env)
+        out = json.loads(r.stdout)
+        assert out["claude_install"].startswith("npm (node") and out["parent_pid"] == fc.pid, out
+        # since 2.1.113: the native binary at bin/claude.exe
+        native = D.python_at(pkg, "claude.exe")
+        fc2 = de.claude(exe=native, session="s-npm-native")
+        r = fc2.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "gated", "status"], env=env)
+        out = json.loads(r.stdout)
+        assert out["claude_install"] == "npm (its native binary)" and out["parent_pid"] == fc2.pid, out
+        # not Claude Code: node running another script, a node option before
+        # cli.js, cli.js run by another program, a cli.js outside the package
+        other = de.root / "other" / "cli.js"
+        other.parent.mkdir()
+        shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", other)
+        loose = de.root / "loose" / "node_modules" / "claude-code" / "cli.js"
+        loose.parent.mkdir(parents=True)
+        shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", loose)
+        for argv in ([node, other], [node, "-S", shim], [D.named_python("python3"), shim],
+                     [node, loose], [node, os.path.relpath(shim, de.root)]):
+            stranger = de.claude(argv=[str(a) for a in argv], register=False, cwd=de.root)
+            st, body = stranger.http("POST", "/ui/register", {"claude_pid": stranger.pid})
+            assert st == 403 and body["error"] == "exe", (argv, body)
+            r = stranger.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "gated",
+                              "status"], env=env)
+            out = json.loads(r.stdout)
+            assert out["claude_install"] == "" and "parent_pid" not in out and out["parent_exe"], (argv, out)
+            # (named: a hook that names none takes the first Claude Code above it,
+            # which under a test run may be the runner's own)
+            st, body = de.probe(stranger, gate / "run.py", ["hook-session"], "/agent/register",
+                                body={"claude_pid": stranger.pid})
+            assert st == 403 and body["error"] == "exe", (argv, body)
+        assert de.health()["sessions"] == 2

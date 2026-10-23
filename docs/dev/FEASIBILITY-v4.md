@@ -1,3 +1,5 @@
+> Design history: the platform probes behind the v4 plan (Claude Code 2.1.301, 2026-10-19). Developer documentation, not a user guide (see the [README](../../README.md)).
+
 # Native-capability probes (Claude Code 2.1.301 CLI, 2.1.299 types; macOS 25.6; 2026-10-19)
 
 All probes ran in a scratch `CLAUDE_CONFIG_DIR` against a local fake Messages API
@@ -49,7 +51,7 @@ HOME, bash and zsh as `$SHELL`; and 2.1.301's own code):
 | Monitor, plugin monitors and `!`-mode completion use the same shell function as Bash (`Rue(cmd, signal, "bash", ...)`), so the prefix covers them; Monitor isn't offered against the fake API (server-side gate `tengu_amber_sentinel`; neither `CLAUDE_INTERNAL_FC_OVERRIDES` nor a cached feature value enabled it) | code; probe |
 | The script: `source <snap> 2>/dev/null \|\| true && <env-file text>\n: && { shopt -u extglob \|\| setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 \|\| true && { \builtin unalias -- 'unsetenv'; ... } ... && eval '<cmd>' [< /dev/null] && pwd -P >\| <tmp>/claude-XXXX-cwd`; heredocs drop `< /dev/null`; paths are quoted `'...'` with `'"'"'` only when needed; every plugin's `CLAUDE_ENV_FILE` text is inline | recorder |
 | The prefix is joined as `'<prefix>' '<script>'` (split at the prefix's last `" -"` to allow flags) and run by `<shell> -c` (`-l` only without a snapshot); the shell execs it (its parent pid is Claude Code's) | code (`Xfe`), recorder |
-| Exec-form hooks (`command` + `args`) and the organization's hooks are never prefixed; shell-form hooks run as `/bin/sh -c` (spawn shell:true) with the prefix composed into the string; MCP stdio servers started after session start get `prefix "<quoted argv>"` | code; recorder |
+| Exec-form hooks (`command` + `args`) and an organization's managed hooks are never prefixed; shell-form hooks run as `/bin/sh -c` (spawn shell:true) with the prefix composed into the string; MCP stdio servers started after session start get `prefix "<quoted argv>"` | code; recorder |
 | A string-form hook through a `#!/bin/sh` prefix that execs `/bin/sh -c "$1"`: same env and `$0` (`/bin/sh`) except `SHLVL` +1 on macOS (bash as /bin/sh); dash doesn't touch it | recorder diff with and without the prefix |
 | `CLAUDE_CODE_SHELL` set by a mod at `session.start` is honoured (the snapshot became `snapshot-bash-*` for a zsh user): Claude Code picks its shell and makes its snapshot at the first shell use; the system prompt still names `$SHELL` | recorder, request log |
 | Installed plugins' `bin/` folders are on PATH through the snapshot's `export PATH=` line (bare, or `'...'` quoted); a `--plugin-dir` plugin's `bin/` is not | recorder |

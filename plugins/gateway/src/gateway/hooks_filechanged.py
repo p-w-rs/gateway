@@ -3,7 +3,7 @@
 The watch path is registered by SessionStart (watchPaths). On a change:
 validate the form, persist narrowings (consent.ratchet, through
 hooks_session.prepare), and send the user a systemMessage with the errors or
-with what changed since the last version this machine saw (`powerslabs: sudo
+with what changed since the last version this machine saw (`example: sudo
 now ask`), plus which widenings wait for their OK. The last seen version is a
 snapshot of rights in the run dir (form-seen.json, also written by
 SessionStart); without one, the approved rights are the baseline. Unchanged

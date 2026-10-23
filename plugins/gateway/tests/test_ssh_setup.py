@@ -5,13 +5,14 @@ Install and rotate write to the sshd's own authorized_keys through the
 `ssh_authorized_keys` test override (never ~/.ssh)."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
 
 import harness  # noqa: F401
 import harness_ssh as H
-from gateway import ssh, vault
+from gateway import paths, ssh, vault
 
 
 def _approved(s: H.SshEnv, t: H.Sshd, name: str = "box", extra: str = "") -> None:
@@ -22,19 +23,19 @@ def _approved(s: H.SshEnv, t: H.Sshd, name: str = "box", extra: str = "") -> Non
 def test_ssh_setup_resolve() -> None:
     with H.ssh_env() as s:
         t = s.sshd("target")
-        s.write_form(f'[hosts.powerslabs]\naddress = "{t.addr()}"\n\n'
+        s.write_form(f'[hosts.example]\naddress = "{t.addr()}"\n\n'
                      '[accounts.gh]\nkind = "github"\nlogin = "me"\n')
-        r = ssh.resolve(["powerslabs", "uptime"])
-        assert (r["kind"], r["name"], r["by"], r["user"]) == ("host", "powerslabs", "name",
+        r = ssh.resolve(["example", "uptime"])
+        assert (r["kind"], r["name"], r["by"], r["user"]) == ("host", "example", "name",
                                                               H.real_user())
         assert r["addr"] == t.addr()
         r = ssh.resolve([f"{H.real_user()}@127.0.0.1", "-p", str(t.port), "uptime"])
-        assert (r["kind"], r["name"], r["by"]) == ("host", "powerslabs", "address")
+        assert (r["kind"], r["name"], r["by"]) == ("host", "example", "address")
         r = ssh.resolve(["-o", "SendEnv=GIT_PROTOCOL", "git@github.com", "git-upload-pack 'a/b'"])
         assert (r["kind"], r["name"], r["user"]) == ("endpoint", "github.com", "git")
-        r = ssh.resolve(["powerlabs", "x"])
-        assert r["kind"] == "unknown" and r["suggest"] == "powerslabs"
-        assert ssh.resolve(["-F", "/x", "powerslabs"])["kind"] == "refused"
+        r = ssh.resolve(["exmple", "x"])
+        assert r["kind"] == "unknown" and r["suggest"] == "example"
+        assert ssh.resolve(["-F", "/x", "example"])["kind"] == "refused"
         assert ssh.resolve(["localhost", "id"])["kind"] == "local"
         assert ssh.resolve([])["kind"] == "error"
         assert t.accepted() == 0                       # resolving never connects
@@ -213,11 +214,28 @@ def test_ssh_setup_rotate() -> None:
     with H.ssh_env() as s:
         t = s.sshd("target")
         _approved(s, t)
+        # review round 2: `gate rotate`'s copy is taken only when the rotation
+        # is about to change the vault (before_change), never when it fails
+        # first (here: no key of the gateway's on the host yet)
+        calls: list[bytes] = []
+        try:
+            ssh.rotate("box", before_change=lambda: calls.append(paths.vault_path().read_bytes()))
+        except ssh.SshError:
+            pass
+        else:
+            raise AssertionError("a rotation without a key succeeded")
+        assert calls == [], "before_change ran for a rotation that failed first"
         priv, old_pub = s.host("box", t)
         s.set(ssh_authorized_keys=str(t.ak))
         assert s.run("ssh", "box", "echo before").stdout == "before\n"
-        line = ssh.rotate("box")
+        line = ssh.rotate("box", before_change=lambda: calls.append(paths.vault_path().read_bytes()))
         assert "box has a new key (SHA256:" in line and "old one was removed" in line, line
+        # once, just before the vault changed: the vault then held the old key alone
+        assert len(calls) == 1
+        snap = s.root / "before-rotate.age"
+        snap.write_bytes(calls[0])
+        then = json.loads(vault._decrypt(snap).decode())["hosts"]["box"]["keys"]
+        assert [" ".join(k["public"].split()[:2]) for k in then] == [" ".join(old_pub.split()[:2])], then
         keys = s.vault()["hosts"]["box"]["keys"]
         live = vault.live_keys(s.vault()["hosts"]["box"])
         assert len(keys) == 2 and len(live) == 1 and live[0]["public"] != old_pub

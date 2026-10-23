@@ -12,12 +12,15 @@ import {
   formatUptime,
   formatElapsed,
   locate,
+  managedLines,
   managedPlan,
+  noDisplayHere,
   parseDaemon,
   parseManagedState,
   parsePixiVersion,
   parseStatus,
   pixiVerdict,
+  secretLine,
   sessionColumns,
   setupReady,
   shouldProvision,
@@ -153,7 +156,8 @@ describe('gateway daemon', () => {
   test('parses launch.sh gated status|start, and nothing else', () => {
     const d = parseDaemon(`noise\n${JSON.stringify({ ...health, parent_pid: 4242, skew: 'x' })}\n`)!
     expect(d).toEqual({ running: true, version: '0.7.0', epoch: 4, uptime: 59.9, vault: 'unwrapped',
-                        sessions: 1, socket: '/tmp/gw-501/gated.sock', parentPid: 4242, skew: 'x', terminals: 0, jobs: 0 })
+                        sessions: 1, socket: '/tmp/gw-501/gated.sock', parentPid: 4242, skew: 'x', terminals: 0, jobs: 0,
+                        claudeInstall: '', parentExe: '', error: '', message: '', otherConfig: '', platform: '' })
     expect(parseDaemon('gateway: still setting up')).toBeUndefined()
     expect(parseDaemon('{nope')).toBeUndefined()
     expect(parseDaemon(JSON.stringify({ ok: false, running: false }))!.running).toBe(false)
@@ -171,12 +175,39 @@ describe('gateway daemon', () => {
       'Gateway daemon: running (0.7.0, epoch 4, up 59 s, 3 sessions); vault unlocked (its key has a passphrase); a newer gateway daemon (0.9.0) answers')
     expect(daemonLine(parseDaemon('{"ok": false}'))).toBe('Gateway daemon: not running (it starts when a session or tool needs it)')
     expect(daemonLine(undefined)).toContain("can't be asked until setup finishes")
+    // GW-ROB-1: a run folder it can't use is said, with gated's remedy
+    expect(daemonLine(parseDaemon(JSON.stringify({ ok: false, running: false, error: 'run_dir',
+      message: "gateway: the gateway's run folder /tmp/gw-501 belongs to another user; the gateway won't use it; only that user or the machine's administrator can remove it" }))))
+      .toBe("Gateway daemon: can't start: the gateway's run folder /tmp/gw-501 belongs to another user; the gateway won't use it; only that user or the machine's administrator can remove it")
+  })
+  test('a daemon serving another Claude Code configuration is said, not shown as plainly running (review round 2)', () => {
+    const note = 'the gateway daemon running now serves another Claude Code configuration (its data folder is ~/.claude-a/plugins/data/gate-gateway; this one\'s is ~/.claude-b/plugins/data/gate-gateway): ...'
+    const d = parseDaemon(JSON.stringify({ ...health, other_config: note, platform: 'linux' }))!
+    expect(d.otherConfig).toBe(note)
+    expect(d.platform).toBe('linux')
+    expect(daemonLine(d)).toBe(`Gateway daemon: running (0.7.0, epoch 4, up 59 s, 1 session); vault unwrapped (its key has no passphrase); ${note}`)
+    expect(daemonLine(parseDaemon(JSON.stringify(health)))).not.toContain('another Claude Code configuration')
   })
   test('the doctor shows the daemon line', () => {
     const located = locate('/u/.claude/plugins/cache/gateway/gate/0.7.0', 'gate', '/u/.claude')
     const t = doctorText({ pluginVersion: '0.7.0', claude: undefined, surfaces: [], located, status: undefined,
                            daemon: parseDaemon(JSON.stringify({ ...health, vault: 'locked' })) })
     expect(t).toContain('Gateway daemon: running (0.7.0, epoch 4, up 59 s, 1 session); vault locked (its key has a passphrase)')
+  })
+  test('the doctor names how Claude Code was installed, and says when the daemon does not recognize it (GW-COMPAT-1)', () => {
+    const located = locate('/u/.claude/plugins/cache/gateway/gate/0.7.0', 'gate', '/u/.claude')
+    const npm = doctorText({ pluginVersion: '0.7.0', claude: undefined, surfaces: [], located, status: undefined,
+                             daemon: parseDaemon(JSON.stringify({ ...health, claude_install: 'npm (its native binary)', parent_pid: 7 })) })
+    expect(npm).toContain('Claude Code install: npm (its native binary)')
+    expect(npm).not.toContain('not recognized')
+    const other = doctorText({ pluginVersion: '0.7.0', claude: undefined, surfaces: [], located, status: undefined,
+                               daemon: parseDaemon(JSON.stringify({ ...health, claude_install: '', parent_exe: 'bun' })) })
+    expect(other).toContain('Claude Code install: not recognized (the process that asked is bun)')
+    expect(other).toContain('no gateway dialog')
+    // an older gated status without the fields: no line
+    const old = doctorText({ pluginVersion: '0.7.0', claude: undefined, surfaces: [], located, status: undefined,
+                             daemon: parseDaemon(JSON.stringify(health)) })
+    expect(old).not.toContain('Claude Code install')
   })
 })
 
@@ -225,4 +256,49 @@ test('parseManagedState: only a known mode counts; lists keep their well-formed 
   expect(s.env).toEqual([{ name: 'A', origin: '' }])
   expect(s.pending).toEqual(['p'])
   expect(s.vaultReadable).toBe(false)
+  expect(s.found).toEqual([])
+})
+
+test('managedLines: the tool folders found here but not imported (GW-UX-2b)', () => {
+  const st = parseManagedState(JSON.stringify({ mode: 'on', ready: true, bash: '/b', bash_version: '5.2.37', path: [], env: [],
+                                                found: ['/opt/homebrew/bin', '/u/.cargo/bin', 3] }))!
+  expect(st.found).toEqual(['/opt/homebrew/bin', '/u/.cargo/bin'])
+  const lines = managedLines(undefined, st, '', '/u')
+  expect(lines).toContain("  found here but not imported: /opt/homebrew/bin, ~/.cargo/bin (Claude can propose importing them: [shell] import_path, then your OK in the gateway's dialog)")
+  expect(managedLines(undefined, { ...st, found: [] }, '', '/u').some((l) => l.includes('found here'))).toBe(false)
+})
+
+test('secretLine: says before any dialog whether a secret can be typed here (GW-UX-6)', () => {
+  const main = secretLine(['terminal'], false, false)!
+  expect(main).toContain("main screen, so a secret can't be typed into the gateway dialog's field")
+  expect(main).toContain('(/gate-dialog, then Tab and Enter)')
+  expect(main).toContain('Paste leaves the value on your clipboard: clear it yourself')
+  expect(main).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(main).not.toContain('tmux')
+  expect(secretLine(['terminal'], false, true)).toContain('main screen (inside tmux)')
+  expect(secretLine(['terminal'], true, true)).toContain('the fullscreen view')
+  expect(secretLine(['terminal'], undefined, false)).toBe(undefined)
+  expect(secretLine(['desktop'], undefined, false)).toContain('desktop app')
+  expect(secretLine([], false, false)).toBe(undefined)                 // -p: no dialog anyway
+})
+
+test('secretLine: on Linux without a display neither typing nor Paste works on the main screen, and it says what to do (review round 2)', () => {
+  expect(noDisplayHere('linux', undefined, undefined)).toBe(true)
+  expect(noDisplayHere('linux', '', '')).toBe(true)
+  expect(noDisplayHere('linux', ':0', undefined)).toBe(false)
+  expect(noDisplayHere('linux', undefined, 'wayland-0')).toBe(false)
+  expect(noDisplayHere('darwin', undefined, undefined)).toBe(false)
+  expect(noDisplayHere('', undefined, undefined)).toBe(false)              // an older gated: not known
+  const main = secretLine(['terminal'], false, true, true)!
+  expect(main).toContain('neither typing nor Paste can work in this terminal')
+  expect(main).toContain('main screen (inside tmux)')
+  expect(main).toContain('no DISPLAY or WAYLAND_DISPLAY')
+  expect(main).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(main).toContain("from a Claude Code session in this machine's desktop")
+  expect(main).not.toContain('press Paste')
+  const full = secretLine(['terminal'], true, false, true)!
+  expect(full).toContain("the fullscreen view, so the gateway dialog's field takes a click, then keys")
+  expect(full).toContain("Paste from clipboard can't work here")
+  expect(secretLine(['terminal'], undefined, false, true)).toContain("Paste from clipboard can't work")
+  expect(secretLine(['terminal'], true, false, false)).not.toContain('Paste')
 })

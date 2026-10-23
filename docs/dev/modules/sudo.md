@@ -83,11 +83,14 @@ returns why the process counts as started from Claude Code:
   (`is_claude_exe(exe, home)`): basename `claude`, anything under
   `HOME/.local/share/claude/versions/` (the native install names the binary
   by its version), or under `HOME/Library/Application
-  Support/Claude/claude-code/` (the desktop app's bundled copy); `home` is
-  `paths.user_home()` (also compared resolved). The returned reason is that
-  path;
-- an ancestor whose pid is `CLAUDE_PID` (`"CLAUDE_PID"`; covers an npm
-  install, whose executable is `node`, while the variable is there);
+  Support/Claude/claude-code/` (the desktop app's bundled copy), or npm's
+  native binary `.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`;
+  or node running npm's `.../@anthropic-ai/claude-code/cli.js` as its first
+  argument (`is_claude_node`, by argv: an npm install before 2.1.113;
+  together `is_claude_process`); `home` is `paths.user_home()` (also
+  compared resolved). The returned reason is that path;
+- an ancestor whose pid is `CLAUDE_PID` (`"CLAUDE_PID"`, whatever its
+  executable);
 - `UNREADABLE` when the chain can't be read: a parent pid of 0 before pid 1
   (also a parent outside the PID namespace, as under `docker exec`), a loop,
   more than `MAX_DEPTH` levels, or a process whose executable can't be read
@@ -152,7 +155,12 @@ times itself with it (`hooks_session.session_hook`).
    the user to set it to true.`; inside a gateway terminal or job, culprit
    `gateway-terminal`, `ASK_PANE` = `consent.pane_ask_message`: `gateway: a
    gateway terminal or job can't use the "ask" right for sudo on this machine
-   (nobody can be asked about what runs there); ...`).
+   (nobody can be asked about what runs there); ...`). While a passphrase
+   vault is locked (`vault.VaultLocked`) the rights come from the new
+   install's defaults, so a `true` or unsaid sudo here is `"ask"` (fails
+   closed); each of these refusals then ends with
+   `consent.LOCKED_SUDO_NOTE` (unlock it with `/gate-unlock`), as do the
+   approval hook's prompt and job refusal for it.
 3. `-S`/`-A` → refuse, including the long forms `--stdin`/`--askpass` and any
    getopt abbreviation of them (`--std`, `--ask`, `--a`). sudo's options are
    scanned the way sudo does (getopt `+`: stop at the first non-option word;
@@ -263,7 +271,8 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
 1. deny `curl`/`wget` in command position (any stage), also behind
    `command` (not `-v`/`-V`), `builtin`, `busybox`, `env` (`-S` strings are
    split), `nohup`, `nice`, `stdbuf`, `time`, `ionice`, `chrt`, `taskset`,
-   `setsid`, `timeout`, `xargs`, `sudo`, `doas`, `caffeinate` and shell
+   `setsid`, macOS's `arch` (`-arm64`, `-arch NAME`; `_ARCH_VALUE`),
+   `timeout`, `xargs`, `sudo`, `doas`, `caffeinate` and shell
    reserved words (`if`, `then`, `do`, `!`, ...); `_unwrap(argv, fork)`.
    Also `az … get-access-token` for Bash and Monitor (round 2: the az
    stand-in gives tokens only to programs; not for the Terminal panel).
@@ -287,7 +296,10 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
    - **every word** (not just path-looking ones: a bare `key.txt` is a file in
      the working directory) except a command name without `/`, resolved from
      the payload's `cwd` **and every directory a `cd`/`pushd` earlier in the
-     command can move to** (logical and physical spellings, `CDPATH`);
+     command can move to** (logical and physical spellings, `CDPATH`); a
+     wrapper's `env -C`/`--chdir DIR` or `sudo -D DIR` (`_wrapper_chdir`)
+     moves its own command only, not the stages after it, and a target the
+     hook can't know (`env -C "$X"`) isn't followed, like `cd $X`;
    - option values (`--file=PATH`, `-fPATH`) and redirect targets (a write
      into private/ destroys the vault);
    - globs, expanded (real matches, plus a component-wise, case-insensitive
@@ -296,7 +308,12 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
    - recursive readers on a folder that *holds* private/ (`paths.Protected.
      is_parent`): `grep -r/-R` (with no path: the working directory), `rg`,
      `ag`, `ack`, `rsync`, `scp -r`, `cp -r/-a`, `tar`, `zip`, `ditto`, `pax`,
-     `cpio` → `DENY_PRIVATE_TREE`. `ls` with no operand lists `.`.
+     `cpio` → `DENY_PRIVATE_TREE`. `ls` with no operand lists `.`. grep's
+     recursion is read in every spelling: `-r`/`-R` in a cluster, any getopt
+     abbreviation of `--recursive`/`--dereference-recursive` (`--recur`,
+     `--dereference-rec`), and `-d`/`--directories` (or `--dir`) with an action
+     other than `read`/`skip`, glued, clustered (`-id recurse`) or in the next
+     word; a grep's long options must all be known ones or it isn't vouched for.
    The `GIT_TRACE_REDACT` check is on the raw text with quotes and
    backslashes removed (so `=""0`, `=''0`, `=fal"se"`, `=\0` and an empty
    value are caught) and fires even though the assignment prefix makes the
@@ -348,8 +365,33 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
      guardrail, like the prefilter.
 5. allow (only in `auto`/`bypassPermissions`) when every stage is an allowed
    gateway verb on a host with the **effective** right `true`, a `gate`
-   subcommand (`status check login forget rotate why log export import copy-to
-   migrate` — never `with`), or a benign read-only command. Option/target rules:
+   subcommand (`status check login rotate why log export import copy-to
+   migrate scrub` — never `with`, nor `forget`, which deletes stored secrets
+   with no dialog and no backup: the reviewer or a prompt decides), or a
+   benign command (`cd pwd echo printf true : test [ ls cat head tail wc grep
+   sort uniq date sleep`). The ones that read (`pwd test [ ls cat head tail wc
+   grep sort uniq`, `BENIGN_READERS`) only when everything they may read
+   (`_read_operands`: every operand and option value; grep's pattern left out
+   only when it can be told apart) is a plain file of the project
+   (`CLAUDE_PROJECT_DIR`, else the cwd; not `/`, the home folder or above it)
+   or a temp folder (the scp rule's; never a path in the home folder):
+   resolved inside one, no hidden or credential-like name below it
+   (`_CRED_NAME`: `.env*`, `*.pem`, `*.key`, `id_*`, `*credentials*`,
+   `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `krb5cc*`, `*secret*`, `*token*`,
+   `*.p12/.pfx/.ppk/.jks/.keystore/.p8/.keytab/.kdbx/.gpg/.ovpn/.age`,
+   `*_rsa/_dsa/_ed25519/_ecdsa`, `passwords*.txt`, `*.tfstate*`, `*.tfvars`,
+   `kubeconfig*`, `service-account*.json`), not in a credential folder
+   (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`,
+   `~/.claude`, the Claude config folder and the gateway's home; a project in
+   one doesn't count, in any letter case); with no path operand the cwd (or
+   stdin) must be in the project or a temp folder; a recursive grep's whole
+   tree must hold nothing hidden or credential-like, each symlink in it
+   pointing at a plain file too (at most `READ_TREE_MAX` entries); `wc
+   --files0-from` never; and no allow at all when a wrapper changed the
+   command's directory (`env -C`/`--chdir`, `sudo -D`), since the file is read
+   from there, not the stage's cwd (`_reads_plain`, GW-UX-1). Such an
+   all-benign command gets its own reason
+   (`READ_ALLOW`), not "host/account rights". Option/target rules:
    sudo (`-u/-g/-H`, `-n` tolerated, no `-S/-A/-E`/long opts, command not in the
    destructive list — see below); ssh (safe option set only, every target
    resolving to a form host); scp/sftp/rsync (`_scan_transfer`, round 1):
@@ -384,8 +426,9 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
    be known (`cd -`, `cd $D`, `popd`); `sort` with `-o` or any long option
    (`--output`, `--compress-program` runs a program; long options abbreviate);
    `uniq` with a second operand (its output file); `grep -R` /
-   `--dereference-recursive` (follows symlinks met while recursing, which
-   the path checks can't see; `grep -r` doesn't).
+   `--dereference-recursive` / BSD grep's `-S` (follow symlinks met while
+   recursing, which the path checks can't see; `grep -r` doesn't), or a grep
+   with an unknown long option (an abbreviation could be `--recursive`).
 6. otherwise no decision.
 
 For the user's Terminal panel, a command with a `#` is also judged (steps
@@ -416,9 +459,17 @@ list must hold against the natural ways of writing those commands
   `su`, `runuser`, a nested `sudo`/`sudoedit`/`doas`/`pkexec`; `xargs` and
   `parallel` (arguments from stdin); `at`/`batch` (commands from stdin);
   `env -S`/`--split-string` (and any long `env` option); `find` with
-  `-exec/-execdir/-ok/-okdir/-delete`.
-- **Assignments**: `sudo VAR=value CMD` and `sudo env VAR=value CMD` are not
-  vouched for, like a shell assignment prefix (`PATH=`, `LD_PRELOAD=`).
+  `-exec/-execdir/-ok/-okdir/-delete`; and the tracers, sandboxes and
+  wrappers that exec a command (`_EXEC_RUNNERS`: sshpass, strace, ltrace,
+  dtruss, flock, script, unbuffer, chroot, tmux, screen, ssh-agent, nsenter,
+  setarch, catchsegv, proot, fakeroot) as the program itself, the command's
+  first word or a word by its path (`sudo strace -f make`), never as a plain
+  operand (`sudo apt install tmux strace` keeps its allow). macOS's `arch`
+  is looked through like `nice` (`sudo arch -arm64 make install` is judged
+  as `make install`).
+- **Assignments**: `sudo VAR=value CMD`, `sudo env VAR=value CMD` and `sudo
+  arch -e VAR=value CMD` are not vouched for, like a shell assignment prefix
+  (`PATH=`, `LD_PRELOAD=`).
 - **Dangerous targets** (for `rm -r` and `chmod/chown/chgrp -R`): `/`, `~`,
   `~user`, `~+`, `$HOME`, a home directory, or any top-level directory
   (`/usr`, `/Users`, `/tmp`, macOS's `/private/etc|var|tmp`), spelled
@@ -470,8 +521,8 @@ runs first so a narrow-then-raise within one session still needs the user's OK.
   pipe (`echo 'rm -rf /' | sudo bash`), both hidden from the list
   (verification 2026-10). The classifier judges them instead.
 - **`sudo curl`**, `command curl`, `busybox wget` and other wrapped spellings
-  are denied like `curl` (round 1); the org's managed `Bash(curl *)` ask rule
-  still applies to whatever the hook doesn't decide.
+  are denied like `curl` (round 1); an organization's managed `Bash(curl *)` ask
+  rule, where there is one, still applies to whatever the hook doesn't decide.
 - **scp/sftp/rsync on an "ask" right are denied, not asked** (round 1): the
   stand-in would refuse after the prompt (only a command Claude typed gets an
   "ask" right), so the hook says so first. The user's Terminal panel, which
@@ -530,7 +581,8 @@ under `passwd_tries=1`, the stderr relay and its scrubbing, `--stdin` /
 `--askpass` and option scanning); fixtures in `tests/harness_sudo.py`
 (including `OneTryFakeSudo`, a fake sudo that gives up after one wrong
 password, and the checkpoint-runner imitations). Security properties are
-mutation-checked in `tests/mutations_sudo.py` (158 mutations on 2026-10-19, all killed;
+mutation-checked in `tests/mutations_sudo.py` (158 mutations on 2026-10-19, 208 in
+0.10.0's working tree; counts per run in [TEST-LOG.md](../TEST-LOG.md);
 the hook's remote-sudo ones are in `tests/mutations_e2e.py`); the group's
 tests are 111 across 10 modules. The
 askpass **euid-0** refusal is not mutation-checked because it can't be
@@ -607,7 +659,7 @@ being allowed;
 | finding | fix | tests / mutations |
 |---|---|---|
 | (MEDIUM) `sudo visudo`, `sudo vipw`, `sudo vigr` were allowed: no word names `/etc/sudoers`, yet SPEC 8 keeps editing sudoers off the allow list | `_PRIV_EDITORS` in `_is_destructive` (by basename, so a path or a wrapper such as `sudo nice visudo` is caught) | `test_hookbash_destructive::test_sudoers_and_user_database_editors_are_never_vouched_for`; 2 mutations |
-| (MEDIUM) a background command's raw output tail reached Claude in Claude Code's "waiting for interactive input" notice | **the deny is rolled back (see "Rolled back"; the prompt hook stays)**: with a vault, `run_in_background: true` needed `_monitor_scrubbed(segs, stderr=True)`: every top-level segment ends with the bare `gate scrub` and every stage before it sends stderr along (`2>&1` or `2>FILE`; a loop's closing `done 2>&1 \| gate scrub`); `DENY_BACKGROUND` says how and how to see a failure (`if CMD; then echo ok; else echo "Exit code $?"; fi 2>&1 \| gate scrub`); `pre_bash.sh` passes every such call. A foreground command Claude Code moves to the background is left to the UserPromptSubmit hook (docs/modules/ux.md) | `test_hookbash_round4`; 3 mutations |
+| (MEDIUM) a background command's raw output tail reached Claude in Claude Code's "waiting for interactive input" notice | **the deny is rolled back (see "Rolled back"; the prompt hook stays)**: with a vault, `run_in_background: true` needed `_monitor_scrubbed(segs, stderr=True)`: every top-level segment ends with the bare `gate scrub` and every stage before it sends stderr along (`2>&1` or `2>FILE`; a loop's closing `done 2>&1 \| gate scrub`); `DENY_BACKGROUND` says how and how to see a failure (`if CMD; then echo ok; else echo "Exit code $?"; fi 2>&1 \| gate scrub`); `pre_bash.sh` passes every such call. A foreground command Claude Code moves to the background is left to the UserPromptSubmit hook (docs/dev/modules/ux.md) | `test_hookbash_round4`; 3 mutations |
 
 ### Rolled back (2026-10-19, lead decision)
 
@@ -617,7 +669,7 @@ The gateway must not change how Claude's ordinary commands run (DECISIONS,
 | removed | was | now |
 |---|---|---|
 | Monitor rule (round 3) | `DENY_MONITOR` unless every top-level segment ended in the bare `gate scrub` (`_monitor_scrubbed`, `_ends_in_scrub`, `_head`, `_OPENERS`, `_MONITOR_QUIET`) | Monitor is judged like Bash; its lines reach no output hook (known limit); `gate scrub` stays an allowed, optional filter |
-| background rule (round 4) | `DENY_BACKGROUND` for `run_in_background: true` unless output and errors went through `gate scrub` (`_stderr_handled`) | judged like Bash; Claude Code's raw "waiting for input" notice is left to the prompt hook (docs/modules/ux.md), the task file stays raw (known limit) |
+| background rule (round 4) | `DENY_BACKGROUND` for `run_in_background: true` unless output and errors went through `gate scrub` (`_stderr_handled`) | judged like Bash; Claude Code's raw "waiting for input" notice is left to the prompt hook (docs/dev/modules/ux.md), the task file stays raw (known limit) |
 | pre_bash.sh's always-to-Python cases | every Monitor and background call went to Python | the word list decides for every call |
 
 `hooks_bash.main` is the former `_main` (the decision order above, nothing
@@ -665,7 +717,7 @@ the gateway entirely.
 | (LOW, follow-up) a caller with no culprit to name (`?`: no `CLAUDE_PID`, the walk reached init, as for a job still running after its session ended) was "sudo started by ? got no password" here and "ssh started by a script" in the ssh stand-in | `ancestry.UNTRACED` / `UNTRACED_WHO`: local sudo (`sudo.not_direct_who`), ssh and remote sudo (`ssh._direct`), the account CLIs and asiml all say "a program the gateway can't trace back to Claude (such as a job still running after its session ended)" | `test_sudo_standin::test_not_direct_untraced_caller_is_named_as_such` (a real tree re-parented away from the test, as an orphaned job is), `test_ssh_exec::test_ssh_exec_scripts_and_ancestry` (ssh and remote sudo), `test_accounts_clis::test_gh_not_direct_refused_unless_scripts`, `test_accounts_asiml::test_asiml_not_direct_refused_unless_scripts`; wording, no mutation |
 
 What `job_tail`, `job_status` and `job_stop` return passes the output hooks
-like Bash output (integration review; docs/modules/ux.md, "Checkpoint job
+like Bash output (integration review; docs/dev/modules/ux.md, "Checkpoint job
 results"). Known limit: a `job_stop` that fails (`stop_failed`, an MCP error
 result with the last log lines) only gets the PostToolUseFailure warning,
 like a failed Bash command.
@@ -674,7 +726,7 @@ like a failed Bash command.
 
 | requirement | how | tests / mutations |
 |---|---|---|
-| no blanket NOPASSWD advice anywhere | the passwordless installer (local and remote, its root script, gate check's choice that offered it, the sudoers test overrides) is removed; every message and doc that recommended a sudoers rule is reworded | `test_sudo_nopasswd::test_no_blanket_passwordless_sudo_advice_anywhere` (scans src, hooks, skills, commands, README, docs/modules, CAPABILITIES); `test_gate_check_offers_to_store_or_ask_and_never_a_sudoers_rule` |
+| no blanket NOPASSWD advice anywhere | the passwordless installer (local and remote, its root script, gate check's choice that offered it, the sudoers test overrides) is removed; every message and doc that recommended a sudoers rule is reworded | `test_sudo_nopasswd::test_no_blanket_passwordless_sudo_advice_anywhere` (scans src, hooks, skills, commands, README, docs/dev/modules, CAPABILITIES); `test_gate_check_offers_to_store_or_ask_and_never_a_sudoers_rule` |
 | passwordless sudo only when already configured | `probe_nopasswd` (`sudo -n true`): when it works, nothing is stored or asked; gate check skips the step | `test_passwordless_sudo_already_configured_is_used_and_nothing_is_asked` |
 | per-call password via the dialog, remember or not | gate check offers "Store the sudo password" (`SUDO_STORE`) or "Ask me each time a command needs it" (`SUDO_ASK`, `vault.sudo_choice` = `ask`); a command's sudo dialog has Remember it, ticked (unticked: used for that command, never stored); a stored password is kept as it is | `test_gate_check_store_choice_is_remembered`, `test_a_stored_password_is_used_as_it_is_without_a_choice`, `test_gate_check_remote_offers_store_or_ask`; `test_sudo_standin::test_missing_password_pop_up_stores_it_and_stale_opens_one_reentry` |
 | a sudoers that wants a terminal (requiretty, use_pty) | sudo's own words (`NEEDS_TTY`) after a relayed password → `NEEDS_TTY_MSG`: run it in a gateway terminal (`terminal_open` + `terminal_send`), where sudo has a tty and its prompt opens the credential dialog (terminals.md) | `test_a_sudoers_that_wants_a_terminal_points_to_a_gateway_terminal` |

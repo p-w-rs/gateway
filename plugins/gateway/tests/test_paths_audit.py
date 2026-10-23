@@ -59,7 +59,7 @@ def test_run_dir_mode_and_type_checks():
         try:
             paths.run_dir()
         except paths.PathError as e:
-            assert "readable by others" in str(e)
+            assert "open to other users" in str(e) and f"chmod 700 {r}" in e.remedy, (e, e.remedy)
         else:
             raise AssertionError("a 0755 run dir must be refused")
         os.chmod(r, 0o700)
@@ -69,11 +69,43 @@ def test_run_dir_mode_and_type_checks():
         try:
             paths.run_dir()
         except paths.PathError as e:
-            assert "not a directory" in str(e)
+            assert "not a folder of its own" in str(e) and f"rm {alt}" in e.remedy, (e, e.remedy)
         else:
             raise AssertionError("a symlinked run dir must be refused")
         env.o.run = env.root / "fresh-run"
         assert stat.S_IMODE(paths.run_dir().stat().st_mode) == 0o700
+
+
+def test_a_run_dir_others_could_write_to_is_removed_never_chmodded():
+    """Review round 2 (must-fix): a run folder group or others can write to
+    was refused with "run chmod 700 DIR, then try again". Another user may
+    have bound a gated.sock (or an ssh ControlMaster socket) in it while it
+    was open, and a chmod keeps that: the gateway would then talk to it. Such
+    a folder is to be removed once nothing uses it (the gateway makes a new
+    one); chmod 700 stays the remedy only for read/search-only bits."""
+    with H.gateway_env() as env:
+        r = paths.run_dir()
+        for mode in (0o777, 0o775, 0o757, 0o730, 0o702, 0o1777):
+            os.chmod(r, mode)
+            try:
+                paths.run_dir()
+            except paths.PathError as e:
+                assert "writable by other users" in str(e) and f"{stat.S_IMODE(mode):o}" in str(e), e
+                assert "chmod" not in e.remedy.replace("don't just chmod it", ""), (oct(mode), e.remedy)
+                assert f"rm -rf {r}" in e.remedy and "no Claude Code session" in e.remedy \
+                    and "gated" in e.remedy and "makes a new one" in e.remedy, e.remedy
+            else:
+                raise AssertionError(f"a {mode:o} run dir must be refused")
+        for mode in (0o755, 0o750, 0o705, 0o711):
+            os.chmod(r, mode)
+            try:
+                paths.run_dir()
+            except paths.PathError as e:
+                assert e.remedy == f"run chmod 700 {r}, then try again", (oct(mode), e.remedy)
+            else:
+                raise AssertionError(f"a {mode:o} run dir must be refused")
+        os.chmod(r, 0o700)
+        assert paths.run_dir() == r
 
 
 def test_data_dir_precedence():
@@ -365,3 +397,68 @@ def test_last_refusal_is_per_session():
                 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
             else:
                 os.environ["CLAUDE_CODE_SESSION_ID"] = old
+
+
+def test_an_unusable_run_dir_is_reported_with_its_reason_and_remedy():
+    """GW-ROB-1: a run folder another user made first, a link or one open to
+    others stopped the stand-ins with "failed unexpectedly (PathError)",
+    `gate status` said the daemon "starts when needed" and /gate-doctor knew
+    nothing. Each now says what is wrong and what to do. (A test override
+    makes its run folder 0700 again in every process, and no other user's
+    folder can be made here: a link stands in for the squatted folder.)"""
+    import json
+    import shutil
+    import subprocess
+    with H.gateway_env() as env:
+        r = env.root / "run"
+        real = env.root / "real-run"
+        shutil.rmtree(r)
+        real.mkdir(mode=0o700)
+        r.symlink_to(real)
+        # a wrapped vault key: every vault read goes to the daemon, at the run folder
+        paths.ensure_private()
+        paths.wrapped_key_path().write_text("not a real key\n")
+        paths.vault_path().write_bytes(b"not a real vault\n")
+        sub = env.subprocess_env({"GATEWAY_TEST_RUN": ""})
+        p = subprocess.run([*H.entry_cmd(env), "shim", "gh", "api", "user"], capture_output=True,
+                           text=True, timeout=60, env=sub, cwd=str(env.root))
+        assert p.returncode == 1 and "failed unexpectedly" not in p.stderr, p.stderr
+        assert f"gateway: gh can't run: the gateway's run folder {r} is not a folder of its own" \
+            in p.stderr and f"rm {r}" in p.stderr and "Tell the user" in p.stderr, p.stderr
+        # review round 2: the ssh, scp and sftp stand-ins gave the reason without the remedy
+        env.write_form('[hosts.box]\naddress = "tester@10.1.2.3:2222"\nssh = true\n')
+        p = subprocess.run([*H.entry_cmd(env), "shim", "ssh", "box", "true"], capture_output=True,
+                           text=True, timeout=60, env=sub, cwd=str(env.root))
+        assert p.returncode != 0 and f"gateway: ssh can't run: the gateway's run folder {r} " \
+            "is not a folder of its own" in p.stderr and f"rm {r}" in p.stderr \
+            and "Tell the user" in p.stderr, (p.returncode, p.stderr)
+        # scp and sftp reach the run folder through the ssh stand-in they run;
+        # their own handler is the same one (in process: a PathError from the copy)
+        import contextlib
+        import io
+        from gateway import ssh
+
+        def copy(tool, argv):
+            raise paths.PathError(f"the gateway's run folder {r} is not a folder of its own",
+                                  f"remove it (rm {r}) and try again")
+        saved = ssh._copy
+        ssh._copy = copy
+        try:
+            for tool in ("scp", "sftp"):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = ssh.main(tool, ["box:/x", "."])
+                assert rc != 0 and err.getvalue().startswith(
+                    f"gateway: {tool} can't run: the gateway's run folder {r} is not a folder of its "
+                    f"own; remove it (rm {r}) and try again. Tell the user."), (tool, err.getvalue())
+        finally:
+            ssh._copy = saved
+        p = subprocess.run([*H.entry_cmd(env), "gate", "status"], capture_output=True, text=True,
+                           timeout=60, env=sub, cwd=str(env.root))
+        assert f"Gateway daemon: can't start: the gateway's run folder {r} is not a folder" in p.stdout \
+            and "starts when needed" not in p.stdout, (p.stdout, p.stderr)
+        for sub_cmd, rc in (("status", 0), ("start", 1)):
+            p = H.run_py(env, "--test", "gated", sub_cmd, extra_env={"GATEWAY_TEST_RUN": ""})
+            out = json.loads(p.stdout)
+            assert p.returncode == rc and out["ok"] is False and out["error"] == "run_dir" \
+                and f"rm {r}" in out["message"] and "Traceback" not in p.stderr, (p.stdout, p.stderr)

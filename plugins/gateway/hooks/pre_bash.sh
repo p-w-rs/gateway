@@ -25,7 +25,7 @@
 # This is a text prefilter, not a boundary: symlinks and computed names can
 # strip every trigger word from a command (`tar c /tmp/alias-of-config`). The
 # private-folder deny is a guardrail for a cooperative model; see
-# docs/modules/sudo.md.
+# docs/dev/modules/sudo.md.
 #
 # Monitor calls and Bash calls with run_in_background go by the same word
 # list: the gateway doesn't change how Claude's ordinary commands run
@@ -39,7 +39,7 @@ set -u 2>/dev/null || true
 case $0 in */*) dir=${0%/*} ;; *) dir=. ;; esac   # dirname, without a process
 payload=$(cat 2>/dev/null) || exit 0
 
-# Managed execution (PLAN-v4 phase 4, docs/modules/managed.md): in managed
+# Managed execution (PLAN-v4 phase 4, docs/dev/modules/managed.md): in managed
 # mode Bash and Monitor run in the gateway's managed bash through
 # CLAUDE_CODE_SHELL_PREFIX, which the mod sets to hooks/gate-sh at session
 # start. When it isn't this plugin's gate-sh (mods off, Claude Code older

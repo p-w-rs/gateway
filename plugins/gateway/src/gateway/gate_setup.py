@@ -1157,8 +1157,42 @@ def forget(name: str, what: str | None) -> int:
         _out(f"gateway: nothing stored for {real}" + (f" ({what})" if what else ""))
         return 0
     audit.log("forget", entry=real, what=what or "all")
-    _out(f"gateway: forgot {', '.join(gone)} for {real}")
+    _out(f"gateway: forgot {', '.join(gone)} for {real}" + _older_copies_note())
     return 0
+
+
+def _older_copies_note() -> str:
+    """For `gate forget`, which keeps no copy (forgetting means gone): the
+    older copies of the vault in private/backups that may still hold what
+    was forgotten (gate rotate's, an import's backup, the 0.6 conversion's),
+    and how the person deletes them (in their own terminal: Claude's tools
+    can't reach the private folder). "" when there are none."""
+    try:
+        found = vault.older_copies()
+    except Exception:  # noqa: BLE001 - a note, never a failure
+        return ""
+    if not found:
+        return ""
+    names = [n for _g, ns in found for n in ns]
+    shown = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
+    d = paths.describe(paths.backups_dir())
+    return (f". Older copies of the vault in {d} ({shown}: from gate rotate, an import or the "
+            "0.6 conversion) may still hold it; to remove it from them too, the user deletes "
+            f"them in their own terminal: cd {d} && rm -r {' '.join(g for g, _ns in found)}")
+
+
+def _snapshot() -> str:
+    """vault.snapshot("rotate") just before `gate rotate` changes the vault
+    (ssh.rotate's before_change, under the vault's lock), and where it is,
+    for its output (a failed copy doesn't stop the rotation)."""
+    try:
+        p = vault.snapshot("rotate")
+    except (OSError, vault.VaultError) as e:
+        return f"no copy of the vault could be kept first ({type(e).__name__})"
+    if p is None:
+        return "there was no vault to keep a copy of"
+    return (f"the vault from before is kept in {paths.describe(p)} (encrypted; the newest "
+            f"{vault.SNAPSHOT_KEEP} such copies are kept)")
 
 
 def remembered_host_keys(rec: dict[str, Any]) -> list[str]:
@@ -1178,15 +1212,25 @@ def rotate(name: str) -> int:
     if real not in form.hosts or form.hosts[real].is_local:
         _err(f"gateway: {real} isn't a remote host; gate rotate gives a host a new key")
         return 2
+    # the copy only once the rotation is about to change the vault: not when
+    # it fails before (the host not set up: no gateway key, not approved),
+    # so such failures never push older copies out
+    kept: list[str] = []
+    ssh = _ssh()
     try:
-        line = _ssh().rotate(real)
+        line = ssh.rotate(real, before_change=lambda: kept.append(_snapshot()))
     except NotImplementedError:
         _err("gateway: `gate rotate` isn't available in this build yet")
         return 2
     except popup.StillOpen:
         return popup.EX_TEMPFAIL
+    except ssh.SshError as e:            # its own words (before: "gate rotate failed (SshError)")
+        if not e.printed:
+            _err(formmod.strip_unsafe(e.message))
+        return e.code or 1
     audit.log("rotate", entry=real)
-    _out(formmod.strip_unsafe(str(line or f"gateway: {real} has a new key")))
+    _out(formmod.strip_unsafe(str(line or f"gateway: {real} has a new key"))
+         + (f"; {kept[0]}" if kept else ""))
     return 0
 
 

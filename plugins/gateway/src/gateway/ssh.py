@@ -53,7 +53,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import accounts, ancestry, audit, consent, paths, testing, vault
 from . import form as formmod
@@ -551,7 +551,9 @@ def main(tool: str, argv: list[str]) -> int:
             return _copy(tool, list(argv))
     except SshError as e:
         return _refuse(tool, None, e)
-    except (vault.VaultError, paths.PathError) as e:   # their messages hold no secret
+    except paths.PathError as e:       # the run folder: its reason and remedy (GW-ROB-1), a path only
+        return _refuse(tool, None, f"gateway: {tool} can't run: {paths.explain(e)}. Tell the user.")
+    except vault.VaultError as e:      # its message holds no secret
         return _refuse(tool, None, f"gateway: {tool} can't run: {e}; run gate status")
     except OSError as e:
         return _refuse(tool, None, f"gateway: {tool} failed ({type(e).__name__}); try again, "
@@ -639,7 +641,7 @@ def _form_host_behind(argv: list[str], form: formmod.Form) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Policy (PLAN-v4 phase 7, docs/modules/policy.md): what the call does on the
+# Policy (PLAN-v4 phase 7, docs/dev/modules/policy.md): what the call does on the
 # host, each action decided on its own (a read never implies exec), with the
 # rule behind a refusal
 # ---------------------------------------------------------------------------
@@ -976,7 +978,7 @@ def host_check(name: str, *rights: str) -> dict[str, Any]:
 
 
 def _sudo_note(name: str, user: str) -> str:
-    """The sudo pop-up's honest caveat (docs/modules/ssh.md, residual risk)."""
+    """The sudo pop-up's honest caveat (docs/dev/modules/ssh.md, residual risk)."""
     return (f"While sudo uses it, commands Claude runs on {name} could read it. Untick Remember "
             "it to use it for this command only.")
 
@@ -1819,10 +1821,13 @@ def close_masters(name: str) -> int:
     return n
 
 
-def rotate(name: str) -> str:
+def rotate(name: str, before_change: Callable[[], Any] | None = None) -> str:
     """Rotate a host's key (SPEC 15): new key, installed with the current one,
     verified alone, the old authorized_keys lines removed, the old keys
-    retired in the vault. Returns a status line; raises SshError."""
+    retired in the vault. Returns a status line; raises SshError.
+    before_change runs once, under the vault's lock, just before the first
+    change to the vault (`gate rotate` keeps its copy of the vault there),
+    never when the rotation fails before (no key, an unusable link)."""
     st = _load()
     link = _build_link(name, st)
     rec = (st.data.get("hosts") or {}).get(name) or {}
@@ -1830,6 +1835,8 @@ def rotate(name: str) -> str:
     priv, pub = vault.generate_ssh_key(_key_comment(name, st.data))
     new = vault.key_record(priv, pub)
     with vault.edit() as d:
+        if before_change is not None:
+            before_change()
         vault.host_record(d, name)["keys"].append(new)
 
     def drop_new() -> None:

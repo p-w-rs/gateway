@@ -1,4 +1,4 @@
-"""The managed shell (PLAN-v4 phase 4; docs/modules/managed.md).
+"""The managed shell (PLAN-v4 phase 4; docs/dev/modules/managed.md).
 
 In managed mode (`[shell] managed = "on"`, the default, or "warn") the
 gateway mod sets CLAUDE_CODE_SHELL_PREFIX to the shipped `hooks/gate-sh` at
@@ -391,6 +391,7 @@ def state_dict(eff: Any, *, vault_readable: bool = True, prefix: Path | None = N
         "env": [{"name": n, "origin": o} for n, o in env_plan(eff)],
         "pending": pending,
         "vault_readable": vault_readable,
+        "found": found_not_imported(eff),
         "written": time.time(),
     }
 
@@ -525,6 +526,10 @@ def status_lines(eff: Any) -> list[str]:
     pend = [c.render() for c in getattr(eff, "pending", []) if c.entry == "settings"]
     if pend:
         out.append("  waiting for your OK: " + "; ".join(pend) + " (gate check settings)")
+    found = found_not_imported(eff)
+    if found:
+        out.append("  found here but not imported: " + ", ".join(found) + " (add them to [shell] "
+                   "import_path, or ask Claude to; each needs your OK in the gateway's dialog)")
     if st and st.get("vault_readable") is False:
         out.append("  the vault was locked when these were written, so approved imports were "
                    "left out; they apply after /gate-unlock")
@@ -701,6 +706,53 @@ def path_entries(texts: list[tuple[str, str]], home: str, isdir: Any) -> list[di
                 d = expand(w)
                 if d:
                     add(d, f"{label} line {i}")
+    return out
+
+
+# Tool folders this machine has that the managed PATH lacks (GW-UX-2b): the
+# session context proposes importing them while the form has no [shell]
+# import_path at all (an explicit `import_path = []` says no), and
+# /gate-doctor and `gate status` list them. Nothing is imported by finding:
+# an import is a form edit and the consent dialog, as always.
+FOUND_MAX = 8
+_FOUND_SAFE = re.compile(r"[A-Za-z0-9._+@/~-]{1,200}")
+_FOUND_SKIP = ("/System/", "/Library/Apple/", "/usr/libexec/")
+
+
+def found_not_imported(eff: Any) -> list[str]:
+    """Folders (~ for the home) that hold programs and that a login shell
+    puts on PATH (login_path_entries) or a well-known toolchain installs
+    into (TOOLCHAIN_DIRS), minus the system folders, the macOS system ones,
+    what is imported and the gateway's own folders; at most FOUND_MAX, names
+    of plain characters only (they go into Claude's context). Reads files
+    and lists folders only, like host_inspect."""
+    imported = set(eff.shell.import_path) if getattr(eff, "shell", None) is not None else set()
+    gw_home, gw_data = _gateway_home_names()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def consider(d: str) -> None:
+        d = os.path.normpath(d)
+        if d in seen or len(out) >= FOUND_MAX:
+            return
+        seen.add(d)
+        if d in SYSTEM_DIRS or d in imported or d.startswith(_FOUND_SKIP) \
+                or d.startswith((gw_home, gw_data)):
+            return
+        t = _tilde(d)
+        if not _FOUND_SAFE.fullmatch(t) or ".." in t.split("/") or not os.path.isdir(d):
+            return
+        if _tools_in(Path(d)):
+            out.append(t)
+    with contextlib.suppress(Exception):
+        for e in login_path_entries():
+            if e.get("exists"):
+                consider(e["dir"])
+    with contextlib.suppress(Exception):
+        for _name, pats in TOOLCHAIN_DIRS:
+            for pat in pats:
+                for d in _glob_dirs(pat):
+                    consider(str(d))
     return out
 
 

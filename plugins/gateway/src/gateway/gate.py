@@ -169,10 +169,15 @@ def render_status(form: formmod.Form, eff: consent.Effective, data: dict[str, An
                                                         "version)" if (data or {}).get("form_last_good")
                                                         else ")"))
         else:
-            # A fresh install: nothing was ever there to go missing.
+            # A fresh install: nothing was ever there to go missing. This
+            # computer's sudo as it applies now ("ask" on a new install, true
+            # on one an older gateway set up).
+            lh = eff.hosts.get("localhost")
+            r = lh.sudo if lh is not None else False
+            sudo = "sudo asks each time" if r == "ask" else ("sudo on" if r is True else "sudo off")
             lines.append("No gateway.toml yet: the gateway creates it at the next session start "
                          "(or ask Claude to add a host or account, which creates it); until then "
-                         "only this computer's defaults apply (sudo on)")
+                         f"only this computer's defaults apply ({sudo})")
     lines.append("Hosts")
     hw = max([len(n) for n in eff.hosts] + [8]) + 3
     for e in eff.hosts.values():
@@ -381,6 +386,8 @@ def daemon_line() -> str:
     try:
         from .daemon import client
         h = client.health(timeout=1.0)
+    except paths.PathError as e:
+        return f"Gateway daemon: can't start: {paths.explain(e)}; {key}"
     except Exception:  # noqa: BLE001
         h = None
     if h is None:
@@ -388,11 +395,13 @@ def daemon_line() -> str:
             ("; locked until it runs and is unlocked" if mode == "wrapped" else "")
     state = str(h.get("vault") or "?")
     from .daemon import plugin_version, skew_text
+    from .daemon.planes import other_config_note
     theirs = formmod.safe(str(h.get("version"))) or "?"
     skew = skew_text(theirs, plugin_version()) if theirs != "?" else ""
+    other = other_config_note(h)          # a second Claude Code configuration (review round 2)
     return (f"Gateway daemon: running ({theirs}, epoch "
             f"{int(h.get('epoch') or 0)}, up {_ago(float(h.get('uptime') or 0))}); vault {state}"
-            + (f"; {skew}" if skew else ""))
+            + (f"; {skew}" if skew else "") + (f"; {other}" if other else ""))
 
 
 def lock_cmd(args: list[str]) -> int:

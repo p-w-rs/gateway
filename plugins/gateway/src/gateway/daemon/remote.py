@@ -1,6 +1,6 @@
 """Remote hosts in gated: the managed remote runtime (PLAN-v4 phase 6).
 
-docs/modules/remote.md has the whole picture; in short:
+docs/dev/modules/remote.md has the whole picture; in short:
 
 - **Connection**: the gateway's own ssh (ssh.py / ssh_conf.py: the host's key
   from the vault, its pinned host keys, the per-host ControlMaster shared with

@@ -434,8 +434,8 @@ LOCKD="$ENVD.building"
 
 # A stable id for this machine, written into the build lock's owner so a lock
 # can be judged "another host" only across machines, never across network
-# names. uname -n follows the DHCP domain on macOS (Joshuas-MBP.home one
-# minute, Joshuas-MacBook-Pro.local the next), which made a killed build on
+# names. uname -n follows the DHCP domain on macOS (Example-MBP.home one
+# minute, Example-MacBook-Pro.local the next), which made a killed build on
 # this machine look like one on another and stall for 30 minutes. A real
 # machine id (Linux /etc/machine-id, macOS IOPlatformUUID) is stable across
 # networks and reboots, so after a reboot the recorded builder is simply gone

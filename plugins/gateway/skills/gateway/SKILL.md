@@ -1,6 +1,6 @@
 ---
 name: gateway
-description: How Claude works with the gateway plugin - adding or changing hosts and accounts in ~/.config/gateway/gateway.toml (only when the user asks), running gate check while the user is present, reading gate status, handling "dialog still open" (exit 75) and refusals (gate why), choosing accounts (GATE_ACCOUNT), Azure and API keys through the http tool, the ML Catalog (asiml), gate with, import-ssh, export / import / copy-to, the managed shell your commands run in ([shell] imports, host_inspect, "managed shell unavailable"), and what the gateway does to checkpoint jobs (job_start), and remote terminals and jobs (host, host_runtime). Use when the user asks to add, change, remove, export or copy a machine or account, wants one of their own tools or variables in your shell, or when a gateway message mentions gate check, the gateway dialog, GATE_ACCOUNT, the managed shell or a refusal.
+description: How Claude works with the gateway plugin - adding or changing hosts and accounts in ~/.config/gateway/gateway.toml (only when the user asks), running gate check while the user is present, reading gate status, handling "dialog still open" (exit 75) and refusals (gate why), choosing accounts (GATE_ACCOUNT), Azure and API keys through the http tool, an ML model catalog (asiml), gate with, import-ssh, export / import / copy-to, the managed shell your commands run in ([shell] imports, host_inspect, "managed shell unavailable"), and what the gateway does to checkpoint jobs (job_start), and remote terminals and jobs (host, host_runtime). Use when the user asks to add, change, remove, export or copy a machine or account, wants one of their own tools or variables in your shell, or when a gateway message mentions gate check, the gateway dialog, GATE_ACCOUNT, the managed shell or a refusal.
 user-invocable: false
 ---
 
@@ -61,7 +61,9 @@ gateway message starts with `gateway:` and says what to do next: follow it.
 Taking rights away (a right to `false` or `"ask"`, removing an address,
 owner, site or a whole entry) applies at once and needs no dialog and no
 `gate check`. Removing an entry keeps its stored secrets; `gate forget NAME`
-deletes them (only when the user asks).
+deletes them (only when the user asks). When its output names older copies
+of the vault in `private/backups` that may still hold them, pass that on:
+only the user can delete those, in their own terminal.
 
 Names: lowercase `[a-z][a-z0-9-]{0,31}`, one namespace for hosts and accounts;
 `local`, `this`, `all`, `gateway`, `gate` and `settings` are reserved, and
@@ -76,7 +78,12 @@ default `true`), `scripts` (default `false`), `note`, `runtime` (where the
 gateway stages its own bash and tmux for remote terminals and jobs on that host;
 default `~/.local/share/gateway-runtime`; an absolute or `~/` folder; changing it
 waits for the user's OK). `[hosts.localhost]` takes only `sudo`, `scripts`,
-`note`, `policy` and `workspaces`.
+`note`, `policy` and `workspaces`; its `sudo` defaults to `"ask"` on a new
+install (its starter form says `sudo = "ask"`: Claude Code asks each time),
+while an install an older gateway set up keeps that version's default, `true`.
+Raising it to `true` (no prompt) is a widening the user approves (`gate check
+localhost`). While a passphrase vault is locked its approvals can't be read,
+so a `true` sudo here asks until the user unlocks it (`/gate-unlock`).
 
 Accounts, `[accounts.NAME]` with `kind` and: `login`, `owners` (orgs/users
 whose repos use it), `default` (one per kind and host), `name` and `email`
@@ -89,7 +96,7 @@ Per kind:
 | `github` | `host` (GitHub Enterprise; default github.com), `packages` (ghcr.io) |
 | `huggingface` | none |
 | `azure` | `tenant` (required), `client_id`, `databricks` [workspace hosts], `storage` [account names], `registries` [`x.azurecr.io`], `sites` [other hosts] |
-| `ml-catalog` | `host` (default is the ASI catalog) |
+| `ml-catalog` | `host` (required: the catalog's address; an ML model catalog behind Microsoft Entra ID, with its `asiml` CLI) |
 | `pijul` | `host` (default nest.pijul.com), `remote_pijul` |
 | `registry` | `host` (required) |
 | `api-key` | `sites` (required: `"api.x.com"` exact, `".x.com"` any subdomain), `auth`: `bearer` (default), `basic`, `header:NAME`, `header:NAME:PREFIX`, `query:PARAM` |
@@ -192,16 +199,19 @@ never proposed as a machine: GitHub and Hugging Face need an account instead
 
 ## Using hosts
 
-- This machine: plain `sudo CMD` (no `-S`, `-A` or `-E`).
+- This machine: plain `sudo CMD` (no `-S`, `-A` or `-E`). Its right
+  (`[hosts.localhost] sudo`) is in the session's Hosts line: `sudo: yes` is
+  `true`, `asks the user each time` is `"ask"` (below), `off` is `false`.
 - Other machines: `ssh NAME CMD` (always with a command: interactive ssh
   can't work here), `ssh NAME sudo CMD`, `scp`, `sftp`,
   `rsync -a dir/ NAME:/path/`. Use the form's name; a jump host comes from
   `via`, not `-J`.
 - Run these as their own command, optionally after `cd` or with simple
-  read-only commands chained. Then the gateway approves them without a
-  prompt (in auto mode, where the right is `true`). Pipes into other
-  programs, `$(...)`, redirections into files or `sh -c` wrappers go to Claude
-  Code's normal review instead.
+  read-only commands chained (reading only the project's or a temp folder's
+  files). Then the gateway approves them without a prompt (in auto mode,
+  where the right is `true`). Pipes into other programs, `$(...)`,
+  redirections into files or `sh -c` wrappers go to Claude Code's normal
+  review instead.
 - `"ask"` means Claude Code asks the user each time you run that ssh or sudo
   as your own command. It can't ask about ssh or sudo that another program
   starts, so for an `"ask"` right `scp`, `sftp`, `rsync` and `git` to that
@@ -262,7 +272,8 @@ never proposed as a machine: GitHub and Hugging Face need an account instead
   token from the host (management.azure.com, graph.microsoft.com, the listed
   Databricks workspaces and storage accounts; a host listed under `sites`
   needs `scope`). Azure Container Registry goes through `crane`.
-- The ML Catalog: the `asiml` CLI: `asiml search [--kind K] QUERY`,
+- An ML model catalog behind Microsoft Entra ID (an `ml-catalog` account): its
+  `asiml` CLI: `asiml search [--kind K] QUERY`,
   `asiml show datasets/NAME[@VER]`, `asiml files datasets/NAME@VER`,
   `asiml clone datasets/NAME[@REV] [DIR]`, `asiml pull`, `asiml push`,
   `asiml status`, `asiml init datasets/NAME` (or `models/...`). Inside an
@@ -294,15 +305,20 @@ origins.
 - A program "not found" that the user has (Homebrew, cargo, nvm's node,
   conda, ...): look with the gw tool `host_inspect` (it reads the user's rc
   files and tool folders as text, runs nothing; looking imports nothing).
+  Until the form has a `[shell] import_path`, your session context may list
+  the tool folders found here but not imported: propose them to the user
+  when their work needs them.
   When the user wants it, add the folder to `[shell] import_path` (or a
   variable name to `import_env`) in `~/.config/gateway/gateway.toml`, then
   run `gate check settings` while the user is here: each new import needs
   their OK in the gateway's dialog. Never import a credential (the form
   refuses credential-looking names; an account holds those), and never run
   or source the user's rc files to get a tool.
-- `gateway: the managed shell isn't ready`: the gateway is still setting up
-  its environment (first run, about a minute); tell the user once, try again
-  later. Never work around it.
+- `gateway: the managed shell isn't ready`: its message says why: still
+  setting up (first run, about a minute: try again later), setup failed (it
+  names the log; `/gate-doctor` shows why), pixi isn't installed, or the
+  gateway's data folder is gone (uninstalled: the user restarts Claude Code
+  or reinstalls). Tell the user once what it says. Never work around it.
 - `gateway: managed shell unavailable`: Claude Code's mods are off or too old
   for the managed shell, so the gateway refused the command. Tell the user
   once (turn mods on or update Claude Code, then a new session); don't retry
@@ -412,7 +428,10 @@ and take them over with `/gate-terminal`.
 - Never type a password, token or passphrase into a terminal. When a
   program asks for one, the gateway's dialog opens for the user by itself;
   the read says `waiting_auth` and you can't type meanwhile. Afterwards you
-  see "[credential supplied]". `sudo` in a gateway terminal asks this way.
+  see "[credential supplied]". `sudo` in a gateway terminal works only where
+  this machine's sudo right is `true` (its password comes through that
+  dialog); an `"ask"` right is refused there, as in a job: run that sudo with
+  the Bash tool as its own command.
 - `job_start` runs one command that outlives your turn; poll `job_status`
   and `job_tail` (bounded, masked). Give `idempotency_key` when you might
   retry, so a retry returns the same job instead of running it twice.
@@ -440,7 +459,9 @@ right but the user hasn't approved it yet; run `gate check NAME` when they
 are there (it opens the gateway's dialog). `NAME goes through JUMP, which isn't set up
 yet`: run `gate check JUMP` first. Run a stand-in or tool by its name
 (`ssh`, `cat`), not by a path (`./ssh`, `/bin/cat`): only the names are
-approved without a prompt.
+approved without a prompt (`cat`, `grep`, `ls` and the other plain readers
+only for the project's or a temp folder's files; `gate forget` never, it goes
+to Claude Code's own review).
 
 ## Moving the gateway (only when the user asks)
 

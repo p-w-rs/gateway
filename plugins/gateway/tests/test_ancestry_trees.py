@@ -314,3 +314,49 @@ def test_claude_ancestor_passes_linux_logins_it_can_only_partly_read():
     above = [("/bin/bash", ME, "bash"), (None, 0, "sudo"), ("/bin/zsh", ME, "zsh"),
              (VERSIONS_BIN, ME, "claude")]
     assert _walk(above) == VERSIONS_BIN, "sudo in between hides nothing above it"
+
+
+def test_npms_claude_code_counts_as_claude_code_and_no_other_node_script():
+    """GW-COMPAT-1: npm's @anthropic-ai/claude-code is Claude Code: its
+    native binary (bin/claude.exe, since 2.1.113) by path, and before that
+    node running its cli.js (npm's shim, <prefix>/bin/claude, links to it) by
+    argv; node running anything else isn't."""
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory(dir=H.tmp_base()) as d:
+        pre = Path(d) / "npm"
+        pkg = pre / "lib" / "node_modules" / "@anthropic-ai" / "claude-code"
+        pkg.mkdir(parents=True)
+        (pkg / "cli.js").write_text("// cli\n")
+        (pre / "bin").mkdir()
+        (pre / "bin" / "claude").symlink_to(pkg / "cli.js")
+        other = Path(d) / "other.js"
+        other.write_text("// other\n")
+        native = str(pkg / "bin" / "claude.exe")
+        node = "/opt/x/bin/node"
+        assert ancestry.is_claude_exe(native)
+        assert ancestry.claude_install(native) == "npm (its native binary)"
+        # a claude.exe anywhere else isn't (only npm's package folder names it so)
+        for exe in (str(Path(d) / "bin" / "claude.exe"), str(pre / "node_modules" / "claude-code" / "bin" / "claude.exe")):
+            assert not ancestry.is_claude_exe(exe) and ancestry.claude_install(exe) == "", exe
+        for argv in ([node, str(pre / "bin" / "claude"), "--resume"], [node, str(pkg / "cli.js")],
+                     ["/usr/bin/nodejs", str(pkg / "cli.js")]):
+            assert ancestry.is_claude_node(argv[0], argv), argv
+            assert ancestry.claude_install(argv[0], argv).startswith("npm (node"), argv
+        for argv in ([node, str(other)], [node, "--require", str(pkg / "cli.js"), str(other)],
+                     [node, "-r", str(pkg / "cli.js")], ["/opt/x/bin/python3", str(pkg / "cli.js")],
+                     [node, "cli.js"], [node, str(pkg / "nope" / "cli.js")], [node], None):
+            assert not ancestry.is_claude_node(argv[0] if argv else node, argv), argv
+            assert ancestry.claude_install(argv[0] if argv else node, argv) == "", argv
+        # the ancestor walk (gate secret's check) finds it too, by argv
+        argvs = {}
+        saved = ancestry._argv
+        ancestry._argv = lambda pid: argvs.get(pid)
+        try:
+            argvs[910001] = [node, str(pre / "bin" / "claude")]
+            assert _walk([("/bin/zsh", ME, "zsh"), (node, ME, "node")]) == node
+            argvs[910001] = [node, str(other)]
+            assert _walk([("/bin/zsh", ME, "zsh"), (node, ME, "node")]) is None
+            assert _walk([("/bin/zsh", ME, "zsh"), (native, ME, "claude.exe")]) == native
+        finally:
+            ancestry._argv = saved

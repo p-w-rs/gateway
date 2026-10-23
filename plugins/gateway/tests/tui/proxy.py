@@ -23,7 +23,7 @@ TUI_RECORD_PROXY to the proxy URL. safety.hermetic_env lets the
 disable flags go only when TUI_RECORD_PROXY, HTTPS_PROXY, HTTP_PROXY (and
 their lower-case spellings) all name the same loopback URL: with the
 harness's own proxy in the way nothing leaves the machine. (Probe evidence:
-gateway docs/FEASIBILITY-v4.md P6, 8 decrypted first-party requests in one
+gateway docs/dev/FEASIBILITY-v4.md P6, 8 decrypted first-party requests in one
 session, none forwarded.) What a client sends outside its proxy settings
 (none was seen) would not be recorded here: say so in reports.
 

@@ -1,3 +1,5 @@
+> Developer documentation: the code's modules and their APIs, for people changing the code. To use the plugin, read the [README](../../README.md).
+
 # Gateway v3 modules
 
 The modules of gateway v3 (written for plugin 0.7.0; the tables and the
@@ -63,7 +65,7 @@ How phase B's requests were settled is in
 | `data_dir()` | hook/MCP modes: `CLAUDE_PLUGIN_DATA`. Every mode: the folder of the pixi env that `sys.executable` belongs to (`<DATA>/envs/<sha12>/.pixi/envs/default/bin/python3`). Then `GW_DATA` (the stubs set it themselves), then `~/.claude/plugins/data/gate-gateway` (`CLAUDE_CONFIG_DIR` only in hook/MCP modes). |
 | `trust_plugin_env(ok)`, `data_from_executable(exe=None)` | run.py's per-mode switch; the env-python rule above |
 | `bin_dir()`, `git_dir()`, `git_config_path()`, `envs_dir()`, `audit_path()` | `$DATA/bin`, `$DATA/git`, `$DATA/git/config`, `$DATA/envs`, `$DATA/audit.jsonl` |
-| `run_dir()` | `/tmp/gw-$UID`, created with mode 0700. Raises `PathError` if it isn't a directory owned by you with mode 0700. |
+| `run_dir()` | `/tmp/gw-$UID`, created with mode 0700. Raises `PathError` if it isn't a directory owned by you with mode 0700; the error's `remedy` says what to do: a link or a file, `rm` it; another user's, only they or an administrator can remove it (a restart empties /tmp); writable by group or others (`mode & 0o022`), remove it (`rm -rf`) once no Claude Code session or gated uses it, never chmod it (what others put there, a `gated.sock` or a ControlMaster socket, would stay); only read/search bits, `chmod 700`. `explain(e)` gives message and remedy as one line (the stand-ins, `gate status`, SessionStart, `gated start|status`, /gate-doctor). |
 | `run_file(name)`, `refusals_dir()`, `session_dir()` | paths inside the run dir |
 | `sudo_probe_path(user)` | the cache file for the sudo stand-in's `sudo -n true` probe. Write `yes …` or `no …`; status and context read it. |
 | `plugin_root()`, `run_py()`, `launch_sh()` | the plugin's own files |
@@ -141,6 +143,12 @@ How phase B's requests were settled is in
   `GLOBAL_POLICY_KEYS` (grants `POLICY_GRANT` only per host). An unknown key
   or a bad word is an entry error; in `[policy]` it counts as deny.
 - `clear_cache()`
+- `apply_install_defaults(form, older_install)`: sudo on this computer where
+  the form doesn't say (`Host.sudo_default`: no `[hosts.localhost]`, or one
+  without `sudo`) is `LOCALHOST_SUDO` ("ask") on a new install and
+  `LOCALHOST_SUDO_OLDER` (true) on one whose vault an older gateway made
+  (`vault.older_install`); `consent.compute` calls it before it reads the
+  form, so every later reader of the form sees the same value.
 - Writers: `append_table("hosts.NAME", {key: value}, comment=..., path=None)`
   and `set_key("hosts.NAME", "sudo", False, path=None)`. Both refuse a form
   with a syntax error. They re-parse after writing and roll back (raising
@@ -170,6 +178,7 @@ Form:     path, exists, text, used_text, mtime_ns, sha256 (of used_text),
           hosts: {name: Host}            # valid entries, plus the implicit localhost
           accounts: {name: Account}      # valid entries only
           disabled: {safe name: first error}
+          disabled_kinds: {name: kind}   # disabled accounts whose kind could be read
           dup_disabled: {name: "hosts"|"accounts"}   # a name used by both: the later section is off
           unnamed_off (entries whose name can't be shown), n_off (total off)
           problems: [Problem], errors, warnings, syntax_error: Problem|None,
@@ -181,7 +190,8 @@ Address:  host (lowercase; IPv6 without brackets), port (22), user (None = local
           when (CIDR str|None), raw
           effective_user(), hostport(), render(with_user=True) -> "u@h[:p]", key() -> (user, host, port)
 Host:     name, line, address: Address|None (None only for localhost), also: [Address],
-          via, ssh/sudo: True|"ask"|False, scripts, note, explicit (False = implicit localhost)
+          via, ssh/sudo: True|"ask"|False, scripts, note, explicit (False = implicit localhost),
+          sudo_default (localhost whose sudo the form doesn't say; apply_install_defaults)
           is_local, addresses() (address first, then also), user()
 Account:  name, kind, line, login, owners, default, commit_name (the `name` key), email, env,
           scripts, use, note, host (github/ml-catalog/pijul/registry; may carry :port),
@@ -252,7 +262,11 @@ picks before sending (`consent.bound_ok`). A test checks that every
 - `load()` (a missing vault is `empty()`), `save(data, *, migrating=False)`,
   `locked()`, `edit()` (a context manager: locked load, saves only if
   changed), `exists()`, `ensure_key()`, `recipient()`, `empty()` (a fresh
-  vault dict), `now()` (the timestamp format used everywhere), `VaultError`
+  vault dict, with the baseline mark `"baseline": 2`), `older_install(data)`
+  (a vault document without the mark: an older gateway made it, so its
+  install keeps the old defaults; never for no vault or a non-vault dict;
+  `_fill` never adds the mark, the broker's `merge` keeps the vault's own,
+  a 0.6 conversion has none), `now()` (the timestamp format used everywhere), `VaultError`
   (raised for unreadable/unwritable vaults; the message holds no secret).
   `save` refuses to create `vault.age` while a v2 `store.age` waits for
   migration.
@@ -260,6 +274,22 @@ picks before sending (`consent.bound_ok`). A test checks that every
   `cache_put(account, scope, value, expires_at)` (call it under
   `locked()`), `cache_clear(account=None)`, `cache_values()`, `cache_load()`,
   `cache_save()`.
+- Durable writes: `write_private(path, data)` (temp file beside it, 0600,
+  flushed, renamed, then the folder flushed: a crash or power loss leaves
+  the old file or the new one; vault.age, cache.age, the broker's
+  key.recipient, an import's restore), `fsync_dir(d)` (best
+  effort), `full_fsync(fd)` (`fcntl(F_FULLFSYNC)` on macOS, whose fsync
+  leaves the data in the drive's cache; fsync where that is refused, and on
+  Linux). `_encrypt_to` takes age's stdout and writes it this way.
+- Copies: `snapshot(kind="rotate")` copies vault.age as it is (encrypted,
+  0600) to `private/backups/<kind>-<YYYYmmdd-HHMMSS>-<hex>.vault.age`
+  (folder 0700) and keeps the newest `SNAPSHOT_KEEP` (5) of that kind; None
+  without a vault. `gate rotate` takes one through `ssh.rotate`'s
+  `before_change` (just before its first vault write, under the vault's
+  lock; not when it fails before). `gate forget` takes none (forgetting
+  means gone): `older_copies()` lists, by kind with a glob for `rm -r`, the
+  backups that may still hold what it forgot (`*.vault.age`, `import-*`
+  folders with a vault.age, `store-v2-*.age`); names only, nothing read.
 - Events: `add_event(data, what, detail)` keeps the last 100, each with
   `n` and `at`. `new_events(data)` and `mark_events_seen(data)` track
   `events_seen`. Kinds: widen, narrow, bind, export, copy, import, migrate,
@@ -285,7 +315,8 @@ picks before sending (`consent.bound_ok`). A test checks that every
   `localhost`/`hosts`/`accounts`; the PostToolUseFailure warning names the
   entry and picks the fix by section and kind, never showing the value);
   `labeled_values(data)` is the same without the section.
-  `export_view(data)` is the vault without approved, imported, last-good and events.
+  `export_view(data)` is the vault without approved, imported, last-good, events,
+  `sudo_choice` and the baseline mark (per machine).
 - Keys: `normalize_key`, `public_key_of`, `fingerprint_of`,
   `generate_ssh_key(comment)`, `norm_host_key(line) -> "type key"`,
   `host_key_fingerprints(keys)`, `builtin_host_keys(host, port)`, and
@@ -352,15 +383,20 @@ stored as `"type base64"`.
 - `close_masters_for(changes, form)` calls `ssh.close_masters` for hosts
   whose address, via or ssh right narrowed. NotImplementedError is tolerated.
 - `bound_hosts(data, name)`, `bound_ok(data, name, host)`, `unbound(form_account, data)`
-- `snapshot(form)`, `host_snapshot(h)`, `account_snapshot(a)`, `baseline()`
-  (the empty form), `approved_rights(data)`, `imported_rights(data)`
+- `snapshot(form)`, `host_snapshot(h)`, `account_snapshot(a)`, `baseline(older=False)`
+  (the empty form under the install's defaults), `older_install(data)`,
+  `approved_rights(data)`, `imported_rights(data)`
 - `load_form(data=None)`: the form, with the vault's last good text as the fallback.
 - `ask_phrase(name, verb)` ("ssh on box", "sudo (root) on box", "sudo on
   this machine") and `job_ask_message(phrases)`: the refusal for `"ask"`
   rights inside a checkpoint job, shared by the approval hook (job_start)
   and the ssh and sudo stand-ins (culprit `ancestry.CHECKPOINT`);
   `pane_ask_message(phrases)`: the same inside a gateway terminal or job
-  (culprit `ancestry.TERMINAL`).
+  (culprit `ancestry.TERMINAL`). `locked_sudo_note(form)`: `LOCKED_SUDO_NOTE`
+  (the vault is locked, so sudo here asks until `/gate-unlock`) when the
+  form's localhost sudo is `true` or unsaid, else ""; appended to the hook's
+  sudo prompt and job refusal and to the sudo stand-in's "ask" refusals while
+  the vault is locked.
 
 ```
 Effective:  form, others ("refuse" unless the user approved "mine"), hosts {name: EffectiveHost},
@@ -376,8 +412,12 @@ EffectiveAccount: name, kind, use, scripts, env (None until approved), destinati
 Change:     entry, kind ("widen"|"narrow"), what (safe text), line; render() -> "box: sudo \"ask\" -> true"
 ```
 
-Without any approved snapshot, the baseline is an empty form: localhost with
-sudo true, others "refuse". A jump host's ssh right caps the hosts behind it.
+Without any approved snapshot, the baseline is an empty form under the
+install's defaults: others "refuse"; localhost sudo "ask" on a new install (no
+vault, or one with the baseline mark), true on one whose vault an older
+gateway made (`vault.older_install`: its effective right then, kept). A
+vault that can't be read gets the new defaults. A jump host's ssh right caps
+the hosts behind it.
 
 `imported` = `{"from": "v2", "at", "rights": {"hosts": {...}, "accounts": {...}}}`:
 written by migration when the user already had a gateway.toml (the converted
@@ -402,7 +442,7 @@ Imported entries that aren't in the form are neither approved nor "removed".
   entry (control characters, an unknown kind, a bad address, colliding sudo
   passwords, more rotated private keys than public keys) is dropped or fixed
   and reported, never a permanent failure; the failure reason names the full
-  ref (`sudo joshua@lab.example.com`).
+  ref (`sudo octo@lab.example.com`).
 - `tidy_leftover() -> Result | None`: a v2 store.age next to the v3 vault
   (SessionStart calls it; `gate migrate` does the same): the migrated store
   is moved into the backups (and a missing gateway.toml restored from
@@ -422,7 +462,16 @@ Imported entries that aren't in the form are neither approved nor "removed".
   itself an entry name.
 - `map_export_v1(obj)` maps a v2 export file (`gateway_export: 1`) for
   `transfer.import_cmd`. `check(mapped, v2)` re-validates a mapping.
-- `HEADER` and `STARTER` are the form's header comment and the starter form.
+- `HEADER` and `STARTER` are the form's header comment and the starter form
+  (`[hosts.localhost] sudo = "ask"`); `STARTER_OLDER` is the one older
+  gateways wrote (`sudo = true`), and `starter(data)` picks it for an older
+  install (`vault.older_install`) whose form went missing with nothing to
+  restore. A converted vault carries no baseline mark (an existing install).
+  `Mapped.hostless` holds, for each 0.6 catalog account with no single host
+  (none, or several different ones; a list naming one host twice names one),
+  the approval snapshot the conversion records for it (kind ml-catalog, no
+  destinations), so the user adding `host` later is one new destination
+  that keeps the sign-in.
   `mark_report_shown()`. `report_flag()` is `private/migrated.unshown`, left
   by a successful `run()` (round 4); `take_unshown_report()` gives the report
   once (marking it shown, removing the flag) to the UserPromptSubmit hook, so
@@ -555,13 +604,16 @@ Imported entries that aren't in the form are neither approved nor "removed".
   how-to line and lists as many names as fit. The prompt hook may reuse it.
   The how-to lines are `HOWTO`, plus `JOBS_HOWTO` (checkpoint jobs: stand-ins
   through env.sh, curl refused, no "ask" rights, job_tail/job_stop masked) when
-  `paths.checkpoint_state_dir()` exists.
+  `paths.checkpoint_state_dir()` exists, `MANAGED_HOWTO` in managed mode, and
+  `NO_DISPLAY_NOTE` on Linux without `DISPLAY` and `WAYLAND_DISPLAY` (the
+  dialog's Paste can't work there, nor typing on the main screen; what to tell
+  the user; review round 2). `IMPORT_OFFER` follows only when it fits.
 - `prepare(msgs, write=bool) -> (form, eff, vault_data)`: the shared loader.
   Every mode ratchets (consent.ratchet; also with no vault yet, where only a
   narrowing creates one). A missing form is restored from the
   vault's `form_last_good` (write=True), never replaced by the starter when
   the vault holds approvals or can't be read; the starter is written only
-  when nothing is stored. With `write=True` it also keeps `form_last_good`
+  when nothing is stored (an older install's: `migrate.starter`). With `write=True` it also keeps `form_last_good`
   (never from a fallback form) and the machine record.
 - `record_context(session_id, form)` and `context_state(session_id)`
   hold `{form_mtime_ns, form_sha256}` from the last context (run dir), so
@@ -608,7 +660,10 @@ Imported entries that aren't in the form are neither approved nor "removed".
   folder, with `~` and globs, depth 16).
 - `gate lock` (PLAN-v4 phase 2) locks a wrapped vault in the daemon;
   `gate status` ends with `daemon_line()` (the daemon's /health: running,
-  version, epoch, uptime, vault state; never starts it).
+  version, epoch, uptime, vault state, and, when it serves another Claude
+  Code configuration's data folder, `planes.other_config_note`'s words;
+  never starts it; a run folder it can't use: "can't start:" with
+  `paths.explain`).
 - run.py modes: hook-session, hook-session-async, hook-subagent, hook-bash,
   hook-files, hook-post, hook-prompt, hook-filechanged and hook-daemon (JSON
   on stdin, JSON on stdout); mcp; `shim TOOL …`; askpass; git-credential;
@@ -623,7 +678,10 @@ Imported entries that aren't in the form are neither approved nor "removed".
   (exit 75), never replaced by the system tool; no module raises it any
   more. An unexpected exception in a stand-in or `gate` prints one
   `gateway: TOOL failed unexpectedly (TypeName)` line (never a traceback)
-  and exits 1 (`_failed`, round 3). `run.py gate` (and `shim gate`) drops `HTTP(S)_PROXY`, `ALL_PROXY`,
+  and exits 1 (`_failed`, round 3); a `paths.PathError` (the run folder
+  another user's, a link, open to others) isn't unexpected: `gateway: TOOL
+  can't run: <paths.explain(e)>. Tell the user.` (GW-ROB-1). The ssh, scp
+  and sftp stand-ins (`ssh.main`) print the same for a PathError. `run.py gate` (and `shim gate`) drops `HTTP(S)_PROXY`, `ALL_PROXY`,
   `NO_PROXY` (both cases) and `SSL_CERT_FILE`/`SSL_CERT_DIR` from its
   environment first, except for `gate with` (whose child inherits it).
 
@@ -708,11 +766,12 @@ PLAN-v4 phase 4: first in `session.start` (before the daemon and the dialog
 loop) the mod reads `$DATA/managed/state.json` and sets `GW_MANAGED_DIR`,
 `CLAUDE_CODE_SHELL_PREFIX` (`hooks/gate-sh`, unless the effective mode is
 "off") and, once the env is built, `CLAUDE_CODE_SHELL` (the env's bash); the
-three are its only env writes (docs/modules/managed.md). `run.py
+three are its only env writes (docs/dev/modules/managed.md). `run.py
 managed-sync` (the `$DATA/managed/sync` stub; also `launch.sh ensure-env`
 after a build) rewrites the managed shell's files. The gw MCP server's tools
-are `http`, `download` and `host_inspect` (allowed by `mcp_perm.sh` in every
-mode).
+include `http`, `download` and `host_inspect`; `mcp_perm.sh` allows
+`host_inspect` in every mode and gives `http` and `download` no decision
+(0.10.0).
 PLAN-v4 phase 3: in an interactive session the mod long-polls
 `/ui/dialog/next` and draws the session's dialog as the pane `gate-dialog`
 (`ui.render` on `{ component: 'Pane', requestId: 'gate-dialog' }`): fixed
@@ -790,8 +849,8 @@ would come last).
   test entry point for stand-ins; `GW_DUMP=1` prints which secret slots a
   mode sees), `full_vault(passphrase)`.
 - Mutation checks: `tests/mutation_check.py` (core, 76) and
-  `tests/mutations_{sudo,ssh,accounts,ux,e2e,packaging,daemon,dialogs}.py`
-  (counts in CLAUDE.md, "Last full run") weaken one
+  `tests/mutations_*.py` (how they run: [TESTING.md](TESTING.md); counts
+  per run: [TEST-LOG.md](TEST-LOG.md)) weaken one
   security guard each and expect the named test to fail. `pixi run
   mutations` (`tests/run_mutations.py [-j N] [-k SUBSTR] [FILE...]`) runs
   them all, each file on its own scratch copy of the plugin (`--copy DIR`),

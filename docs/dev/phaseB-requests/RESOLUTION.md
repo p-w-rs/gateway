@@ -3,7 +3,7 @@
 > Historical record. Superseded where it concerns sudo: PLAN-v4 phase 7 removed
 > the passwordless sudo setup of #7 (the sudoers file, its choice and its
 > advice); the gateway never writes or recommends a sudoers rule
-> (docs/DECISIONS.md "No sudoers rule, ever", docs/modules/sudo.md). The rows
+> (docs/dev/DECISIONS.md "No sudoers rule, ever", docs/dev/modules/sudo.md). The rows
 > that describe it are marked.
 
 Every request in `accounts.md`, `ssh.md`, `sudo.md` and `ux.md`, plus the

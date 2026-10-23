@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 
 import harness as H
 from gateway import consent, migrate, paths, vault, vault_v2
@@ -34,6 +35,168 @@ def _users_data():
     return json.loads(json.dumps(_CACHE["d"]))
 
 
+def test_a_converted_06_vault_keeps_sudo_true_on_this_computer():
+    """New installs start with sudo = "ask" on this computer; a 0.6 vault
+    converted now still gets [hosts.localhost] sudo = true, approved by the
+    migration (SPEC 4), with or without a stored sudo password, and keeps it
+    through the next session start."""
+    from gateway import hooks_bash, hooks_session
+    for v2 in ({"version": 2, "secrets": {}, "sudo": {}, "accounts": {}}, None):
+        with H.gateway_env() as env:
+            _setup_v2(env, v2 if v2 is not None else _users_data())
+            r = migrate.run("test")
+            assert r.ok and r.status == "migrated", r.message
+            text = paths.form_path().read_text()
+            loc = text.split("[hosts.localhost]", 1)[1].split("\n[", 1)[0]
+            assert "\nsudo = true" in loc, text
+            f = env.form()
+            assert f.hosts["localhost"].explicit and f.hosts["localhost"].sudo is True
+            data = vault.load()
+            assert data["approved"]["rights"]["hosts"]["localhost"]["sudo"] is True
+            hooks_session.session_main({"session_id": "after-06", "source": "startup"})
+            eff = consent.compute(env.form(), vault.load())
+            assert eff.hosts["localhost"].sudo is True and "localhost" not in eff.pending_names()
+            out = hooks_bash.main({"tool_name": "Bash", "permission_mode": "auto",
+                                   "tool_input": {"command": "sudo ls"}})
+            assert out["hookSpecificOutput"]["permissionDecision"] == "allow", out
+            assert paths.form_path().read_text() == text
+
+
+def test_a_06_catalog_account_gets_its_host_written_out():
+    """The gateway has no default catalog host: a 0.6 catalog account gets
+    0.6's host (else the one host it was bound to, also when its list names
+    it twice) as `host`; with neither (no host, or several), a commented
+    `host` line and a note naming what 0.6 had, its sign-in kept in the vault
+    and an approval snapshot with no destination kept for it (m.hostless)."""
+    rt = "0.CCCC-catalog-refresh-token-xyz"
+
+    def v2(acct):
+        acct = {"kind": "mlcat", "login": "work@example.com", "tenant_id": "t.example.com",
+                "client_id": "99999999-8888-7777-6666-555555555555",
+                "secrets": {"refresh_token": rt}, **acct}
+        return {"version": 2, "secrets": {}, "sudo": {}, "accounts": {"mlcat:work": acct}}
+
+    with H.gateway_env():
+        for acct, host in (({"host": "Catalog.Example.com"}, "catalog.example.com"),
+                           ({"hosts": ["models.example.org"]}, "models.example.org"),
+                           ({"hosts": ["models.example.org", "Models.Example.org "]},
+                            "models.example.org")):
+            m = migrate.map_v2(v2(acct), local_user="me")
+            f = F.parse_text(m.form_text)
+            assert f.accounts["catalog"].host == host, m.form_text
+            assert m.vault["accounts"]["catalog"]["bound"]["hosts"] == [host]
+        m = migrate.map_v2(v2({"hosts": []}), local_user="me")
+        f = F.parse_text(m.form_text)
+        assert "catalog" in f.disabled and "# host = \"\"" in m.form_text, m.form_text
+        assert any("catalog: set host" in a for a in m.attention), m.attention
+        assert m.vault["accounts"]["catalog"]["entra"]["refresh_token"] == rt, "the sign-in is kept"
+        assert not any("catalog" in d for d in m.dropped), m.dropped
+        assert m.hostless["catalog"]["kind"] == "ml-catalog" and m.hostless["catalog"]["destinations"] == []
+        # several different hosts: none is picked (the user names it)
+        m = migrate.map_v2(v2({"hosts": ["a.example.com", "b.example.com"]}), local_user="me")
+        assert "catalog" in F.parse_text(m.form_text).disabled, m.form_text
+        assert "0.6 listed 2: a.example.com, b.example.com" in m.form_text, m.form_text
+        assert m.vault["accounts"]["catalog"]["bound"]["hosts"] == [] and "catalog" in m.hostless
+
+
+def test_a_06_conversion_beside_the_users_own_form_keeps_its_sudo():
+    """A 0.6 store converted while a gateway.toml already exists approves
+    nothing of the user's form (approved {}), and is an existing install: its
+    vault has no baseline mark, so the user's own `sudo = true` stays true
+    (no OK waiting, the hook allowing it in auto mode), and a form that never
+    said sudo keeps the old implicit true; never narrowed by a session start."""
+    from gateway import hooks_bash, hooks_session
+    for mine in ("[hosts.localhost]\nsudo = true\n", '[hosts.box]\naddress = "u@box.example.com"\n'):
+        with H.gateway_env() as env:
+            env.write_form(mine)
+            _setup_v2(env, _users_data())
+            r = migrate.run("test")
+            assert r.ok and r.status == "migrated", r.message
+            assert paths.form_path().read_text() == mine and paths.from_v2_form_path().exists()
+            data = vault.load()
+            assert data["approved"] == {} and vault.older_install(data), "an existing install"
+            hooks_session.session_main({"session_id": "conv", "source": "startup"})
+            eff = consent.compute(consent.load_form(), vault.load())
+            assert eff.hosts["localhost"].sudo is True, mine
+            assert "localhost" not in eff.pending_names(), [c.render() for c in eff.pending]
+            out = hooks_bash.main({"tool_name": "Bash", "permission_mode": "auto",
+                                   "tool_input": {"command": "sudo ls"}})
+            assert out["hookSpecificOutput"]["permissionDecision"] == "allow", out
+            ap = (vault.load().get("approved") or {}).get("rights")
+            assert ap is None or ap["hosts"]["localhost"]["sudo"] is True, ap
+    with H.gateway_env() as env:                   # no form of the user's: the converted one
+        _setup_v2(env, _users_data())
+        assert migrate.run("test").ok
+        assert vault.older_install(vault.load()), "a converted 0.6 store is an existing install"
+
+
+RT = "0.CCCC-catalog-refresh-token-xyz"
+
+
+def _v2_catalog(acct):
+    acct = {"kind": "mlcat", "login": "work@example.com", "tenant_id": "t.example.com",
+            "client_id": "99999999-8888-7777-6666-555555555555",
+            "secrets": {"refresh_token": RT}, **acct}
+    return {"version": 2, "secrets": {}, "sudo": {}, "accounts": {"mlcat:work": acct}}
+
+
+def test_a_hostless_06_catalog_keeps_its_sign_in_when_the_user_adds_the_host():
+    """A 0.6 catalog account with no single host (none, or two different
+    ones) is converted off, with a commented host line naming what 0.6 had;
+    the conversion's approval records it as an approved account with no
+    destination yet, so the user adding `host` later is one new destination
+    of that account: `gate check` approves it and the sign-in (Entra refresh
+    token) is still there, now bound to that host. Also when the conversion
+    went to gateway.from-v2.toml (the user's form existed) and the entry is
+    copied in with its host."""
+    from gateway import hooks_session
+    cases = (({"hosts": []}, "0.6 had none", "catalog.example.com"),
+             ({"hosts": ["a.example.com", "B.example.com"]}, "0.6 listed 2: a.example.com, "
+              "b.example.com", "b.example.com"))
+    for acct, why, pick in cases:
+        with H.gateway_env() as env:
+            _setup_v2(env, _v2_catalog(acct))
+            r = migrate.run("test")
+            assert r.ok and r.status == "migrated", r.message
+            text = paths.form_path().read_text()
+            assert f'# host = ""' in text and why in text, text
+            assert f"catalog: set host" in r.report and why in r.report, r.report
+            f = env.form()
+            assert "catalog" in f.disabled and "catalog" not in f.accounts
+            data = vault.load()
+            snap = data["approved"]["rights"]["accounts"]["catalog"]
+            assert snap["kind"] == "ml-catalog" and snap["destinations"] == [], snap
+            assert data["accounts"]["catalog"]["entra"]["refresh_token"] == RT
+            hooks_session.session_main({"session_id": "hl1", "source": "startup"})
+            assert vault.load()["approved"]["rights"]["accounts"]["catalog"] == snap, \
+                "a session start keeps the approval of the entry that is off"
+            env.write_form(text.replace('# host = ""', f'host = "{pick}"', 1))
+            f = env.form()
+            eff = consent.compute(f, vault.load())
+            pend = [c.render() for c in eff.pending_for("catalog")]
+            assert pend == [f"catalog: may now send to {pick}"], pend
+            assert not consent.drops_credential(vault.load(), f.accounts["catalog"])
+            consent.approve("catalog", eff.pending_for("catalog"), form=f)
+            rec = vault.load()["accounts"]["catalog"]
+            assert rec["entra"]["refresh_token"] == RT, "the sign-in is kept"
+            assert rec["bound"]["hosts"] == [pick]
+            assert consent.compute(env.form(), vault.load()).accounts["catalog"].may_send_to(pick)
+    with H.gateway_env() as env:                    # converted beside the user's own form
+        env.write_form("[hosts.localhost]\nsudo = true\n")
+        _setup_v2(env, _v2_catalog({"hosts": []}))
+        assert migrate.run("test").ok
+        conv = paths.from_v2_form_path().read_text()
+        block = conv[conv.index("[accounts.catalog]"):]
+        assert vault.load()["imported"]["rights"]["accounts"]["catalog"]["destinations"] == []
+        env.write_form("[hosts.localhost]\nsudo = true\n\n"
+                       + block.replace('# host = ""', 'host = "catalog.example.com"', 1))
+        f = env.form()
+        assert not consent.drops_credential(vault.load(), f.accounts["catalog"])
+        consent.approve("catalog", consent.compute(f, vault.load()).pending_for("catalog"), form=f)
+        rec = vault.load()["accounts"]["catalog"]
+        assert rec["entra"]["refresh_token"] == RT and rec["bound"]["hosts"] == ["catalog.example.com"]
+
+
 def test_full_migration_of_users_vault():
     with H.gateway_env() as env:
         v2data = _setup_v2(env, _users_data())
@@ -57,51 +220,55 @@ def test_full_migration_of_users_vault():
         assert f.syntax_error is None and not f.errors, f.report_lines()
         data = vault.load()
         # --- names -------------------------------------------------------
-        assert set(f.hosts) == {"localhost", "powerslabs", "builder", "db"}
+        assert set(f.hosts) == {"localhost", "example", "builder", "db"}
         assert set(f.accounts) == {"github-personal", "github-work", "hf", "azure", "catalog",
                                    "pijul", "openai-api-key", "legacy-token"}
         al = data["aliases"]
-        assert al["github:work"] == "github-work" and al["ssh:powerslabs"] == "powerslabs"
+        assert al["github:work"] == "github-work" and al["ssh:example"] == "example"
         assert al["registry:ghcr"] == "github-work" and al["OPENAI_API_KEY"] == "openai-api-key"
-        assert al["hf:me"] == "hf" and al["mlcat:asi"] == "catalog" and al["pijul:nest"] == "pijul"
+        assert al["hf:me"] == "hf" and al["mlcat:work"] == "catalog" and al["pijul:nest"] == "pijul"
         # --- hosts -------------------------------------------------------
-        p = f.hosts["powerslabs"]
-        assert p.address.render() == "joshua@10.0.0.5" and p.address.when == "10.0.0.0/24"
-        assert [a.render() for a in p.also] == ["joshua@lab.example.com:2222"]
+        p = f.hosts["example"]
+        assert p.address.render() == "octo@10.0.0.5" and p.address.when == "10.0.0.0/24"
+        assert [a.render() for a in p.also] == ["octo@lab.example.com:2222"]
         assert p.ssh is True and p.sudo is True and p.note == "the lab box"
-        assert f.hosts["builder"].via == "powerslabs" and f.hosts["builder"].address.render() == "ci@builder.internal"
+        assert f.hosts["builder"].via == "example" and f.hosts["builder"].address.render() == "ci@builder.internal"
         assert f.hosts["db"].address.render() == "admin@db.internal"
-        vp = data["hosts"]["powerslabs"]
+        vp = data["hosts"]["example"]
         assert len(vp["keys"]) == 2 and all(k["retired"] is None for k in vp["keys"])
-        assert vp["keys"][0]["public"] == " ".join(v2data["accounts"]["ssh:powerslabs"]["public_key"].split()[:2]) or \
-            vp["keys"][0]["public"] == v2data["accounts"]["ssh:powerslabs"]["public_key"]
+        assert vp["keys"][0]["public"] == " ".join(v2data["accounts"]["ssh:example"]["public_key"].split()[:2]) or \
+            vp["keys"][0]["public"] == v2data["accounts"]["ssh:example"]["public_key"]
         assert len(vp["host_keys"]) == 1 and vp["host_keys"][0].startswith("ssh-ed25519 ")
-        assert vp["sudo"]["joshua"]["password"] == "lab-sudo-pw-22"
+        assert vp["sudo"]["octo"]["password"] == "lab-sudo-pw-22"
         assert data["localhost"]["sudo"][paths.local_user()]["password"] == "mac-login-pw-1"
         assert data["hosts"]["db"]["sudo"]["admin"]["password"] == "db-admin-pw-44"
         assert "bob" not in json.dumps(data["localhost"])
         # --- accounts ----------------------------------------------------
         gw = f.accounts["github-work"]
-        assert gw.login == "jpowers-asi" and gw.owners == ["asirobots"] and gw.email == "jpowers@asirobots.com"
-        assert gw.commit_name == "J Powers" and gw.packages is True
+        assert gw.login == "octo-work" and gw.owners == ["example-org"] and gw.email == "work@example.com"
+        assert gw.commit_name == "Octo Cat" and gw.packages is True
         assert f.accounts["github-personal"].packages is False
         rw = data["accounts"]["github-work"]
         assert rw["token"]["value"] == "ghp_workTOKEN0123456789abcdefghij" and rw["token"]["source"] == "pasted"
         assert "ghcr.io" in rw["bound"]["hosts"] and rw["ssh_key"]["fingerprint"].startswith("SHA256:")
         assert data["accounts"]["github-personal"]["token"]["source"] == "gh-oauth"
         az = f.accounts["azure"]
-        assert az.tenant == "asirobots.com" and az.client_id == F.AZURE_CLI_CLIENT_ID
-        assert az.databricks == ["adb-1234567890.7.azuredatabricks.net"] and az.storage == ["asistore"]
-        assert az.registries == ["asicr.azurecr.io"] and az.sites == ["custom.example.com"]
+        assert az.tenant == "example.com" and az.client_id == F.AZURE_CLI_CLIENT_ID
+        assert az.databricks == ["adb-1234567890.7.azuredatabricks.net"] and az.storage == ["examplestore"]
+        assert az.registries == ["examplecr.azurecr.io"] and az.sites == ["custom.example.com"]
         assert "client_id" not in text.split("[accounts.azure]")[1].split("[accounts.")[0]
         ea = data["accounts"]["azure"]["entra"]
         assert ea["refresh_token"] == "0.AAAA-azure-refresh-token-xyz"
         assert ea["tenant_id"] == "11111111-2222-3333-4444-555555555555"
         assert f.accounts["catalog"].kind == "ml-catalog"
+        assert f.accounts["catalog"].host == "catalog.example.com"
+        assert re.search(r'^host\s*= "catalog\.example\.com"$',
+                         text.split("[accounts.catalog]")[1].split("[accounts.")[0], re.M), \
+            "the catalog's address is written out (no default catalog)"
         cb = data["accounts"]["catalog"]["bound"]
-        assert cb["hosts"] == ["app-dev-ai-mlreg.azurewebsites.net"] and cb["client_id"] == "99999999-8888-7777-6666-555555555555"
+        assert cb["hosts"] == ["catalog.example.com"] and cb["client_id"] == "99999999-8888-7777-6666-555555555555"
         pj = f.accounts["pijul"]
-        assert pj.login == "pwrs" and pj.remote_pijul == "/usr/local/bin/pijul" and pj.email == "j@example.com"
+        assert pj.login == "octocat" and pj.remote_pijul == "/usr/local/bin/pijul" and pj.email == "j@example.com"
         assert data["accounts"]["pijul"]["host_keys"] == vault.NEST_HOST_KEYS
         ok = f.accounts["openai-api-key"]
         assert ok.sites == ["api.openai.com"] and ok.auth == "bearer" and ok.note == "OpenAI for experiments"
@@ -122,13 +289,13 @@ def test_full_migration_of_users_vault():
         rep = data["migrated"]["report"]
         assert data["migrated"]["store_sha256"] == hashlib.sha256(store_bytes).hexdigest()
         assert data["migrated"]["shown"] is False and r.report == rep
-        for s in ("github:work -> github-work", "ssh:powerslabs -> powerslabs", "sudo on localhost",
-                  "sudo on powerslabs", "ssh on powerslabs", "registry:ghcr -> github-work",
+        for s in ("github:work -> github-work", "ssh:example -> example", "sudo on localhost",
+                  "sudo on example", "ssh on example", "registry:ghcr -> github-work",
                   "sudo bob@localhost", "db: new host", "per-session sudo switches",
                   "open setup grants", "connection-reuse", "route names (home, away)",
                   "host-key policy accept-new"):
             assert s in rep, (s, rep)
-        assert "p-w-rs" in rep, "owner differences of the folded registry are reported"
+        assert "octocat" in rep, "owner differences of the folded registry are reported"
         for secret in [v for _, v in vault_v2.credentials(v2data)]:
             assert secret not in rep and secret not in text
         assert [e["what"] for e in data["events"]] == ["migrate"]
@@ -145,10 +312,10 @@ def test_full_migration_of_users_vault():
 
 def test_naming_rules_and_clashes():
     with H.gateway_env():
-        d = {"version": 2, "secrets": {"POWERSLABS": {"value": "secret-value-1234", "hosts": ["a.example.com"]},
+        d = {"version": 2, "secrets": {"EXAMPLE": {"value": "secret-value-1234", "hosts": ["a.example.com"]},
                                        "_weird": {"value": "secret-value-5678", "hosts": ["b.example.com"]}},
              "sudo": {}, "accounts": {
-                 "ssh:powerslabs": {"kind": "ssh", "user": "j", "host": "p.example.com"},
+                 "ssh:example": {"kind": "ssh", "user": "j", "host": "p.example.com"},
                  "ssh:hf": {"kind": "ssh", "user": "j", "host": "hfbox.example.com"},
                  "ssh:gateway": {"kind": "ssh", "user": "j", "host": "gw.example.com"},
                  "hf:me": {"kind": "hf", "hosts": ["huggingface.co", "hf.co"], "secrets": {"token": "hf_token_123456789"}},
@@ -159,7 +326,7 @@ def test_naming_rules_and_clashes():
         al = m.aliases
         assert al["ssh:hf"] == "hf" and al["hf:me"] == "hf-acct", al
         assert al["ssh:gateway"] == "gateway-host"
-        assert al["POWERSLABS"] == "powerslabs-acct" and al["_weird"] == "weird"
+        assert al["EXAMPLE"] == "example-acct" and al["_weird"] == "weird"
         assert al["github:a"] == "github-a" and al["github:b.c"] == "github-b-c"
         f = F.parse_text(m.form_text)
         assert not f.errors, f.report_lines()
@@ -192,10 +359,10 @@ def test_export_v1_mapper_keeps_source_localhost_apart():
     with H.gateway_env():
         obj = {"gateway_export": 1, "from_host": "macbook",
                "secrets": {}, "accounts": {},
-               "sudo": {"powers@localhost": {"user": "powers", "host": "localhost", "password": "mac-pw-9999"}}}
-        m = migrate.map_export_v1(obj, local_user="powers")
+               "sudo": {"octo@localhost": {"user": "octo", "host": "localhost", "password": "mac-pw-9999"}}}
+        m = migrate.map_export_v1(obj, local_user="octo")
         assert m.vault["localhost"]["sudo"] == {}
-        assert m.source_localhost["sudo"]["powers"]["password"] == "mac-pw-9999"
+        assert m.source_localhost["sudo"]["octo"]["password"] == "mac-pw-9999"
         migrate.check(m, vault_v2.normalize({"version": 2, "sudo": obj["sudo"]}))
         try:
             migrate.map_export_v1({"gateway_export": 2})
@@ -337,20 +504,20 @@ def test_keys_with_crlf_and_odd_whitespace_still_land():
 def test_sudo_collision_keeps_the_newer_password_and_lists_the_other():
     with H.gateway_env():
         d = vault_v2.normalize({"version": 2, "accounts": {
-            "ssh:lab": {"kind": "ssh", "user": "joshua", "host": "lab.example.com",
+            "ssh:lab": {"kind": "ssh", "user": "octo", "host": "lab.example.com",
                         "routes": [{"name": "home", "host": "10.0.0.5", "when": ""},
                                    {"name": "away", "host": "lab.example.com", "when": ""}]}},
-            "sudo": {"joshua@10.0.0.5": {"user": "joshua", "host": "10.0.0.5", "password": "old-pw-1111",
+            "sudo": {"octo@10.0.0.5": {"user": "octo", "host": "10.0.0.5", "password": "old-pw-1111",
                                          "updated": "2026-01-01T00:00:00+0000"},
-                     "joshua@lab.example.com": {"user": "joshua", "host": "lab.example.com",
+                     "octo@lab.example.com": {"user": "octo", "host": "lab.example.com",
                                                 "password": "new-pw-2222", "updated": "2026-09-01T00:00:00+0000"},
                      "me@localhost": {"user": "me", "host": "localhost", "password": "a-pw-3333"},
                      "me@127.0.0.1": {"user": "me", "host": "127.0.0.1", "password": "a-pw-3333"}}})
         m = migrate.map_v2(d, local_user="me")
         migrate.check(m, d)
-        assert m.vault["hosts"]["lab"]["sudo"]["joshua"]["password"] == "new-pw-2222"
-        assert any("joshua@10.0.0.5" in x and "newer one was kept" in x for x in m.dropped)
-        assert "sudo joshua@10.0.0.5" in m.dropped_refs
+        assert m.vault["hosts"]["lab"]["sudo"]["octo"]["password"] == "new-pw-2222"
+        assert any("octo@10.0.0.5" in x and "newer one was kept" in x for x in m.dropped)
+        assert "sudo octo@10.0.0.5" in m.dropped_refs
         assert m.vault["localhost"]["sudo"]["me"]["password"] == "a-pw-3333", "identical values both land"
 
 
@@ -395,15 +562,15 @@ def test_control_characters_in_hosts_are_reported_not_fatal():
 
 
 def test_failure_reason_names_the_full_ref():
-    d = vault_v2.normalize({"version": 2, "sudo": {"joshua@lab.example.com": {
-        "user": "joshua", "host": "lab.example.com", "password": "pw-123456789"}}})
+    d = vault_v2.normalize({"version": 2, "sudo": {"octo@lab.example.com": {
+        "user": "octo", "host": "lab.example.com", "password": "pw-123456789"}}})
     with H.gateway_env():
         m = migrate.map_v2(d, local_user="me")
-        m.vault["hosts"]["lab"]["sudo"]["joshua"]["password"] = "other"
+        m.vault["hosts"]["lab"]["sudo"]["octo"]["password"] = "other"
         try:
             migrate.check(m, d)
         except migrate.MigrationError as e:
-            assert "sudo joshua@lab.example.com didn't map" in str(e) and "pw-123" not in str(e)
+            assert "sudo octo@lab.example.com didn't map" in str(e) and "pw-123" not in str(e)
         else:
             raise AssertionError("expected a failure")
 
@@ -488,7 +655,7 @@ def test_existing_form_keeps_approvals_and_imports_converted_entries():
         assert r.ok and r.form_path == paths.from_v2_form_path() and "gateway.from-v2.toml" in r.report
         data = vault.load()
         assert data["form_last_good"] == mine, "the user's form is the fallback, not the from-v2 text"
-        assert "powerslabs" in data["imported"]["rights"]["hosts"]
+        assert "example" in data["imported"]["rights"]["hosts"]
         before_bound = data["accounts"]["github-work"]["bound"]["hosts"]
         hooks_session.prepare([], write=True)                      # the first session
         data = vault.load()
@@ -500,17 +667,17 @@ def test_existing_form_keeps_approvals_and_imports_converted_entries():
         buf = _io.StringIO()
         with _cl.redirect_stdout(buf):
             gate.main(["status"])
-        assert "Converted from 0.6, not in the form yet:" in buf.getvalue() and "powerslabs" in buf.getvalue()
+        assert "Converted from 0.6, not in the form yet:" in buf.getvalue() and "example" in buf.getvalue()
         # copy two converted entries in: no pop-up, keys and bindings intact
         conv = paths.from_v2_form_path().read_text()
-        ps = conv.split("\n[hosts.powerslabs]")[1].split("\n[")[0]
+        ps = conv.split("\n[hosts.example]")[1].split("\n[")[0]
         gw = conv.split("\n[accounts.github-work]")[1].split("\n[")[0]
-        env.write_form(mine + "\n[hosts.powerslabs]" + ps + "\n[accounts.github-work]" + gw + "\n")
+        env.write_form(mine + "\n[hosts.example]" + ps + "\n[accounts.github-work]" + gw + "\n")
         form, eff, data = hooks_session.prepare([], write=True)
         assert not eff.pending, [c.render() for c in eff.pending]
-        assert eff.hosts["powerslabs"].ssh is True and eff.hosts["localhost"].sudo is False
+        assert eff.hosts["example"].ssh is True and eff.hosts["localhost"].sudo is False
         assert "ghcr.io" in eff.accounts["github-work"].destinations
-        assert "powerslabs" in data["approved"]["rights"]["hosts"], "moved into approved"
+        assert "example" in data["approved"]["rights"]["hosts"], "moved into approved"
 
 
 def test_existing_form_with_syntax_error_never_falls_back_to_from_v2():
@@ -587,7 +754,7 @@ def test_a_host_known_only_from_a_sudo_entry_says_how_its_key_gets_there():
     the report called 0.6 "v2" and didn't say how to get a prompt back."""
     with H.gateway_env():
         d = {"version": 2, "secrets": {}, "accounts": {},
-             "sudo": {"joshua@db.example.com": {"password": "db-sudo-pw-123"}}}
+             "sudo": {"octo@db.example.com": {"password": "db-sudo-pw-123"}}}
         m = migrate.map_v2(d, local_user="me")
         assert "run gate check db while you're here to install Claude's key" in m.form_text, m.form_text
         assert "first use" not in m.form_text

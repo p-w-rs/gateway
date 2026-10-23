@@ -33,7 +33,13 @@ the pane's Client), then a restart, then a main-screen session:
             the screen"); the user types in the same shell (cd, export)
   handback  Hand back: the agent's old seq is refused (stale); after a read it
             types again: the same shell pid, the user's cwd and variable kept
-  sudo      sudo typed in the terminal: the stand-in hands it to sudo (the
+  sudo      first sudo = true here: a new install's sudo on this computer is
+            "ask" (0.10.0), which a gateway terminal can't use, so the form
+            gets [hosts.localhost] sudo = true and the agent runs gate check
+            localhost: the consent dialog (sudo "ask" -> true) is approved and
+            the sudo-method choice answered "Ask me each time" (nothing
+            stored), as a user would; then
+            sudo typed in the terminal: the stand-in hands it to sudo (the
             e2e fake, which asks on its tty with echo off, as sudo does);
             gated opens the credential dialog; a canary typed into its
             private field reaches that tty only; the agent sees
@@ -41,7 +47,8 @@ the pane's Client), then a restart, then a main-screen session:
   jobs      job_start, job_status, job_tail (bounded, scrubbed)
   askright  a script the agent runs in the terminal (sh rights.sh: a sudo
             and an ssh it starts itself; the approval hook sees only the sh
-            line): with localhost's sudo true its sudo works (the fake's
+            line): with localhost's sudo true (approved in the sudo step, kept
+            in every form written after it) its sudo works (the fake's
             cached timestamp); a new host approved in the consent dialog (gate
             check askhost with ssh true; the e2e fake ssh-keyscan gives its
             key, its address only answers with an ssh banner, the key-install
@@ -93,6 +100,10 @@ PREBUILD_TIMEOUT = 1800
 FIELD = "click here, then type"
 TAKEN = "input taken by the user; re-read the screen"
 GW = "mcp__plugin_gate_gw__"
+# sudo on this computer set to true (a new install's default is "ask" since 0.10.0); the sudo step
+# approves it in the consent dialog, and every form written after it keeps it until askright's step 3
+LOCAL_SUDO_TRUE = "[hosts.localhost]\nsudo = true\n"
+SUDO_ASK = "Ask me each time a command needs it"     # gate_setup.SUDO_ASK: nothing stored
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -621,7 +632,32 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
           state.get("pid0") is not None and line.startswith(f"PID1={state['pid0']} CWD=/tmp") and
           "GWX=user-was-here" in line, line or json.dumps(r)[:400])
 
+    print("sudo: sudo = true on this machine, approved in the consent dialog", flush=True)
+    # 0.10.0: a new install's sudo here is "ask", and a gateway terminal can't use an "ask" right
+    # (step_ask_rights shows the refusal); the user sets it to true and approves it in the dialog
+    gi.gateway_home.mkdir(parents=True, exist_ok=True)
+    (gi.gateway_home / "gateway.toml").write_text(LOCAL_SUDO_TRUE)
+    n0, done = ag.start_bash("gate check localhost", "set up sudo here")
+    ok = wait(s, lambda: "Approve" in screen(s) and "localhost" in screen(s), 120)
+    check("sudo: a new install's sudo here is \"ask\": the form's sudo = true waits for the OK, and gate check "
+          "localhost opens the consent dialog naming the change (sudo \"ask\" -> true)",
+          ok and '"ask" -> true' in screen(s) and "Decline" in screen(s), s.dump(25))
+    picked = False
+    if ok:
+        press(s, "Approve", lambda: SUDO_ASK in screen(s), settle=4.0)
+        ok = wait(s, lambda: SUDO_ASK in screen(s), 90)
+        check("sudo: Approve, then the sudo-method choice (store the password, or ask each time)", ok, s.dump(25))
+        if ok:
+            picked = press(s, SUDO_ASK, lambda: SUDO_ASK not in screen(s), settle=3.0)
+    res = ag.finish_bash(n0, done)
+    check("sudo: gate check localhost reports sudo here on (approved), its password asked each time "
+          "(\"Ask me each time\": nothing stored)",
+          picked and "localhost ready: sudo ✓" in (res or "") and "asked each time" in (res or ""),
+          " ".join((res or "no result").split())[:300])
+    ag.pane_focus = True
+
     print("sudo: the password prompt goes through the credential dialog", flush=True)
+    r = ag.tool("terminal_read", {"id": tid})
     # one turn: the sudo line, then (2 s on) a read, then an attempt to type into the prompt
     # (the prompt box itself takes nothing but the gateway's commands while the secret
     # dialog waits: phase 3's guard)
@@ -820,7 +856,7 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
             s.pump(0.5)
         return codes, rd(Path(f"{out}.sudo")), rd(Path(f"{out}.ssh")), screen_r
 
-    # 1. no form: localhost's sudo is true (the default, the sudo step used it)
+    # 1. the form's localhost sudo = true (approved in the sudo step, which used it)
     a0 = len(audit_lines())
     codes, err_sudo, _err_ssh, r = run_probe(1)
     new = audit_lines()[a0:]
@@ -831,8 +867,10 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
     check("askright: the pane shows the script's result line",
           has_line(r, lambda ln: ln.startswith("RIGHTS-1 sudo=0")), json.dumps(lines_of(r)[-6:]))
 
-    # 2. a new ssh host, approved in the dialog (ssh true), then narrowed to "ask"
-    form.write_text(ask_form(port, "true"))
+    # 2. a new ssh host, approved in the dialog (ssh true), then narrowed to "ask"; localhost's
+    # approved sudo = true stays in the form (without it localhost's sudo would be the new
+    # install's "ask", a narrowing that applies at once)
+    form.write_text(ask_form(port, "true", "true"))
     n0, done = ag.start_bash(f"gate check {ASK_HOST}", f"set up {ASK_HOST}")
     ok = wait(s, lambda: "Approve" in screen(s) and ASK_HOST in screen(s), 120)
     check(f"askright: gate check {ASK_HOST} opens the consent dialog (new host, its host key)", ok,
@@ -847,7 +885,7 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
     res = ag.finish_bash(n0, done)
     note(f"gate check {ASK_HOST}: {' '.join((res or 'no result').split())[:200]}")
     ag.pane_focus = True
-    form.write_text(ask_form(port, '"ask"'))
+    form.write_text(ask_form(port, '"ask"', "true"))
     host = state["askhost"]
     a0, f0, c0 = len(audit_lines()), fake_calls(), host.conns
     codes, err_sudo, err_ssh, r = run_probe(2)

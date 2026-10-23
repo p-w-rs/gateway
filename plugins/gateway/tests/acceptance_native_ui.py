@@ -25,7 +25,9 @@ on Linux the whole run can be wrapped in `strace -f -e trace=execve` (see
   hosts     /gate-hosts: the pane lists this machine with its runtime state;
             an edit typed into its field (workspace add) is written through
             the form writer, waits for the OK (Review localhost...), the
-            consent dialog approves it, the pane lists the workspace
+            consent dialog approves it (with the form's sudo = true, which
+            a new install's "ask" default makes a widening too), the pane
+            lists the workspace
   accounts  /gate-accounts: the accounts with their states; "Enter a
             credential for ..." opens the private dialog (a canary typed), the
             state turns to "stored, not checked yet"; "Check ..." runs
@@ -246,6 +248,10 @@ def part_hosts(s, gi, proj: Path) -> None:
                                           if "│" in ln and ln.split("│")[-1].strip()][:8]
     check("hosts: the localhost workspace waits for the OK: the consent dialog opens and names it",
           ok and "proj" in scr(s), s.dump(20))
+    # 0.10.0: FORM's sudo = true was written before any vault existed and a new install's sudo
+    # here is "ask", so the same dialog also asks for that change; Approve answers both
+    check("hosts: the same consent dialog asks for the form's sudo = true too (a new install's sudo on "
+          "this machine is \"ask\": sudo \"ask\" -> true)", ok and '"ask" -> true' in scr(s), s.dump(20))
     if ok:
         press_text(s, "Approve", lambda: "Approve" not in scr(s), settle=4.0)
         check("hosts: approved in the dialog, the localhost workspace no longer waits",

@@ -1,8 +1,13 @@
 """Vault v3: ~/.config/gateway/private/vault.age (SPEC 3).
 
 age-encrypted JSON (same crypto and locking as v2): `age -e -r RECIPIENT`
-and `age -d -i key.txt` through stdin/stdout only, atomic replace, and a
-flock on private/.lock around every read-modify-write. age comes from the
+and `age -d -i key.txt` through stdin/stdout only, a durable replace (temp
+file, fsync, rename, fsync the folder: write_private; F_FULLFSYNC on
+macOS), and a flock on private/.lock around every read-modify-write. `gate
+rotate` keeps a copy of vault.age from just before it changes it (snapshot:
+private/backups, the newest 5); `gate forget` keeps none, and names the
+older copies that may still hold what it forgot (older_copies). age comes
+from the
 gateway's pixi env by absolute path (never PATH).
 
     {"version": 3,
@@ -22,7 +27,8 @@ gateway's pixi env by absolute path (never PATH).
      "form_last_good": "<text>",
      "aliases": {"github:work": "github-work"},
      "events": [{"n", "at", "what", "detail"}], "events_seen": N,
-     "migrated": {"from", "store_sha256", "at", "report", "shown"}}
+     "migrated": {"from", "store_sha256", "at", "report", "shown"},
+     "baseline": 2}           (made by a gateway with "ask" as this computer's sudo default; below)
 
 cache.age holds short-lived tokens (Entra access tokens, ACR refresh tokens)
 keyed by account and scope, with their expiry; it is safe to delete.
@@ -37,6 +43,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -116,15 +123,41 @@ def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+# The defaults a vault was made under (review round 3). A vault this gateway
+# makes says `"baseline": 2`: this computer's sudo is "ask" where the form
+# doesn't say. A vault without it was made by an older gateway (0.9.1 and
+# before), whose default was sudo = true, and that install keeps it
+# (older_install; consent's baseline and the form's localhost default). Every
+# writer keeps the mark as it is: empty() has it, _fill never adds it to an
+# older vault, save() writes what load() gave, the broker's merge keeps the
+# vault's own (a writer can neither add nor drop it), export leaves it out
+# (export_view: per machine), and a converted 0.6 vault has none (migrate).
+BASELINE_KEY = "baseline"
+BASELINE = 2
+
+
 def empty() -> dict[str, Any]:
+    """A new vault (a missing one loads as this): it carries the baseline mark."""
     return {"version": VERSION, "machine": {}, "localhost": {"sudo": {}}, "hosts": {},
             "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {},
-            "events": [], "events_seen": 0, "migrated": None}
+            "events": [], "events_seen": 0, "migrated": None, BASELINE_KEY: BASELINE}
+
+
+def older_install(data: dict[str, Any] | None) -> bool:
+    """Was this vault made by an older gateway: a vault document (version 3,
+    as load() returns it) without the baseline mark? Never for no vault
+    (None: a new install, or one that can't be read now), an empty() one, or
+    anything that isn't a vault document: those get the stricter new defaults."""
+    if not isinstance(data, dict) or data.get("version") != VERSION:
+        return False
+    mark = data.get(BASELINE_KEY)
+    return not (isinstance(mark, int) and not isinstance(mark, bool) and mark >= BASELINE)
 
 
 def _fill(data: dict[str, Any]) -> dict[str, Any]:
     for k, v in empty().items():
-        data.setdefault(k, v)
+        if k != BASELINE_KEY:         # an older vault stays one (older_install)
+            data.setdefault(k, v)
     data["localhost"].setdefault("sudo", {})
     return data
 
@@ -199,21 +232,141 @@ def _decrypt(path: Path) -> bytes:
     return out.stdout
 
 
-def _encrypt_to(path: Path, plaintext: bytes) -> None:
-    rec = ensure_key()
+_DARWIN = sys.platform == "darwin"
+
+
+def full_fsync(fd: int) -> None:
+    """Flush a file (or folder) to the disk itself. On macOS fsync only hands
+    the data to the drive, whose cache a power loss can lose (APFS too):
+    F_FULLFSYNC asks the drive to flush it; where that fails (a file system
+    that doesn't take it), fsync (review round 2)."""
+    if _DARWIN:
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except (OSError, AttributeError):
+            pass
+    os.fsync(fd)
+
+
+def write_private(path: Path, data: bytes) -> None:
+    """Write whole and durably, mode 0600: a temp file beside it, fsync
+    (full_fsync: F_FULLFSYNC on macOS), rename, then fsync the folder, so a
+    crash or power loss leaves the old file or the new one, never an empty
+    or truncated one (GW-DUR-1; the broker's key.recipient uses it too)."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    old = os.umask(0o077)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        r = subprocess.run([_age(), "-e", "-r", rec, "-o", str(tmp)], input=plaintext,
-                           capture_output=True, timeout=30)
-        if r.returncode != 0:
-            raise VaultError(f"age could not encrypt {path.name}")
-        os.chmod(tmp, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            full_fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
-    finally:
-        os.umask(old)
-        with contextlib.suppress(FileNotFoundError):
+    except BaseException:
+        with contextlib.suppress(OSError):
             tmp.unlink()
+        raise
+    fsync_dir(path.parent)
+
+
+def fsync_dir(d: Path) -> None:
+    """fsync a folder (full_fsync), so a rename into it is on disk (best
+    effort)."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        full_fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _encrypt_to(path: Path, plaintext: bytes) -> None:
+    """age's ciphertext on its stdout, written durably (write_private)."""
+    rec = ensure_key()
+    r = subprocess.run([_age(), "-e", "-r", rec], input=plaintext, capture_output=True, timeout=30)
+    if r.returncode != 0 or not r.stdout:
+        raise VaultError(f"age could not encrypt {path.name}")
+    try:
+        write_private(path, r.stdout)
+    except OSError as e:
+        raise VaultError(f"{path.name} couldn't be written ({type(e).__name__})") from None
+
+
+# ---------------------------------------------------------------------------
+# A copy before `gate rotate` changes the vault; older copies `gate forget`
+# can't reach (the lead's decision, review round 2: forget keeps none)
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_KEEP = 5
+
+
+def _snapshot_re(kind: str) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(kind)}-\d{{8}}-\d{{6}}-[0-9a-f]{{6}}\.vault\.age$")
+
+
+def snapshot(kind: str = "rotate") -> Path | None:
+    """A copy of vault.age as it is now (still encrypted, its key unchanged)
+    in private/backups/<kind>-<time>-<hex>.vault.age (0600, the folder 0700),
+    written durably; only the newest SNAPSHOT_KEEP copies of that kind stay
+    (import backups and the 0.6 conversion's aren't touched). None when there
+    is no vault yet. `gate rotate` takes one just before it first changes the
+    vault (ssh.rotate's before_change, under the vault's lock), so the person
+    can put it back by hand (SPEC 15: copy it over vault.age with gated
+    stopped). `gate forget` takes none: forgetting means gone (GW-DUR-1)."""
+    import secrets
+    src = paths.vault_path()
+    try:
+        data = src.read_bytes()
+    except FileNotFoundError:
+        return None
+    d = paths.backups_dir()
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(d, 0o700)
+    p = d / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.vault.age"
+    write_private(p, data)
+    pat = _snapshot_re(kind)
+    snaps = sorted((f for f in d.iterdir() if pat.match(f.name) and f.is_file()),
+                   key=lambda f: (f.stat().st_mtime, f.name))
+    for old in snaps[:-SNAPSHOT_KEEP]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+    return p
+
+
+# What in private/backups holds an older copy of the vault (or of the 0.6
+# store), so a forgotten secret may survive there: rotate's copies (and any
+# other *.vault.age), an import's backup folders (their vault.age), the 0.6
+# conversion's store-v2-*.age. Globs for the person's own `rm -r`, by kind.
+OLDER_COPY_GLOBS = (("*.vault.age", lambda f: f.is_file() and f.name.endswith(".vault.age")),
+                    ("import-*", lambda f: f.is_dir() and f.name.startswith("import-")
+                     and (f / "vault.age").exists()),
+                    ("store-v2-*.age", lambda f: f.is_file() and f.name.startswith("store-v2-")
+                     and f.name.endswith(".age")))
+
+
+def older_copies() -> list[tuple[str, list[str]]]:
+    """[(glob, [names])] of the backups that hold an older vault (or 0.6
+    store), by kind, only kinds present; [] when there are none. Names only
+    (listing a folder, reading nothing)."""
+    d = paths.backups_dir()
+    try:
+        items = sorted(d.iterdir(), key=lambda f: f.name)
+    except OSError:
+        return []
+    out = []
+    for glob, test in OLDER_COPY_GLOBS:
+        names = [f.name for f in items if not f.is_symlink() and test(f)]
+        if names:
+            out.append((glob, names))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -606,9 +759,11 @@ def labeled_values(data: dict[str, Any]) -> list[tuple[str, str, str]]:
 
 
 def export_view(data: dict[str, Any]) -> dict[str, Any]:
-    """The vault minus cache-like and per-machine consent state (SPEC 16)."""
+    """The vault minus cache-like and per-machine consent state (SPEC 16; the
+    baseline mark is this machine's: the importing vault keeps its own)."""
     d = copy.deepcopy(data)
-    for k in ("approved", "imported", "form_last_good", "events", "events_seen", "sudo_choice"):
+    for k in ("approved", "imported", "form_last_good", "events", "events_seen", "sudo_choice",
+              BASELINE_KEY):
         d.pop(k, None)
     return d
 

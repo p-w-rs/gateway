@@ -22,18 +22,18 @@ PASS = "correct horse battery staple"
 A_FORM = '''[hosts.localhost]
 sudo = true
 
-[hosts.powerslabs]
-address = "joshua@10.0.0.5"
+[hosts.example]
+address = "octo@10.0.0.5"
 
 [hosts.builder]
 address = "ci@builder.internal"
-via = "powerslabs"
+via = "example"
 sudo = false
 
 [accounts.github-work]
 kind = "github"
-login = "jpowers-asi"
-owners = ["asirobots"]
+login = "octo-work"
+owners = ["example-org"]
 
 [accounts.openai]
 kind = "api-key"
@@ -58,11 +58,11 @@ def _machine_a(env) -> None:
     k2, p2 = H.ssh_keypair("builder")
     with vault.edit() as d:
         d["machine"] = {"id": "MACHINE-A", "name": "macbook", "hostname": "macbook.local"}
-        lab = vault.host_record(d, "powerslabs")
+        lab = vault.host_record(d, "example")
         lab["keys"] = [vault.key_record(k1, p1)]
         lab["host_keys"] = [vault.norm_host_key(LAB_KEY)]
         lab["pinned_at"] = "2026-01-01T00:00:00+0000"
-        vault.set_sudo(d, "powerslabs", "joshua", "lab-sudo-pw-22")
+        vault.set_sudo(d, "example", "octo", "lab-sudo-pw-22")
         b = vault.host_record(d, "builder")
         b["keys"] = [vault.key_record(k2, p2)]
         b["host_keys"] = [vault.norm_host_key(H.fake_host_key("bkey"))]
@@ -75,7 +75,7 @@ def _machine_a(env) -> None:
 def _groups(form_text: str = A_FORM, sudo: bool = True) -> str:
     """The selection pane's lines for machine A (PLAN-v4 phase 7: one per
     item), all ticked (and this machine's sudo password when `sudo`)."""
-    opts = ["Host powerslabs (joshua@10.0.0.5)", "powerslabs: its SSH key and sudo password",
+    opts = ["Host example (octo@10.0.0.5)", "example: its SSH key and sudo password",
             "Host builder (ci@builder.internal)", "builder: its SSH key",
             "Account github-work (github)", "github-work: its token",
             "Account openai (api-key)", "openai: its token"]
@@ -144,8 +144,8 @@ def test_export_import_round_trip_with_localhost_remap():
             assert c[0]["kind"] == "checklist" and "This machine's sudo password" in c[0]["default"]
             assert any(e["what"] == "export" for e in vault.load()["events"])
         ans = U.answers(("ok", PASS), ("ok", "Keep mine"), ("ok",))
-        with U.ux_env(ans, local_user="joshua", machine_id="MACHINE-B") as env:
-            env.o.extra["etc_ssh"] = str(_etc(env.root, LAB_KEY))       # this machine is powerslabs
+        with U.ux_env(ans, local_user="octo", machine_id="MACHINE-B") as env:
+            env.o.extra["etc_ssh"] = str(_etc(env.root, LAB_KEY))       # this machine is example
             U.setup(env, '[accounts.openai]\nkind = "api-key"\nsites = ["api.openai.com"]\n')
             U.set_token("openai", "api-key", "sk-local-openai-key-99999999")
             # what this machine kept under a name it removed earlier is not what
@@ -160,17 +160,17 @@ def test_export_import_round_trip_with_localhost_remap():
             assert c[0]["kind"] == "secret" and c[1]["kind"] == "choice" and "openai" in c[1]["message"]
             assert c[2]["kind"] == "confirm" and c[2]["default"] == "Cancel"
             msg = c[2]["message"]
-            assert "This machine is powerslabs in the file (found by host key)" in msg, msg
+            assert "This machine is example in the file (found by host key)" in msg, msg
             assert "Adds:" in msg and "builder" in msg and "github-work" in msg and "macbook" in msg
             assert "Keeps yours: openai" in msg
             form = env.form()
-            assert "powerslabs" not in form.hosts, "this machine isn't added as a host"
+            assert "example" not in form.hosts, "this machine isn't added as a host"
             assert form.hosts["builder"].via is None, "reached through this machine: direct now"
             mac = form.hosts["macbook"]
             assert mac.ssh is False and mac.address.user == "alice"
             assert mac.address.host == socket.gethostname().lower()
             data = vault.load()
-            assert data["localhost"]["sudo"]["joshua"]["password"] == "lab-sudo-pw-22"
+            assert data["localhost"]["sudo"]["octo"]["password"] == "lab-sudo-pw-22"
             assert data["hosts"]["macbook"]["host_keys"] == [vault.norm_host_key(MAC_KEY)]
             assert data["hosts"]["macbook"]["sudo"]["alice"]["password"] == "mac-pw-alice-1"
             assert data["accounts"]["openai"]["token"]["value"] == "sk-local-openai-key-99999999"
@@ -234,28 +234,29 @@ def test_export_passphrase_is_never_on_a_dialog_command_line():
 
 def test_import_of_a_v2_export():
     with _xfer_dir() as x:
-        with U.ux_env(local_user="joshua") as env:
-            v2 = H.users_v2_vault("joshua")
+        with U.ux_env(local_user="octo") as env:
+            v2 = H.users_v2_vault("octo")
             obj = {"gateway_export": 1, "created": "2026-10-01", "from_host": "oldmac.local",
                    "secrets": v2["secrets"], "sudo": v2["sudo"], "accounts": v2["accounts"],
                    "account_prompts": v2["account_prompts"]}
             f = x / "v2.age"
             f.write_bytes(transfer.encrypt_passphrase(json.dumps(obj).encode(), PASS))
         none = "None of them (this machine isn't in the file)"
-        with U.ux_env(U.answers(("ok", PASS), ("ok", none), ("ok",)), local_user="joshua") as env:
+        with U.ux_env(U.answers(("ok", PASS), ("ok", none), ("ok",)), local_user="octo") as env:
             env.o.extra["etc_ssh"] = str(_etc(env.root, None))
             U.setup(env, "")
             rc, out, err = _run(transfer.import_cmd, str(f))
             assert rc == 0, (out, err)
             form = env.form()
-            for n in ("powerslabs", "builder", "github-personal", "github-work", "hf", "azure", "catalog"):
+            for n in ("example", "builder", "github-personal", "github-work", "hf", "azure", "catalog"):
                 assert n in form.hosts or n in form.accounts, (n, out)
             assert "oldmac" in form.hosts and form.hosts["oldmac"].ssh is False
+            assert form.hosts["oldmac"].sudo is True, "the 0.6 export's localhost said sudo = true"
             data = vault.load()
             assert data["accounts"]["github-work"]["token"]["value"] == "ghp_workTOKEN0123456789abcdefghij"
             assert "entra" not in data["accounts"]["github-work"], "the old record's sign-in is gone"
             assert data["accounts"]["github-work"]["kind"] == "github"
-            assert data["hosts"]["powerslabs"]["sudo"]["joshua"]["password"] == "lab-sudo-pw-22"
+            assert data["hosts"]["example"]["sudo"]["octo"]["password"] == "lab-sudo-pw-22"
             assert data["accounts"]["azure"]["entra"]["refresh_token"] == "0.AAAA-azure-refresh-token-xyz"
             calls = env.dialog.calls()
             assert calls[1]["kind"] == "choice" and "Which host in the file is this machine" in calls[1]["message"]
@@ -274,7 +275,7 @@ def test_strict_validation_refuses_bad_files():
     with U.ux_env(local_user="alice") as env:
         good = _content(env)
         inc = transfer.parse_incoming(json.loads(json.dumps(good)))
-        assert "powerslabs" in inc.form.hosts and inc.source_sudo["alice"]["password"] == "mac-pw-alice-1"
+        assert "example" in inc.form.hosts and inc.source_sudo["alice"]["password"] == "mac-pw-alice-1"
 
         def bad(mutate, frag, redigest=True):
             c = json.loads(json.dumps(good))
@@ -288,7 +289,7 @@ def test_strict_validation_refuses_bad_files():
                 assert frag in str(e) and "nothing was imported" in str(e), (frag, e)
         bad(lambda c: c.update(extra=1), "unknown fields")
         bad(lambda c: c["vault"]["hosts"].update(ghost={"keys": []}), "isn't in its form")
-        bad(lambda c: c["vault"]["hosts"]["powerslabs"]["keys"][0].update(private="not a key"), "OpenSSH key")
+        bad(lambda c: c["vault"]["hosts"]["example"]["keys"][0].update(private="not a key"), "OpenSSH key")
         bad(lambda c: c["vault"]["accounts"]["openai"]["token"].update(value=5), "isn't valid")
         bad(lambda c: c["vault"]["accounts"]["openai"].update(kind="github"), "wrong kind")
         bad(lambda c: c["vault"]["accounts"]["openai"]["bound"].update(hosts=["bad host!"]), "binding")
@@ -326,7 +327,7 @@ def _remote_b(root_b: Path):
         calls.append(command)
         if command.startswith("test -x"):
             return 0, b"gateway-present\n", b""
-        with testing.override(root_b, local_user="joshua", machine_id="MACHINE-B",
+        with testing.override(root_b, local_user="octo", machine_id="MACHINE-B",
                               etc_ssh=str(_etc(root_b, LAB_KEY)), peer_parent_ok=True):
             formmod.clear_cache()
             if command.endswith(" pubkey"):
@@ -349,35 +350,35 @@ def _remote_b(root_b: Path):
 def test_copy_to_a_fake_remote_gate():
     with _xfer_dir() as x:
         root_b = x / "machine-b"
-        with testing.override(root_b, local_user="joshua", machine_id="MACHINE-B"):
+        with testing.override(root_b, local_user="octo", machine_id="MACHINE-B"):
             (root_b / "home").mkdir(parents=True, exist_ok=True)
             vault.save(vault.empty())
-        ans = U.answers(("ok", _groups()), ("ok", "powerslabs"))
+        ans = U.answers(("ok", _groups()), ("ok", "example"))
         with U.ux_env(ans, local_user="alice", machine_id="MACHINE-A") as env:
             _machine_a(env)
             with _remote_b(root_b) as calls:
-                rc, out, err = _run(transfer.copy_to, "powerslabs")
+                rc, out, err = _run(transfer.copy_to, "example")
             assert rc == 0, (out, err)
-            assert "copied to powerslabs" in out and "added" in out, out
+            assert "copied to example" in out and "added" in out, out
             # (the import call itself runs in the pop-up helper, a forked process)
             assert calls[0].startswith("test -x") and calls[1].endswith("gate pubkey")
             assert env.dialog.calls()[1]["kind"] == "text" and "Type the host name" in env.dialog.calls()[1]["message"]
             assert any(e["what"] == "copy" for e in vault.load()["events"])
-            # the pop-ups say plainly that Claude's commands reach powerslabs, and show
+            # the pop-ups say plainly that Claude's commands reach example, and show
             # the remote's recipient (to compare with gate pubkey on that machine)
             groups_msg = env.dialog.calls()[0]["message"]
-            assert "Claude can run commands on powerslabs" in groups_msg, groups_msg
-            assert "within reach of Claude's commands on powerslabs" in groups_msg
-            with testing.override(root_b, local_user="joshua", machine_id="MACHINE-B"):
+            assert "Claude can run commands on example" in groups_msg, groups_msg
+            assert "within reach of Claude's commands on example" in groups_msg
+            with testing.override(root_b, local_user="octo", machine_id="MACHINE-B"):
                 recipient = vault.ensure_key()
             confirm_msg = env.dialog.calls()[1]["message"]
             assert recipient in confirm_msg and "gate pubkey" in confirm_msg, confirm_msg
-        with testing.override(root_b, local_user="joshua", machine_id="MACHINE-B"):
+        with testing.override(root_b, local_user="octo", machine_id="MACHINE-B"):
             formmod.clear_cache()
             form = formmod.load(use_cache=False)
             data = vault.load()
-            assert "builder" in form.hosts and "powerslabs" not in form.hosts and "macbook" in form.hosts
-            assert data["localhost"]["sudo"]["joshua"]["password"] == "lab-sudo-pw-22"
+            assert "builder" in form.hosts and "example" not in form.hosts and "macbook" in form.hosts
+            assert data["localhost"]["sudo"]["octo"]["password"] == "lab-sudo-pw-22"
             assert any(e["what"] == "import" and "copy from macbook" in e["detail"] for e in data["events"])
             formmod.clear_cache()
 
@@ -385,13 +386,13 @@ def test_copy_to_a_fake_remote_gate():
 def test_copy_to_refusals():
     with _xfer_dir() as x:
         root_b = x / "machine-b"
-        with testing.override(root_b, local_user="joshua", machine_id="MACHINE-B"):
+        with testing.override(root_b, local_user="octo", machine_id="MACHINE-B"):
             (root_b / "home").mkdir(parents=True, exist_ok=True)
             vault.save(vault.empty())
-        with U.ux_env(U.answers(("ok", _groups()), ("ok", "powerslab"))) as env:
+        with U.ux_env(U.answers(("ok", _groups()), ("ok", "exampl"))) as env:
             _machine_a(env)
             with _remote_b(root_b) as calls:
-                rc, out, err = _run(transfer.copy_to, "powerslabs")
+                rc, out, err = _run(transfer.copy_to, "example")
                 assert rc == 1 and "didn't match" in err, err
                 assert not any("from-peer" in c for c in calls), "nothing was sent"
                 rc, out, err = _run(transfer.copy_to, "localhost")
@@ -404,18 +405,18 @@ def test_copy_to_refusals():
                 rec.write_text("started=1\n")
                 os.utime(rec, (rec.stat().st_mtime - 60, rec.stat().st_mtime - 60))
                 with vault.edit() as d:
-                    d["hosts"]["powerslabs"]["pinned_at"] = vault.now()
-                rc, out, err = _run(transfer.copy_to, "powerslabs")
+                    d["hosts"]["example"]["pinned_at"] = vault.now()
+                rc, out, err = _run(transfer.copy_to, "example")
                 assert rc == 2 and "pinned in this session" in err, err
                 # the verifier's case: the session id unset (or unknown) no longer skips the rule
                 for sid in (None, "made-up-session"):
                     with U.env_vars(CLAUDE_CODE_SESSION_ID=sid):
-                        rc, out, err = _run(transfer.copy_to, "powerslabs")
+                        rc, out, err = _run(transfer.copy_to, "example")
                     assert rc == 2 and "less than 12 hours ago" in err, (sid, err)
                 # a run-dir record Claude's commands could touch doesn't count
                 (paths.session_dir() / "sess-ux.json").write_text("{}")
                 rec.unlink()
-                rc, out, err = _run(transfer.copy_to, "powerslabs")
+                rc, out, err = _run(transfer.copy_to, "example")
                 assert rc == 2 and "less than 12 hours ago" in err, err
                 assert not any("from-peer" in c for c in calls), "nothing was sent"
 
@@ -535,13 +536,13 @@ def test_copy_to_a_remote_still_setting_up_or_without_the_gateway():
                 return 0, b"gateway-present\n", b""
             return 75, b"", b"gateway: still setting up (first run); try again in a minute\n"
         with U.patch(transfer, "remote", building):
-            rc, out, err = _run(transfer.copy_to, "powerslabs")
-        assert rc == 2 and "the gateway on powerslabs is still setting up" in err, err
-        assert "try gate copy-to powerslabs again in a minute" in err
+            rc, out, err = _run(transfer.copy_to, "example")
+        assert rc == 2 and "the gateway on example is still setting up" in err, err
+        assert "try gate copy-to example again in a minute" in err
 
         def absent(name, command, input=None, timeout=120):
             return 1, b"", b""
         with U.patch(transfer, "remote", absent):
-            rc, out, err = _run(transfer.copy_to, "powerslabs")
-        assert rc == 1 and "signing in to Claude Code on powerslabs themselves" in err, err
+            rc, out, err = _run(transfer.copy_to, "example")
+        assert rc == 1 and "signing in to Claude Code on example themselves" in err, err
         assert "first-time setup finishes" in err

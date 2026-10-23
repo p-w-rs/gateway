@@ -60,7 +60,8 @@ else
   esac
 fi
 
-BLOCK='{"decision": "block", "reason": "gateway: that looked like a secret, so it was not sent (the check could not run, so it was blocked to be safe); Claude can open a pop-up for it", "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true}}'
+# The paste guard's refusal is hooks_prompt.BLOCK_REASON word for word (a test compares them).
+BLOCK='{"decision": "block", "reason": "gateway: that looked like a secret, so it wasn'\''t sent; Claude can open the gateway'\''s dialog for it (gate check NAME), where it is typed privately", "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true}}'
 BLOCK_NOTICE='{"decision": "block", "reason": "gateway: a background command notice was held back from Claude: it quotes raw output, and the check for stored secrets could not run, so it was blocked to be safe", "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true}}'
 # Same alternatives as hooks_prompt.TOKEN_PATTERNS (a test keeps them in sync).
 # The payload is JSON: a token at the start of a line follows the two

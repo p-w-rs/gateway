@@ -26,12 +26,12 @@ def sel(kind, host, owner, form, env=None, aliases=None):
 FORM = F.parse_text('''
 [accounts.github-personal]
 kind = "github"
-login = "p-w-rs"
+login = "octocat"
 default = true
 [accounts.github-work]
 kind = "github"
-login = "jpowers-asi"
-owners = ["asirobots"]
+login = "octo-work"
+owners = ["example-org"]
 [accounts.github-old]
 kind = "github"
 login = "oldme"
@@ -41,7 +41,7 @@ kind = "github"
 host = "github.acme.com"
 [accounts.hf]
 kind = "huggingface"
-login = "pwrs"
+login = "octocat"
 [accounts.hf2]
 kind = "huggingface"
 owners = ["shared-org"]
@@ -50,22 +50,22 @@ kind = "api-key"
 sites = ["api.openai.com", ".openai.azure.com"]
 [accounts.pijul]
 kind = "pijul"
-login = "pwrs"
+login = "octocat"
 ''', Path("/x"))
 
 # (id, kind, host, owner, env, expected account | "ERR:substr" | "NONE")
 SELECT = [
-    ("owner_login_match", "github", "github.com", "p-w-rs", {}, "github-personal"),
-    ("owner_org_match", "github", "github.com", "asirobots", {}, "github-work"),
-    ("owner_case_insensitive", "github", "github.com", "AsiRobots", {}, "github-work"),
-    ("owner_work_login", "github", "github.com", "jpowers-asi", {}, "github-work"),
+    ("owner_login_match", "github", "github.com", "octocat", {}, "github-personal"),
+    ("owner_org_match", "github", "github.com", "example-org", {}, "github-work"),
+    ("owner_case_insensitive", "github", "github.com", "Example-Org", {}, "github-work"),
+    ("owner_work_login", "github", "github.com", "octo-work", {}, "github-work"),
     ("unknown_owner_default", "github", "github.com", "torvalds", {}, "github-personal"),
     ("no_owner_default", "github", "github.com", None, {}, "github-personal"),
-    ("api_host_counts", "github", "api.github.com", "asirobots", {}, "github-work"),
-    ("ghcr_via_packages", "github", "ghcr.io", "asirobots", {}, "github-work"),
+    ("api_host_counts", "github", "api.github.com", "example-org", {}, "github-work"),
+    ("ghcr_via_packages", "github", "ghcr.io", "example-org", {}, "github-work"),
     ("use_false_owner_never_falls_back", "github", "github.com", "oldme", {}, "ERR:github-old is the account for oldme but has use = false"),
     ("ghes_single", "github", "github.acme.com", "team", {}, "ghes"),
-    ("explicit_overrides_owner", "github", "github.com", "asirobots", {"GATE_ACCOUNT": "github-personal"}, "github-personal"),
+    ("explicit_overrides_owner", "github", "github.com", "example-org", {"GATE_ACCOUNT": "github-personal"}, "github-personal"),
     ("explicit_alias", "github", "github.com", None, {"GATE_ACCOUNT": "github:work"}, "github-work"),
     ("explicit_wrong_kind", "github", "github.com", None, {"GATE_ACCOUNT": "hf"}, "ERR:huggingface account"),
     ("explicit_wrong_host", "github", "github.acme.com", None, {"GATE_ACCOUNT": "github-work"}, "ERR:may not be used"),
@@ -77,7 +77,7 @@ SELECT = [
     ("api_key_subdomain", "api-key", "x.openai.azure.com", None, {}, "openai"),
     ("api_key_bare_domain_not_covered", "api-key", "openai.azure.com", None, {}, "NONE"),
     ("no_account_for_gitlab", "github", "gitlab.com", "acme", {}, "NONE"),
-    ("pijul_single", "pijul", "nest.pijul.com", "pwrs", {}, "pijul"),
+    ("pijul_single", "pijul", "nest.pijul.com", "octocat", {}, "pijul"),
 ]
 
 
@@ -273,18 +273,18 @@ def test_ssh_endpoints():
     assert ("git", "github.com") in ep["github-work"] and ("git", "ssh.github.com") in ep["github-work"]
     assert ep["ghes"] == [("git", "github.acme.com")]
     assert ep["hf"] == [("git", "hf.co")]
-    assert ep["pijul"] == [("pwrs", "nest.pijul.com")]
+    assert ep["pijul"] == [("octocat", "nest.pijul.com")]
     assert ep["openai"] == []
     names = {a.name for a in A.endpoint_accounts("git", "github.com", FORM)}
     assert names == {"github-personal", "github-work", "github-old"}
-    assert A.is_ssh_endpoint("hf.co", FORM) and not A.is_ssh_endpoint("powerslabs", FORM)
+    assert A.is_ssh_endpoint("hf.co", FORM) and not A.is_ssh_endpoint("example", FORM)
     assert A.kinds_for_host("api.openai.com", FORM) == ["api-key"]
 
 
 def test_owner_extraction():
-    assert A.owner_from_path("asirobots/repo.git") == "asirobots"
-    assert A.owner_from_path("/asirobots/repo") == "asirobots"
-    assert A.owner_from_path("'~asirobots/repo'") == "asirobots"
+    assert A.owner_from_path("example-org/repo.git") == "example-org"
+    assert A.owner_from_path("/example-org/repo") == "example-org"
+    assert A.owner_from_path("'~example-org/repo'") == "example-org"
     assert A.owner_from_path("lonely") is None
     assert A.owner_from_path("datasets/org/name", "huggingface") == "org"
     assert A.owner_from_url("https://github.com/acme/x.git") == ("github.com", "acme")

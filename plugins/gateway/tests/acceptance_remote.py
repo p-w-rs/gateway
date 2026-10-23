@@ -323,7 +323,9 @@ def main(argv: list[str]) -> int:
                       srt.get("bash", "").startswith("5.") and srt.get("tmux", "").startswith("tmux 3"),
                       json.dumps({k: srt.get(k) for k in ("runtime", "identity", "bash", "tmux",
                                                           "platform")}))
-                tm = vm.ssh(f"ps -eo user,args | grep '[g]w-remote/rt/{ver}' | head -3").stdout
+                # the run's own folder (--vm-dir): vmp() rewrites only path prefixes, not this
+                # bracketed grep word (which keeps grep from matching itself)
+                tm = vm.ssh(f"ps -eo user,args | grep '[{VMDIR[0]}]{VMDIR[1:]}/rt/{ver}' | head -3").stdout
                 check("stage: the runtime's tmux runs on its private socket in the runtime folder",
                       f"{rtv}/tmux.sock" in tm, " ".join(tm.split())[:200])
                 print(f"   (staging + first terminal took {took:.1f} s)")

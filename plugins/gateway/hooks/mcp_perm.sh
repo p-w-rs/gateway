@@ -2,7 +2,6 @@
 # PreToolUse decisions for the gateway's own MCP tools (SPEC 14). POSIX sh + awk,
 # no Python. Matcher (phase C): mcp__plugin_gate_gw__.*
 #
-#   download                       -> allow (every mode)
 #   host_inspect                   -> allow (every mode: reads files and lists folders on
 #                                     this machine, runs nothing, imports nothing)
 #   terminal_read, terminal_list,  -> allow (every mode: bounded, scrubbed reads of the
@@ -18,13 +17,16 @@
 #                                     judges what they type or run (Bash's denies; never
 #                                     allow), then Claude Code's mode decides
 #   terminal_signal, terminal_close, job_signal -> no decision (Claude Code's mode decides)
-#   http, method GET or HEAD       -> allow (a missing method means GET)
-#   http, other method + account   -> allow (the credential only goes to the account's
-#                                     own approved sites; web.py enforces that)
+#   http, download                 -> no decision, in every mode, for any method, with or
+#                                     without an account: a request can carry data out or
+#                                     use an account's credential, so Claude Code's mode
+#                                     decides (a prompt in default and plan mode, the
+#                                     reviewer in auto); web.py still keeps a credential to
+#                                     its account's sites and applies the policy
 #   anything else                  -> no output (Claude Code's mode decides)
 #
-# Only TOP-LEVEL keys of tool_input count: a "method" or "account" key inside
-# headers, json or a body string never decides anything. The payload is
+# Only TOP-LEVEL keys of tool_input count: a "host" or "action" key inside an
+# object or a string of the input never decides anything. The payload is
 # tokenized properly: escape sequences are neutralized first (so every
 # remaining double quote delimits a string), then awk splits on quotes and
 # tracks the object depth outside strings.
@@ -51,8 +53,8 @@ function out_chars(s,   n, j, c) {
     }
   }
 }
-BEGIN { depth = 0; lastkey = ""; lastdepth = -1; tool = ""; method = ""; hasmethod = 0;
-        account = ""; hasaccount = 0; bad = 0; host = ""; hashost = 0; action = ""; hasaction = 0 }
+BEGIN { depth = 0; lastkey = ""; lastdepth = -1; tool = ""; bad = 0; host = ""; hashost = 0;
+        action = ""; hasaction = 0 }
 {
   for (i = 1; i <= NF; i++) {
     if (i % 2 == 1) { out_chars($i); continue }
@@ -65,14 +67,6 @@ BEGIN { depth = 0; lastkey = ""; lastdepth = -1; tool = ""; method = ""; hasmeth
       if (strval) tool = $(i + 2); else bad = 1
     }
     if (depth == 2 && kind[2] == "{" && owner[2] == "tool_input") {
-      if (k == "method") {
-        hasmethod++
-        if (strval) method = toupper($(i + 2)); else method = "?"
-      }
-      if (k == "account") {
-        hasaccount++
-        if (strval) account = $(i + 2); else account = ""
-      }
       if (k == "host") {
         hashost++
         if (strval) host = $(i + 2); else host = "?"
@@ -86,7 +80,6 @@ BEGIN { depth = 0; lastkey = ""; lastdepth = -1; tool = ""; method = ""; hasmeth
 }
 END {
   if (bad || depth != 0) { print "none"; exit }
-  if (tool == "mcp__plugin_gate_gw__download") { print "allow-download"; exit }
   if (tool == "mcp__plugin_gate_gw__host_inspect") { print "allow-inspect"; exit }
   if (tool == "mcp__plugin_gate_gw__terminal_read" || tool == "mcp__plugin_gate_gw__terminal_list" ||
       tool == "mcp__plugin_gate_gw__job_status" || tool == "mcp__plugin_gate_gw__job_tail" ||
@@ -100,10 +93,6 @@ END {
     if (hasaction == 0 || (hasaction == 1 && action == "status")) print "allow-runtime-read"
     else print "none"
     exit }
-  if (tool != "mcp__plugin_gate_gw__http") { print "none"; exit }
-  if (hasmethod > 1 || hasaccount > 1) { print "none"; exit }
-  if (hasmethod == 0 || method == "GET" || method == "HEAD") { print "allow-read"; exit }
-  if (account != "" && account ~ /^[A-Za-z0-9_.:@-]+$/) { print "allow-account"; exit }
   print "none"
 }')
 
@@ -112,13 +101,10 @@ allow() {
 }
 
 case $decision in
-  allow-download) allow "gateway: download writes a new, non-executable file" ;;
   allow-inspect) allow "gateway: a read-only look at what this machine offers (nothing is run or imported)" ;;
   allow-term-read) allow "gateway: a bounded, scrubbed read of a gateway terminal or job (nothing is typed or run)" ;;
   allow-term-open) allow "gateway: an idle managed shell or a window size (nothing of the model's runs)" ;;
   allow-runtime-read) allow "gateway: a read of a remote host's identity and runtime readiness (nothing is run or staged)" ;;
-  allow-read) allow "gateway: a GET/HEAD request" ;;
-  allow-account) allow "gateway: the account's credential goes only to its approved sites" ;;
   *) : ;;
 esac
 exit 0

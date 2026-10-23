@@ -144,6 +144,30 @@ def test_merges_restore_sentinels_and_refuse_changes_to_what_was_hidden():
     assert "gh-me" not in broker.merge(allv, cur, broker.ALL, key)["accounts"]
 
 
+def test_a_merge_keeps_the_vaults_own_baseline_mark():
+    """The baseline mark is the vault's own: a writer that leaves it out
+    can't drop it (a new install would get an older one's sudo true), one
+    that adds it or changes it can't put it on an older vault or change it;
+    with no vault yet the server merges against empty(), which has it."""
+    key = os.urandom(32)
+    sudo = broker.scope_for("shim sudo")
+    cur = _sample()
+    assert cur[vault.BASELINE_KEY] == vault.BASELINE
+    w = broker.make_view(cur, sudo, key)
+    assert w[vault.BASELINE_KEY] == vault.BASELINE, "the view shows it"
+    del w[vault.BASELINE_KEY]
+    assert broker.merge(w, cur, sudo, key)[vault.BASELINE_KEY] == vault.BASELINE
+    w[vault.BASELINE_KEY] = 1
+    assert broker.merge(w, cur, broker.ALL, key)[vault.BASELINE_KEY] == vault.BASELINE
+    older = _sample()
+    del older[vault.BASELINE_KEY]
+    w = broker.make_view(older, broker.ALL, key)
+    w[vault.BASELINE_KEY] = vault.BASELINE
+    assert vault.BASELINE_KEY not in broker.merge(w, older, broker.ALL, key)
+    first = {k: v for k, v in vault.empty().items() if k != vault.BASELINE_KEY}
+    assert broker.merge(first, vault.empty(), sudo, key)[vault.BASELINE_KEY] == vault.BASELINE
+
+
 def test_the_token_cache_is_scoped_and_merged():
     cache = {"tokens": {"gh-me|repo": {"value": "t1", "expires": 9e9},
                         "az-work|https://x": {"value": "t2", "expires": 9e9}}}

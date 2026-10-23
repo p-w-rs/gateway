@@ -1,4 +1,4 @@
-"""Policy decisions (PLAN-v4 phase 7, docs/modules/policy.md).
+"""Policy decisions (PLAN-v4 phase 7, docs/dev/modules/policy.md).
 
 Every gateway action on a host or with an account is decided here, at the
 boundary that performs it (the ssh and sudo stand-ins, gated's terminals,

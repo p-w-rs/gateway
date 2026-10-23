@@ -6,6 +6,8 @@
 // Everything security-relevant stays in the classic hooks (hooks.json):
 // Anthropic can switch mods off, and the guards must hold without them.
 
+import { FULLSCREEN_HINT, MAIN_KEYS, NO_DISPLAY, NO_DISPLAY_TODO, PASTE_NOTE } from './dialog.ts'
+
 // pixi versions that install this plugin's lock (format v7) with the
 // launcher's own `pixi install --locked --manifest-path`, tested 2026-10-19 on
 // macOS arm64: 0.68.0, 0.69.0, 0.70.0, 0.81.0, 0.82.0 (0.61.0-0.67.0 refuse
@@ -21,7 +23,7 @@ export const MODS_MIN_DESKTOP = '2.1.286'
 
 export const DOCTOR_COMMAND = 'gate-doctor'
 
-// Managed execution (PLAN-v4 phase 4; docs/modules/managed.md): the prefix
+// Managed execution (PLAN-v4 phase 4; docs/dev/modules/managed.md): the prefix
 // Claude Code runs every shell command through, the folder Python writes the
 // managed shell's files to (named to gate-sh by GW_MANAGED_DIR), and the
 // state.json /gate-doctor reads.
@@ -38,6 +40,7 @@ export type ManagedState = {
   env: { name: string; origin: string }[]
   pending: string[]
   vaultReadable: boolean
+  found: string[]                 // tool folders here the managed PATH lacks (managed.found_not_imported)
 }
 
 const MODES: readonly string[] = ['on', 'warn', 'off']
@@ -67,6 +70,7 @@ export function parseManagedState(text: string | undefined): ManagedState | unde
     env: list('env', (x) => (typeof x.name === 'string' ? { name: x.name, origin: typeof x.origin === 'string' ? x.origin : '' } : undefined)),
     pending: Array.isArray(o.pending) ? (o.pending as unknown[]).filter((x): x is string => typeof x === 'string') : [],
     vaultReadable: o.vault_readable !== false,
+    found: Array.isArray(o.found) ? (o.found as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 8) : [],
   }
 }
 
@@ -133,6 +137,7 @@ export function managedLines(plan: ManagedPlan | undefined, state: ManagedState 
   out.push(`  PATH: ${state.path.map((p) => `${c(p.dir)} (${p.origin})`).join('; ')}; then other plugins' bin/ folders`)
   out.push(`  Environment: platform variables, SHELL, Claude Code's own; imported: ${state.env.length > 0 ? state.env.map((e) => `${e.name} (${e.origin})`).join('; ') : 'nothing'}`)
   if (state.pending.length > 0) out.push(`  waiting for the user's OK: ${state.pending.join('; ')}`)
+  if (state.found.length > 0) out.push(`  found here but not imported: ${state.found.map(c).join(', ')} (Claude can propose importing them: [shell] import_path, then your OK in the gateway's dialog)`)
   if (!state.vaultReadable) out.push('  the vault was locked when these were written: approved imports apply after /gate-unlock')
   return out
 }
@@ -266,7 +271,7 @@ export function shouldProvision(st: EnvStatus | undefined): boolean {
 // Is SHLVL one that keeps a `bash -c` with a socket on stdin from sourcing
 // ~/.bashrc (bash counts itself started by sshd/rshd at shell level 1: SHLVL
 // unset, 0 or garbage; from 1000 on bash resets it to 1)? The mod sets 1
-// otherwise (managedSetup; docs/modules/managed.md, "Known limits").
+// otherwise (managedSetup; docs/dev/modules/managed.md, "Known limits").
 export function shlvlOk(v: string | undefined): boolean {
   return v !== undefined && /^[1-9][0-9]{0,2}$/.test(v) && Number(v) < 999
 }
@@ -374,6 +379,12 @@ export type DaemonHealth = {
   skew: string
   terminals: number        // live gateway terminals and jobs (PLAN-v4 phase 5)
   jobs: number
+  claudeInstall: string    // how the Claude Code that asked was installed ("" not recognized)
+  parentExe: string        // what asked, when it isn't recognized as Claude Code
+  error: string            // why it can't run ("run_dir": its run folder can't be used)
+  message: string          // ... in words, with the remedy
+  otherConfig: string      // it serves another Claude Code configuration: in words ("" it serves this one)
+  platform: string         // this machine's sys.platform ("linux", "darwin"; "" from an older gated)
 }
 
 export function parseDaemon(stdout: string): DaemonHealth | undefined {
@@ -393,7 +404,20 @@ export function parseDaemon(stdout: string): DaemonHealth | undefined {
     running: o.ok === true, version: s('version'), epoch: n('epoch'), uptime: n('uptime'),
     vault: s('vault'), sessions: n('sessions'), socket: s('socket'), parentPid: n('parent_pid'),
     skew: s('skew'), terminals: n('terminals'), jobs: n('jobs'),
+    claudeInstall: s('claude_install'), parentExe: s('parent_exe'),
+    error: s('error'), message: s('message'), otherConfig: s('other_config'), platform: s('platform'),
   }
+}
+
+// The doctor's install line: how this Claude Code was installed, as the
+// gateway daemon's side sees it (`gated status` names the process that ran
+// it: ancestry.claude_install). One it doesn't recognize as Claude Code can't
+// register with the daemon, so no gateway dialog can open in it.
+export function installLine(d: DaemonHealth | undefined): string | undefined {
+  if (d === undefined) return undefined
+  if (d.claudeInstall !== '') return `Claude Code install: ${d.claudeInstall}`
+  if (d.parentExe === '') return undefined
+  return `Claude Code install: not recognized (the process that asked is ${d.parentExe}): the gateway daemon can't register this session, so no gateway dialog (credentials, consent, sudo) can open. Recognized: the native installer, npm (@anthropic-ai/claude-code), the desktop app, an executable named claude`
 }
 
 export function formatUptime(sec: number): string {
@@ -414,13 +438,19 @@ const VAULT_WORDS: Record<string, string> = {
 // vault key's state, or why there is none.
 export function daemonLine(d: DaemonHealth | undefined): string {
   if (d === undefined) return "Gateway daemon: unknown (it can't be asked until setup finishes)"
+  // its run folder can't be used (another user's, a link, open to others):
+  // gated's own explanation and remedy (GW-ROB-1)
+  if (!d.running && d.error === 'run_dir' && d.message !== '') return `Gateway daemon: can't start: ${d.message.replace(/^gateway: /, '')}`
   if (!d.running) return 'Gateway daemon: not running (it starts when a session or tool needs it)'
   const vault = VAULT_WORDS[d.vault] ?? (d.vault === '' ? 'unknown' : d.vault)
   const sessions = `${d.sessions} session${d.sessions === 1 ? '' : 's'}`
   const panes = [d.terminals > 0 ? `${d.terminals} terminal${d.terminals === 1 ? '' : 's'}` : '',
     d.jobs > 0 ? `${d.jobs} job${d.jobs === 1 ? '' : 's'}` : ''].filter((x) => x !== '').join(', ')
   const skew = d.skew !== '' ? `; ${d.skew}` : ''
-  return `Gateway daemon: running (${d.version || '?'}, epoch ${d.epoch}, up ${formatUptime(d.uptime)}, ${sessions}${panes !== '' ? `, ${panes}` : ''}); vault ${vault}${skew}`
+  // a second Claude Code configuration: the daemon answers, but serves the
+  // other one's data folder (`gated status`'s other_config; review round 2)
+  const other = d.otherConfig !== '' ? `; ${d.otherConfig}` : ''
+  return `Gateway daemon: running (${d.version || '?'}, epoch ${d.epoch}, up ${formatUptime(d.uptime)}, ${sessions}${panes !== '' ? `, ${panes}` : ''}); vault ${vault}${skew}${other}`
 }
 
 export type DoctorFacts = {
@@ -431,6 +461,38 @@ export type DoctorFacts = {
   status: EnvStatus | undefined
   daemon?: DaemonHealth | undefined
   managed?: { plan: ManagedPlan | undefined; state: ManagedState | undefined; replaced: string }
+  fullscreen?: boolean | undefined    // command.run's presentation.isFullscreen
+  tmux?: boolean                      // TMUX is set
+  noDisplay?: boolean                 // Linux without DISPLAY or WAYLAND_DISPLAY (noDisplayHere)
+}
+
+// Linux without a graphical display in Claude Code's environment: gated
+// reads the clipboard with wl-paste (WAYLAND_DISPLAY) or xclip/xsel
+// (DISPLAY), so without either Paste can't work (review round 2).
+export function noDisplayHere(platform: string, display: string | undefined, wayland: string | undefined): boolean {
+  return platform.startsWith('linux') && (display ?? '') === '' && (wayland ?? '') === ''
+}
+
+// Can a secret be typed into the gateway's field here (GW-UX-6)? A Client
+// takes keys only after a click, and the terminal reports clicks to plugins
+// only in its fullscreen layout: on the main screen (CLAUDE_CODE_NO_FLICKER=0,
+// tmux by default) only Paste works. Said before any dialog opens.
+// On Linux without a display (noDisplay) Paste can't work either: on the
+// main screen neither route does, and the line says what to do.
+export function secretLine(surfaces: readonly string[], fullscreen: boolean | undefined, tmux: boolean, noDisplay = false): string | undefined {
+  if (surfaces.includes('terminal')) {
+    const noPaste = noDisplay ? `; Paste from clipboard can't work here: ${NO_DISPLAY}` : ''
+    if (fullscreen === true) return `Secrets here: the fullscreen view, so the gateway dialog's field takes a click, then keys${noPaste}`
+    if (fullscreen === false && noDisplay) {
+      return `Secrets here: neither typing nor Paste can work in this terminal: it shows Claude Code's main screen${tmux ? ' (inside tmux)' : ''}, so a secret can't be typed into the gateway dialog's field, and ${NO_DISPLAY}. To enter one, ${NO_DISPLAY_TODO}.`
+    }
+    if (fullscreen === false) {
+      return `Secrets here: this terminal shows Claude Code's main screen${tmux ? ' (inside tmux)' : ''}, so a secret can't be typed into the gateway dialog's field: copy it and press Paste from clipboard (${MAIN_KEYS}). ${PASTE_NOTE} ${FULLSCREEN_HINT}`
+    }
+    return noDisplay ? `Secrets here: Paste from clipboard can't work: ${NO_DISPLAY}` : undefined
+  }
+  if (surfaces.includes('desktop')) return "Secrets here: the desktop app: click the gateway dialog's field, then type"
+  return undefined
 }
 
 function envLine(st: EnvStatus, home: string): string {
@@ -476,6 +538,8 @@ export function doctorText(f: DoctorFacts): string {
     lines.push(`Environment: ${envLine(st, userHome)}`)
   }
   lines.push(...managedLines(f.managed?.plan, f.managed?.state, f.managed?.replaced ?? '', userHome))
+  const sec = secretLine(f.surfaces, f.fullscreen, f.tmux === true, f.noDisplay === true)
+  if (sec !== undefined) lines.push(sec)
   if (st !== undefined) {
     const vault = st.vault
       ? 'present'
@@ -485,6 +549,8 @@ export function doctorText(f: DoctorFacts): string {
     lines.push(`Vault: ${vault}; form (gateway.toml): ${st.form ? 'present' : 'not written yet'} (checked by existence only; the vault is never read)`)
   }
   lines.push(clean(daemonLine(f.daemon), userHome))
+  const inst = installLine(f.daemon)
+  if (inst !== undefined) lines.push(clean(inst, userHome))
   lines.push(`Capabilities here (Claude Code ${f.claude?.version ?? '?'}, ${sessionColumns(f.surfaces).map((s) => SURFACE_NAMES[s]).join(' + ')}):`)
   lines.push(...capabilityLines(f.surfaces))
   lines.push('Full matrix: docs/CAPABILITIES.md in the gateway repository.')

@@ -266,10 +266,10 @@ def test_url_and_argument_rules():
 
 AZFORM = '''[accounts.az]
 kind = "azure"
-tenant = "asirobots.com"
+tenant = "example.com"
 databricks = ["adb-1.7.azuredatabricks.net"]
-storage = ["asistore"]
-registries = ["asicr.azurecr.io"]
+storage = ["examplestore"]
+registries = ["examplecr.azurecr.io"]
 sites = ["127.0.0.1", "custom.example.com"]
 '''
 
@@ -285,10 +285,10 @@ def _azure_scope_mapping():
     assert s(a, "management.azure.com", None) == "https://management.azure.com/.default"
     assert s(a, "graph.microsoft.com", None) == "https://graph.microsoft.com/.default"
     assert s(a, "adb-1.7.azuredatabricks.net", None) == "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
-    assert s(a, "asistore.blob.core.windows.net", None) == "https://storage.azure.com/.default"
-    assert s(a, "asistore.dfs.core.windows.net", None) == "https://storage.azure.com/.default"
+    assert s(a, "examplestore.blob.core.windows.net", None) == "https://storage.azure.com/.default"
+    assert s(a, "examplestore.dfs.core.windows.net", None) == "https://storage.azure.com/.default"
     assert s(a, "custom.example.com", "https://custom.example.com/.default") == "https://custom.example.com/.default"
-    for host, scope, frag in [("asicr.azurecr.io", None, "crane"), ("custom.example.com", None, "pass scope="),
+    for host, scope, frag in [("examplecr.azurecr.io", None, "crane"), ("custom.example.com", None, "pass scope="),
                               ("custom.example.com", "javascript:x", "scope must"),
                               ("other.blob.core.windows.net", None, "no Entra scope")]:
         try:
@@ -423,7 +423,7 @@ def test_azure_listed_sites_never_get_first_party_scopes():
         bad = ["https://management.azure.com/.default", "https://management.azure.com//.default",
                "https://MANAGEMENT.azure.com/.default", "https://management.core.windows.net/.default",
                "https://graph.microsoft.com/.default", "https://graph.windows.net/.default",
-               "https://storage.azure.com/.default", "https://asistore.blob.core.windows.net/.default",
+               "https://storage.azure.com/.default", "https://examplestore.blob.core.windows.net/.default",
                "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default",
                "api://797f4846-ba00-4fd7-ba43-dac1f8f63013/.default",
                "00000003-0000-0000-c000-000000000000/.default", "https://graph.microsoft.us/.default",

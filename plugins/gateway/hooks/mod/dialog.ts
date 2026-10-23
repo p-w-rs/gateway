@@ -12,9 +12,18 @@ export const PANE = 'gate-dialog'
 export const SECRET_KINDS: readonly string[] = ['secret', 'passphrase', 'unlock']
 export const CLIENT_SURFACES: readonly string[] = ['terminal', 'desktop']
 export const GUARD_TEXT = "click the gateway dialog's field first, then type there (what you type here is held back)"
+// The one keyboard route to the dialog's buttons where no click reaches them
+// (the terminal's main screen): /gate-dialog gives the pane the keys, Tab
+// moves to Paste from clipboard, Enter presses it (tests/acceptance_dialogs.py
+// presses Paste this way, live). Every text here says it the same way.
+export const MAIN_KEYS = '/gate-dialog, then Tab and Enter'
+// What Paste leaves behind: gated reads the clipboard and never clears it.
+export const PASTE_NOTE = 'Paste leaves the value on your clipboard: clear it yourself afterwards (copy something else).'
+// How to get the fullscreen view, where the field takes a click and keys.
+export const FULLSCREEN_HINT = 'For a field you can type into, quit Claude Code and start it with CLAUDE_CODE_NO_FLICKER=1 (its fullscreen view).'
 // The guard's words where the field can't take keys: the terminal's main
 // screen (no clicks reach plugins there) and a pane the person closed.
-export const GUARD_MAIN_TEXT = "a gateway dialog waits for a secret, so typing here is held back: copy it and press the dialog's Paste from clipboard (/gate-dialog, then Tab and Enter), or start Claude Code with CLAUDE_CODE_NO_FLICKER=1 to type it there"
+export const GUARD_MAIN_TEXT = `a gateway dialog waits for a secret, so typing here is held back: this terminal can't type into its field (the main screen); copy the secret and press the dialog's Paste from clipboard (${MAIN_KEYS}; it stays on your clipboard), or start Claude Code with CLAUDE_CODE_NO_FLICKER=1 to type it there`
 export const GUARD_CLOSED_TEXT = "a gateway dialog waits for a secret, so typing here is held back: /gate-dialog shows it again (type or paste it there, or cancel it)"
 // What the guard lets into the prompt box while a secret dialog waits: one
 // of the gateway's own commands being typed (so /gate-dialog can bring the
@@ -23,7 +32,17 @@ export const GUARD_CLOSED_TEXT = "a gateway dialog waits for a secret, so typing
 // plugin's prompt hooks and, on Enter, the model.
 export const GATE_COMMANDS: readonly string[] = ['/gate-dialog', '/gate-unlock', '/gate-lock', '/gate-doctor']
 export const NOT_RECEIVED = "the gateway couldn't open what was sent (its dialog changed meanwhile); type it again"
-export const MAIN_SCREEN = "Typing a secret here needs Claude Code's fullscreen view, which is off in this terminal (CLAUDE_CODE_NO_FLICKER=0, or tmux). Copy it and press Paste from clipboard (ctrl+x tab, then Tab and Enter), or start Claude Code with CLAUDE_CODE_NO_FLICKER=1 and ask again. Don't type it into the prompt."
+export const MAIN_SCREEN = `This terminal can't type into the gateway's field: it shows Claude Code's main screen (CLAUDE_CODE_NO_FLICKER=0, or tmux), where clicks don't reach plugins. Copy the secret and press Paste from clipboard (${MAIN_KEYS}). ${PASTE_NOTE} Don't type it into the prompt. ${FULLSCREEN_HINT}`
+// Linux without DISPLAY or WAYLAND_DISPLAY in Claude Code's environment (a
+// console, ssh without X forwarding): gated can't read a clipboard there
+// (daemon/clipboard.py needs one of them), so on the main screen neither
+// typing nor Paste works (review round 2). The Paste button stays (a test
+// override's clipboard program works anywhere); these texts say what to do.
+export const NO_DISPLAY = "this Linux session has no graphical display (no DISPLAY or WAYLAND_DISPLAY), so the gateway can't read a clipboard"
+export const NO_DISPLAY_TODO = "quit Claude Code and start it with CLAUDE_CODE_NO_FLICKER=1 (its fullscreen view, where the field takes a click and keys), or set the credential from a Claude Code session in this machine's desktop (where Paste works)"
+export const NO_DISPLAY_MAIN = `Neither typing nor Paste can work in this terminal: it shows Claude Code's main screen, where clicks don't reach plugins, so the field can't take keys; and ${NO_DISPLAY}. Cancel this dialog, then ${NO_DISPLAY_TODO}, and ask again. Don't type it into the prompt.`
+export const NO_DISPLAY_PASTE = `Paste from clipboard can't work here: ${NO_DISPLAY}. Type the secret into the field.`
+export const GUARD_NODISPLAY_TEXT = 'a gateway dialog waits for a secret, so typing here is held back: neither typing nor Paste can work in this terminal (the main screen, and no graphical display for the clipboard); /gate-dialog shows what to do'
 export const UNAVAILABLE_SURFACE = "Credential entry isn't available on this surface (it has no private field). Answer it at the computer, in the terminal or the desktop app, or cancel."
 
 export type DialogView = {
@@ -169,9 +188,10 @@ export function guardSubmitPasses(text: string, base: string | undefined): boole
 }
 
 // The guard's status line: the field can take keys (click it), the
-// terminal's main screen (Paste, or the fullscreen view), or a closed pane.
-export function guardText(placed: boolean, fieldUsable: boolean): string {
-  if (!fieldUsable) return GUARD_MAIN_TEXT
+// terminal's main screen (Paste, or the fullscreen view; neither without a
+// display on Linux), or a closed pane.
+export function guardText(placed: boolean, fieldUsable: boolean, noDisplay = false): string {
+  if (!fieldUsable) return noDisplay ? GUARD_NODISPLAY_TEXT : GUARD_MAIN_TEXT
   return placed ? GUARD_TEXT : GUARD_CLOSED_TEXT
 }
 

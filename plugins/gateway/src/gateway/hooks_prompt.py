@@ -14,8 +14,9 @@ this session's record into private/sessions/ at the first prompt.)
     (suppressOriginalPrompt) and scrubs the values from the transcript and
     the prompt history (same-length overwrite, every line that holds them, a
     first pass at once and a detached helper for a few seconds while Claude
-    Code writes the blocked prompt), then tells the user `gateway: that looked
-    like a secret, so it wasn't sent; Claude can open a pop-up for it`.
+    Code writes the blocked prompt), then tells the user BLOCK_REASON (`gateway:
+    that looked like a secret, so it wasn't sent; Claude can open the gateway's
+    dialog for it (gate check NAME), where it is typed privately`).
 (b) Form changed since the session's last context (mtime and sha256):
     additionalContext with the new summary (hooks_session.context_text).
 (c) Pending requests: a systemMessage with the fixed terminal command and

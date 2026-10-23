@@ -97,12 +97,12 @@ def test_an_unrelated_ip_suggests_no_host_and_an_account_endpoint_asks_for_an_ac
     x` without a GitHub account said Claude could import it from ~/.ssh/config."""
     from pathlib import Path
     from gateway import form as F, ssh, ssh_args
-    f = F.parse_text('[hosts.powerslabs]\naddress = "u@10.0.0.9"\nalso = ["u@lab.example.com"]\n',
+    f = F.parse_text('[hosts.example]\naddress = "u@10.0.0.9"\nalso = ["u@lab.example.com"]\n',
                      Path("/x"))
     assert ssh._suggest("10.0.0.99", f) is None
-    assert ssh._suggest("10.0.0.9", f) == "powerslabs", "an IP that is one of its addresses"
-    assert ssh._suggest("powerlabs", f) == "powerslabs"
-    assert ssh._suggest("lab.exampel.com", f) == "powerslabs"
+    assert ssh._suggest("10.0.0.9", f) == "example", "an IP that is one of its addresses"
+    assert ssh._suggest("exmple", f) == "example"
+    assert ssh._suggest("lab.exampel.com", f) == "example"
     m = ssh._unknown_message(ssh_args.parse_destination("10.0.0.99"), "uptime", f)
     assert "Did you mean" not in m, m
     m = ssh._unknown_message(ssh_args.parse_destination("github.com"), "x", f)

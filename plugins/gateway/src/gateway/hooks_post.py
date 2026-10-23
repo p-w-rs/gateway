@@ -12,8 +12,8 @@ session was shown.
   response (dict stays dict, list stays list, string stays string).
 - Form edits: validate, persist narrowings (consent.ratchet) and return
   `additionalContext` with the result, so Claude fixes its own mistake in the
-  same turn: `gateway: form OK; powerslabs: new address needs the user's OK
-  - run gate check powerslabs`.
+  same turn: `gateway: form OK; example: new address needs the user's OK
+  - run gate check example`.
 - Pending requests that can't open a pop-up (no screen): a `systemMessage`
   (shown to the user; the model can't alter it) with the fixed terminal
   command and its one-time code, once per request per session.

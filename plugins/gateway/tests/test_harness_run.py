@@ -298,7 +298,13 @@ def test_dispatch_unknown_mode_and_subprocess_hooks():
                                                            "tool_input": {"file_path": str(paths.vault_path())}})
         assert r.returncode == 0 and json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         r = H.run_py(env, "--test", "hook-bash", payload={"tool_input": {"command": "sudo ls"}})
-        assert r.returncode == 0 and r.stdout == ""
+        # no form yet: sudo on this computer is "ask" by default, so Claude Code asks
+        assert r.returncode == 0 and \
+            json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask", r.stdout
+        env.write_form("[hosts.localhost]\nsudo = false\n")
+        r = H.run_py(env, "--test", "hook-bash", payload={"tool_input": {"command": "sudo ls"}})
+        assert r.returncode == 0 and \
+            json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", r.stdout
 
 
 def test_stand_in_triggers_migration():

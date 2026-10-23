@@ -455,9 +455,9 @@ def fake_host_key(seed: str) -> str:
 
 def users_v2_vault(local_user: str) -> dict[str, Any]:
     """A v2 vault shaped like the user's: 8 accounts (github:personal,
-    github:work, hf:me, ssh:powerslabs with 2 routes incl. a CIDR `when`,
-    azure:work with databricks/storage/acr hosts, mlcat:asi, registry:ghcr via
-    github:work, pijul:nest), a jump host (ssh:builder via powerslabs), rotated
+    github:work, hf:me, ssh:example with 2 routes incl. a CIDR `when`,
+    azure:work with databricks/storage/acr hosts, mlcat:work, registry:ghcr via
+    github:work, pijul:nest), a jump host (ssh:builder via example), rotated
     keys, two secrets (one with no hosts) and sudo entries."""
     k_gh, p_gh = ssh_keypair("gh-work")
     k_lab, p_lab = ssh_keypair("lab-new")
@@ -477,7 +477,7 @@ def users_v2_vault(local_user: str) -> dict[str, Any]:
         "sudo": {
             f"{local_user}@localhost": {"user": local_user, "host": "localhost",
                                         "password": "mac-login-pw-1", "updated": now},
-            "joshua@10.0.0.5": {"user": "joshua", "host": "10.0.0.5",
+            "octo@10.0.0.5": {"user": "octo", "host": "10.0.0.5",
                                 "password": "lab-sudo-pw-22", "updated": now},
             "bob@localhost": {"user": "bob", "host": "localhost", "password": "bobs-pw-333",
                               "updated": now},
@@ -489,25 +489,25 @@ def users_v2_vault(local_user: str) -> dict[str, Any]:
         "accounts": {
             "github:personal": {
                 "kind": "github", "description": "my own GitHub", "host": "github.com",
-                "login": "p-w-rs", "name": "", "email": "", "owners": [],
+                "login": "octocat", "name": "", "email": "", "owners": [],
                 "hosts": ["github.com", "api.github.com"],
                 "secrets": {"token": "gho_personalTOKEN0123456789abcdef"},
                 "token_source": "gh-oauth", "prompts": {}, "updated": now},
             "github:work": {
-                "kind": "github", "description": "work GitHub (asirobots)", "host": "github.com",
-                "login": "jpowers-asi", "name": "J Powers", "email": "jpowers@asirobots.com",
-                "owners": ["asirobots"], "hosts": ["github.com", "api.github.com"],
+                "kind": "github", "description": "work GitHub (example-org)", "host": "github.com",
+                "login": "octo-work", "name": "Octo Cat", "email": "work@example.com",
+                "owners": ["example-org"], "hosts": ["github.com", "api.github.com"],
                 "secrets": {"token": "ghp_workTOKEN0123456789abcdefghij", "ssh_key": k_gh},
                 "public_key": p_gh, "key_fingerprint": "", "prompts": {"delete": "ask"},
                 "updated": now},
             "hf:me": {
                 "kind": "hf", "description": "Hugging Face", "host": "huggingface.co",
-                "login": "pwrs", "owners": [], "hosts": ["huggingface.co", "hf.co"],
+                "login": "octocat", "owners": [], "hosts": ["huggingface.co", "hf.co"],
                 "secrets": {"token": "hf_TESTtoken0123456789abcdefgh"}, "prompts": {},
                 "updated": now},
-            "ssh:powerslabs": {
+            "ssh:example": {
                 "kind": "ssh", "description": "the lab box", "host": "lab.example.com",
-                "user": "joshua", "port": "2222", "jump": "",
+                "user": "octo", "port": "2222", "jump": "",
                 "routes": [{"name": "home", "host": "10.0.0.5", "port": "", "when": "10.0.0.0/24"},
                            {"name": "away", "host": "lab.example.com", "port": "2222", "when": ""}],
                 "hosts": ["10.0.0.5", "lab.example.com"],
@@ -517,35 +517,35 @@ def users_v2_vault(local_user: str) -> dict[str, Any]:
                 "host_key_policy": "pinned", "comfort": {"keepalive": 15}, "updated": now},
             "ssh:builder": {
                 "kind": "ssh", "description": "CI builder", "host": "builder.internal",
-                "user": "ci", "port": "", "jump": "ssh:powerslabs", "hosts": ["builder.internal"],
+                "user": "ci", "port": "", "jump": "ssh:example", "hosts": ["builder.internal"],
                 "secrets": {"ssh_key": k_bld}, "public_key": p_bld,
                 "known_hosts": "builder.internal " + fake_host_key("builderkey") + "\n",
                 "host_key_policy": "accept-new", "updated": now},
             "azure:work": {
-                "kind": "azure", "description": "ASI Azure", "tenant": "asirobots.com",
+                "kind": "azure", "description": "work Azure", "tenant": "example.com",
                 "tenant_id": "11111111-2222-3333-4444-555555555555",
                 "client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-                "login": "jpowers@asirobots.com", "host": "management.azure.com",
+                "login": "work@example.com", "host": "management.azure.com",
                 "hosts": ["management.azure.com", "adb-1234567890.7.azuredatabricks.net",
-                          "asistore.blob.core.windows.net", "asistore.dfs.core.windows.net",
-                          "asicr.azurecr.io", "custom.example.com"],
+                          "examplestore.blob.core.windows.net", "examplestore.dfs.core.windows.net",
+                          "examplecr.azurecr.io", "custom.example.com"],
                 "secrets": {"refresh_token": "0.AAAA-azure-refresh-token-xyz"},
                 "token_source": "entra", "token_refreshed": now, "updated": now},
-            "mlcat:asi": {
-                "kind": "mlcat", "description": "ASI ML catalog",
-                "host": "app-dev-ai-mlreg.azurewebsites.net", "login": "jpowers@asirobots.com",
+            "mlcat:work": {
+                "kind": "mlcat", "description": "ML model catalog",
+                "host": "catalog.example.com", "login": "work@example.com",
                 "client_id": "99999999-8888-7777-6666-555555555555",
                 "tenant_id": "11111111-2222-3333-4444-555555555555",
-                "hosts": ["app-dev-ai-mlreg.azurewebsites.net"],
+                "hosts": ["catalog.example.com"],
                 "secrets": {"refresh_token": "0.BBBB-mlcat-refresh-token-xyz"},
                 "token_source": "entra", "updated": now},
             "registry:ghcr": {
                 "kind": "registry", "description": "ghcr", "host": "ghcr.io", "login": "",
-                "via": "github:work", "owners": ["asirobots", "p-w-rs"], "hosts": ["ghcr.io"],
+                "via": "github:work", "owners": ["example-org", "octocat"], "hosts": ["ghcr.io"],
                 "secrets": {}, "updated": now},
             "pijul:nest": {
                 "kind": "pijul", "description": "the Nest", "host": "nest.pijul.com",
-                "login": "pwrs", "name": "J Powers", "email": "j@example.com",
+                "login": "octocat", "name": "Octo Cat", "email": "j@example.com",
                 "remote_pijul": "/usr/local/bin/pijul", "owners": [],
                 "hosts": ["nest.pijul.com"], "secrets": {"ssh_key": k_pj}, "public_key": p_pj,
                 "known_hosts": "nest.pijul.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6",
@@ -553,5 +553,5 @@ def users_v2_vault(local_user: str) -> dict[str, Any]:
         },
         "account_prompts": {"delete": "refuse"},
         "grants": {"g1": {"op": "add"}},
-        "ssh_reuse": {"ssh:powerslabs": ["sess-1"]},
+        "ssh_reuse": {"ssh:example": ["sess-1"]},
     }

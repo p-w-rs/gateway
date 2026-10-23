@@ -17,7 +17,10 @@ Decision order (reasons always start with `gateway:`):
    checked (a bare `key.txt` is a file in the working directory, which `cd`s
    in the command move), and option values (`--file=P`, `-fP`), redirect
    targets, globs (expanded) and recursive readers (`grep -r`, `rsync`,
-   `scp -r`, `cp -r`, `tar`, ... on a folder holding private/).
+   `scp -r`, `cp -r`, `tar`, ... on a folder holding private/). A tilde is
+   expanded as the shell does it (`~+` the stage's working directory, an
+   unknown user's `~name/x` a relative path); a word starting with `~-` or
+   `~N` names a folder the hook can't know and is denied (DENY_TILDE).
 3. **deny** a gateway verb whose target right is `false` in the form (looked
    up behind exec-style wrappers: `env`, `nohup`, `nice`, `command`, ...),
    and one the form gives but the user hasn't approved yet (the effective
@@ -47,7 +50,15 @@ Decision order (reasons always start with `gateway:`):
    file is there, not the stand-in PATH finds; round 3): a gateway verb on a
    host with the right `true` (effective; remote
    sudo also needs the host's effective sudo `true`), a `gate`
-   subcommand, or a benign read-only command. scp / sftp / rsync only with
+   subcommand (never `forget`, which deletes stored secrets: GW-DATA-1), or
+   a benign command; one that reads files (cat, grep, ls, ...) only when
+   everything it may read is a plain file of the project (CLAUDE_PROJECT_DIR,
+   else the cwd; not the home folder or above) or a temp folder (never in
+   the home): no hidden or credential-like name (.env*, *.pem, *.key, id_*,
+   *credentials*, ...) below it, a recursive grep's whole tree included, and
+   with no path operand the cwd in one of them (GW-UX-1; its own reason
+   text, READ_ALLOW); the same for such a reader under sudo, unless a wrapper
+   changed its directory (env -C / sudo -D). scp / sftp / rsync only with
    options on an allowlist (never rsync's -e in any spelling, --log-file,
    --write-batch, --remove-source-files, --old-args, -M, -K, ...), plain
    remote paths, downloads that name what they copy (no folder contents, no
@@ -76,7 +87,7 @@ the Terminal panel), an "ask" right of step 4 denied instead (nobody can be
 asked while a job runs), and never step 5 (nor any ask): only a deny or no
 decision.
 
-Managed mode (PLAN-v4 phase 4, docs/modules/managed.md), before step 1:
+Managed mode (PLAN-v4 phase 4, docs/dev/modules/managed.md), before step 1:
 pre_bash.sh sends every Bash and Monitor call here with GW_MANAGED_CHECK=1
 when CLAUDE_CODE_SHELL_PREFIX isn't this plugin's hooks/gate-sh (the mod
 sets it at session start; so mods are off, Claude Code is older than
@@ -100,6 +111,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import unicodedata
 from typing import Any
 
@@ -122,7 +134,10 @@ SAFE_REDIRECTS = frozenset({("2>&1", ""), (">", "/dev/null"), (">>", "/dev/null"
                             ("2>", "/dev/null")})
 GLOB_MAX = 500           # matches of one glob checked against the protected set
 
-GATE_SUBCMDS = frozenset({"status", "check", "login", "forget", "rotate", "why", "log",
+# gate subcommands the hook may allow. Not `forget`: it deletes an entry's
+# stored secrets for good (no dialog, no backup), so the reviewer or a prompt
+# decides (GW-DATA-1); nor `with` (an account's credential to any program).
+GATE_SUBCMDS = frozenset({"status", "check", "login", "rotate", "why", "log",
                           "export", "import", "copy-to", "migrate", "scrub"})
 # gate subcommands that log in to a host with Claude's key (the sudo probe,
 # the key install, the rotation, copy-to's transfer): judged like ssh to it.
@@ -160,6 +175,31 @@ GW_JOB_TOOL = "mcp__plugin_gate_gw__job_start"
 GW_SEND_TOOL = "mcp__plugin_gate_gw__terminal_send"
 BENIGN = frozenset({"cd", "pwd", "echo", "printf", "true", ":", "test", "[", "ls", "cat",
                     "head", "tail", "wc", "grep", "sort", "uniq", "date", "sleep"})
+# The benign commands that read files, a folder's listing or the working
+# directory (GW-UX-1): allowed only when everything they may read is a plain
+# file of the project or a temp folder (_reads_plain); with no path operand
+# they read the working directory (or stdin), which must be in the project.
+BENIGN_READERS = frozenset({"pwd", "test", "[", "ls", "cat", "head", "tail", "wc", "grep",
+                            "sort", "uniq"})
+# Names that hold credentials wherever they are, in any letter case (the
+# hidden ones are refused as hidden anyway): never vouched for, in the project
+# too. Besides keys and dotfiles: Kerberos ticket caches (krb5cc_UID in
+# /tmp), anything named for a secret or a token, key stores, Terraform state
+# and variables, kubeconfig files and cloud service-account keys.
+_CRED_NAME = re.compile(r"(?i)\A(?:\.env.*|.*\.pem|.*\.key|id_.*|.*credentials.*|\.?netrc|"
+                        r"\.?pgpass|\.?npmrc|\.?pypirc|krb5cc.*|.*secret.*|.*token.*|"
+                        r".*\.(?:p12|pfx|ppk|jks|keystore|p8|keytab|kdbx|gpg|ovpn|age)|"
+                        r".*_(?:rsa|dsa|ed25519|ecdsa)|passwords?.*\.txt|"
+                        r".*\.tfstate.*|.*\.tfvars(?:\.json)?|"
+                        r"kubeconfig.*|service[-_]?account.*\.json)\Z")
+# The user's credential folders (under the home): a project or temp folder in
+# one is no place to read from without a prompt.
+_CRED_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config", ".claude")
+READ_TREE_MAX = 2000     # entries a recursive grep's folder may hold and still be vouched for
+# macOS's file systems ignore letter case: a path compares to the project and
+# the temp folders that way there (web._under folds everywhere; the credential
+# folders and the home are always compared folded, which only refuses more)
+_CASELESS = sys.platform == "darwin"
 
 # ssh options that take a value, the safe no-arg flags, and the safe value-takers.
 SSH_ARG_OPTS = set(ssh_args.SSH_ARGOPTS)      # the stand-in's own table (-B, -P too)
@@ -169,13 +209,16 @@ SSH_SAFE_O = frozenset({"connecttimeout", "serveraliveinterval", "batchmode"})
 
 DENY_PRIVATE = ("gateway: that path holds the gateway's private keys and vault; Claude never "
                 "needs it (gate status shows what is stored).")
-DENY_TRANSCRIPT = ("gateway: that reads Claude Code's session transcripts, which can hold the "
-                   "one-time codes the gateway shows the user; Claude doesn't read them (the "
-                   "tool-results folders next to them, and a Workflow run's journal.jsonl, are "
-                   "fine).")
+DENY_TRANSCRIPT = ("gateway: that reads Claude Code's session transcripts, which can hold output "
+                   "Claude Code showed unmasked (a failed command's, a background command's "
+                   "notice); Claude doesn't read them (the tool-results folders next to them, and "
+                   "a Workflow run's journal.jsonl, are fine).")
 DENY_PRIVATE_TREE = ("gateway: that would read the gateway's private folder (its keys and vault) "
                      "recursively; name a narrower path that doesn't contain "
                      "~/.config/gateway/private.")
+DENY_TILDE = ("gateway: a path starting with `~-` or `~N` (the shell's previous or stacked "
+              "working directory), or `~` when no home folder is known, names a folder the "
+              "gateway can't resolve, which could be its private folder; spell the path out.")
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +243,8 @@ def _deny(reason: str, tool: str = "bash", target: str | None = None,
 
 def _deny_curl(tool: str) -> dict[str, Any]:
     return _deny(f"gateway: use the http tool (or download / WebFetch) instead of {tool}; it "
-                 "adds account keys and needs no prompt. If the http tool isn't available in this "
+                 "adds account keys (Claude Code's permission mode decides whether it asks, as "
+                 "for any tool). If the http tool isn't available in this "
                  "session (the gateway was still setting up when it started), ask the user to "
                  "reconnect gw in /mcp or start a new session.", tool=tool)
 
@@ -224,10 +268,12 @@ def _ask(name: str, verb: str, more: list[tuple[str, str]] | None = None,
     rights = list(dict.fromkeys([(name, verb), *(more or [])]))
     shown = [_ask_phrase(n, v) for n, v in rights]
     what = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+    # a locked vault: sudo here asks until it is unlocked (consent.LOCKED_SUDO_NOTE)
+    note = _LOCKED.get("sudo", "") if ("localhost", "sudo") in rights else ""
     if in_job:
-        return _deny(consent.job_ask_message(shown), tool=verb, target=name)
+        return _deny(consent.job_ask_message(shown) + note, tool=verb, target=name)
     are = "is" if len(shown) == 1 else "are"
-    return _out("ask", f'gateway: {what} {are} set to "ask"; approve it to run.')
+    return _out("ask", f'gateway: {what} {are} set to "ask"; approve it to run.{note}')
 
 
 # ---------------------------------------------------------------------------
@@ -591,8 +637,19 @@ def _remote_sudo(base: str, argv: list[str]) -> tuple[bool, bool]:
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "yash", "fish",
                      "csh", "tcsh", "rbash", "posh", "oksh", "loksh", "pdksh"})
+# Programs whose argument is a command they run, so a stage holding one hides
+# how it calls a tool (it can't be vouched for, and under sudo it isn't a
+# plain `sudo CMD ARGS`): shells and su, and the job runners, wherever they
+# stand as a program word.
 _RUNNERS = _SHELLS | frozenset({"su", "runuser", "sudo", "sudoedit", "doas", "pkexec",
                                 "xargs", "parallel", "at", "batch"})
+# The tracers, sandboxes and wrappers that exec a command (also _TEXT_RUNNER
+# below): a runner only as the program itself (the stage's first word, or a
+# word by its path), so `sudo apt install tmux` names tmux as data. (macOS's
+# `arch -arm64 CMD` isn't one: the hook looks through it like nice.)
+_EXEC_RUNNERS = frozenset({"sshpass", "strace", "ltrace", "dtruss", "flock", "script", "unbuffer",
+                           "chroot", "tmux", "screen", "ssh-agent", "nsenter", "setarch",
+                           "catchsegv", "proot", "fakeroot"})
 _FIND_RUN = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 _GNU_PREFIXED = {"grm": "rm", "gdd": "dd", "gchmod": "chmod", "gchown": "chown",
                  "gshred": "shred"}
@@ -811,9 +868,29 @@ def _env_hides(args: list[str]) -> bool:
     return False
 
 
+# macOS's arch (`arch -arm64 CMD`, `arch -arch x86_64 CMD`): its options are
+# whole words; these take the next word as their value (-e NAME=VALUE sets a
+# variable for the command, -d NAME unsets one).
+_ARCH_VALUE = frozenset({"-arch", "-d", "-e"})
+
+
+def _arch_sets_env(args: list[str]) -> bool:
+    """Does `arch ARGS` set a variable for its command (`-e NAME=VALUE`)?"""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] not in ("-", "--"):
+        if args[i] == "-e":
+            return True
+        i += 2 if args[i] in _ARCH_VALUE else 1
+    return False
+
+
 def _runs_hidden(cmd: list[str]) -> bool:
     """Does CMD contain a program that runs a command its words don't show
-    (a shell, su, xargs, at, `env -S`, `find -exec`, a nested sudo)?"""
+    (a shell, su, xargs, at, `env -S`, `find -exec`, a nested sudo; a tracer
+    or sandbox as the program: _EXEC_RUNNERS)?"""
+    run = _unwrap(cmd, fork=True)
+    if run and _prog_name(run[0]) in _EXEC_RUNNERS:
+        return True                         # the program, also behind nice/env/timeout
     for j, w in enumerate(cmd):
         if j and not _names_program(w):
             continue
@@ -822,6 +899,8 @@ def _runs_hidden(cmd: list[str]) -> bool:
             return True
         if name == "env" and _env_hides(cmd[j + 1:]):
             return True
+        if name == "arch" and _arch_sets_env(cmd[j + 1:]):
+            return True                     # `arch -e VAR=value CMD`, like env's
         if name == "find" and any(a in _FIND_RUN for a in cmd[j + 1:]):
             return True
     return False
@@ -877,9 +956,10 @@ def _sudo_structure_ok(argv: list[str], cwds: list[str] | None = None) -> bool:
 # exactly like one Claude's shell started: the hook looks through them for
 # deny and ask. (`command -v X` only looks X up.) Forking wrappers (timeout,
 # xargs, sudo) are looked through only for the curl/wget rule: the stand-ins
-# see them as an intermediate anyway.
+# see them as an intermediate anyway. macOS's `arch -arm64 CMD` execs its
+# command too (its options: _ARCH_VALUE).
 _EXEC_WRAPPERS = frozenset({"command", "builtin", "busybox", "env", "nohup", "nice", "stdbuf",
-                            "time", "ionice", "chrt", "taskset", "setsid"})
+                            "time", "ionice", "chrt", "taskset", "setsid", "arch"})
 _FORK_WRAPPERS = frozenset({"timeout", "gtimeout", "xargs", "sudo", "doas", "caffeinate"})
 # Shell reserved words bashparse leaves at the start of a stage; the command
 # follows them. A loop or case (`for h in a b; do ssh $h x; done`) names its
@@ -887,7 +967,7 @@ _FORK_WRAPPERS = frozenset({"timeout", "gtimeout", "xargs", "sudo", "doas", "caf
 _RESERVED_PREFIX = frozenset({"if", "then", "else", "elif", "while", "until", "do", "!"})
 _LOOP_WORDS = frozenset({"for", "case", "select"})
 _WRAPPER_VALUE_OPTS = {"env": "uCPS", "nice": "n", "stdbuf": "ioe", "ionice": "cnp",
-                       "timeout": "sk", "gtimeout": "sk", "xargs": "EIJLRSdeiLnPs",
+                       "timeout": "sk", "gtimeout": "sk", "xargs": "EIJLRSadeiLnPs",
                        "sudo": "ugpChrtTUD", "doas": "uC", "time": "o", "chrt": "",
                        "taskset": "", "caffeinate": "tw"}
 _WRAPPER_VALUE_LONG = frozenset({
@@ -949,6 +1029,9 @@ def _unwrap(argv: list[str], fork: bool = False) -> list[str]:
                         return _unwrap(shlex.split(split[0]) + argv[split[1]:], fork)
                     except ValueError:
                         return ["sh"]
+            if w == "arch" and a.startswith("-") and len(a) > 1:
+                i += 2 if a in _ARCH_VALUE else 1      # whole-word options (-arm64, -arch x86_64)
+                continue
             if a.startswith("-") and len(a) > 1 and not (w == "busybox"):
                 if a.startswith("--"):
                     i += 2 if ("=" not in a and a in _WRAPPER_VALUE_LONG) else 1
@@ -1206,28 +1289,137 @@ def _flag_values(a: str) -> list[str]:
     return [v for v in out if v]
 
 
+# A tilde prefix that names the shell's previous working directory (`~-`,
+# OLDPWD) or an entry of its directory stack (`~N`, `~+N`, `~-N`): a folder the
+# hook can't know.
+_TILDE_STACK = re.compile(r"(?:[+-]?[0-9]+|-)\Z")
+
+
+def _tilde_user(name: str) -> list[str] | None:
+    """The home folder `~NAME` expands to (the password database); None for
+    no such user, whose word the shell leaves as written. Under a test
+    override a user that exists is the test's home: a test never resolves a
+    real home folder."""
+    try:
+        import pwd
+        d = pwd.getpwnam(name).pw_dir
+    except (KeyError, ValueError, TypeError, OSError, ImportError):
+        return None
+    if testing.active() is not None:
+        return _home_dirs()
+    return [d] if os.path.isabs(d) else []
+
+
+def _tilde(word: str, cwds: list[str], homes: list[str]) -> list[str] | None:
+    """The spellings of a word that starts with `~`, as bash and zsh expand
+    it: `~` and `~/x` in the home folders, `~+/x` ($PWD) in the working
+    directories, `~NAME/x` in that user's home, and an unknown user's word as
+    written (a relative path) from the working directories. None when the
+    folder can't be known: `~-`, `~N`, `~+N`, `~-N` (_TILDE_STACK), or no home
+    folder known for it."""
+    prefix, slash, rest = word[1:].partition("/")
+    tail = slash + rest
+    if prefix == "":
+        dirs = homes
+    elif prefix == "+":
+        dirs = cwds
+    elif _TILDE_STACK.match(prefix):
+        return None
+    else:
+        known = _tilde_user(prefix)
+        if known is None:
+            return [os.path.join(c, word) for c in cwds]
+        dirs = known
+    if not dirs:
+        return None
+    return [d + tail for d in dirs]
+
+
+def _tilde_unknown(word: str) -> bool:
+    """Does the word start with a tilde whose folder the hook can't know
+    (`~-/x`, `~1/x`, ...; _tilde)?"""
+    return word.startswith("~") and _tilde(word, ["/"], _home_dirs()) is None
+
+
 def _abs_candidates(token: str, cwds: list[str]) -> list[str]:
-    """Absolute spellings of a token: `~`, `~user` and `$HOME`/`${HOME}`
-    expanded, relative ones taken from every candidate working directory."""
+    """Absolute spellings of a token: `~`, `~+`, `~user` and `$HOME`/`${HOME}`
+    expanded (_tilde), relative ones taken from every candidate working
+    directory. Only absolute paths, and none for a tilde whose folder can't
+    be known (_tilde_unknown: callers refuse those)."""
     homes = _home_dirs()
     variants = [token]
     if "$HOME" in token or "${HOME}" in token:
         variants = [token.replace("${HOME}", h).replace("$HOME", h) for h in homes]
     out: list[str] = []
     for t in variants:
-        if t == "~" or t.startswith("~/"):
-            out += [h + t[1:] for h in homes]
-        elif t.startswith("~"):
-            rest = t[1:].partition("/")[2]
-            if testing.active() is not None:
-                out += [h + ("/" + rest if rest else "") for h in homes]
-            else:
-                out.append(os.path.expanduser(t))
+        if t.startswith("~"):
+            out += _tilde(t, cwds, homes) or []
         elif os.path.isabs(t):
             out.append(t)
         else:
             out += [os.path.join(c, t) for c in cwds]
-    return list(dict.fromkeys(out))
+    return [p for p in dict.fromkeys(out) if os.path.isabs(p)]
+
+
+def _chdir_abs(v: str, cwds: list[str]) -> list[str]:
+    """The chdir target `v` resolved to absolute spellings; [] when it can't be
+    known (`$X`, `~-`), so the caller refuses rather than guessing a cwd."""
+    bare = v.replace("${HOME}", "").replace("$HOME", "")
+    if not v or "$" in bare or _tilde_unknown(v):
+        return []
+    return _abs_candidates(v, cwds)
+
+
+def _wrapper_chdir(words: list[str], cwds: list[str]) -> list[str] | None:
+    """The directories a leading `env -C/--chdir DIR` or `sudo -D/--chdir DIR`
+    makes the command run in (resolved, absolute), or None. Only the wrapper
+    chain is read (env, sudo/doas, nice, nohup, ...), not the command, and an
+    unknown target (`$X`, `~-`) gives []. A per-command chdir, not a cd that
+    outlives the stage."""
+    i, n = 0, len(words)
+    for _ in range(12):
+        while i < n and words[i] in _RESERVED_PREFIX:
+            i += 1
+        if i >= n:
+            return None
+        w = os.path.basename(words[i])
+        letter = {"env": "C", "sudo": "D", "sudoedit": "D", "doas": None}.get(w)
+        if w not in _EXEC_WRAPPERS and w not in _FORK_WRAPPERS:
+            return None
+        vals = _WRAPPER_VALUE_OPTS.get(w, "")
+        i += 1
+        while i < n:
+            a = words[i]
+            if a == "--":
+                i += 1
+                break
+            if w == "env" and _ASSIGN.match(a):
+                i += 1
+                continue
+            if not a.startswith("-") or a == "-":
+                break                      # the command (or env's next wrapper)
+            if w == "arch":
+                i += 2 if a in _ARCH_VALUE else 1
+                continue
+            if a.startswith("--"):
+                if a.startswith("--chdir") and letter:
+                    v = a.split("=", 1)[1] if "=" in a else (words[i + 1] if i + 1 < n else "")
+                    return _chdir_abs(v, cwds)
+                i += 2 if ("=" not in a and a in _WRAPPER_VALUE_LONG) else 1
+                continue
+            body = a[1:]
+            for k, c in enumerate(body):
+                if letter and c == letter:
+                    v = body[k + 1:] or (words[i + 1] if i + 1 < n else "")
+                    return _chdir_abs(v, cwds)
+                if c in vals:
+                    if k == len(body) - 1:
+                        i += 1
+                    break
+            i += 1
+        if w in ("timeout", "gtimeout", "chrt", "taskset") and i < n:
+            i += 1
+    return None
 
 
 def _cd_targets(argv: list[str], cwds: list[str]) -> list[str] | None:
@@ -1243,9 +1435,11 @@ def _cd_targets(argv: list[str], cwds: list[str]) -> list[str] | None:
     if not ops:
         return _home_dirs() or None
     tgt = ops[0]
-    if "$" in tgt.replace("${HOME}", "").replace("$HOME", ""):
+    if "$" in tgt.replace("${HOME}", "").replace("$HOME", "") or _tilde_unknown(tgt):
         return None
     out = _abs_candidates(tgt, cwds)
+    if not out:
+        return None
     cdpath = os.environ.get("CDPATH", "") if testing.active() is None else ""
     if cdpath and not tgt.startswith(("/", "~", "./", "../")) and tgt not in (".", ".."):
         out += [os.path.join(d or ".", tgt) for d in cdpath.split(":")]
@@ -1299,6 +1493,94 @@ _RECURSIVE_ALWAYS = frozenset({"rsync", "tar", "gtar", "bsdtar", "zip", "ditto",
                                "rgrep", "rg", "ag", "ack"})
 
 
+def _grep_dirs_recurse(val: str) -> bool:
+    """grep's -d / --directories ACTION recurses unless it is read or skip
+    (BSD grep takes the word in any letter case; GNU an abbreviation)."""
+    return val.lower() not in ("read", "skip")
+
+
+def _grep_recursive(argv: list[str]) -> bool:
+    """Does grep read whole folder trees: -r / -R anywhere in a cluster, any
+    abbreviation getopt accepts of --recursive or --dereference-recursive (3+
+    letters), and -d / --directories (or an abbreviation: `--dir`, `--di`)
+    with an action other than read or skip, glued, in a cluster (`-id
+    recurse`, `-nd recurse`) or in the next word?"""
+    i, n = 1, len(argv)
+    while i < n:
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if len(name) >= 3 and ("recursive".startswith(name)
+                                   or "dereference-recursive".startswith(name)):
+                return True
+            if len(name) >= 2 and "directories".startswith(name):
+                if not eq:
+                    val, i = (argv[i] if i < n else ""), i + 1
+                if _grep_dirs_recurse(val):
+                    return True
+            continue
+        if a.startswith("-") and a != "-":
+            body = a[1:]
+            for k, c in enumerate(body):
+                if c in "rR":
+                    return True
+                if c in _GREP_VALUE_SHORT:
+                    val = body[k + 1:]
+                    if not val:
+                        val, i = (argv[i] if i < n else ""), i + 1
+                    if c == "d" and _grep_dirs_recurse(val):
+                        return True
+                    break                # the rest of the word (or the next) is the value
+    return False
+
+
+# grep's long options that take a value in the next word when not glued (GNU;
+# --context's is optional in BSD grep, so it isn't counted)
+_GREP_LONG_NEXT = frozenset({"regexp", "file", "max-count", "after-context", "before-context",
+                             "label", "binary-files", "devices", "directories", "exclude",
+                             "exclude-from", "exclude-dir", "include", "group-separator"})
+
+
+def _grep_files(argv: list[str]) -> tuple[list[str], bool]:
+    """grep's file operands (option values and the pattern left out) and
+    whether they could be told apart (False: a long option that may take the
+    next word)."""
+    ops: list[str] = []
+    given, sure = False, True
+    i, n = 1, len(argv)
+    while i < n:
+        a = argv[i]
+        i += 1
+        if a == "--":
+            ops += argv[i:]
+            break
+        if a == "-" or not a.startswith("-"):
+            ops.append(a)
+            continue
+        if a.startswith("--"):
+            name, eq, _v = a[2:].partition("=")
+            if len(name) >= 3 and ("regexp".startswith(name) or "file".startswith(name)):
+                given = True
+            if not eq and name in _GREP_LONG_NEXT:
+                i += 1
+            elif not eq and name not in _GREP_LONG_FLAGS:
+                sure = False
+            continue
+        body = a[1:]
+        for k, c in enumerate(body):
+            if c in _GREP_VALUE_SHORT:
+                given = given or c in "ef"
+                if not body[k + 1:]:
+                    i += 1
+                break
+    if not given and ops:
+        ops = ops[1:]
+    return ops, sure
+
+
 def _recursive(base: str, argv: list[str]) -> bool:
     """Does this command read whole folder trees (so naming a parent of the
     private folder reads it)?"""
@@ -1308,10 +1590,7 @@ def _recursive(base: str, argv: list[str]) -> bool:
     longs = [a.split("=", 1)[0] for a in flags if a.startswith("--")]
     shorts = "".join(a[1:] for a in flags if not a.startswith("--"))
     if base in _GREP:
-        return ("r" in shorts or "R" in shorts or "--recursive" in longs
-                or "--dereference-recursive" in longs
-                or any(a in ("--directories=recurse", "-drecurse") for a in flags)
-                or ("-d" in argv and "recurse" in argv))
+        return "r" in shorts or "R" in shorts or _grep_recursive(argv)
     if base in ("cp", "gcp", "scp", "sftp"):
         return ("r" in shorts or "R" in shorts or (base in ("cp", "gcp") and "a" in shorts)
                 or "--recursive" in longs or "--archive" in longs)
@@ -1368,11 +1647,20 @@ def _deny_sensitive(stages: list[list[str]], cwd: str | None,
         return any(_prot_parent(prot, c) for c in _abs_candidates(tok, cwds))
 
     for st in stages:
-        stage_cwds.append(list(cwds))
         argv, exp, glb = _argv_meta(st)
         if not argv:
+            stage_cwds.append(list(cwds))
             continue
         base = os.path.basename(argv[0])
+        # A wrapper that changes directory (env -C/--chdir, sudo -D) runs this
+        # stage's command there: resolve its paths (and the destructive list)
+        # from that folder too, so `env -C ~/.config/gateway cat private/x` is
+        # denied and `sudo env -C / rm -rf usr` reaches / (SF1).
+        chd = _wrapper_chdir(argv, cwds)
+        saved_cwds = cwds
+        stage_cwds.append(list(dict.fromkeys(cwds + (chd or []))))
+        if chd:
+            cwds = list(dict.fromkeys(chd))
         uargv, ubase = _command(st)            # behind env / nohup / command ...
         if ubase == "git" and _git_subcommand(uargv) == "credential":
             return _deny("gateway: don't run `git credential` directly; let git call the "
@@ -1403,20 +1691,28 @@ def _deny_sensitive(stages: list[list[str]], cwd: str | None,
         if base == "ls" and not operands:
             toks.append((".", False))
         for tok, g in toks:
+            if _tilde_unknown(tok):
+                # `~-/x`, `~1/x`: a folder the hook can't know may be the private one
+                return _deny(DENY_TILDE, tool=tool, target="~"), cwd_known, stage_cwds
             if hit(tok, g):
                 return _deny(DENY_PRIVATE, tool=tool, target=target), cwd_known, stage_cwds
             if transcript(tok, False, g):
                 return _deny(DENY_TRANSCRIPT, tool=base, target="transcript"), cwd_known, \
                     stage_cwds
         if _recursive(base, argv):
-            if len(operands) <= 1 and (base in _GREP or base in ("rg", "ag", "ack", "rgrep")):
-                operands.append((".", False))    # searches the working directory
+            if base in _GREP:
+                files, sure = _grep_files(argv)
+                if not files or (not sure and len(files) <= 1):
+                    operands.append((".", False))    # searches the working directory
+            elif len(operands) <= 1 and base in ("rg", "ag", "ack", "rgrep"):
+                operands.append((".", False))
             for tok, g in operands:
                 if tree_hit(tok, g):
                     return _deny(DENY_PRIVATE_TREE, tool=base), cwd_known, stage_cwds
                 if transcript(tok, True, g):
                     return _deny(DENY_TRANSCRIPT, tool=base, target="transcripts"), cwd_known, \
                         stage_cwds
+        cwds = saved_cwds                      # env -C is a per-command chdir, not a cd
         if base in ("cd", "pushd", "popd"):
             nxt = _cd_targets(argv, cwds)
             if nxt is None:
@@ -1486,17 +1782,24 @@ def _uniq_ok(argv: list[str]) -> bool:
 
 
 def _grep_follows_links(argv: list[str]) -> bool:
-    """grep -R / --dereference-recursive follows symlinks met while recursing,
-    which the path checks can't see (a link planted in a project could point
-    into private/), so it is never vouched for; -r doesn't follow them."""
+    """grep -R / --dereference-recursive (GNU) and -S (BSD grep, macOS's
+    /usr/bin/grep: every link followed while recursing) follow symlinks met
+    while recursing, which the path checks can't see (a link planted in a
+    project could point into private/), so they are never vouched for; -r
+    doesn't follow them. A short option's value (`-e`, `-f`, ...) ends its
+    cluster."""
     for a in argv[1:]:
         if a == "--":
             break
         if a.startswith("--"):
             if a.split("=", 1)[0] in ("--dereference-recursive", "--dereference"):
                 return True
-        elif a.startswith("-") and "R" in a[1:]:
-            return True
+        elif a.startswith("-"):
+            for c in a[1:]:
+                if c in "RS":
+                    return True
+                if c in _GREP_VALUE_SHORT:
+                    break                # the rest of the word is that option's value
     return False
 
 
@@ -1563,8 +1866,209 @@ def _date_ok(argv: list[str]) -> bool:
     return True
 
 
+# grep's options whose value is the rest of the word or the next one
+_GREP_VALUE_SHORT = frozenset("efmABCdD")
+# grep's long options that take no value, spelled out: any other long option
+# may take the next word, so the pattern can't be told from a file then
+_GREP_LONG_FLAGS = frozenset({
+    "extended-regexp", "fixed-strings", "basic-regexp", "perl-regexp", "ignore-case",
+    "no-ignore-case", "word-regexp", "line-regexp", "null-data", "no-messages", "invert-match",
+    "version", "help", "byte-offset", "line-number", "line-buffered", "with-filename",
+    "no-filename", "only-matching", "quiet", "silent", "recursive", "files-without-match",
+    "files-with-matches", "count", "initial-tab", "null", "text", "binary", "unix-byte-offsets",
+    "color", "colour", "no-group-separator"})
+# the long options a vouched-for grep may carry, spelled out (getopt also takes
+# any unique abbreviation, which can hide --recursive, --dereference-recursive
+# or --directories=recurse): the flags above and those with a value
+_GREP_LONG_OK = _GREP_LONG_FLAGS | _GREP_LONG_NEXT | frozenset({"context"})
+
+
+def _grep_longs_known(argv: list[str]) -> bool:
+    """Is every long option of this grep one of _GREP_LONG_OK, spelled out?"""
+    for a in argv[1:]:
+        if a == "--":
+            break
+        if a.startswith("--") and a[2:].split("=", 1)[0] not in _GREP_LONG_OK:
+            return False
+    return True
+READ_ALLOW = ("gateway: allowed (plain commands that change nothing; any file they read is in "
+              "the project or a temp folder).")
+
+
+def _read_operands(base: str, argv: list[str]) -> list[str] | None:
+    """The words a benign reader may read as a file or a folder (GW-UX-1):
+    its operands and every option's value (a count or a name lands in the
+    working directory, where it passes). grep's pattern is left out only
+    when it can be told apart: no -e/-f/--regexp/--file, and no long option
+    that may take the next word as its value. None: `wc --files0-from`,
+    which reads file names from a file."""
+    out: list[str] = []
+    ops: list[str] = []
+    grep = base in _GREP
+    given, sure = False, True        # grep: a pattern from -e/-f; the first operand surely the pattern
+    i, n = 1, len(argv)
+    while i < n:
+        a = argv[i]
+        i += 1
+        if a == "--":
+            ops += argv[i:]
+            break
+        if a == "-" or not a.startswith("-"):
+            ops.append(a)
+            continue
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if base == "wc" and name.startswith("f"):
+                return None
+            # a vouched grep's long options are all known, full spellings
+            # (_grep_longs_known refuses any abbreviation, which could be
+            # --recursive), so only the exact names reach here
+            if grep and name in ("regexp", "file"):
+                given = True
+                if not eq:
+                    val, i = (argv[i] if i < n else ""), i + 1
+                if name == "file":
+                    out.append(val)      # patterns read from a file
+            elif eq:
+                out.append(val)
+            elif grep and name not in _GREP_LONG_FLAGS:
+                sure = False             # it may take the next word as its value
+            continue
+        if not grep:
+            out += _flag_values(a)
+            continue
+        body = a[1:]
+        for k, c in enumerate(body):
+            if c in _GREP_VALUE_SHORT:
+                val = body[k + 1:]
+                if not val:
+                    val, i = (argv[i] if i < n else ""), i + 1
+                if c == "e":
+                    given = True         # a pattern
+                else:
+                    given = given or c == "f"
+                    out.append(val)      # -f FILE (a count or an action passes as a name)
+                break
+    if grep and not given and sure and ops:
+        ops = ops[1:]                    # the pattern
+    return out + ops
+
+
+def _inside(p: str, root: str, fold: bool = False) -> bool:
+    """Is `p` the folder `root` or below it (with `fold`, ignoring letter case
+    and Unicode normalization, as macOS's file systems do)?"""
+    if fold:
+        p, root = _fold(p), _fold(root)
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+def _read_roots(cwd: str | None) -> tuple[list[str], list[str], str, list[str]]:
+    """(project roots, temp roots, home, credential folders), resolved, for
+    _reads_plain. The project is CLAUDE_PROJECT_DIR, else the working
+    directory; the temp folders are the scp rule's (TMPDIR, /tmp, /var/tmp).
+    / doesn't count, nor a project that is the home folder or above it, nor
+    a temp folder in the home. The credential folders: the user's (_CRED_DIRS),
+    the Claude config folder and the gateway's home."""
+    home = os.path.realpath(str(paths.user_home()))
+    creds = [os.path.realpath(os.path.join(home, d)) for d in _CRED_DIRS]
+    for extra in (os.environ.get("CLAUDE_CONFIG_DIR", ""), str(paths.home())):
+        if extra and os.path.isabs(extra):
+            creds.append(os.path.realpath(extra))
+
+    def ok(r: str) -> str | None:
+        try:
+            rr = os.path.realpath(r)
+        except (OSError, ValueError):
+            return None
+        return rr if rr != "/" else None
+
+    proj = os.environ.get("CLAUDE_PROJECT_DIR") or ""
+    if not os.path.isabs(proj):
+        proj = cwd if cwd and os.path.isabs(cwd) else os.getcwd()
+    projects = [r for r in [ok(proj)] if r and not _inside(home, r, fold=True)]
+    temps = testing.get("download_temp_roots")
+    if temps is None:
+        import tempfile
+        temps = [tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    roots = [ok(t) for t in temps if isinstance(t, str) and os.path.isabs(t)]
+    return projects, [r for r in roots if r and not _inside(r, home, fold=True)], home, creds
+
+
+def _plain_read_path(p: str, roots: tuple[list[str], list[str], str, list[str]]) -> bool:
+    """Is the absolute path `p` a plain file of the project or a temp folder:
+    resolved, not in a credential folder (a project in one included; letter
+    case ignored), inside one of them (a temp folder's never in the home
+    folder; letter case ignored on macOS), with no hidden or credential-like
+    name below it? A Claude Code worktree of the project
+    (`.claude/worktrees/NAME/...`) counts as the project when the rest of the
+    path is plain (NAME included)."""
+    projects, temps, home, creds = roots
+    try:
+        real = os.path.realpath(os.path.normpath(p))
+    except (OSError, ValueError):
+        return False
+    if any(_inside(real, c, fold=True) for c in creds):
+        return False
+    for r in projects + [t for t in temps if not _inside(real, home, fold=True)]:
+        if _inside(real, r, fold=_CASELESS):
+            tail = _fold(real)[len(_fold(r)):] if _CASELESS else real[len(r):]
+            parts = [x for x in tail.split("/") if x]
+            if r in projects and len(parts) >= 3 and parts[:2] == [".claude", "worktrees"]:
+                parts = parts[2:]        # a worktree of the project: its name and the rest
+            return not any(x.startswith(".") or _CRED_NAME.match(x) for x in parts)
+    return False
+
+
+def _tree_plain(top: str, roots: tuple[list[str], list[str], str, list[str]]) -> bool:
+    """Does the folder hold nothing hidden or credential-like anywhere below
+    it (a recursive grep reads it all), in at most READ_TREE_MAX entries?
+    Links aren't followed (grep -r doesn't; -R and BSD's -S, which do, are
+    never vouched for), but each must point at a plain file of the project or
+    a temp folder all the same (_plain_read_path: not out of them, not at a
+    hidden or credential-like name)."""
+    seen, todo = 0, [top]
+    while todo:
+        try:
+            with os.scandir(todo.pop()) as it:
+                for e in it:
+                    seen += 1
+                    if seen > READ_TREE_MAX or e.name.startswith(".") or _CRED_NAME.match(e.name):
+                        return False
+                    if e.is_symlink():
+                        if not _plain_read_path(e.path, roots):
+                            return False
+                    elif e.is_dir(follow_symlinks=False):
+                        todo.append(e.path)
+        except OSError:
+            return False
+    return True
+
+
+def _reads_plain(base: str, argv: list[str], cwds: list[str],
+                 roots: tuple[list[str], list[str], str, list[str]]) -> bool:
+    """Is everything a benign reader may read a plain file of the project or a
+    temp folder (GW-UX-1)? With no path operand it reads the working
+    directory (or stdin): that must be in the project or a temp folder. A
+    recursive grep also reads every operand's whole tree."""
+    words = _read_operands(base, argv)
+    if words is None:
+        return False
+    rec = base in _GREP and _recursive(base, argv)
+    for w in [x for x in words if x != "-"] or ["."]:
+        cands = _abs_candidates(w, cwds)
+        if not cands or not all(os.path.isabs(c) for c in cands):
+            return False                 # a folder the hook can't know (`~-`, no home)
+        for c in cands:
+            if not _plain_read_path(c, roots):
+                return False
+            if rec and os.path.isdir(c) and not _tree_plain(os.path.realpath(c), roots):
+                return False
+    return True
+
+
 def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
-                   cwds: list[str] | None = None, first: bool = True) -> bool:
+                   cwds: list[str] | None = None, first: bool = True,
+                   roots: tuple[list[str], list[str], str, list[str]] | None = None) -> bool:
     argv, exp, glb = _argv_meta(stage)
     if not argv:
         return False
@@ -1582,7 +2086,17 @@ def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
         return False
     base = os.path.basename(argv[0])
     if base == "sudo":
-        return _eff_right(eff, "localhost", "sudo") is True and _sudo_structure_ok(argv, cwds)
+        if _eff_right(eff, "localhost", "sudo") is not True or not _sudo_structure_ok(argv, cwds):
+            return False
+        # a plain reader under sudo reads as root: the same rule as without it
+        # (GW-UX-1), but never when a wrapper changed its directory (env -C /
+        # sudo -D): the read rule resolves the file from the stage's cwd (SF1)
+        cmd = _unwrap(argv, fork=True)
+        if cmd and os.path.basename(cmd[0]) in BENIGN_READERS:
+            if _wrapper_chdir(argv, cwds or [os.getcwd()]) is not None:
+                return False
+            return _stage_allowed(cmd, form, eff, cwds, first, roots)
+        return True
     if base in ("ssh", "scp", "sftp", "rsync"):
         targets, safe = _scan_family(base, argv)
         if not safe or not targets:
@@ -1608,14 +2122,18 @@ def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
     if base in BENIGN:
         if base == "sleep":
             return len(argv) == 2 and argv[1].isdigit() and int(argv[1]) <= 5
-        if base == "sort":
-            return _sort_ok(argv)
-        if base == "uniq":
-            return _uniq_ok(argv)
+        if base == "sort" and not _sort_ok(argv):
+            return False
+        if base == "uniq" and not _uniq_ok(argv):
+            return False
         if base == "grep" and _grep_follows_links(argv):
             return False
+        if base == "grep" and not _grep_longs_known(argv):
+            return False                 # an abbreviation may be --recursive (MF1)
         if base == "date":
             return _date_ok(argv)
+        if base in BENIGN_READERS:
+            return roots is not None and _reads_plain(base, argv, cwds or [os.getcwd()], roots)
         return True
     return False
 
@@ -1649,6 +2167,8 @@ def _load_rights() -> tuple[formmod.Form, consent.Effective]:
         eff = consent.compute(form, data)
     except Exception:  # noqa: BLE001
         eff = consent.compute(form, None)
+    if _LOCKED:
+        _LOCKED["sudo"] = consent.locked_sudo_note(form)     # _ask says how to get it back
     return form, eff
 
 
@@ -1715,7 +2235,7 @@ def _deny_transfer_ask(base: str, name: str, verb: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Alternate routes in managed mode (PLAN-v4 phase 7, docs/modules/managed.md):
+# Alternate routes in managed mode (PLAN-v4 phase 7, docs/dev/modules/managed.md):
 # a credential tool run by its path (/usr/bin/ssh, /opt/homebrew/bin/gh, ...)
 # is the system's binary with the user's own keys, logins and config, around
 # the gateway's stand-ins and gateway.toml; so is one run after the PATH was
@@ -1744,18 +2264,87 @@ _GIT_SSH_KEYS = ("core.sshcommand", "ssh.variant")
 _ROUTED_BY = {"PATH": ROUTE_TOOLS, "SUDO_ASKPASS": frozenset({"sudo", "sudoedit"}),
               "RSYNC_RSH": frozenset({"rsync"})}
 # Text the parser can't split (a shell string, eval, a function, an
-# assignment statement, ...): a credential tool named by a path anywhere, or
-# a transport/PATH change together with a tool word.
+# assignment statement, ...): a credential tool named by a path (the word's
+# last part) anywhere but as an operand of a command that never runs its
+# operands (GW-UX-4: `sudo cat /etc/ssh/sshd_config`, `sudo cp x
+# /etc/pam.d/sudo` and `sudo rm /usr/local/bin/gh` name data), or a
+# transport/PATH change together with a tool word.
 _TOOL_ALT = "|".join(sorted((re.escape(x) for x in ROUTE_TOOLS), key=len, reverse=True))
-_TEXT_TOOL_PATH = re.compile(rf"[~$A-Za-z0-9_.{{}}/+-]*/({_TOOL_ALT})(?![A-Za-z0-9_.-])")
+_TEXT_TOOL_PATH = re.compile(rf"[~$A-Za-z0-9_.{{}}/+-]*/({_TOOL_ALT})(?![A-Za-z0-9_./-])")
+# Programs that run the next word (after their options) as a program, beside
+# the wrappers _unwrap looks through; and those whose -c takes a command string.
+_TEXT_RUN_NEXT = frozenset({"eval", "exec", "source", ".", "pkexec", "watch", "parallel"})
+_TEXT_RUN_C = _SHELLS | frozenset({"su", "runuser"})
+# what separates commands in the text: a brace only as a group's own word
+# (`{ cmd; }`), not inside one (awk's `{print}`, `${HOME}`)
+_TEXT_SEP = re.compile(r"[;&|()`\n]|(?<!\S)[{}](?!\S)")
+# Commands that only read, write, list, compare or edit the files their
+# operands name and never run them: a tool's path as their operand is data (a
+# bin-folder tool path included: GW-UX-4's own `sudo cat /etc/ssh/sshd_config`,
+# `sudo cp x /etc/pam.d/sudo`, `sudo rm /usr/local/bin/gh`). `less` isn't here
+# (it runs `! CMD`); nor are awk, vi/vim/view/nvim, sed with an `e` command or
+# the transfer tools (rsync, scp, tar), which may run their operands or a
+# script (handled below). Any other program (an unknown one, a runner such as
+# sshpass, strace, flock, script or chroot, a shell's script or its arguments)
+# may run it, so a bin-folder tool path there is a program (round 1's rule).
+_TEXT_DATA = frozenset({
+    "cat", "tac", "more", "nano", "tee", "sed", "gsed", "cp", "gcp", "mv", "gmv", "ls", "gls",
+    "grep", "egrep", "fgrep", "chmod", "gchmod", "chown", "gchown", "chgrp", "chflags", "chattr",
+    "getfacl", "setfacl", "restorecon", "install", "ginstall", "mkdir", "rm", "grm", "rmdir",
+    "touch", "ln", "gln", "stat", "gstat", "file", "diff", "cmp", "head", "tail", "wc", "sort",
+    "uniq", "cut", "strings", "xxd", "od", "hexdump", "md5", "md5sum", "shasum", "sha1sum",
+    "sha256sum", "sha512sum", "cksum", "readlink", "realpath", "basename", "dirname", "du",
+    "test", "[", "[[", "xattr", "codesign", "otool", "nm", "lipo", "truncate", "which", "whereis",
+    "type", "cd", "pushd", "base64", "nl", "paste", "join", "comm", "fold", "rev", "unzip",
+    "gzip", "gunzip", "zcat", "bzip2", "bunzip2", "xz", "unxz", "echo", "printf", ":", "true"})
+# Runners whose command is the next program word, after their own options (a
+# value option takes the next word or the rest of its cluster); the tool path
+# that follows may be run, bin-folder or not (round 1's non-bin blind spots).
+_TEXT_RUNNER: dict[str, str] = {
+    "sshpass": "pfdP", "strace": "oApeEzbuGISrx", "ltrace": "oeSpsnuFl", "dtruss": "",
+    "unbuffer": "", "ssh-agent": "", "screen": "", "nsenter": "", "setarch": "",
+    "catchsegv": "", "proot": "", "fakeroot": ""}
+# Runners that take a resource operand (a lock file, a root, a typescript, a
+# tmux subcommand) before the command: skip their options and one operand.
+_TEXT_RUNNER_SKIP1 = frozenset({"flock", "chroot", "script", "tmux"})
+# Commands that copy or archive their operands locally but run their transport
+# or compressor option's value as a program (rsync -e, scp/sftp -S, tar -I).
+_TEXT_TRANSFER = {"rsync": "e", "scp": "S", "sftp": "S", "tar": "I", "gtar": "I", "bsdtar": "I"}
+# an sed address (a line, a step, `$`, or a /regex/[flags]), for its `e COMMAND`
+_SED_ADDR = r"(?:[0-9]+(?:~[0-9]+)?|\$|/(?:\\.|[^/])*/[A-Za-z]*)"
+# GNU sed's `e COMMAND` (an address or a `0,/re/` range, an optional block `{`,
+# an optional `!`, then `e`) runs a command
+_TEXT_SED_EXEC = re.compile(
+    rf"\A(?:{_SED_ADDR}(?:,(?:{_SED_ADDR}|\+[0-9]+|~[0-9]+))?)? *\{{? *!?e\Z")
+# the word before a path that makes it a program even after a command that
+# never runs its operands: a long option naming a program (sort's
+# --compress-program, --rsh, --to-command, --pager, ...), ssh's ProxyCommand
+# and LocalCommand (rsync -e and scp -S need no rule: those commands may run
+# their operands anyway)
+_TEXT_PROGRAM_OPT = re.compile(
+    r"\A(?:--\S*(?:rsh|rsync-path|program|command|shell|exec|pager|editor|askpass|proxy)\S*|"
+    r"(?i:proxycommand|localcommand|knownhostscommand))\Z")
+# a redirection word (`3</dev/null`, `>x`, `2>&1`) or operator (`>`, `<<<`)
+_TEXT_REDIR = re.compile(r"\A(?:[0-9]+|&)?(?:>>?\|?|<<<|<<?-?|<>|>&|<&)")
+# a pipe into a shell (`echo '/opt/x/ssh h' | sh`): every word may be a program
+_TEXT_PIPE_SHELL = re.compile(
+    r"\|&?\s*(?:(?:sudo|doas|env|nohup|command|exec|nice|time|arch)(?:\s+-\S*)*\s+)*"
+    r"(?:\S*/)?(?:" + "|".join(sorted(_SHELLS | {"xargs", "parallel"})) + r")(?![A-Za-z0-9_.-])")
 _TEXT_TOOL_WORD = re.compile(rf"(?<![A-Za-z0-9_./-])({_TOOL_ALT}|git|rsync)(?![A-Za-z0-9_-])")
-# a word in command position (after a separator, a reserved word or the
-# wrappers that exec their command)
+# a word in command position (after a separator, a reserved word, or the
+# wrappers that exec their command): `_program_word` reads a `$(...)` or
+# backtick there as "$" (a computed program managed mode refuses)
 _TEXT_CMD_WORD = re.compile(
     r"(?:^|[;&|\n(]|\b(?:then|do|else|elif|if|while|until)\b|!)\s*"
-    r"(?:(?:exec|eval|command|builtin|nohup|time|nice|env|xargs|setsid|stdbuf)\s+"
+    r"(?:(?:exec|eval|command|builtin|nohup|time|nice|env|xargs|setsid|stdbuf|arch)\s+"
     r"(?:-[^\s;&|]*\s+|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*\s+)*)*"
     r"([^\s;&|()<>]+)")
+# the first word of a shell's or su's -c string (`bash -c '$(echo /x/ssh) h'`,
+# `bash -c "$CMD"`); only theirs: any other program's -c is its own option
+# (`gcc -c "$f"`, `psql -c "$Q"`)
+_TEXT_SHELL_C = re.compile(
+    r"(?<![\w./-])(?:\S*/)?(?:" + "|".join(sorted(_SHELLS | {"su", "runuser"})) +
+    r")(?:\s+-\S+)*?\s+-[A-Za-z]*c\b\s*([^\s;&|()<>]+)")
 _TEXT_STEER = [
     (re.compile(rf"(?<![A-Za-z0-9_])({_ROUTE_VAR})\+?="), "{0} changed"),
     (re.compile(rf"\bunset\b[^;&|\n]*?(?<![A-Za-z0-9_])({_ROUTE_VAR})(?![A-Za-z0-9_])"),
@@ -1774,28 +2363,40 @@ _TEXT_STEER = [
 _TEXT_GIT_SSH = re.compile(r"(?i)core\.sshcommand|ssh\.variant|--config-env")
 
 
+# the way out for a real need of the system's own tool (a widening: the user's OK)
+_ROUTE_OFF = (" If the user really needs the system's own tool, they can set [shell] managed = "
+              "\"off\" in gateway.toml (approved in the gateway's dialog; it applies from the "
+              "next session); ask them first.")
+
+
 def _route_deny(word: str, base: str, why: str = "") -> dict[str, Any]:
     return _deny(f"gateway: {why or word} runs the system's {base} around the gateway (with your "
                  "own keys, logins and config, outside gateway.toml's hosts and rights); run "
                  f"`{base}` by its bare name: the gateway's stand-in is first on PATH. (A script "
-                 "that runs it by path is the gateway's limit with code running as you: "
-                 "docs/modules/managed.md.)", tool=base, target=word)
+                 "that runs it by path is a known limit of the gateway with code running as "
+                 "you.)" + _ROUTE_OFF, tool=base, target=word)
 
 
-def _route_deny_hidden(base: str | None, why: str) -> dict[str, Any]:
+# the way out of a refused `bash -c "$CMD"`: the command written out
+_SHELL_C_RUN = ("write the command itself in the -c string (`bash -c 'make test'`, not `bash -c "
+                "\"$CMD\"`), or run it")
+
+
+def _route_deny_hidden(base: str | None, why: str, run: str = "") -> dict[str, Any]:
     """A command whose use of a credential tool the hook can't follow
     (managed mode): denied, never left to Claude Code's own mode. `base`
-    None: the program itself can't be told (a variable)."""
+    None: the program itself can't be told (a variable). `run`: the way out,
+    when it isn't running the tool or the program by its name."""
     tool = base or "credential tool (ssh, sudo, gh, ...)"
-    run = f"run `{base}` by its bare name" if base else "name the program itself"
+    run = run or (f"run `{base}` by its bare name" if base else "name the program itself")
     return _deny(f"gateway: this command may run the system's {tool} around the gateway ({why}; "
                  "the gateway can't follow a shell string, eval or exec, a function, find -exec, "
                  "a variable as the program, or PATH or ssh settings changed earlier in the "
                  "command), which would use your own keys, logins and config outside "
                  f"gateway.toml's hosts and rights; {run} as its own command: the gateway's "
-                 "stand-ins are first on PATH. (A script that runs a tool by path is the "
-                 "gateway's limit with code running as you: docs/modules/managed.md.)",
-                 tool=base or "shell", target=why[:60])
+                 "stand-ins are first on PATH. (A script that runs a tool by path is a known "
+                 "limit of the gateway with code running as you.)"
+                 + _ROUTE_OFF, tool=base or "shell", target=why[:60])
 
 
 def _is_stand_in(word: str, base: str) -> bool:
@@ -1869,15 +2470,207 @@ def _text_word(text: str, i: int) -> tuple[str, int]:
     return "".join(out), i
 
 
+_TEXT_TARGET = "\x00"       # the tool path's place in _text_program's words
+# where a word a shell reads as a script (`-c STRING`, a here-string `<<<`,
+# eval/source/`.`'s argument) sits; separators that aren't a word join
+_GLUED_STOP = frozenset(" \t\n;&|()`{}")
+# a shell command whose stdin is a here-string (`bash <<< 'SCRIPT'`, `sh -s
+# <<< ...`): its content is a script. (`bash -c CMD <<< DATA` doesn't match:
+# CMD stands between the shell and the here-string, so the content is CMD's.)
+_HERESTRING_SHELL = re.compile(
+    r"(?:^|[;&|(`\n])\s*"
+    r"(?:(?:sudo|doas|env|nohup|command|nice|time|setsid|stdbuf|exec|arch)\s+(?:-\S+\s+)*|"
+    r"[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"([^\s;&|<>]+)(?:\s+-\S+)*\s*<<<\s*\Z")
+
+
+def _herestring_into_shell(text: str, i: int) -> bool:
+    """Does text[:i] end with a shell command and a `<<<` here-string whose
+    content starts at i (`bash <<< '/x/ssh h'`, `sh -s <<< ...`)? The content
+    is then a program the shell runs."""
+    m = _HERESTRING_SHELL.search(text[:i])
+    if not m:
+        return False
+    sh = os.path.basename(m.group(1))
+    return sh in _SHELLS or sh in ("eval", "source", ".")
+
+
+def _text_unredirect(words: list[str]) -> list[str] | None:
+    """The words without their redirections (`3</dev/null`, `> f`, `2>&1`);
+    None when _TEXT_TARGET is a redirection's target (a file: data)."""
+    out: list[str] = []
+    skip = False
+    for w in words:
+        if skip:
+            if w == _TEXT_TARGET:
+                return None
+            skip = False
+            continue
+        m = _TEXT_REDIR.match(w)
+        if m and w != _TEXT_TARGET:
+            skip = m.end() == len(w)       # a lone operator: its target is the next word
+            continue
+        out.append(w)
+    return out
+
+
+def _skip_runner(argv: list[str], vals: str) -> list[str]:
+    """argv past a runner's own options (a value option, in `vals`, takes the
+    next word or the rest of its cluster)."""
+    argv = argv[1:]
+    while argv and argv[0].startswith("-") and argv[0] not in ("-", "--", _TEXT_TARGET):
+        body = argv[0][1:]
+        argv = argv[2:] if (body and body[-1] in vals) else argv[1:]
+    return argv[1:] if argv[:1] == ["--"] else argv
+
+
+def _text_program(words: list[str]) -> str:
+    """How _TEXT_TARGET, the last of these words (one command of quote-stripped
+    text, up to the tool path), stands in the command (GW-UX-4):
+
+    - "run": it is the program, reached through assignments, redirections,
+      reserved words, the wrappers _unwrap looks through (env, nohup, sudo,
+      timeout, xargs, ...), eval/exec/source, a shell's or su's -c string, su's
+      -s shell, find's -exec, a runner (sshpass, strace, flock, chroot, ...),
+      or a transfer tool's transport option (rsync -e, tar -I);
+    - "pure": it is a plain operand of a command that never runs it (_TEXT_DATA
+      without GNU sed's `e COMMAND`, a transfer tool's local path): the one case
+      where a bin-folder tool path is still data (round 1's own false positives:
+      `sudo rm /usr/local/bin/gh`, `sudo cp x /etc/pam.d/sudo`);
+    - "data": a redirection's target, a here-string a reader consumes, or find's
+      operand without -exec: data for a non-bin path, a program for a bin-folder
+      one (round 1 denied a bin-folder path there);
+    - "operand": it is an operand of an unknown program (the caller decides by
+      the path: a bin-folder tool path is a program, round 1's rule; a non-bin
+      path is data)."""
+    argv: list[str] | None = words
+    for _ in range(12):
+        while argv and _ASSIGN.match(argv[0]):
+            argv = argv[1:]
+        argv = _unwrap(argv, fork=True)
+        if not argv:
+            return "data"                  # `command -v X`: looked up, not run
+        # a here-string into a shell (`bash <<< '/x/ssh'`) is caught in
+        # _text_runs by _herestring_into_shell before the walk; here it is left
+        # as a redirection's target (data), so a bin-folder path still denies
+        argv = _text_unredirect(argv)
+        if argv is None:
+            return "data"                  # a redirection's target: a file
+        if not argv:
+            return "data"
+        if argv[0] == _TEXT_TARGET:
+            return "run"
+        b = os.path.basename(argv[0])
+        if b in _TEXT_RUN_NEXT:
+            argv = argv[1:]
+            while argv and argv[0].startswith("-") and argv[0] != _TEXT_TARGET:
+                argv = argv[2:] if argv[0] == "-a" else argv[1:]   # exec -a NAME
+            continue
+        if b in _TEXT_RUNNER:
+            argv = _skip_runner(argv, _TEXT_RUNNER[b])
+            continue
+        if b in _TEXT_RUNNER_SKIP1:
+            argv = _skip_runner(argv, "")
+            argv = argv[1:]                # the resource operand (lock file, dir, subcommand)
+            continue
+        if b in _TEXT_RUN_C:
+            rest = argv[1:]
+            if b in ("su", "runuser") and any(
+                    w in ("-s", "--shell") or w.startswith("--shell=") or
+                    (w.startswith("-") and not w.startswith("--") and "s" in w[1:])
+                    for w in rest):
+                return "run"               # su -s SHELL: whatever follows may be that shell
+            c = next((j for j, w in enumerate(rest) if w.startswith("-") and not
+                      w.startswith("--") and "c" in w[1:]), None)
+            if c is None:
+                return "run"               # a script and its arguments, runuser's command
+            argv = rest[c + 1:]            # the -c string: its first word is a program
+            if b in _SHELLS:
+                # a shell's string is its first operand after the options (`-c -e`, `-c --`)
+                while argv and argv[0].startswith("-"):
+                    end = argv[0] in ("-", "--")
+                    argv = argv[1:]
+                    if end:
+                        break
+            continue
+        if b == "find":
+            k = next((j for j, w in enumerate(argv) if w in _FIND_RUN), None)
+            if k is None:
+                return "pure"              # find's search roots and tests: never run
+            argv = argv[k + 1:]
+            continue
+        if b in _TEXT_TRANSFER:
+            j = argv.index(_TEXT_TARGET) if _TEXT_TARGET in argv else len(argv)
+            prev = argv[j - 1] if j else ""
+            if prev.startswith("--") and _TEXT_PROGRAM_OPT.match(prev.split("=", 1)[0]):
+                return "run"               # rsync --rsh PROG, tar --use-compress-program PROG
+            if prev.startswith("-") and not prev.startswith("--") and \
+                    prev[-1:] == _TEXT_TRANSFER[b]:
+                return "run"               # rsync -e PROG, scp -S PROG, tar -I PROG
+            return "pure"                  # a local path or a remote path
+        if b in _TEXT_DATA:
+            # an operand of a command that never runs it (GNU sed's `e CMD` does)
+            if b in ("sed", "gsed") and any(_TEXT_SED_EXEC.match(w) for w in argv[1:-1]):
+                return "run"
+            return "pure"
+        return "operand"                   # an unknown program: the caller decides by the path
+    return "operand"
+
+
+def _text_runs(text: str, m: re.Match[str]) -> bool:
+    """May the tool path _TEXT_TOOL_PATH matched in the (quote-stripped) text
+    be run as a program there (GW-UX-4)? A bin-folder tool path is a program
+    anywhere except as an operand of a command that never runs it (round 1's
+    rule); a non-bin path only in a program position or after a known runner.
+    Yes anywhere in a text piped into a shell or a shell's here-string, glued
+    to a value (`--rsh=/x/ssh`, `X=/x/ssh`, `-e/x/ssh`), after a word that
+    names a program (_TEXT_PROGRAM_OPT), and wherever _text_program finds it
+    runs. Data: a remote path (`box:/x/ssh`), a redirection's target, an
+    operand of a command that never runs it (`sudo cat /etc/ssh`, `sudo cp x
+    /etc/pam.d/sudo`, `sudo rm /usr/local/bin/gh`)."""
+    word = m.group(0)
+    if word.startswith("-"):
+        return True                      # an option's own value (`-e/x/ssh`)
+    path = re.sub(r"^-[A-Za-z]*(?=[/~$.])", "", word)
+    pre = path.split("/", 1)[0]
+    if pre and _TEXT_SED_EXEC.match(pre) and re.search(r"(?<![\w./-])g?sed\b", text):
+        return True                      # sed's `1e/x/ssh`: the e command glued to its path
+    is_bin = _names_program(path)
+    if _TEXT_PIPE_SHELL.search(text):
+        return True
+    i = m.start()
+    if _herestring_into_shell(text, i):
+        return True
+    prev = text[i - 1] if i else " "
+    if prev not in _GLUED_STOP:
+        # glued to the previous word: a value (`--rsh=`, `X=`) runs; a remote
+        # path (`box:/x/ssh`) or a redirect target (`>/x/ssh`) is data
+        return prev not in ":<>"
+    words = _TEXT_SEP.split(text[:i])[-1].split()
+    if words and _TEXT_PROGRAM_OPT.match(words[-1]):
+        return True                      # --compress-program, --rsh, ProxyCommand, ...: a program
+    kind = _text_program(words + [_TEXT_TARGET])
+    if kind == "run":
+        return True
+    if kind == "pure":
+        return False                     # a plain operand of a command that never runs it
+    # "data" (a redirect target, a reader's here-string, find's operand) or
+    # "operand" (an unknown program's operand): a bin-folder tool path is a
+    # program (round 1); a non-bin path is data
+    return is_bin
+
+
 def _route_text(command: str) -> dict[str, Any] | None:
     """The text scan for a command the parser can't follow (see _TEXT_*): a
-    credential tool by a path that isn't the stand-in, or a PATH/transport
-    change (or an alias, a function, `hash -p`, `command -p`, `env -i`, git's
-    ssh setting) with a tool named anywhere. Here-documents that are data
-    aren't read."""
+    credential tool by a path that isn't the stand-in, where it can run as a
+    program (_text_runs), or a PATH/transport change (or an alias, a
+    function, `hash -p`, `command -p`, `env -i`, git's ssh setting) with a
+    tool named anywhere. Here-documents that are data aren't read."""
     text = _QUOTES.sub("", _drop_heredoc_data(command))
     for m in _TEXT_TOOL_PATH.finditer(text):
         word = re.sub(r"^-[A-Za-z]*(?=[/~$.])", "", m.group(0))
+        if not _text_runs(text, m):
+            continue
         if not _is_stand_in(word, m.group(1)):
             return _route_deny_hidden(m.group(1), f"{word[:60]} by its path")
     for m in _TEXT_CMD_WORD.finditer(text):
@@ -1885,6 +2678,12 @@ def _route_text(command: str) -> dict[str, Any] | None:
         if "$" in os.path.basename(w) or "`" in os.path.basename(w):
             return _route_deny_hidden(None, f"the program is a variable or a command's output "
                                             f"({w[:40]})")
+    for m in _TEXT_SHELL_C.finditer(text):
+        w = _program_word(text, m.start(1))
+        if "$" in os.path.basename(w) or "`" in os.path.basename(w):
+            # `bash -c "$CMD"`: whatever the variable holds runs, unseen
+            return _route_deny_hidden(None, f"the shell's -c string is a variable or a command's "
+                                            f"output ({w[:40]})", _SHELL_C_RUN)
     if _TEXT_GIT_SSH.search(text) and re.search(r"(?<![A-Za-z0-9_.-])git(?![A-Za-z0-9_-])", text):
         return _route_deny_hidden("ssh", "git's ssh setting")
     # a change steers only the tools after it (`sudo env -i make` is sudo's own business)
@@ -1901,7 +2700,13 @@ def _route_text(command: str) -> dict[str, Any] | None:
 
 def _stage_hidden(st: list, argv: list[str], base: str) -> bool:
     """Does the stage run code its words don't show (a shell, eval, exec,
-    source, su, xargs, env -S, find -exec, a loop)?"""
+    source, su, xargs, env -S, find -exec, a nested sudo/runner, a loop; a
+    tracer or sandbox as the program, also behind a wrapper)? A
+    plain `sudo CMD ARGS` counts (sudo is a runner), and the text scan reads
+    the command it elevates: with the corrected data/program classification a
+    tool path that CMD only reads (`sudo restorecon /etc/ssh`, `sudo tar ...
+    /etc/ssh`) is no longer refused (MF3), while one it runs (`sudo sort
+    --compress-program /x/ssh`, `sudo strace /x/ssh`) still is."""
     return base in _HIDDEN_RUNNERS or base in _LOOP_WORDS or _runs_hidden(list(st))
 
 
@@ -2639,8 +3444,14 @@ def _judge(segs: list | None, command: str, payload: dict, mode: str, cwd: str |
     if in_job:
         return None    # never allow a job: Claude Code's own permission check decides
     if mode in ("auto", "bypassPermissions") and cwd_known and not in_user_terminal:
+        try:
+            roots = _read_roots(cwd)
+        except Exception:  # noqa: BLE001 - no roots: no file read is vouched for
+            roots = None
         if len(stage_cwds) == len(stages) and all(
-                _stage_allowed(st, form, eff, c, f)
+                _stage_allowed(st, form, eff, c, f, roots)
                 for st, c, f in zip(stages, stage_cwds, firsts)):
+            if all(_argv_meta(st)[0][0] in BENIGN for st in stages):
+                return _out("allow", READ_ALLOW)
             return _out("allow", "gateway: allowed (host/account rights in gateway.toml).")
     return None

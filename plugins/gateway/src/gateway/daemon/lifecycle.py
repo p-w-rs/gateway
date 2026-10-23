@@ -13,6 +13,9 @@ wrapped (client.py). ensure_running():
      kept and reported ("old gateway daemon still runs N jobs").
   `gated status` never starts or restarts it and reports any version
   difference with its plugin copy in "skew" (/gate-doctor shows it).
+  /health names the data folder the daemon serves ("data"); `gated
+  start|status` from another one (a second CLAUDE_CONFIG_DIR) add
+  "other_config", the words /gate-doctor shows (planes.other_config_note).
   3. Otherwise, under <run>/gated.start.lock (flock), `run.py gated serve
      --detach` is started and its /health awaited.
 
@@ -492,6 +495,9 @@ class Daemon:
              "uptime": round(time.monotonic() - self.t0, 1), "vault": self.broker.state(),
              "sessions": live, "socket": str(self.sock_path),
              "lock_after": int(self.broker.lock_after()), "dialogs": self.dialogs.count(),
+             # the data folder it serves (its python's): a second Claude Code
+             # configuration's `gated status` says it isn't theirs (planes.other_config_note)
+             "data": str(paths.data_dir()),
              **self.terminals.counts()}
         if self.draining:
             h["draining"] = self.draining
@@ -1146,6 +1152,34 @@ def serve(detach: bool = False) -> int:
         os.close(lock_fd)
 
 
+def _run_dir_refused(e: paths.PathError) -> dict[str, Any]:
+    """`gated start|status` when the run folder can't be used (another user's,
+    a link, open to others): its own explanation and remedy for /gate-doctor
+    (GW-ROB-1), never a traceback."""
+    return {"ok": False, "running": False, "error": "run_dir",
+            "message": f"gateway: {paths.explain(e)}"}
+
+
+def _parent_facts(ppid: int) -> dict[str, Any]:
+    """What `gated start|status` says about the process that ran it (the mod
+    runs them through $.process.run, and launch.sh execs Python, so that is
+    the Claude Code process when the engine starts children directly):
+    parent_pid when it is a Claude Code process (the daemon checks the claim
+    against the kernel's peer pid either way), claude_install (how it was
+    installed, for /gate-doctor; "" when it isn't recognized as Claude Code)
+    and, then, parent_exe (its executable's name, so the doctor can say what
+    asked); and this machine's platform (sys.platform)."""
+    from . import peers
+    # platform: the mod has no other way to know it is on Linux, where Paste
+    # needs a display (DISPLAY or WAYLAND_DISPLAY; review round 2)
+    out: dict[str, Any] = {"claude_install": peers.claude_install(ppid), "platform": sys.platform}
+    if out["claude_install"]:
+        out["parent_pid"] = ppid
+    else:
+        out["parent_exe"] = os.path.basename(peers.exe(ppid) or "")[:64]
+    return out
+
+
 def main(args: list[str]) -> int:
     """run.py gated serve [--detach] | start [--register] | status | stop."""
     sub = args[0] if args else "status"
@@ -1157,16 +1191,19 @@ def main(args: list[str]) -> int:
         except client.DaemonError as e:
             print(json.dumps({"ok": False, "message": e.message}))
             return 1
+        except paths.PathError as e:
+            print(json.dumps(_run_dir_refused(e), sort_keys=True))
+            return 1
         out = dict(h)
+        note = planes.other_config_note(out)
+        if note:
+            out["other_config"] = note
         # The mod runs `launch.sh gated start` through $.process.run; launch.sh
         # execs Python, so the parent is the Claude Code process the mod runs in
         # when the engine starts children directly (named only when it is a
         # Claude Code executable; the daemon checks the claim against the
         # kernel's peer pid either way).
-        from . import peers
-        ppid = os.getppid()
-        if peers.is_claude(ppid):
-            out["parent_pid"] = ppid
+        out.update(_parent_facts(os.getppid()))
         if "--register" in args[1:]:
             try:
                 r = client.call("POST", "/agent/register",
@@ -1180,10 +1217,17 @@ def main(args: list[str]) -> int:
     if sub == "status":
         # never starts or restarts the daemon; a version difference with this
         # plugin copy is reported either way (/gate-doctor shows it)
-        h = client.health(timeout=2.0)
-        print(json.dumps(_skew(h, plugin_version(), older=True) if h is not None
-                         else {"ok": False, "running": False, "socket": str(paths.gated_socket())},
-                         sort_keys=True))
+        try:
+            h = client.health(timeout=2.0)
+            out = (_skew(h, plugin_version(), older=True) if h is not None
+                   else {"ok": False, "running": False, "socket": str(paths.gated_socket())})
+            note = planes.other_config_note(out) if h is not None else ""
+            if note:
+                out = {**out, "other_config": note}
+        except paths.PathError as e:
+            out = _run_dir_refused(e)
+        out.update(_parent_facts(os.getppid()))
+        print(json.dumps(out, sort_keys=True))
         return 0
     if sub == "stop":
         ok = stop()

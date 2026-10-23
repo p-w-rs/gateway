@@ -53,7 +53,20 @@ HEADER = (
     "# Secrets never go here; the gateway asks for them in its dialog in Claude Code.\n"
     "#   true = Claude may do it without asking   \"ask\" = ask me each time   false = no\n"
 )
-STARTER = HEADER + "\n[hosts.localhost]                  # this computer, whichever one you're on\nsudo = true\n"
+# A new install's form: sudo on this computer starts as "ask" (Claude Code asks
+# each time). Forms written before (sudo = true) and converted 0.6 vaults
+# keep what they say. STARTER_OLDER is what older gateways wrote: an install
+# whose vault one of them made (vault.older_install) gets it back if its form
+# goes missing with no copy to restore (starter()), so its sudo stays true.
+_STARTER_HEAD = HEADER + "\n[hosts.localhost]                  # this computer, whichever one you're on\n"
+STARTER = _STARTER_HEAD + "sudo = \"ask\"\n"
+STARTER_OLDER = _STARTER_HEAD + "sudo = true\n"
+
+
+def starter(data: dict[str, Any] | None) -> str:
+    """The starter form for this install (data: its vault, None if none)."""
+    return STARTER_OLDER if vault.older_install(data) else STARTER
+
 
 SHORT = {"github": "github", "hf": "hf", "azure": "azure", "mlcat": "catalog", "pijul": "pijul"}
 V3_KIND = {"github": "github", "hf": "huggingface", "azure": "azure", "mlcat": "ml-catalog",
@@ -88,6 +101,9 @@ class Mapped:
     switches: list[str] = field(default_factory=list)
     aliases: dict[str, str] = field(default_factory=dict)
     source_localhost: dict[str, Any] = field(default_factory=lambda: {"sudo": {}})
+    # catalog accounts 0.6 named no single host for (off until the user sets
+    # `host`): name -> the approval snapshot the conversion records for them
+    hostless: dict[str, dict[str, Any]] = field(default_factory=dict)
     report: str = ""
 
 
@@ -595,6 +611,19 @@ def map_v2(v2: dict[str, Any], *, local_user: str | None = None, mode: str = "mi
             rec["bound"]["tenant"] = rec["entra"].get("tenant_id")
             rec["bound"]["client_id"] = rec["entra"].get("client_id")
             rec["bound"]["scope"] = None  # pinned at the first token (the catalog's /api/config)
+    # A hostless catalog account is off (host is required) but keeps its
+    # sign-in: the conversion's approval records it as an approved account
+    # with no destination yet, so the user adding `host` later is a new
+    # destination of that account (one OK, the sign-in kept:
+    # consent.drops_credential), not a new account whose OK drops it.
+    for n in list(m.hostless):
+        if n in parsed.accounts or n not in blocks_by_name:
+            del m.hostless[n]
+            continue
+        use = not any(k == "use" and v is False for k, v, _ in blocks_by_name[n].items)
+        snap = consent.account_snapshot(formmod.Account(name=n, kind="ml-catalog", use=use))
+        snap["destinations"] = []
+        m.hostless[n] = snap
     for p in parsed.errors:
         m.attention.append(f"gateway.toml {p.render()}")
     # An old name that is now itself an entry name would hide that entry.
@@ -760,9 +789,23 @@ def _map_account(m: Mapped, accts: dict[str, Any], ref: str, n: str, out: dict[s
         if cid and cid != vault_v2.AZURE_CLI_CLIENT_ID:
             b.add("client_id", cid)
     elif k == "mlcat":
-        host = host_ok(host) if host else formmod.DEFAULT_HOSTS["ml-catalog"]
-        if host != formmod.DEFAULT_HOSTS["ml-catalog"]:
+        # The catalog's address is written out (the gateway has no default
+        # catalog): 0.6's host, else the one host 0.6 bound the account to (a
+        # list naming it twice still names one host).
+        bound: list[str] = []
+        if not host:
+            bound = list(dict.fromkeys(h.strip().lower() for h in _str_list(a.get("hosts"))
+                                       if formmod.valid_hostname(h.strip().lower())))
+            host = bound[0] if len(bound) == 1 else ""
+        if host:
+            host = host_ok(host)
             b.add("host", host)
+        else:
+            why = ("0.6 had none" if not bound else f"0.6 listed {len(bound)}: "
+                   + ", ".join(bound[:3]) + (", ..." if len(bound) > 3 else ""))
+            b.commented.append(f"# host = \"\"                       # {why}; set the catalog's address")
+            m.attention.append(f"{n}: set host = \"...\" (the catalog's address; {why})")
+            m.hostless[n] = {}
         if login:
             b.add("login", login)
     elif k == "pijul":
@@ -1201,11 +1244,17 @@ def _migrate_locked(store: Path, key: Path, trigger: str, fail_at: str | None) -
         raise MigrationError("test failure after check")
     target = paths.form_path() if not paths.form_path().exists() else paths.from_v2_form_path()
     data = m.vault
+    # A converted 0.6 store is an existing install: its vault carries no
+    # baseline mark (vault.older_install), so it keeps the old defaults, like
+    # this computer's sudo true in the user's own gateway.toml below.
+    data.pop(vault.BASELINE_KEY, None)
     vault.ensure_machine(data)
     report = m.report
+    rights = consent.snapshot(parsed)
+    for n, snap in m.hostless.items():
+        rights["accounts"].setdefault(n, snap)
     if target == paths.form_path():
-        data["approved"] = {"form_sha256": parsed.sha256, "at": vault.now(),
-                            "rights": consent.snapshot(parsed)}
+        data["approved"] = {"form_sha256": parsed.sha256, "at": vault.now(), "rights": rights}
         data["form_last_good"] = m.form_text
     else:
         # The user's own form stays in charge: nothing of theirs is approved by
@@ -1213,7 +1262,7 @@ def _migrate_locked(store: Path, key: Path, trigger: str, fail_at: str | None) -
         # copied in (consent.compute counts them as approved then).
         mine = formmod.load(use_cache=False)
         data["approved"] = {}
-        data["imported"] = {"from": "v2", "at": vault.now(), "rights": consent.snapshot(parsed)}
+        data["imported"] = {"from": "v2", "at": vault.now(), "rights": rights}
         data["form_last_good"] = mine.used_text if (mine.syntax_error is None and mine.exists) else None
         report += "\n" + FROM_V2_NOTE
     data["migrated"] = {"from": "v2", "store_sha256": store_sha, "at": vault.now(),

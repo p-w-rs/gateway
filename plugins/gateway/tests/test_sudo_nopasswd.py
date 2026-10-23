@@ -114,7 +114,7 @@ def test_passwordless_sudo_already_configured_is_used_and_nothing_is_asked():
 
 def test_gate_check_remote_offers_store_or_ask():
     from gateway import ssh as sshmod
-    form = '[hosts.box]\naddress = "joshua@box.example.com"\n'
+    form = '[hosts.box]\naddress = "octo@box.example.com"\n'
     with U.ux_env() as env:
         U.setup(env, form)
         with vault.edit() as d:
@@ -131,7 +131,7 @@ def test_gate_check_remote_offers_store_or_ask():
         assert "placed briefly on box" in q and "sudoers" not in q.lower()
         assert not hasattr(sshmod, "setup_remote_nopasswd")
         data = vault.load()
-        assert not data["hosts"]["box"]["sudo"] and vault.sudo_choice(data, "box", "joshua") == "ask"
+        assert not data["hosts"]["box"]["sudo"] and vault.sudo_choice(data, "box", "octo") == "ask"
 
 
 # what would advise or install blanket passwordless sudo
@@ -193,8 +193,9 @@ def test_no_blanket_passwordless_sudo_advice_anywhere():
     files = advice_files(plugin)
     if (repo / "docs").is_dir():
         # every Markdown file under docs/ is read, the historical records too
-        for want in ("docs/phaseB-requests/ssh.md", "docs/phaseB-requests/RESOLUTION.md",
-                     "docs/DECISIONS.md", "docs/history/REDESIGN-v3.md", "docs/modules/sudo.md"):
+        for want in ("docs/dev/phaseB-requests/ssh.md", "docs/dev/phaseB-requests/RESOLUTION.md",
+                     "docs/dev/DECISIONS.md", "docs/dev/history/REDESIGN-v3.md",
+                     "docs/dev/modules/sudo.md", "docs/CAPABILITIES.md"):
             assert repo / want in files, want
     else:
         print("       (docs part skipped: a copy of the plugin folder alone)")

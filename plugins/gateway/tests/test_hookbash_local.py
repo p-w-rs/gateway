@@ -49,11 +49,13 @@ def test_local_sudo_true_allows_only_in_auto():
         assert _decide("sudo ls", "default") is None
 
 
-def test_implicit_localhost_sudo_true():
-    # No [hosts.localhost] at all: localhost is implicit with sudo = true.
+def test_implicit_localhost_sudo_asks():
+    # No [hosts.localhost] at all: localhost is implicit with sudo = "ask"
+    # (the default): Claude Code asks, in auto mode too; never allowed.
     with H.gateway_env() as env:
         _approved(env, '[hosts.box]\naddress = "u@box.example.com"\nssh = true\n')
-        assert _decide("sudo ls", "auto") == "allow"
+        assert _decide("sudo ls", "auto") == "ask"
+        assert _decide("sudo ls", "bypassPermissions") == "ask"
 
 
 def test_pending_new_host_is_denied_with_the_next_step():
@@ -129,8 +131,8 @@ def test_reasons_start_with_gateway():
 
 def test_missing_vault_and_form_no_crash():
     with H.gateway_env():
-        # no form, no vault: localhost implicit sudo true -> allow in auto
-        assert _decide("sudo ls", "auto") == "allow"
+        # no form, no vault: localhost implicit sudo "ask" -> ask, even in auto
+        assert _decide("sudo ls", "auto") == "ask"
         assert _decide("curl http://x", "auto") == "deny"
 
 
@@ -218,4 +220,5 @@ def test_allow_needs_the_effective_right_even_without_the_deny():
         st = bashparse.parse("ssh newbox uptime")[0][0]
         assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"]) is False
         st = bashparse.parse("sudo ls")[0][0]
-        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"]) is True
+        roots = hooks_bash._read_roots("/tmp")       # ls reads /tmp, a temp folder
+        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"], roots=roots) is True

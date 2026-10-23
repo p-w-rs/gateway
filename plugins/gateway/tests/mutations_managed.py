@@ -49,7 +49,7 @@ MUTATIONS = [
      T + "test_gate_sh_takes_exactly_one_argument"),
     # --- never the user's own shell ------------------------------------------------
     ("an unknown shape runs in the user's shell", G,
-     "  exit 126\n}\n\ngw_notready", '  exec "${SHELL:-/bin/sh}" -c "$GW_SCRIPT"\n}\n\ngw_notready',
+     "  exit 126\n}\n\n# Is the build lock", '  exec "${SHELL:-/bin/sh}" -c "$GW_SCRIPT"\n}\n\n# Is the build lock',
      T + "test_unknown_shapes_are_refused_and_never_run_anywhere"),
     ("an unready managed shell runs the command in the user's shell", G,
      "  exit 75\n}", '  exec /bin/sh -c "$GW_SCRIPT"\n}',
@@ -172,6 +172,16 @@ MUTATIONS = [
      '  if [ "${GW_MANAGED_CHECK-}" = 1 ]; then\n    degraded_bash_text managed; return 0\n  fi\n', "",
      T + "test_the_cold_guard_denies_bash_without_the_prefix_byte_identically"),
     # --- host inspection ----------------------------------------------------------------
+    # --- tool folders found but not imported (GW-UX-2b): an offer, never an import ---
+    ("the tool folders found here go on the managed PATH without the user's OK", "src/gateway/managed.py",
+     "    out += [(d, \"system\") for d in SYSTEM_DIRS]\n",
+     "    out += [(os.path.expanduser(d.replace('~', _home_s(), 1)), \"found\") for d in found_not_imported(eff)]\n"
+     "    out += [(d, \"system\") for d in SYSTEM_DIRS]\n",
+     T + "test_tool_folders_found_but_not_imported_are_offered_and_listed_never_imported"),
+    ("the import offer stays after the user said no (import_path = [])", "src/gateway/hooks_session.py",
+     "            or form.shell.path_line is not None:\n",
+     "            or bool(form.shell.import_path):\n",
+     T + "test_tool_folders_found_but_not_imported_are_offered_and_listed_never_imported"),
     ("host_inspect returns any first line of a version file", "src/gateway/managed.py",
      '        return f"version {first}" if _VERSION_WORD.fullmatch(first) else "present"',
      '        return f"version {first}"',

@@ -20,20 +20,20 @@ def run_gate(*args: str) -> tuple[int, str, str]:
 
 FORM = '''[hosts.localhost]
 sudo = true
-[hosts.powerslabs]
-address = "joshua@10.0.0.5"
+[hosts.example]
+address = "octo@10.0.0.5"
 [hosts.builder]
 address = "ci@builder.internal"
-via = "powerslabs"
+via = "example"
 sudo = false
 [accounts.github-personal]
 kind = "github"
-login = "p-w-rs"
+login = "octocat"
 default = true
 [accounts.github-work]
 kind = "github"
-login = "jpowers-asi"
-owners = ["asirobots"]
+login = "octo-work"
+owners = ["example-org"]
 [accounts.openai]
 kind = "api-key"
 sites = ["api.openai.com"]
@@ -50,9 +50,9 @@ def _setup(env, extra: str = ""):
     priv, pub = H.ssh_keypair("ps")
     with vault.edit() as d:
         vault.set_sudo(d, "localhost", paths.local_user(), "local-pw-1234")
-        h = vault.host_record(d, "powerslabs")
+        h = vault.host_record(d, "example")
         h["keys"].append(vault.key_record(priv, pub))
-        vault.set_sudo(d, "powerslabs", "joshua", "lab-pw-5678")
+        vault.set_sudo(d, "example", "octo", "lab-pw-5678")
         vault.account_record(d, "github-personal", "github")["token"] = {
             "value": "gho_abcdefghijklmnop0123", "source": "gh-oauth", "stale": False}
         vault.account_record(d, "github-work", "github")["token"] = {
@@ -72,11 +72,11 @@ def test_status_table():
         assert lines[0] == "Hosts" and "Accounts" in lines
         row = {l.split()[0]: l for l in lines if l.startswith("  ") and l.split()}
         assert "sudo ✓ password saved" in row["localhost"]
-        assert "ssh ✓ joshua@10.0.0.5, key saved" in row["powerslabs"] and "password saved" in row["powerslabs"]
-        assert "ssh ✓ via powerslabs, no key yet" in row["builder"] and "sudo ✗" in row["builder"]
+        assert "ssh ✓ octo@10.0.0.5, key saved" in row["example"] and "password saved" in row["example"]
+        assert "ssh ✓ via example, no key yet" in row["builder"] and "sudo ✗" in row["builder"]
         assert "waits for your OK (gate check fresh)" in row["fresh"]
-        assert "p-w-rs (default)" in row["github-personal"] and "signed in" in row["github-personal"]
-        assert "asirobots" in row["github-work"] and "token rejected (gate check github-work)" in row["github-work"]
+        assert "octocat (default)" in row["github-personal"] and "signed in" in row["github-personal"]
+        assert "example-org" in row["github-work"] and "token rejected (gate check github-work)" in row["github-work"]
         assert "api.openai.com" in row["openai"] and "key saved" in row["openai"]
         assert "off (use = false)" in row["off"]
         assert "Waiting for your OK" in out and "fresh: new host" in out
@@ -93,9 +93,9 @@ def test_status_entry_and_alias():
         code, out, _ = run_gate("status", "github:work")
         assert code == 0 and out.startswith("github-work (github account)")
         assert "sends to github.com, api.github.com, ghcr.io" in out and "token rejected" in out
-        code, out, _ = run_gate("status", "powerslabs")
-        assert "address joshua@10.0.0.5" in out and "keys    SHA256:" in out
-        assert "sudo password for joshua: saved" in out
+        code, out, _ = run_gate("status", "example")
+        assert "address octo@10.0.0.5" in out and "keys    SHA256:" in out
+        assert "sudo password for octo: saved" in out
         code, out, _ = run_gate("status", "nobody")
         assert "isn't in gateway.toml" in out
 
@@ -106,7 +106,7 @@ def test_status_writes_the_vault_only_to_persist_a_narrowing():
         before = paths.vault_path().read_bytes()
         run_gate("status")
         assert paths.vault_path().read_bytes() == before, "an unchanged form writes nothing"
-        env.write_form(FORM.replace('sudo = true\n[hosts.powerslabs]', 'sudo = false\n[hosts.powerslabs]'))
+        env.write_form(FORM.replace('sudo = true\n[hosts.example]', 'sudo = false\n[hosts.example]'))
         run_gate("status")
         d = vault.load()
         assert d["approved"]["rights"]["hosts"]["localhost"]["sudo"] is False, "the narrowing is persisted"
@@ -148,7 +148,7 @@ def test_log_and_why():
         try:
             audit.refusal("sudo", "builder", "gateway: sudo is off for builder (gateway.toml)",
                           fix="ask the user if it should be on")
-            audit.use("ssh", "powerslabs", None, ["ssh", "powerslabs", "uptime"])
+            audit.use("ssh", "example", None, ["ssh", "example", "uptime"])
             code, out, _ = run_gate("why")
             assert "sudo is off for builder" in out and "Fix: ask the user" in out and "(sudo builder)" in out
             code, out, _ = run_gate("log", "5")
@@ -169,9 +169,9 @@ def test_import_ssh_prints_toml_and_never_writes():
         cfg = env.user_home / ".ssh" / "config"
         cfg.parent.mkdir(parents=True)
         cfg.write_text("""
-Host lab powerlab
+Host lab labbox
     HostName 10.0.0.5
-    User joshua
+    User octo
     Port 2222
 Host inner
     HostName inner.internal
@@ -190,11 +190,11 @@ Host *
         code, out, err = run_gate("import-ssh")
         assert code == 0, err
         assert paths.form_path().read_text() == before, "import-ssh never writes the form"
-        assert '[hosts.lab]\naddress = "joshua@10.0.0.5:2222"' in out
+        assert '[hosts.lab]\naddress = "octo@10.0.0.5:2222"' in out
         assert '[hosts.inner]\naddress = "ci@inner.internal"\nvia     = "lab"' in out
         assert 'via     = "jump"' in out.split("[hosts.viajump]")[1]
         assert "ProxyCommand" in out.split("[hosts.weird]")[1]
-        assert "Host *" not in out and "[hosts.powerlab]" in out
+        assert "Host *" not in out and "[hosts.labbox]" in out
         toml_part = "\n".join(l for l in out.splitlines())
         f = F.parse_text(before + "\n" + toml_part)
         assert {"lab", "inner", "viajump", "weird"} <= set(f.hosts), f.report_lines()
@@ -246,19 +246,31 @@ def test_help_and_unknown():
 
 def test_status_on_a_fresh_install_says_no_form_yet():
     """Round 3: a new user's first `gate status` (before the starter form
-    exists) said "gateway.toml is missing ... (approvals are kept)"."""
+    exists) said "gateway.toml is missing ... (approvals are kept)". It names
+    this computer's sudo as it applies: "ask" on a new install, on for one an
+    older gateway set up."""
     with H.gateway_env():
         assert not paths.form_path().exists() and not vault.exists()
         code, out, _ = run_gate("status")
         assert code == 0 and out.startswith("No gateway.toml yet"), out
         assert "missing" not in out and "approvals are kept" not in out
+        assert "this computer's defaults apply (sudo asks each time)" in out.splitlines()[0], out
+    # an older install (its vault an older gateway made, nothing approved or
+    # kept as the last good form): its default then, sudo on
+    with H.gateway_env():
+        vault.save({"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {},
+                    "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {},
+                    "events": [], "events_seen": 0, "migrated": None})
+        code, out, _ = run_gate("status")
+        assert code == 0 and out.startswith("No gateway.toml yet"), out
+        assert "this computer's defaults apply (sudo on)" in out.splitlines()[0], out
 
 
 def test_status_footer_names_the_users_own_hosts():
     with H.gateway_env() as env:
         _setup(env)
         code, out, _ = run_gate("status")
-        assert '"turn off sudo on powerslabs"' in out and "builder\"" not in out.splitlines()[-1]
+        assert '"turn off sudo on example"' in out and "builder\"" not in out.splitlines()[-1]
         env.write_form('[accounts.openai]\nkind = "api-key"\nsites = ["api.openai.com"]\n')
         code, out, _ = run_gate("status")
         last = out.splitlines()[-1]

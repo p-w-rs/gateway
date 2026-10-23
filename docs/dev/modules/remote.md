@@ -271,7 +271,7 @@ again by the next start; panes in it are reported, never assumed.
 
 ## Policy, inspection and imports (phase 7)
 
-- **Policy** (docs/modules/policy.md): terminals and jobs are decided by the host's `exec`
+- **Policy** (docs/dev/modules/policy.md): terminals and jobs are decided by the host's `exec`
   (and their workspace's) in `Supervisor._bind`; staging a new or changed runtime by
   `provision` (`ensure_runtime`: a refusal is `RemoteError("policy", ..., 403)` with the
   rule; an already staged runtime of the same version is used without asking again);
