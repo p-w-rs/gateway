@@ -254,11 +254,15 @@ def test_run_epipe_closes_reader_without_crashing():
         prog = ("import sys\ntry:\n for i in range(100000): sys.stdout.write('line %d\\n' % i)\n"
                 "except BrokenPipeError: pass")
         child = subprocess.Popen([sys.executable, "-c", prog], stdout=subprocess.PIPE)
+        # pump owns (and closes) its source: hand it a copy of the child's
+        # stdout, so the file object's own close doesn't hit a closed fd
+        src = os.dup(child.stdout.fileno())
+        child.stdout.close()
         # pump through a scrubber into a pipe whose read end we close early
         r, w = os.pipe()
         import threading
         sc = scrub.Scrubber([TOKEN], expand_forms=False)
-        t = threading.Thread(target=scrub.pump, args=(child.stdout.fileno(), w, sc))
+        t = threading.Thread(target=scrub.pump, args=(src, w, sc))
         t.start()
         os.close(r)       # reader gone: writes should hit EPIPE, not hang
         t.join(timeout=10)
@@ -293,3 +297,56 @@ def test_scrub_text_short_values_not_masked_but_shapes_are():
         assert scrub.scrub_text("pin=1234", extra=["1234"]) == "pin=1234"
         assert "Bearer" in scrub.scrub_text("Authorization: Bearer abcdefhijk")
         assert "abcdefhijk" not in scrub.scrub_text("Authorization: Bearer abcdefhijk")
+
+
+# ---------------------------------------------------------------------------
+# PLAN-0.11 §9.1 and §1.6 (WS-6): the user's credential variables in every
+# form, and a passphrase-protected vault's values from gated
+# ---------------------------------------------------------------------------
+
+
+def test_a_credential_variables_value_is_masked_in_every_form():
+    """hooks_post hands the user's credential variables to scrub_text as
+    extra literals: their JSON-escaped (a tool's JSON output), base64 and
+    URL-encoded forms are masked too, never only the plain value."""
+    import json
+    from gateway import hooks_post
+    val = 'User"Tok\\en-' + "x9" * 8
+    with H.gateway_env():
+        env = [val]
+        for shown in (val, json.dumps(val)[1:-1], base64.b64encode(val.encode()).decode(),
+                      urllib.parse.quote(val, safe="")):
+            out = hooks_post.scrub_text(f"a {shown} b", env)
+            assert shown not in out and "***" in out, shown
+        new, changed = hooks_post.scrub_obj({"stdout": f"T={val}", "n": 3, "l": [val]}, env)
+        assert changed and val not in json.dumps(new) and new["n"] == 3
+
+
+def test_a_wrapped_vaults_values_come_from_gated_for_the_output_hook():
+    """With a passphrase the hook can't decrypt the vault itself: its values
+    come from gated (vault.load is brokered; the hooks' scope is every secret
+    class), so a stored value without a token shape is still masked. Locked,
+    the hook masks what it can (shapes) and never fails the call."""
+    import json
+    import harness_daemon as D
+    from gateway import vault
+    pw = "correct horse battery staple wrapped"
+    with D.daemon_env() as de:
+        de.env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
+        vault.save(vault.empty())
+        with vault.edit() as d:
+            vault.set_sudo(d, "box", "u", pw)
+        de.wrap("a vault passphrase for the scrub tests")
+        fc = de.claude(register=False)
+        env = de.env.subprocess_env(de.extra_env())
+        payload = {"tool_name": "WebFetch", "session_id": "s", "hook_event_name": "PostToolUse",
+                   "tool_input": {"url": "https://example.com/"},
+                   "tool_response": {"result": f"the page says {pw} and ghp_{'b' * 30}", "code": 200}}
+        r = fc.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "hook-post"], env=env,
+                   input=json.dumps(payload))
+        assert r.returncode == 0, r.stderr
+        assert pw not in r.stdout and "ghp_bbbb" not in r.stdout and "***" in r.stdout, r.stdout
+        fc.http("POST", "/ui/vault/lock")
+        r = fc.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "hook-post"], env=env,
+                   input=json.dumps(payload))
+        assert r.returncode == 0 and "ghp_bbbb" not in r.stdout, (r.stdout, r.stderr)

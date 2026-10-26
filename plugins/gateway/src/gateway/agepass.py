@@ -36,6 +36,11 @@ AGE_TIMEOUT = 120
 # near the tty's limit (MAX_CANON, 1024 bytes on macOS) never completes and
 # age waits out AGE_TIMEOUT. Passphrases are bounded well below it.
 MAX_PASSPHRASE_BYTES = 512
+# age's passphrase prompts as they end the pty's output ("Enter passphrase
+# (leave empty to autogenerate a secure one): ", "Confirm passphrase: ",
+# "Enter passphrase: "). test_packaging runs the locked age under a pty and
+# checks its prompts against this, so a reworded prompt fails at the relock.
+PROMPT_RE = re.compile(rb"(?i)passphrase[^\n]*:\s*$")
 
 
 class AgePassError(Exception):
@@ -120,7 +125,7 @@ def run_age(args: list[str], passphrase: str, answers: int, fifo: Path,
                     break
                 out.extend(chunk)
                 tail = bytes(out[mark:])
-                if sent < answers and re.search(rb"(?i)passphrase[^\n]*:\s*$", tail):
+                if sent < answers and PROMPT_RE.search(tail):
                     os.write(fd, passphrase.encode() + b"\r")
                     sent += 1
                     mark = len(out)

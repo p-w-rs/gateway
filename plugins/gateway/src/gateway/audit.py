@@ -1,7 +1,7 @@
 """The audit log: $CLAUDE_PLUGIN_DATA/audit.jsonl (SPEC 17).
 
-One JSON line per credential use, pop-up outcome, consent, widening, refusal,
-export/import/copy and migration. Values are redacted: through
+One JSON line per credential use, pop-up outcome, consent, widening, refusal
+and export/import/copy. Values are redacted: through
 scrub.scrub_text when phase B's scrubber is available, else by replacing the
 literal secrets the caller passes plus a few well-known token shapes.
 
@@ -100,9 +100,12 @@ def use(tool: str, target: str, account: str | None, argv: list[str] | None = No
 
 
 def refusal(tool: str, target: str | None, reason: str, fix: str | None = None,
-            secrets: Iterable[str] = ()) -> None:
-    """A refusal: audited, and remembered for `gate why` (per session)."""
-    log("refusal", secrets=secrets, tool=tool, target=target, reason=reason, fix=fix)
+            secrets: Iterable[str] = (), mode: str | None = None) -> None:
+    """A refusal: audited, and remembered for `gate why` (per session).
+    `mode`: the permission mode it was decided in (a mode key, or
+    "modeless"; PLAN-0.11 §2.4), when the caller knows one."""
+    log("refusal", secrets=secrets, tool=tool, target=target, reason=reason, fix=fix,
+        **({"mode": mode} if mode else {}))
     try:
         sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or "nosession"
         sid = re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80]

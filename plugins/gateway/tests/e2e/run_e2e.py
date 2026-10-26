@@ -5,10 +5,11 @@ Not part of `pixi run test`: it runs real `claude -p` sessions (model haiku)
 against a scratch COPY of this plugin and local test servers. See
 tests/e2e/README.md for the redirection and why it is safe.
 
-    pixi run e2e                        everything (10 short sessions; jobs only with a
+    pixi run e2e                        everything (10 short sessions, plus one per
+                                        --permission-mode for `modes`; jobs only with a
                                         checkpoint checkout next to the gateway repo)
-    pixi run e2e --only ssh,git         some scenarios (context ssh git web refuse default leak
-                                        notice midturn jobs)
+    pixi run e2e --only ssh,git         some scenarios (context ssh git web refuse default modes
+                                        leak notice midturn jobs)
     pixi run e2e --keep                 keep the scratch folder (and the transcripts)
     pixi run e2e --save DIR             copy the report, stream-json and debug logs to DIR
 
@@ -26,9 +27,11 @@ by Python and by the sh hooks, every gateway location is inside the e2e root,
 none under the real ~/.config/gateway), the copy's pixi env built into the
 e2e data folder, the fixtures (sshds with a fake password sudo on the remote
 PATH, a smart-HTTP git server with Basic auth, an HTTP API, a fake dialog
-that cancels and logs every pop-up), gateway.toml and the vault seeded through
-the gateway's own API with fake secrets, then the claude sessions and the
-assertions.
+that cancels and logs every pop-up, recording fakes for the user's own ssh,
+git and the rest that a pass-through runs: e2e.json's user_tools, and a probe
+plugin that records each hook payload's permission_mode), gateway.toml and
+the vault seeded through the gateway's own API with fake secrets, then the
+claude sessions and the assertions.
 
 The optional `jobs` scenario also needs checkpoint: when a checkpoint
 checkout sits next to the gateway repo (../checkpoint/plugins/checkpoint
@@ -60,8 +63,11 @@ from typing import Any, Callable
 
 HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parents[1]
-SCENARIOS = ("context", "ssh", "git", "web", "refuse", "default", "leak", "notice", "midturn",
-             "jobs")
+SCENARIOS = ("context", "ssh", "git", "web", "refuse", "default", "modes", "leak", "notice",
+             "midturn", "jobs")
+# the user's own tools the e2e copy's pass-through runs: recording fakes
+# (tests/fakes/fake_user_tool.py, e2e.json's user_tools), never the real ones
+USER_TOOLS = ("ssh", "scp", "sftp", "git", "gh", "hf", "sudo")
 SESSION_TIMEOUT = 90
 JOBS_TIMEOUT = 150      # the jobs scenario: ten job steps and a ToolSearch in one session
 # the scenarios that wait for Claude Code's "waiting for input" notice (45 s
@@ -116,8 +122,8 @@ def _inside(p: Path, root: Path) -> bool:
 
 def checkpoint_env(root: Path) -> dict[str, str]:
     """CHECKPOINT_HOME and CHECKPOINT_GATEWAY_ENV for the jobs session, both
-    set explicitly and inside the e2e root: the state folder the gateway looks
-    for under its e2e home (paths.checkpoint_state_dir) and the env.sh its
+    set explicitly and inside the e2e root: checkpoint's state folder under
+    the e2e home (~/.local/state/checkpoint) and the env.sh the gateway's
     SessionStart writes there. Unset, checkpoint would use the real state
     folder and source the real ~/.config/gateway/env.sh in jobs. Dies on any
     path that resolves outside the root or into the real gateway home."""
@@ -294,10 +300,17 @@ class E2E:
         self.api_key = "e2eK" + secrets.token_hex(16)
         self.remote_pw = "e2e-sudo-" + secrets.token_hex(6)
         self.planted_gh = "e2eG" + secrets.token_hex(16)        # GITHUB_TOKEN in Claude's env
+        # one of Claude Code's own credential variables (the key it unlocks
+        # isn't set, so Claude Code doesn't use it): never in Claude's shell
+        self.planted_ck = "e2eC" + secrets.token_hex(16)
         # round 3: a token shape that is no stored value (the leak scenario's
         # PostToolUseFailure warning; expected unmasked there, so not scanned)
         self.leak_shape = "ghp_" + secrets.token_hex(18)
         self.host_keys: dict[str, str] = {}                     # host -> private key text
+        self.user_tools = self.fx / "user-tools"                # the user's own tools (fakes)
+        self.modeprobe = self.fx / "modeprobe"                  # the permission_mode probe plugin
+        self.modeprobe_log = self.out / "modeprobe.log"
+        self._modes: list[str] | None = None
 
     # -- pre-flight ---------------------------------------------------------
     def preflight(self, C: Any) -> None:
@@ -368,7 +381,6 @@ class E2E:
         import harness_ssh as HS
         import harness_accounts as HA
         import harness_ux as HU
-        from gateway import envfile, paths
         self.H, self.HS, self.HA = H, HS, HA
         for name in ("target", "nosudo", "jump", "behind"):
             self.sshds[name] = HS.Sshd(self.fx, name, sudo_password=self.remote_pw).start()
@@ -380,11 +392,16 @@ class E2E:
         euid = self.fx / "remote-euid.sh"
         euid.write_text(HS.REMOTE_EUID)
         os.chmod(euid, 0o755)
-        with paths.e2e_context():
-            git = envfile.system_git()
+        # the test servers' own git (the person's, from this process's PATH:
+        # under the e2e override the gateway's user_tool would name the fakes)
+        git = shutil.which("git")
         if not git:
             die("no system git")
         self.git = git
+        import acceptance_lib as L
+        L.write_user_tools(self.user_tools, USER_TOOLS, sys.executable)
+        self.modeprobe_plugin()
+        self.pushprobe()
         self.gitsrv = HA.GitServer(self.fx / "git", git)
         self.gitsrv.make_repo("e2eorg", "work")
         self.gitsrv.make_repo("e2euser", "proj")
@@ -414,7 +431,8 @@ class E2E:
         os.chmod(guard, 0o755)
         cfg = {"dialog": str(self.dialog.script), "tools": {"sudo": str(guard)},
                "ssh_remote_euid": str(euid), "machine_id": "E2E-MACHINE-0001",
-               "popup_wait": 5, "popup_lifetime": 20, "dialog_timeout": 20}
+               "popup_wait": 5, "popup_lifetime": 20, "dialog_timeout": 20,
+               "user_tools": str(self.user_tools)}
         p = self.root / "e2e.json"
         p.write_text(json.dumps(cfg, indent=1))
         os.chmod(p, 0o600)
@@ -422,6 +440,57 @@ class E2E:
         # round 3 (leak): a file holding stored values, and one with a token shape
         (self.work / "notes.txt").write_text(f"api_key={self.api_key}\nsudo_pw={self.remote_pw}\n")
         (self.work / "leak.txt").write_text(f"token={self.leak_shape}\n")
+
+    def modeprobe_plugin(self) -> None:
+        """A plugin beside the gateway in the `modes` sessions: its SessionStart
+        and Bash PreToolUse hooks append EVENT<TAB>SESSION<TAB>MODE (the
+        payload's permission_mode, "-" when it has none) to the log and
+        print nothing (no decision). Nothing else of the payload is kept."""
+        p = self.modeprobe
+        (p / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        (p / ".claude-plugin" / "plugin.json").write_text(json.dumps({
+            "name": "modeprobe", "version": "0.0.1",
+            "description": "e2e: records each hook payload's permission_mode"}))
+        rec = p / "rec.sh"
+        rec.write_text(MODEPROBE_REC.replace("@LOG@", str(self.modeprobe_log)))
+        os.chmod(rec, 0o755)
+
+        def h(event: str) -> dict:
+            return {"hooks": [{"type": "command", "command": f"sh '{rec}' {event}"}]}
+        (p / "hooks").mkdir(exist_ok=True)
+        (p / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {
+            "SessionStart": [h("SessionStart")],
+            "PreToolUse": [{"matcher": "Bash", **h("PreToolUse")}]}}, indent=1))
+
+    def pushprobe(self) -> None:
+        """work/pushprobe: a repository with one commit and no remote (the
+        refuse scenario pushes it to the "ask" host's URL; the hook asks
+        before anything runs). Made with the test servers' git, isolated
+        from the person's git config."""
+        d = self.work / "pushprobe"
+        d.mkdir(exist_ok=True)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.fx), "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "LANG": "C"}
+        (d / "README").write_text("e2e push probe\n")
+        for args in (["init", "-q"], ["add", "README"],
+                     ["-c", "user.email=e2e@example.com", "-c", "user.name=e2e", "-c",
+                      "commit.gpgsign=false", "commit", "-qm", "e2e"]):
+            r = subprocess.run([self.git, "-C", str(d), *args], env=env, capture_output=True,
+                               text=True, timeout=60)
+            if r.returncode != 0:
+                die(f"pushprobe: git {args[0]} failed: {r.stderr[-300:]}")
+
+    def claude_modes(self) -> list[str]:
+        """The --permission-mode choices this claude lists (`claude --help`)."""
+        if self._modes is None:
+            from acceptance_lib import permission_modes
+            try:
+                r = subprocess.run([self.claude, "--help"], capture_output=True, text=True,
+                                   timeout=60, env=self.claude_env(), stdin=subprocess.DEVNULL)
+                self._modes = permission_modes(r.stdout)
+            except (OSError, subprocess.TimeoutExpired):
+                self._modes = []
+        return self._modes
 
     def form_text(self) -> str:
         s = self.sshds
@@ -521,9 +590,12 @@ auth = "bearer"
                "PATH": ":".join(d for d in dict.fromkeys(dirs) if os.path.isdir(d)),
                "LANG": os.environ.get("LANG") or "en_US.UTF-8", "TERM": "dumb",
                "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
-               # planted: the env file must unset both in Claude's Bash
+               # planted: the user's own (PLAN-0.11 §1.10: they stay in Claude's
+               # shell; the masker hides the token's value in output)
                "SSH_AUTH_SOCK": str(self.fx / "no-such-agent.sock"),
                "GITHUB_TOKEN": self.planted_gh,
+               # planted: Claude Code's own, which never reaches Claude's shell
+               "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": self.planted_ck,
                # only the plugin's MCP server: none of the account's claude.ai connectors
                "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
         if os.path.isabs(os.environ.get("CLAUDE_CONFIG_DIR", "")):
@@ -710,14 +782,28 @@ done
   echo "path_first=${PATH%%:*}"
   echo "ssh=$(command -v ssh)"
   echo "sudo=$(command -v sudo)"
+  echo "git=$(command -v git)"
   echo "git_include=$inc"
   echo "git_ssh_command=${GIT_SSH_COMMAND-}"
   echo "rsync_rsh=${RSYNC_RSH-}"
   echo "ssh_auth_sock=${SSH_AUTH_SOCK+set}"
   echo "github_token=${GITHUB_TOKEN+set}"
+  echo "client_key_pass=${CLAUDE_CODE_CLIENT_KEY_PASSPHRASE+set}"
   echo "claude_pid=${CLAUDE_PID+set}"
 } > "out-$tag.txt"
 cat "out-$tag.txt"
+"""
+
+# The modes probe plugin's hook (run_e2e.E2E.modeprobe_plugin): one line per
+# payload, its event, session id and permission_mode ("-" when it has none);
+# nothing else of the payload is kept, and it prints nothing (no decision).
+MODEPROBE_REC = r"""#!/bin/sh
+ev=${1:-?}
+p=$(tr '\n\r' '  ')
+m=$(printf '%s' "$p" | sed -n 's/.*"permission_mode"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p')
+sid=$(printf '%s' "$p" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9-]*\)".*/\1/p')
+printf '%s\t%s\t%s\n' "$ev" "${sid:--}" "${m:--}" >> '@LOG@'
+exit 0
 """
 
 

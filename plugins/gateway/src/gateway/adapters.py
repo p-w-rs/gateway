@@ -11,9 +11,11 @@ no proxies, the Python build's own CA bundle):
     huggingface  a user access token: GET /api/whoami-v2
     azure        a service principal's client secret or certificate (the
                  client-credentials grant; a certificate signs a client
-                 assertion with the env's openssl), or a refresh token stored
-                 before PLAN-v4 phase 3 (the refresh grant; a rotated refresh
-                 token is saved)
+                 assertion with the env's openssl), or the refresh token of
+                 the gateway's browser sign-in (PLAN-0.11 §7; the refresh
+                 grant; a rotated refresh token is saved)
+    ml-catalog   the browser sign-in's refresh token (no check of its own:
+                 configured once stored)
 
 States (told apart from the service's own answers, never guessed):
 
@@ -68,9 +70,9 @@ METHODS = {
     "github": ("personal access token (fine-grained or classic)",),
     "huggingface": ("user access token",),
     "azure": ("service principal client secret", "service principal certificate",
-              "refresh token (stored before; kept working)"),
+              "browser sign-in (sign_in = \"browser\": authorization code with PKCE)"),
     "api-key": ("API key",),
-    "ml-catalog": ("unavailable under these constraints (its sign-in is a web page)",),
+    "ml-catalog": ("browser sign-in (authorization code with PKCE)",),
     "pijul": ("ssh key",),
     "registry": ("username and token",),
 }
@@ -114,13 +116,13 @@ def credential_of(kind: str, rec: dict[str, Any]) -> str:
     """The stored credential's kind in words, or "" when none is stored."""
     tok = (rec.get("token") or {}).get("value")
     e = rec.get("entra") or {}
-    if kind == "azure":
+    if kind in ("azure", "ml-catalog"):
         if e.get("client_certificate"):
             return "service principal certificate"
         if e.get("client_secret"):
             return "service principal client secret"
         if e.get("refresh_token"):
-            return "refresh token"
+            return "browser sign-in" if e.get("kind") == "browser" else "refresh token"
         return ""
     if isinstance(tok, str) and tok and not vault.is_redacted(tok):
         return token_kind(kind, tok)
@@ -279,8 +281,8 @@ def _entra_state(e: Exception) -> tuple[str, str]:
     if codes & ENTRA_REAUTH or err in ("interaction_required", "consent_required",
                                        "login_required"):
         return "reauthentication_required", ("Entra needs the person (MFA, consent or a "
-                                             "conditional-access policy); a browser sign-in is "
-                                             "unavailable here, so a service principal is the way")
+                                             "conditional-access policy): a new browser sign-in "
+                                             "(gate login), or a service principal")
     if codes & ENTRA_REVOKED or err in ("invalid_client", "unauthorized_client"):
         return "revoked", "Entra refuses the credential (deleted, wrong or disabled)"
     if isinstance(e, entra.EntraError) and "could not reach" in text:
@@ -291,18 +293,34 @@ def _entra_state(e: Exception) -> tuple[str, str]:
 
 
 def check_azure(a: formmod.Account, rec: dict[str, Any], data: dict[str, Any]) -> Check:
+    from . import accounts as acctmod
     from . import entra
     e = rec.get("entra") or {}
     url = entra._token_url(e.get("tenant_id") or a.tenant or "common")
     meta: dict[str, Any] = {"credential": credential_of("azure", rec)}
+    # the credential use refuses one that doesn't fit the approved account
+    # (PLAN-0.11 §19.5), so the check never sends it to Entra either
+    ap = entra.approved_account(data, a.name)
+    if e and (ap is None or not acctmod.entra_fits(ap, vault.entra_info(rec))):
+        return Check("reauthentication_required", "needs a new sign-in: the stored one was made "
+                     "for other settings than the approved ones (tenant, client_id, sign_in or "
+                     f"scope), or {a.name} isn't approved; gate check {a.name}", meta)
     tenant, client = e.get("tenant_id") or a.tenant, e.get("client_id") or a.client_id
+    arm = entra.SCOPES["arm"]
+    what = "Azure Resource Manager"
     try:
         if e.get("client_certificate"):
-            entra.client_certificate(tenant, client, e["client_certificate"], entra.SCOPES["arm"])
+            entra.client_certificate(tenant, client, e["client_certificate"], arm)
         elif e.get("client_secret"):
-            entra.client_credentials(tenant, client, e["client_secret"], entra.SCOPES["arm"])
+            entra.client_credentials(tenant, client, e["client_secret"], arm)
         elif e.get("refresh_token"):
-            entra.access_token(a.name, "arm")       # rotates and saves the refresh token
+            # a browser sign-in is checked with the scope it was made for (an
+            # account signed in for Graph alone may get no ARM token at all)
+            own = [t for t in str(e.get("scope") or "").split() if t != "offline_access"]
+            scope = own[0] if own else arm
+            if scope != arm:
+                what = "the sign-in's scope"
+            entra.access_token(a.name, scope, mode="modeless")   # rotates and saves the refresh token
         else:
             return Check("missing", f"no Entra credential stored for {a.name}")
     except entra.EntraError as err:
@@ -310,7 +328,7 @@ def check_azure(a: formmod.Account, rec: dict[str, Any], data: dict[str, Any]) -
         return Check(st, why, meta)
     meta["tenant"] = tenant if isinstance(tenant, str) and len(tenant) < 100 else ""
     _ = url
-    return Check("connected", "Entra issued a token for Azure Resource Manager", meta)
+    return Check("connected", f"Entra issued a token for {what}", meta)
 
 
 def check(a: formmod.Account, rec: dict[str, Any], data: dict[str, Any]) -> Check:

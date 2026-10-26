@@ -37,7 +37,7 @@ CONTRACT_VERSIONS = [1]
 # 5: per-job on_pause policies), jobs and terminals (phase 5, localhost),
 # remote (phase 6: terminals and jobs on remote hosts in the managed runtime).
 FEATURES = ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces", "accounts",
-            "pause_id"]
+            "pause_id", "job_env"]
 
 
 def machine_token(raw: str) -> str:

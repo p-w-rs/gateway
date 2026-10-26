@@ -846,8 +846,217 @@ def test_daemon_vault_passphrase_set_then_lock_and_unlock_through_dialogs():
         mod.post("/ui/dialog/submit", seal(d, [PASS]))
         assert de.wait_for(lambda: de.health()["vault"] == "unlocked", 30)
         st, body = fc.http("POST", "/ui/vault/unlock")
-        assert body["available"] is False and "unlocked already" in body["message"]
+        assert body["available"] is True, body                # unlocked: the menu (§19.14)
+        assert mod.dialog()["kind"] == "choice"
         assert PASS not in de.log()
+
+
+def _gate(de: D.DaemonEnv, fc: D.FakeClaude, *args: str):
+    """`gate ARGS` as a gateway program below `fc` (native dialogs)."""
+    drv = _driver(de)
+    env = de.env.subprocess_env()
+    env.pop("GATEWAY_TEST_ROOT")
+    env["CLAUDE_PID"] = str(fc.pid)
+    return fc.run([H.PY, "-I", "-S", drv, str(de.root), "gate", *args], env=env)
+
+
+def _opens(passphrase: str) -> bool:
+    from gateway import agepass
+    try:
+        D.full_vault(passphrase)
+        return True
+    except agepass.AgePassError:
+        return False
+
+
+def _closed(mod: Mod, rid: str, timeout: float = 30) -> dict[str, Any]:
+    """The closed dialog `rid` from the session's recent list (its outcome
+    and note: what gated's own handler said)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for x in mod.view()["recent"]:
+            if x["id"] == rid:
+                return x
+        time.sleep(0.05)
+    raise AssertionError(f"dialog {rid} never closed: {json.dumps(mod.view())[:400]}")
+
+
+def _event_kinds() -> list[str]:
+    """Every event kind gated logged in this test root, in order."""
+    out: list[str] = []
+    for f in sorted((paths.gated_dir() / "events").glob("epoch-*.jsonl")):
+        out += [json.loads(ln)["kind"] for ln in f.read_text().splitlines() if ln.strip()]
+    return out
+
+
+def test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed_in_gateds_dialogs():
+    """PLAN-0.11 §19.14: with the vault unlocked, /gate-unlock opens gated's
+    menu (Change passphrase, Remove passphrase; one per session). Change: the
+    two-field passphrase dialog; the new passphrase opens the key, the old
+    one doesn't any more, the vault stays unlocked and readable. Remove: a
+    confirm (Cancel the default; Cancel keeps the passphrase); its OK puts
+    key.txt back, removes key.wrapped and key.recipient, keeps every secret,
+    declines the passphrase offer and logs vault.unwrapped; a vault locked
+    while the confirm waits keeps its passphrase. `gate passphrase` opens the
+    change dialog, `gate passphrase --remove` the confirm. No value reaches
+    the log."""
+    new = "another vault passphrase for the change test"
+    secret = canary("sv")
+    with D.daemon_env() as de:
+        vault.save(vault.empty())
+        with vault.edit() as d:
+            vault.set_sudo(d, "localhost", paths.local_user(), secret)
+        de.wrap(PASS)
+        fc = de.claude()
+        mod = Mod(fc)
+        st, body = fc.http("POST", "/ui/vault/unlock")
+        assert st == 200 and body["available"], body
+        d = mod.dialog()
+        assert d["kind"] == "choice" and d["entry"] == "vault" and d["fields"] == 0 and \
+            d["options"] == ["Change passphrase", "Remove passphrase"], d
+        fc.http("POST", "/ui/vault/unlock")
+        v = mod.view()
+        assert v["dialog"]["id"] == d["id"] and v["queue"] == [], "one menu per session"
+        mod.post("/ui/dialog/answer", {"id": d["id"], "button": "ok", "choice": "Change passphrase"})
+        p = mod.dialog(lambda x: x["kind"] == "passphrase")
+        assert p["fields"] == 2 and p["what"] == "vault passphrase change", p
+        old_wrapped = paths.wrapped_key_path().read_bytes()
+        mod.post("/ui/dialog/submit", seal(p, [new, new]))
+        # (wait on the dialog's close, cheap; then one scrypt each: a poll of
+        # _opens would run age's scrypt again and again on a loaded machine)
+        x = _closed(mod, p["id"], 60)
+        assert x["outcome"] == "ok", x
+        assert paths.wrapped_key_path().read_bytes() != old_wrapped
+        assert _opens(new), "the new passphrase opens the key"
+        assert not _opens(PASS), "the old one doesn't"
+        assert de.health()["vault"] == "unlocked"
+        assert vault.sudo_entry(D.full_vault(new), "localhost", paths.local_user())["password"] \
+            == secret
+        # `gate passphrase` opens the change dialog too
+        r = _gate(de, fc, "passphrase")
+        assert r.returncode == 0 and "set or change the vault passphrase is open" in r.stdout, \
+            (r.stdout, r.stderr)
+        p = mod.dialog(lambda x: x["kind"] == "passphrase")
+        mod.post("/ui/dialog/cancel", {"id": p["id"]})
+        # remove: Cancel keeps the passphrase
+        fc.http("POST", "/ui/vault/unlock")
+        d = mod.dialog(lambda x: x["kind"] == "choice")
+        mod.post("/ui/dialog/answer", {"id": d["id"], "button": "ok", "choice": "Remove passphrase"})
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        assert c["default_cancel"] is True and c["ok_label"] == "Remove passphrase", c
+        assert any("any program running as you" in ln for ln in c["lines"]), c["lines"]
+        mod.post("/ui/dialog/cancel", {"id": c["id"]})
+        time.sleep(0.3)
+        assert paths.wrapped_key_path().exists() and not paths.key_path().exists()
+        # locked while the confirm waits: its OK removes nothing (the broker's own check)
+        r = _gate(de, fc, "passphrase", "--remove")
+        assert r.returncode == 0 and "remove the vault passphrase is open" in r.stdout, r.stdout
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        fc.http("POST", "/ui/vault/lock")
+        assert de.wait_for(lambda: de.health()["vault"] == "locked", 10)
+        mod.post("/ui/dialog/answer", {"id": c["id"], "button": "ok"})
+        x = _closed(mod, c["id"])
+        assert x["outcome"] == "failed" and "must be unlocked" in x["note"], x
+        assert paths.wrapped_key_path().exists() and paths.recipient_path().exists() and \
+            not paths.key_path().exists() and de.health()["vault"] == "locked"
+        st, _b = de.unlock(new)
+        assert st == 200 and de.health()["vault"] == "unlocked", _b
+        assert "vault.unwrapped" not in _event_kinds()
+        r = _gate(de, fc, "passphrase", "--remove")
+        assert r.returncode == 0 and "remove the vault passphrase is open" in r.stdout, r.stdout
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        mod.post("/ui/dialog/answer", {"id": c["id"], "button": "ok"})
+        assert de.wait_for(lambda: de.health()["vault"] == "unwrapped", 30)
+        assert de.wait_for(lambda: "vault.unwrapped" in _event_kinds(), 10), _event_kinds()
+        assert paths.key_path().exists() and not paths.wrapped_key_path().exists() and \
+            not paths.recipient_path().exists()
+        assert oct(paths.key_path().stat().st_mode & 0o777) == oct(0o600)
+        data = vault.load()
+        assert vault.sudo_entry(data, "localhost", paths.local_user())["password"] == secret
+        assert vault.offer_state(data) == "declined", "not offered again"
+        r = _gate(de, fc, "passphrase", "--remove")
+        assert r.returncode == 1 and "no passphrase to remove" in r.stderr, r.stderr
+        for v_ in (PASS, new, secret):
+            assert v_ not in de.log()
+
+
+def test_daemon_a_vault_whose_passphrase_is_lost_starts_over_only_after_the_ok():
+    """PLAN-0.11 §19.14: `gate passphrase --start-over` (the vault locked)
+    opens gated's confirm, Cancel the default. Cancel changes nothing; OK
+    moves vault.age, key.wrapped, key.recipient and cache.age into
+    private/backups/startover-* (nothing deleted: the old passphrase still
+    opens them there), leaves gateway.toml, and the next store starts a new
+    vault; an import then works (the README's "import your last export"),
+    and vault.started_over is logged. It is refused while the vault is
+    unlocked or has no passphrase, also when the vault is unlocked while its
+    confirm waits. The unlock dialog and the locked messages name it."""
+    with D.daemon_env() as de:
+        de.env.write_form('[hosts.localhost]\nsudo = true\n')
+        vault.save(vault.empty())
+        with vault.edit() as d:
+            vault.set_sudo(d, "localhost", paths.local_user(), canary("sv"))
+        de.wrap(PASS)
+        paths.cache_path().write_bytes(b"an encrypted cache")
+        fc = de.claude()
+        mod = Mod(fc)
+        r = _gate(de, fc, "passphrase", "--start-over")
+        assert r.returncode == 1 and "nothing to start over" in r.stderr, r.stderr
+        fc.http("POST", "/ui/vault/lock")
+        before = {n: (paths.private_dir() / n).read_bytes() for n in vault.START_OVER_FILES}
+        r = _gate(de, fc, "passphrase", "--start-over")
+        assert r.returncode == 0 and "start the vault over" in r.stdout, (r.stdout, r.stderr)
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        assert c["default_cancel"] is True and c["ok_label"] == "Start over", c
+        assert any("nothing is deleted" in ln for ln in c["lines"]), c["lines"]
+        mod.post("/ui/dialog/cancel", {"id": c["id"]})
+        time.sleep(0.3)
+        assert all((paths.private_dir() / n).read_bytes() == b for n, b in before.items())
+        assert de.health()["vault"] == "locked"
+        # the unlock dialog and the locked messages name the way out of a lost passphrase
+        fc.http("POST", "/ui/vault/unlock")
+        u = mod.dialog(lambda x: x["kind"] == "unlock")
+        assert any("gate passphrase --start-over" in ln for ln in u["lines"]), u["lines"]
+        mod.post("/ui/dialog/cancel", {"id": u["id"]})
+        from gateway import hooks_session
+        from gateway.daemon import server
+        for text in (server.LOCKED_INTERACTIVE, server.LOCKED_HEADLESS, hooks_session.VAULT_LOCKED):
+            assert "gate passphrase --start-over" in text, text
+        # unlocked while the confirm waits: its OK moves nothing (the broker's own check)
+        _gate(de, fc, "passphrase", "--start-over")
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        st, _b = de.unlock(PASS)
+        assert st == 200 and de.health()["vault"] == "unlocked", _b
+        mod.post("/ui/dialog/answer", {"id": c["id"], "button": "ok"})
+        x = _closed(mod, c["id"])
+        assert x["outcome"] == "failed" and "vault is unlocked" in x["note"], x
+        assert all((paths.private_dir() / n).exists() for n in before), "nothing moved"
+        bk = paths.backups_dir()
+        assert not (bk.exists() and any(f.name.startswith("startover-") for f in bk.iterdir()))
+        assert de.health()["vault"] == "unlocked" and "vault.started_over" not in _event_kinds()
+        fc.http("POST", "/ui/vault/lock")
+        assert de.wait_for(lambda: de.health()["vault"] == "locked", 10)
+        _gate(de, fc, "passphrase", "--start-over")
+        c = mod.dialog(lambda x: x["kind"] == "confirm")
+        mod.post("/ui/dialog/answer", {"id": c["id"], "button": "ok"})
+        assert de.wait_for(lambda: de.health()["vault"] == "none", 30)
+        assert de.wait_for(lambda: "vault.started_over" in _event_kinds(), 10), _event_kinds()
+        moved = [f for f in paths.backups_dir().iterdir() if f.name.startswith("startover-")]
+        assert len(moved) == 1 and oct(moved[0].stat().st_mode & 0o777) == oct(0o700), moved
+        assert {n: (moved[0] / n).read_bytes() for n in vault.START_OVER_FILES} == before
+        assert not any((paths.private_dir() / n).exists() for n in vault.START_OVER_FILES)
+        assert paths.form_path().exists(), "gateway.toml stays"
+        assert moved[0].name in [n for _g, ns in vault.older_copies() for n in ns]
+        # a new vault from the next store; the old passphrase still opens the moved key
+        with vault.edit() as d:
+            vault.set_sudo(d, "localhost", paths.local_user(), canary("sv"))
+        assert paths.key_path().exists() and vault.key_mode() == "unwrapped"
+        from gateway import agepass
+        from gateway.daemon import broker as bmod
+        ident = bmod.read_identity(agepass.decrypt((moved[0] / "key.wrapped").read_bytes(),
+                                                   PASS).decode())
+        assert "localhost" in json.loads(bmod.decrypt_file(ident, moved[0] / "vault.age"))
+        r = _gate(de, fc, "passphrase", "--start-over")
+        assert r.returncode == 1 and "nothing to start over" in r.stderr, r.stderr
 
 
 def test_daemon_a_locked_read_opens_the_unlock_dialog_in_that_session():
@@ -950,10 +1159,11 @@ def test_daemon_sudo_standin_a_right_switched_off_while_its_dialog_is_open_is_ne
 
 def test_daemon_sudo_standin_control_unchanged_right_runs_and_stores():
     with D.daemon_env() as de:
-        out = _sudo_run(de)
-        assert out["view"]["remember"] is True, "a sudo password a command asks for offers Remember it"
+        out = _sudo_run(de, remember=True)
+        assert out["view"]["remember"] is False, \
+            "a sudo password a command asks for offers Remember it, unticked (WS-9)"
         assert out["ran"] == [["echo", "hi"]] and out["rc"] == 0, out["stderr"]
-        assert out["stored_sha"] == out["sha"], "ticked (the default): stored"
+        assert out["stored_sha"] == out["sha"], "ticked: stored"
 
 
 def test_daemon_sudo_standin_remember_unticked_runs_once_and_stores_nothing():

@@ -5,6 +5,7 @@ played by a copy of python named `claude` (FakeClaude), and gateway entry
 points by probes and the real run.py."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -70,7 +71,7 @@ def test_start_listens_writes_the_contract_file_and_stops_cleanly():
         assert doc["contract"] == "gateway.v1" and doc["versions"] == [1], doc
         assert doc["socket"] == str(de.sock) and doc["pid"] == pid and doc["epoch"] == 1
         assert doc["machine_id"].startswith("m_") and len(doc["machine_id"]) == 28
-        assert doc["features"] == ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces", "accounts", "pause_id"] and doc["gateway_version"] == h["version"]
+        assert doc["features"] == ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces", "accounts", "pause_id", "job_env"] and doc["gateway_version"] == h["version"]
         # detached: a session of its own (double fork: not its leader, so it can never
         # get a terminal), not a child of the starter, stdio to the log
         assert os.getsid(pid) not in (os.getsid(0), pid)
@@ -240,7 +241,9 @@ def test_a_daemon_socket_that_isnt_this_users_own_is_never_talked_to():
 
 def test_idle_exit_without_live_sessions_and_not_while_one_lives():
     # idle_exit leaves room for a loaded machine to register the fake claude
-    # after the restart (0.6 s was flaky with the suite at 6 at a time)
+    # after the restart (0.6 s was flaky with the suite at 6 at a time); the
+    # fake's binary is made (and run once) before the idle clock starts
+    D.named_python("claude")
     with D.daemon_env(knobs={"idle_exit": 1.5}) as de:
         pid = de.daemon_pid()
         assert _wait_dead(pid, 8), "no session: the daemon exits when idle"
@@ -258,6 +261,387 @@ def test_idle_exit_without_live_sessions_and_not_while_one_lives():
         assert [e["kind"] for e in evs] == ["daemon.started", "session.registered", "session.ended",
                                             "daemon.stopping"], evs
         assert evs[2]["session"] == "s-test" and evs[3]["reason"] == "idle"
+
+
+REGISTER_UI = {"session_id": "s-late", "surface": "terminal", "version": "2.1.301"}
+
+
+def test_a_registration_while_gated_stops_is_refused_and_a_new_gated_takes_it():
+    """Verifier (0.11, Rosetta): gated answered /ui/register 200 and then exited
+    for idleness anyway: the registration landed after its idle decision,
+    while it still answered. A registration after the decision to stop is
+    refused on both planes (503 "stopping"), /health says it is stopping,
+    and a session start (the async hook-daemon: ensure_running, then
+    /agent/register) waits for it to go, starts a new gated and registers
+    there, which then stays (the stop_linger knob holds the window open)."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"idle_exit": 0.5, "stop_linger": 4.0}, start=False) as de:
+        fc = de.claude(register=False)
+        de.start()
+        old = de.daemon_pid()
+        assert de.wait_for(lambda: (de.health() or {}).get("stopping") == "idle", 10), de.health()
+        st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+        assert st == 503 and body["error"] == "stopping" and "stopping (idle)" in body["message"], (st, body)
+        st, body = de.probe(fc, D.probe_root(de.root) / "run.py", ["hook-session"], "/agent/register",
+                            body={"session_id": "s-late"})
+        assert st == 503 and body["error"] == "stopping", (st, body)
+        assert de.health()["sessions"] == 0
+        de.knobs(stop_linger=0.05)                          # for the next gated
+        r = fc.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "hook-daemon"],
+                   env=de.env.subprocess_env(de.extra_env()), input=json.dumps({"session_id": "s-late"}))
+        assert r.returncode == 0, r.stderr
+        assert _wait_dead(old, 10), "the stopping gated left"
+        h = de.health()
+        assert h and h["pid"] != old and h["sessions"] == 1 and "stopping" not in h, h
+        time.sleep(1.5)                                     # well past idle_exit
+        h2 = de.health()
+        assert h2 and h2["pid"] == h["pid"] and h2["sessions"] == 1, "the new gated serves the session"
+
+
+def test_the_idle_decision_counts_a_registration_that_came_after_its_prune():
+    """The other side of the race: a registration answered between the tick's
+    prune (no session) and its idle decision is counted by that decision
+    (idle_lock, registry.count()), so the daemon serves on; the idle_gap knob
+    holds the window open."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"idle_exit": 0.5, "idle_gap": 2.0}, start=False) as de:
+        fc = de.claude(register=False)
+        de.start()
+        pid = de.daemon_pid()
+        assert de.wait_for(lambda: "idle: deciding in 2 s" in de.log(), 10), de.log()[-400:]
+        st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+        assert st == 200, (st, body)
+        time.sleep(3.0)                                     # the gap, then a few ticks
+        h = de.health()
+        assert h and h["pid"] == pid and h["sessions"] == 1 and "stopping" not in h, (h, de.log()[-400:])
+        assert _wait_dead(pid, 0.2) is False
+
+
+def test_a_registration_and_the_idle_decision_never_interleave():
+    """A registration holds the idle lock from its stopping check to its
+    record: an idle decision that comes meanwhile waits for it and counts
+    the session (the register_gap knob holds a registration there past the
+    idle deadline)."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"idle_exit": 1.5, "register_gap": 2.5, "tick": 0.05}, start=False) as de:
+        fc = de.claude(register=False)
+        de.start()
+        pid = de.daemon_pid()
+        st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+        assert st == 200, (st, body)
+        time.sleep(1.0)
+        h = de.health()
+        assert h and h["pid"] == pid and h["sessions"] == 1 and "stopping" not in h, (h, de.log()[-400:])
+
+
+def test_a_registration_waiting_for_the_idle_decision_is_refused_once_it_decided_to_stop():
+    """Review (WS-11a) S2: a registration that arrives while the idle
+    decision holds the idle lock (the idle_hold knob: it decided to stop and
+    hasn't marked the daemon stopping yet) waits for it, then finds the
+    daemon stopping: 503 "stopping", never 200 from a daemon about to exit
+    (the stopping check is made under the lock, not before it)."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"idle_exit": 0.5, "idle_hold": 2.0, "stop_linger": 3.0}, start=False) as de:
+        fc = de.claude(register=False)
+        de.start()
+        pid = de.daemon_pid()
+        assert de.wait_for(lambda: "idle: stopping in 2 s" in de.log(), 10), de.log()[-400:]
+        st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+        assert st == 503 and body["error"] == "stopping" and "stopping (idle)" in body["message"], (st, body)
+        assert _wait_dead(pid, 10), "the stopping gated left"
+
+
+def test_every_stop_says_stopping_and_a_start_waits_for_it():
+    """Review (WS-11a) S2: /health says "stopping" for every reason, not only
+    the idle exit: after a signal or a stop request (the stop_linger knob
+    keeps it answering) a registration is refused (503, "stopping (signal)",
+    "stopping (request)"), and a start waits for that gated to go and starts
+    a new one instead of using it."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"stop_linger": 3.0}, start=False) as de:
+        fc = de.claude(register=False)
+        for reason in ("signal", "request"):
+            de.knobs(stop_linger=3.0)
+            old = de.start()["pid"]
+            if reason == "signal":
+                os.kill(old, signal.SIGTERM)
+                stopper = None
+            else:
+                stopper = threading.Thread(target=de.gated, args=("stop",))
+                stopper.start()
+            assert de.wait_for(lambda: (de.health() or {}).get("stopping") == reason, 5), (reason, de.health())
+            st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+            assert st == 503 and f"stopping ({reason})" in body["message"], (reason, st, body)
+            de.knobs(stop_linger=0.05)                      # for the next gated
+            h = de.start()
+            assert h["pid"] != old and "stopping" not in h and not _pid_alive(old), (reason, h)
+            if stopper is not None:
+                stopper.join(10)
+            de.stop()
+
+
+def test_the_orphaned_plugins_exit_counts_a_registration_that_came_after_its_prune():
+    """Review (WS-11a) S3: the plugin folder marked orphaned with no live
+    session: the exit is decided under the idle lock with registry.count()
+    (the idle_gap knob holds the window after the tick's prune open), so a
+    session registered meanwhile (answered 200) keeps the daemon serving it,
+    never a 200 and then an exit."""
+    D.named_python("claude")
+    with D.daemon_env(knobs={"idle_gap": 2.0}, start=False) as de:
+        copy = D.plugin_copy(de.root, D.plugin_version())
+        h = de.start_from(copy)
+        fc = de.claude(register=False)
+        (copy / ".orphaned_at").write_text("1792450000000")
+        assert de.wait_for(lambda: "orphaned: deciding in 2 s" in de.log(), 10), de.log()[-400:]
+        st, body = fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})
+        assert st == 200, (st, body)
+        time.sleep(3.0)                                     # the gap, then a few ticks
+        h2 = de.health()
+        assert h2 and h2["pid"] == h["pid"] and h2["sessions"] == 1 and "stopping" not in h2, \
+            (h2, de.log()[-400:])
+        assert not h2.get("draining"), h2
+        fc.close()
+        assert _wait_dead(h["pid"], 10), "the orphaned version's daemon leaves with its last session"
+    # a registration under way when the decision comes (idle_gap holds the ticker after
+    # its prune, register_gap the registration inside the idle lock past that): the
+    # decision waits for it and counts the session
+    with D.daemon_env(knobs={"idle_gap": 2.0, "register_gap": 3.0}, start=False) as de:
+        copy = D.plugin_copy(de.root, D.plugin_version())
+        h = de.start_from(copy)
+        fc = de.claude(register=False)
+        (copy / ".orphaned_at").write_text("1792450000000")
+        assert de.wait_for(lambda: "orphaned: deciding in 2 s" in de.log(), 10), de.log()[-400:]
+        got: list = []
+        t = threading.Thread(target=lambda: got.append(
+            fc.http("POST", "/ui/register", {**REGISTER_UI, "claude_pid": fc.pid})))
+        t.start()
+        t.join(15)
+        assert got and got[0][0] == 200, got
+        time.sleep(1.0)
+        h2 = de.health()
+        assert h2 and h2["pid"] == h["pid"] and h2["sessions"] == 1 and "stopping" not in h2, \
+            (h2, de.log()[-400:])
+        fc.close()
+        assert _wait_dead(h["pid"], 10), "the orphaned version's daemon leaves with its last session"
+
+
+def test_a_start_waits_for_a_gated_that_still_holds_its_instance_lock():
+    """A gated that no longer answers may still be finishing its exit (its
+    socket gone, its tmux server being stopped) and hold the instance lock:
+    a start waits for the lock (else the new daemon exits at once and the
+    start fails after its whole wait), then starts the new one."""
+    from gateway.daemon import lifecycle
+    with D.daemon_env(start=False) as de:
+        # in process, so nothing depends on how long a start takes to get going:
+        # the spawn records whether the instance lock was free when it came
+        seen: list[bool] = []
+
+        def spawn() -> None:
+            probe = os.open(paths.gated_lock(), os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append(True)
+            except BlockingIOError:
+                seen.append(False)
+            finally:
+                os.close(probe)
+        real = lifecycle._spawn, lifecycle._wait_health
+        lifecycle._spawn = spawn
+        lifecycle._wait_health = lambda deadline: {"ok": True, "version": D.plugin_version(), "pid": 1}
+        fd = os.open(paths.gated_lock(), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        threading.Timer(1.0, os.close, (fd,)).start()
+        try:
+            t0 = time.monotonic()
+            h = lifecycle.ensure_running(wait=5)
+        finally:
+            lifecycle._spawn, lifecycle._wait_health = real
+        assert h["ok"] and seen == [True] and time.monotonic() - t0 >= 0.9, (h, seen)
+        # held past the start's wait: refused in words, nothing spawned
+        fd = os.open(paths.gated_lock(), os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        lifecycle._spawn = spawn
+        try:
+            lifecycle.ensure_running(wait=0.5)
+            raise AssertionError("started beside a daemon holding the instance lock")
+        except lifecycle.StartError as e:
+            assert "still stopping" in e.message, e.message
+        finally:
+            lifecycle._spawn = real[0]
+            os.close(fd)
+        assert seen == [True], seen
+        # and for real: the lock free, a start starts gated
+        h = de.start()
+        assert h["ok"] and _pid_alive(h["pid"]), h
+
+
+class _FakeHealth:
+    """A stand-in for a gated that holds the instance lock: a Unix socket
+    server at gated.sock answering /health (made 0600, as gated makes it:
+    client.foreign_socket), "stopping" when told."""
+
+    def __init__(self, stopping: str = ""):
+        import http.server
+        import socketserver
+        from gateway.daemon import lifecycle
+        version, fake = lifecycle.plugin_version(), self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                h = {"ok": True, "version": version, "pid": os.getpid(), "fake": True,
+                     "socket": str(paths.gated_socket())}
+                if fake.stopping:
+                    h["stopping"] = fake.stopping
+                body = json.dumps(h).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+            def address_string(self):
+                return "unix"
+        self.stopping = stopping
+        self.srv = socketserver.ThreadingUnixStreamServer(str(paths.gated_socket()), Handler)
+        os.chmod(paths.gated_socket(), 0o600)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.srv.shutdown()
+        self.srv.server_close()
+        paths.gated_socket().unlink(missing_ok=True)
+
+
+def test_a_start_uses_a_gated_that_holds_its_instance_lock_once_it_answers():
+    """Review (WS-11a) M2: a gated that took its instance lock but doesn't
+    listen yet (a slow start whose first starter gave up after START_WAIT)
+    and then answers is used by the next start: before the instance-lock
+    wait it was (spawn, then /health), and with the wait polling only the
+    lock the start failed after its whole wait with "still stopping". One
+    that answers "stopping" is not used: the start waits for its lock and
+    starts a new gated."""
+    from gateway.daemon import lifecycle
+    with D.daemon_env(start=False):
+        spawned: list[int] = []
+        real = lifecycle._spawn, lifecycle._wait_health
+        lifecycle._spawn = lambda: spawned.append(1)       # a second gated exits at once on the lock
+        lifecycle._wait_health = lambda deadline: {"ok": True, "version": D.plugin_version(), "pid": 1}
+        fakes: list[_FakeHealth] = []
+        fd = os.open(paths.gated_lock(), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)                     # the starting gated's instance lock
+        try:
+            threading.Timer(1.0, lambda: fakes.append(_FakeHealth())).start()
+            t0 = time.monotonic()
+            try:
+                h = lifecycle.ensure_running(wait=5)
+            except lifecycle.StartError as e:
+                raise AssertionError(f"StartError after {time.monotonic() - t0:.1f} s: {e.message}") from None
+            assert h.get("fake") and spawned == [], (h, spawned)
+            assert time.monotonic() - t0 < 4, "used once it answered, not at the deadline"
+            # the holder answers "stopping" (going away): waited for, then a new gated
+            fakes.pop().close()
+            threading.Timer(1.0, lambda: fakes.append(_FakeHealth(stopping="idle"))).start()
+            threading.Timer(2.5, os.close, (fd,)).start()  # its lock goes when it has exited
+            fd = -1
+            h = lifecycle.ensure_running(wait=8)
+            assert not h.get("fake") and h["pid"] == 1 and spawned == [1], (h, spawned)
+        finally:
+            lifecycle._spawn, lifecycle._wait_health = real
+            for f in fakes:
+                f.close()
+            if fd >= 0:
+                os.close(fd)
+
+
+def test_a_registration_refused_as_stopping_goes_to_a_new_daemon_once():
+    """client.call: POST /agent/register refused with 503 "stopping" (the
+    daemon decided to stop between the caller's start and its registration)
+    starts a new daemon (lifecycle.ensure_running) and is sent there, once;
+    any other refusal, route or socket is not retried."""
+    from gateway.daemon import client, lifecycle
+    stopping = client.DaemonError(503, "stopping", "gateway: the gateway daemon is stopping (idle)")
+    calls: list[tuple] = []
+    starts: list[int] = []
+
+    def fake(answers):
+        def _call(method, path, body=None, *, timeout=15.0, sock=None):
+            calls.append((method, path, sock))
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        return _call
+    real_call, real_start = client._call, lifecycle.ensure_running
+    lifecycle.ensure_running = lambda *a, **k: starts.append(1) or {"ok": True}
+    try:
+        client._call = fake([stopping, {"ok": True, "registered": {"pid": 1}}])
+        assert client.call("POST", "/agent/register", {})["registered"] == {"pid": 1}
+        assert len(calls) == 2 and starts == [1], (calls, starts)
+        for method, path, sock, err in (
+                ("POST", "/agent/register", None, client.DaemonError(503, "stopping", "x")),
+                ("POST", "/agent/register", None, client.DaemonError(403, "pid", "x")),
+                ("POST", "/ui/register", None, stopping),
+                ("POST", "/agent/register", "/elsewhere.sock", stopping)):
+            calls.clear()
+            starts.clear()
+            client._call = fake([err, err] if err.code == "stopping" and path == "/agent/register"
+                                and sock is None else [err])
+            try:
+                client.call(method, path, {}, sock=sock)
+                raise AssertionError("no refusal")
+            except client.DaemonError as e:
+                assert e.code == err.code
+            want = 2 if err.code == "stopping" and path == "/agent/register" and sock is None else 1
+            assert len(calls) == want and len(starts) == want - 1, (method, path, sock, calls, starts)
+    finally:
+        client._call, lifecycle.ensure_running = real_call, real_start
+
+
+def test_gated_start_register_reports_the_daemon_that_took_the_registration():
+    """Review (WS-11a) nit: `gated start --register` whose registration was
+    refused as stopping and sent to a new daemon (client.call) prints that
+    daemon's health, not the stopping one's."""
+    import contextlib
+    import io
+
+    from gateway.daemon import client, lifecycle
+    mine = D.plugin_version()
+    old = {"ok": True, "version": mine, "pid": 101, "stopping": "idle"}
+    new = {"ok": True, "version": mine, "pid": 202}
+    starts = [old, new]
+    answers: list = [client.DaemonError(503, "stopping", "gateway: the gateway daemon is stopping (idle)"),
+                     {"ok": True, "registered": {"pid": 7}}]
+
+    def _call(method, path, body=None, *, timeout=15.0, sock=None):
+        if path == "/health":
+            return new
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    real = client._call, lifecycle.ensure_running
+    client._call = _call
+    lifecycle.ensure_running = lambda *a, **k: starts.pop(0)
+    buf = io.StringIO()
+    try:
+        with D.daemon_env(start=False), contextlib.redirect_stdout(buf):
+            assert lifecycle.main(["start", "--register"]) == 0
+    finally:
+        client._call, lifecycle.ensure_running = real
+    out = json.loads(buf.getvalue())
+    assert out["pid"] == 202 and "stopping" not in out and out["registered"] == {"pid": 7}, out
+    assert starts == [] and answers == [], (starts, answers)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def test_version_skew_a_newer_plugin_restarts_an_idle_older_daemon():
@@ -355,7 +739,7 @@ def test_the_contract_plane_refuses_the_ui_and_strangers():
         assert st == 403 and body["contract"] == 1 and body["error"] == "plane", body
         gate = D.probe_root(de.root)
         st, body = de.probe(fc, gate / "run.py", ["shim", "sudo"], "/v1/capabilities", method="GET")
-        assert st == 200 and body["contract"] == 1 and body["features"] == ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces", "accounts", "pause_id"], body
+        assert st == 200 and body["contract"] == 1 and body["features"] == ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces", "accounts", "pause_id", "job_env"], body
         st, body = de.call("GET", "/v1/snapshot")                   # no registered session above
         assert st == 403 and body["contract"] == 1
         stranger = de.claude(register=False)
@@ -565,8 +949,8 @@ def test_a_session_whose_claude_binary_an_upgrade_deleted_stays_registered():
     keeps the daemon from its idle exit, and is dropped only when it ends.
     The verifier saw it dropped at the next tick, refused on every plane,
     and the daemon exit for idleness under a live session."""
+    exe = D.named_python("claude", folder="claude-upgraded-py")   # before the idle clock starts
     with D.daemon_env(knobs={"idle_exit": 1.0}) as de:
-        exe = D.named_python("claude", folder="claude-upgraded-py")
         fc = de.claude(exe=exe, session="s-before")
         gate = D.probe_root(de.root)
         st, body = de.probe(fc, gate / "run.py", ["shim", "gh"], "/v1/snapshot", method="GET")
@@ -1136,8 +1520,9 @@ def test_claude_codes_native_install_is_recognised_under_a_test_override():
 
 def _npm_layout(base: Path) -> tuple[Path, Path, Path]:
     """npm's global layout under `base` (as `npm i -g @anthropic-ai/claude-code`
-    makes it): (the package folder, <prefix>/bin/claude -> the package's
-    cli.js, which is a copy of fake_claude.py, and a copy of python named node)."""
+    made it before 2.1.113): (the package folder, <prefix>/bin/claude -> the
+    package's cli.js, which is a copy of fake_claude.py, and a copy of python
+    named node)."""
     pkg = base / "lib" / "node_modules" / "@anthropic-ai" / "claude-code"
     pkg.mkdir(parents=True)
     shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", pkg / "cli.js")
@@ -1146,40 +1531,33 @@ def _npm_layout(base: Path) -> tuple[Path, Path, Path]:
     return pkg, base / "bin" / "claude", D.named_python("node")
 
 
-def test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script():
-    """GW-COMPAT-1: an npm-installed Claude Code was never recognized, so no
-    session registered and no gateway dialog could open. npm's package runs
-    its native binary as .../@anthropic-ai/claude-code/bin/claude.exe since
-    2.1.113, and node with cli.js before that: both register on the UI plane
-    and their gateway programs get the agent plane; node running any other
-    script, an option before cli.js, or another program running cli.js, don't."""
+def test_an_npm_installed_claude_code_is_recognised_by_its_native_binary_only():
+    """npm's package runs its native binary as
+    .../@anthropic-ai/claude-code/bin/claude.exe: it registers on the UI plane
+    and its gateway programs get the agent plane. Node running the package's
+    cli.js (npm installs before 2.1.113) is no longer Claude Code (latest
+    only), nor is node running any other script, an option before cli.js, or
+    another program running cli.js."""
     with D.daemon_env() as de:
         pkg, shim, node = _npm_layout(de.root / "npm")
         gate = D.probe_root(de.root)
-        # before 2.1.113: `node <prefix>/bin/claude` (npm's shim; the script a link to cli.js)
-        fc = de.claude(argv=[str(node), str(shim)], session="s-npm-node")
+        env = de.env.subprocess_env(de.extra_env())
+        native = D.python_at(pkg, "claude.exe")
+        fc = de.claude(exe=native, session="s-npm-native")
         st, body = de.probe(fc, gate / "run.py", ["shim", "sudo"], "/agent/vault/status")
         assert st == 200, body
-        env = de.env.subprocess_env(de.extra_env())
         r = fc.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "gated", "status"], env=env)
         out = json.loads(r.stdout)
-        assert out["claude_install"].startswith("npm (node") and out["parent_pid"] == fc.pid, out
-        # since 2.1.113: the native binary at bin/claude.exe
-        native = D.python_at(pkg, "claude.exe")
-        fc2 = de.claude(exe=native, session="s-npm-native")
-        r = fc2.run([H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test", "gated", "status"], env=env)
-        out = json.loads(r.stdout)
-        assert out["claude_install"] == "npm (its native binary)" and out["parent_pid"] == fc2.pid, out
-        # not Claude Code: node running another script, a node option before
-        # cli.js, cli.js run by another program, a cli.js outside the package
+        assert out["claude_install"] == "npm (its native binary)" and out["parent_pid"] == fc.pid, out
         other = de.root / "other" / "cli.js"
         other.parent.mkdir()
         shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", other)
         loose = de.root / "loose" / "node_modules" / "claude-code" / "cli.js"
         loose.parent.mkdir(parents=True)
         shutil.copyfile(D.TESTS / "fakes" / "fake_claude.py", loose)
-        for argv in ([node, other], [node, "-S", shim], [D.named_python("python3"), shim],
-                     [node, loose], [node, os.path.relpath(shim, de.root)]):
+        for argv in ([node, shim], [node, pkg / "cli.js"], [node, other], [node, "-S", shim],
+                     [D.named_python("python3"), shim], [node, loose],
+                     [node, os.path.relpath(shim, de.root)]):
             stranger = de.claude(argv=[str(a) for a in argv], register=False, cwd=de.root)
             st, body = stranger.http("POST", "/ui/register", {"claude_pid": stranger.pid})
             assert st == 403 and body["error"] == "exe", (argv, body)
@@ -1192,4 +1570,4 @@ def test_an_npm_installed_claude_code_is_recognised_and_no_other_node_script():
             st, body = de.probe(stranger, gate / "run.py", ["hook-session"], "/agent/register",
                                 body={"claude_pid": stranger.pid})
             assert st == 403 and body["error"] == "exe", (argv, body)
-        assert de.health()["sessions"] == 2
+        assert de.health()["sessions"] == 1

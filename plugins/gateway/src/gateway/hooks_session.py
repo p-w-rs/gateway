@@ -1,13 +1,16 @@
 """SessionStart (sync) and SubagentStart hooks (SPEC 7, 12, 13).
 
-SessionStart: migrate if needed (offline), validate the form, sync approvals
-(narrowing applies and lowers the approved snapshot), write $CLAUDE_ENV_FILE
-and env.sh, the stand-ins, the git include file and the terminal launcher,
-then print additionalContext (what Claude may use, generated from the
-validated form only: names, kinds, rights, logins, owners, sites; never notes
-or other free text) and a systemMessage for anything the user must know
-(migration report, form errors, widenings waiting for an OK, pending dialogs,
-new security events).
+SessionStart: validate the form, sync approvals (narrowing applies and lowers
+the approved snapshot), write $CLAUDE_ENV_FILE and env.sh, the stand-ins, the
+git include file and the terminal launcher, then print additionalContext
+(what Claude may use, generated from the validated form only: names, kinds,
+rights, logins, owners, sites; never notes or other free text) and a
+systemMessage for anything the user must know (a gateway 0.6 vault waiting
+for its conversion, form errors, widenings waiting for an OK, pending
+dialogs, new security events, the first 0.11 session's notice). Where the
+payload carries `permission_mode`, it is recorded in gated (lead decision 3).
+The context says the posture (PLAN-0.11 §1.9): the gateway stands only
+between Claude and what gateway.toml configures.
 """
 from __future__ import annotations
 
@@ -20,18 +23,24 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import consent, envfile, migrate, paths, testing, vault
+from . import accounts as acctmod
+from . import consent, envfile, paths, testing, vault
 from . import form as formmod
 
 CONTEXT_MAX = 2500
-INTRO = ("Gateway (plugin): you have these machines and accounts. Use normal commands; the "
-         "gateway supplies passwords, keys and tokens. Never ask the user for a password, token "
-         "or key in chat.")
+# PLAN-0.11 §1.9: the gateway stands only between Claude and what
+# gateway.toml configures; everything else is the user's own.
+INTRO = ("Gateway (plugin): machines and accounts in gateway.toml go through the gateway, which "
+         "supplies their passwords, keys and tokens. Anything not in gateway.toml uses your own "
+         "ssh, git, gh and sudo directly, with no gateway involvement. Never ask the user for a "
+         "password, token or key in chat.")
 HOWTO = [
-    "- sudo/ssh/scp/rsync work as usual. Run them as their own command (optionally after cd) so "
-    "the gateway can approve them (without a prompt where the right is true; \"ask\" asks the "
-    "user).",
-    "- Web: the gateway's http and download tools (curl/wget are refused). WebFetch reads pages.",
+    "- Run sudo/ssh/scp/rsync for the machines below as their own command (optionally after cd) "
+    "so the gateway can approve them (\"ask\" asks the user).",
+    "- Don't remove or rename a gateway.toml entry, or reach a configured host by another name, "
+    "address or path, to get past a refusal. Ask the user.",
+    "- Web: the gateway's http and download tools; network commands (curl, wget, ...) are asked "
+    "about. WebFetch reads pages.",
     "- Choose an account with GATE_ACCOUNT=NAME before the command if the gateway says two fit.",
     "- To add or change a host or account, edit ~/.config/gateway/gateway.toml (only when the "
     "user asks), then run `gate check NAME` while the user is here. Adding or widening needs the "
@@ -39,8 +48,15 @@ HOWTO = [
     "- If the gateway says its dialog is waiting, tell the user once and continue with other work.",
     "- `gate status` shows everything; `gate why` explains the last refusal.",
 ]
-# Added when the checkpoint plugin is around (its state folder exists): its
-# job_start runs commands as detached jobs (hooks_bash.JOB_TOOL). Checkpoint
+# Added while this computer's sudo isn't configured (PLAN-0.11 §1.5, §1.9):
+# the user's own sudo, and Claude's Bash has no terminal for its password.
+OWN_SUDO_HOWTO = ("- Your own sudo works only where it needs no password; Claude has no terminal "
+                  "to type one. If sudo says a password or terminal is required, tell the user "
+                  "that the gateway can ask in its dialog once [hosts.localhost] sudo is set "
+                  "(gate host set localhost sudo ask).")
+# Added when the checkpoint plugin is live: gated saw a CONTRACT-v1 client
+# within CHECKPOINT_FRESH (its <run>/checkpoint-seen; PLAN-0.11 §9.4, lead
+# decision 7). Its job_start runs commands as detached jobs (hooks_bash.JOB_TOOL). Checkpoint
 # 0.6+ hands them to gated's contract job routes while gated serves the
 # session (the managed environment, per-job on_pause); only otherwise does
 # its own runner run them, with env.sh. A job of that runner still running
@@ -52,17 +68,19 @@ JOBS_HOWTO = ("- checkpoint jobs (job_start) run on this machine under the gatew
               "supervisor while it serves this session (these stand-ins; on_pause says what a "
               "pause does), else under checkpoint's runner with the gateway's env.sh. Count on "
               "credentials only while this session is open, unless the entry has scripts = true. "
-              "Jobs are judged like Bash: curl is refused, and an \"ask\" right can't be used in a "
-              "job (nobody can be asked while it runs), so run such a command with Bash. job_tail "
-              "and job_stop mask stored secrets as *** like Bash output.")
+              "Jobs are judged like Bash, but nobody can be asked while a job runs: a network "
+              "command that [network] asks about (curl, wget, ...) and an \"ask\" right are "
+              "refused there, so run such a command with Bash. job_tail and job_stop mask stored "
+              "secrets as *** like Bash output.")
 
 
-# Added in managed mode (PLAN-v4 phase 4): where Claude's commands run.
-MANAGED_HOWTO = ("- Your Bash commands run in the gateway's managed bash (bash 5; no login profile, "
-                 "aliases or functions; PATH: the stand-ins, bash, pixi, approved imports, then "
-                 "/usr/bin:/bin:/usr/sbin:/sbin). For another host tool, look with the gw "
-                 "host_inspect tool and suggest a [shell] import_path entry, which the user "
-                 "approves (gate check settings).")
+# Added in managed mode (PLAN-v4 phase 4; PLAN-0.11 §1.6, §1.9): where
+# Claude's commands run.
+MANAGED_HOWTO = ("- Your Bash runs in the gateway's bash 5 with your own PATH, variables and "
+                 "aliases. The gateway's stand-ins come first for the machines and accounts it "
+                 "handles.")
+# How fresh gated's record of a checkpoint client must be for JOBS_HOWTO (s).
+CHECKPOINT_FRESH = 24 * 3600
 
 
 # Added in managed mode while the form has no [shell] import_path at all
@@ -96,8 +114,9 @@ def _import_offer(eff: consent.Effective, form: formmod.Form) -> str | None:
 # (hooks/mod/dialog.ts NO_DISPLAY_MAIN, lib.ts secretLine).
 NO_DISPLAY_NOTE = ("- No graphical display here (Linux, no DISPLAY or WAYLAND_DISPLAY): the "
                    "gateway dialog's Paste from clipboard can't work, nor typing on Claude Code's "
-                   "main screen. If a credential is needed, tell the user: restart Claude Code "
-                   "with CLAUDE_CODE_NO_FLICKER=1 to type it, or set it from this machine's desktop.")
+                   "main screen. If a credential is needed, tell the user: type /tui fullscreen "
+                   "(it restarts and resumes the session) to type it, or set it from this "
+                   "machine's desktop.")
 # What stays when the whole note doesn't fit beside the hosts and accounts:
 # the note never takes a host's or an account's place (on a headless Linux
 # server those matter more, and the dialog and /gate-doctor say it in full).
@@ -117,12 +136,30 @@ def _no_display_note() -> str | None:
     return NO_DISPLAY_NOTE
 
 
-def _howto(eff: consent.Effective | None = None) -> list[str]:
+def checkpoint_live() -> bool:
+    """Did gated serve a checkpoint client (a CONTRACT-v1 route) in the last
+    CHECKPOINT_FRESH seconds (its <run>/checkpoint-seen; PLAN-0.11 §9.4)? A
+    session that checkpoint connects to later lacks JOBS_HOWTO; the next one
+    has it. Never stats checkpoint's own folders."""
     try:
-        jobs = paths.checkpoint_state_dir().is_dir()
-    except OSError:
-        jobs = False
-    out = [*HOWTO, JOBS_HOWTO] if jobs else list(HOWTO)
+        t = paths.checkpoint_seen_path().stat().st_mtime
+    except (OSError, paths.PathError):
+        return False
+    return 0 <= time.time() - t < CHECKPOINT_FRESH
+
+
+def _own_sudo(eff: consent.Effective | None) -> bool:
+    """This computer's sudo is the user's own (nothing configures it)."""
+    lh = eff.hosts.get("localhost") if eff is not None else None
+    return lh is not None and "sudo" not in lh.modes
+
+
+def _howto(eff: consent.Effective | None = None) -> list[str]:
+    out = list(HOWTO)
+    if _own_sudo(eff):
+        out.insert(1, OWN_SUDO_HOWTO)
+    if checkpoint_live():
+        out.append(JOBS_HOWTO)
     if eff is not None and getattr(eff, "shell", None) is not None and eff.shell.managed != "off":
         out.append(MANAGED_HOWTO)
     return out
@@ -148,6 +185,9 @@ def _host_text(e: consent.EffectiveHost, meta: dict[str, Any]) -> str:
         return f"{n} (not active yet: waits for the user's OK; run `gate check {n}` while they're here)"
     bits: list[str] = []
     keyless = False
+    if e.is_local and "sudo" not in e.modes:
+        # PLAN-0.11 §1.5: nothing configures this computer's sudo
+        return f"{n} (sudo: your own, not through the gateway; see below)"
     if e.is_local:
         if e.sudo is True:
             s = "sudo: yes"
@@ -247,10 +287,16 @@ def _account_text(e: consent.EffectiveAccount, meta: dict[str, Any]) -> str:
         if e.env:
             bits.append(f"`gate with {n} -- CMD` for programs")
     am = (meta.get("accounts") or {}).get(n) or {}
-    if meta and not (am.get("token") or am.get("ssh_key") or am.get("entra")):
+    ent = am.get("entra_info") or {}
+    entra = a.kind in ("azure", "ml-catalog") and acctmod.entra_stored(ent)
+    if meta and not (am.get("token") or am.get("ssh_key") or entra):
         bits.append(f"not signed in yet: `gate check {n}`")
     elif am.get("stale"):
         bits.append(f"token rejected: `gate check {n}`")
+    elif entra and not acctmod.entra_fits(a, ent):
+        # gate check's rule: an older gateway's sign-in, or one for settings
+        # that changed since, isn't used
+        bits.append(f"needs a new sign-in: `gate check {n}`")
     if e.pending:
         bits.append(f"a change waits for the user's OK (`gate check {n}`)")
     sep = "; " if a.kind in ("api-key", "azure") else ", "
@@ -277,10 +323,6 @@ def context_text(form: formmod.Form, eff: consent.Effective, meta: dict[str, Any
                      + ("; the gateway uses the last good version" if form.from_last_good
                         else "; until it's fixed only the defaults apply")
                      + " (see `gate status`).")
-    if eff.others == "mine":
-        lines.append("Machines and git servers not listed use the user's own ssh/git setup.")
-    else:
-        lines.append("Machines and git servers not listed are refused (the user can add them).")
     howto = _howto(eff)
     text = "\n".join(lines + howto)
     note = _no_display_note()
@@ -370,7 +412,8 @@ def pending_requests() -> list[dict[str, Any]]:
 
 
 # SSH_AUTH_SOCK: the user's own agent, for gate check's "use my own SSH login
-# once" (Claude's Bash has it unset; ssh._user_agent_sock checks it is a
+# once", as Claude Code's own environment has it (a command in Claude's Bash
+# may have changed or unset its own; ssh._user_agent_sock checks it is a
 # socket of the user's before using it).
 SESSION_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
                 "DBUS_SESSION_BUS_ADDRESS", "SSH_CONNECTION", "SSH_TTY", "SSH_AUTH_SOCK")
@@ -415,9 +458,11 @@ def write_session_record(session_id: str) -> None:
 
 
 VAULT_LOCKED = ("gateway: the gateway vault is locked (its key has a passphrase), so stored "
-                "credentials are unavailable, sudo on this machine asks at most, and rights "
-                "waiting in the vault don't apply until the user unlocks it (/gate-unlock in "
-                "Claude Code); /gate-doctor shows its state.")
+                "credentials are unavailable, the machines and accounts in gateway.toml and this "
+                "computer's configured sudo are refused, and rights waiting in the vault don't "
+                "apply until the user unlocks it (/gate-unlock in Claude Code; only "
+                "if the user lost the passphrase: gate passphrase --start-over); /gate-doctor "
+                "shows its state. Anything not in gateway.toml uses the user's own tools.")
 
 
 def _load_vault(msgs: list[str]) -> dict[str, Any] | None:
@@ -481,19 +526,19 @@ def _has_approvals(data: dict[str, Any] | None) -> bool:
     rights = ((data or {}).get("approved") or {}).get("rights") or {}
     st = rights.get("settings") or {}
     sh = st.get("shell") if isinstance(st.get("shell"), dict) else {}
-    return bool(rights.get("hosts") or rights.get("accounts") or st.get("others") == "mine"
+    return bool(rights.get("hosts") or rights.get("accounts")
                 or sh.get("import_path") or sh.get("import_env")
                 or sh.get("managed", "on") != "on")
 
 
 def _missing_form(msgs: list[str], data: dict[str, Any] | None, write: bool) -> None:
-    """gateway.toml is missing. A pending v2 store: migration writes it. A vault
-    with a last good form: restore that (never the starter, which would read as
-    "every entry removed" and wipe approvals and bindings). A vault with
-    approvals but no copy: leave it missing (nothing ratchets on a missing
-    form). Nothing stored: write the starter form (an older install's: its
-    sudo = true, migrate.starter)."""
-    if paths.v2_store_path().exists():
+    """gateway.toml is missing. A gateway 0.6 vault waiting for its conversion
+    (vault.v06_waiting): leave it missing (gateway 0.10.0's conversion writes
+    it). A vault with a last good form: restore that (never the starter, which
+    would read as "every entry removed" and wipe approvals and bindings). A
+    vault with approvals but no copy: leave it missing (nothing ratchets on a
+    missing form). Nothing stored: write the starter form (form.STARTER)."""
+    if vault.v06_waiting():
         return
     if data is None and vault.exists():
         return       # the vault can't be read now: never write a starter over its approvals
@@ -509,7 +554,7 @@ def _missing_form(msgs: list[str], data: dict[str, Any] | None, write: bool) -> 
                     "write a new one.")
         return
     if write:
-        _create_form(migrate.starter(data))
+        _create_form(formmod.STARTER)
 
 
 def prepare(msgs: list[str], *, write: bool) -> tuple[formmod.Form, consent.Effective,
@@ -523,8 +568,7 @@ def prepare(msgs: list[str], *, write: bool) -> tuple[formmod.Form, consent.Effe
     if not form.exists:
         _missing_form(msgs, data, write)
         form = formmod.load(last_good=last, use_cache=False)
-    if not paths.v2_store_path().exists() and (
-            (data is None and not vault.exists())
+    if ((data is None and not vault.exists())
             or (data is not None and (consent.needs_sync(data, form) or (
                 consent.last_good_ok(form) and data.get("form_last_good") != form.used_text)))):
         # (with no vault yet, ratchet creates one only for a narrowing)
@@ -546,10 +590,68 @@ def prepare(msgs: list[str], *, write: bool) -> tuple[formmod.Form, consent.Effe
                     vault.ensure_machine(cur)
                     data = cur
             except vault.VaultError as e:
-                if not paths.v2_store_path().exists():
-                    msgs.append(f"gateway: couldn't update the vault ({e})")
+                msgs.append(f"gateway: couldn't update the vault ({e})")
     eff = consent.compute(form, data)
     return form, eff, data
+
+
+# The first 0.11 session (PLAN-0.11 §1.5): said once, then recorded in the
+# vault's one-time notices (vault.mark_notice(vault.POSTURE_NOTICE)).
+POSTURE_SUDO = ("gateway: this computer's sudo now uses your own sudo unless gateway.toml sets "
+                "[hosts.localhost] sudo. The stored password stays unused; gate forget localhost "
+                "removes it.")
+POSTURE_POLICY = ("gateway: gateway.toml's [policy] {keys} now binds only the machines and "
+                  "accounts in gateway.toml; anything else is your own (it no longer reaches "
+                  "everything it used to).")
+GLOBAL_REACH_KEYS = ("read", "exec", "write", "credential")
+
+
+def posture_notice(eff: consent.Effective, data: dict[str, Any] | None) -> list[str]:
+    """The first 0.11 session's notice (once per vault): a stored local sudo
+    password that the posture leaves unused (this computer's sudo isn't
+    configured), and the global [policy] denies that no longer reach
+    unconfigured targets. Written as a systemMessage (SessionStart can't wait
+    for a dialog) and recorded in the vault so it never repeats. Nothing
+    while the vault can't be read."""
+    if data is None or vault.notice_shown(data, vault.POSTURE_NOTICE):
+        return []
+    out: list[str] = []
+    try:
+        entry = vault.sudo_entry(data, "localhost", paths.local_user())
+    except Exception:  # noqa: BLE001
+        entry = None
+    if _own_sudo(eff) and entry and entry.get("password"):
+        out.append(POSTURE_SUDO)
+    keys = [k for k in GLOBAL_REACH_KEYS
+            if (mv := eff.policy_modes.get(k)) is not None and "deny" in mv.words]
+    if keys:
+        out.append(POSTURE_POLICY.format(keys=", ".join(f"{k} = deny" for k in keys)))
+    if not out:
+        return []
+    try:
+        with vault.edit() as cur:
+            vault.mark_notice(cur, vault.POSTURE_NOTICE)
+    except vault.VaultError:
+        return []        # said once it can be recorded (never every session)
+    return out
+
+
+# How much of an event's detail the "since your last session" notice shows.
+EVENT_DETAIL = 120
+
+
+def cut_words(text: Any, limit: int) -> str:
+    """`text` whole when it fits `limit` characters, else cut at the last
+    space that leaves at least half of it (inside a word only when there is
+    none) and ended with "…", so a cut never reads as the whole line."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = text[:limit - 1]
+    sp = head.rfind(" ")
+    if sp >= limit // 2:
+        head = head[:sp]
+    return head.rstrip(" ,;:") + "…"
 
 
 def ok_how(target: str, names: list[str]) -> str:
@@ -593,33 +695,20 @@ def session_hook(payload: dict[str, Any]) -> dict[str, Any]:
 def session_main(payload: dict[str, Any], started: float | None = None) -> dict[str, Any]:
     sid = str(payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
     msgs: list[str] = []
-    report = None
-    try:
-        mig = migrate.ensure("session")
-    except Exception as e:  # noqa: BLE001
-        mig = None
-        msgs.append(f"gateway: migration failed ({type(e).__name__}); run gate migrate")
-    if mig is not None and not mig.ok:
-        msgs.append("gateway: " + mig.message)
-    if migrate.leftover_v2():
-        try:
-            left = migrate.tidy_leftover()
-        except Exception as e:  # noqa: BLE001
-            left = None
-            msgs.append(f"gateway: couldn't put away the leftover 0.6 store.age ({type(e).__name__})")
-        if left is not None and left.message:
-            msgs.append(left.message)
+    if vault.v06_waiting():
+        msgs.append(vault.V06_MESSAGE)
     form, eff, data = prepare(msgs, write=True)
     from . import hooks_filechanged
     hooks_filechanged.record_seen(form)    # FileChanged reports against this session's start
+    record_session_mode(payload, eff)
     meta = vault.meta(data) if data else {}
     res = envfile.sync(form, eff, meta, os.environ.get("CLAUDE_ENV_FILE"),
                        vault_readable=not (vault.exists() and data is None))
+    consent.sync_network_words(eff)        # pre_bash.sh's extra trigger words (WS-3, §3.4)
     for err in res.get("errors", []):
         msgs.append(f"gateway: setup step failed: {err}")
-    if data and data.get("migrated") and not data["migrated"].get("shown"):
-        report = data["migrated"].get("report") or ""
     msgs += form_messages(form)
+    msgs += posture_notice(eff, data)
     vault_unreadable = vault.exists() and data is None
     # pending dialogs; the "shown" markers are shared with the prompt and
     # PostToolUse hooks
@@ -633,30 +722,22 @@ def session_main(payload: dict[str, Any], started: float | None = None) -> dict[
         msgs.append(f"gateway: waiting for your OK: {lines}{more}. "
                     + ok_how(target, names))
     msgs += notices
-    if data:
-        evs = [e for e in vault.new_events(data) if e.get("what") != "migrate" or not report]
-        if evs:
-            msgs.append("gateway: since your last session: " + "; ".join(
-                f"{e.get('at', '')[:16]} {e.get('what')}: {e.get('detail', '')[:120]}"
-                for e in evs[-5:]))
+    evs = vault.new_events(data) if data else []
+    if evs:
+        msgs.append("gateway: since your last session: " + "; ".join(
+            f"{e.get('at', '')[:16]} {e.get('what')}: {cut_words(e.get('detail', ''), EVENT_DETAIL)}"
+            for e in evs[-5:]))
     ctx = context_text(form, eff, meta)
-    if report:
-        msgs.insert(0, report)
     e2e = testing.get("e2e")
     if e2e:   # the e2e suite's scratch copy (paths.e2e_marker): say so, first
         msgs.insert(0, f"gateway: e2e test mode: this session uses the test vault in {e2e}, "
                        "not ~/.config/gateway")
-    if data and (report or vault.new_events(data)):
+    if evs:
         try:
             with vault.edit() as cur:
-                if report and cur.get("migrated"):
-                    cur["migrated"]["shown"] = True
                 vault.mark_events_seen(cur)
         except vault.VaultError:
             pass
-    if report:
-        with contextlib.suppress(OSError):
-            migrate.report_flag().unlink()
     # Past Claude Code's limit the hook was cancelled and Claude never got
     # this context (nor, after a compact, the earlier one): with no record,
     # the next prompt's hook gives it.
@@ -696,7 +777,29 @@ def daemon_main(payload: dict[str, Any]) -> None:
                     {"session_id": sid or os.environ.get("CLAUDE_CODE_SESSION_ID", "")})
     except Exception:  # noqa: BLE001 - async and best effort: the next start retries
         pass
+    record_session_mode(payload)
     return None
+
+
+def record_session_mode(payload: dict[str, Any], eff: consent.Effective | None = None) -> bool:
+    """Lead decision 3 (WS-1): where the SessionStart payload carries
+    `permission_mode`, record it in gated (hooks_bash.record_mode: only
+    while the effective form makes the mode matter, with the epoch marker),
+    so a stand-in's first call has a record. The sync SessionStart tries
+    (gated is up on a resume or a clear); the async hook-daemon tries again
+    once it has started gated and registered the session. Until there is a
+    record the stand-ins use the modeless rule (the strict reading). Never
+    fails the hook."""
+    pm = payload.get("permission_mode") if isinstance(payload, dict) else None
+    if not isinstance(pm, str) or not pm:
+        return False
+    try:
+        from . import hooks_bash
+        if eff is None:
+            _form, eff = hooks_bash._load_rights()
+        return hooks_bash.record_mode(pm, eff)
+    except Exception:  # noqa: BLE001 - a record is a guardrail; the modeless rule applies
+        return False
 
 
 def async_main(payload: dict[str, Any]) -> None:
@@ -717,7 +820,7 @@ def degraded_output(exc: BaseException) -> dict[str, Any]:
     path = os.environ.get("CLAUDE_ENV_FILE")
     if path:
         try:
-            envfile.write_env_file(path, envfile.env_text("refuse"))
+            envfile.write_env_file(path, envfile.env_text())
         except OSError:
             pass
     return {"systemMessage": f"gateway: session setup failed ({type(exc).__name__}); "

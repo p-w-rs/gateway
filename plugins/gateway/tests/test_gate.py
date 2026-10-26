@@ -1,5 +1,5 @@
-"""The gate CLI: status rendering (table, entry, --report), log, why,
-migrate, import-ssh, phase-B dispatch (SPEC 15)."""
+"""The gate CLI: status rendering (table, entry), log, why, import-ssh,
+phase-B dispatch (SPEC 15)."""
 from __future__ import annotations
 
 import contextlib
@@ -112,31 +112,82 @@ def test_status_writes_the_vault_only_to_persist_a_narrowing():
         assert d["approved"]["rights"]["hosts"]["localhost"]["sudo"] is False, "the narrowing is persisted"
         env.write_form(FORM)
         code, out, _ = run_gate("status")
-        assert "localhost: sudo false -> true" in out, "raising it again needs the user's OK"
+        assert ("localhost: sudo on this computer: in Auto and Bypass permissions modes the gateway "
+                "now approves without asking you; elsewhere Claude Code decides (was: refused in "
+                "every mode)") in out, "raising it again needs the user's OK"
 
 
-def test_status_report_and_migrate_command():
+def test_a_gateway_06_vault_is_named_and_gate_migrate_is_gone():
+    """A gateway 0.6 vault (store.age, no vault.age) gets one note in `gate
+    status`: convert it with gateway 0.10.0 first. Nothing converts it here:
+    `gate migrate` is refused like any command that isn't read-only (and is
+    unknown without a 0.6 vault), `gate status --report` is a usage error, and
+    no vault appears."""
     with H.gateway_env():
-        code, out, _ = run_gate("status", "--report")
-        assert "no migration report" in out
         paths.ensure_home()
         paths.v2_store_path().write_bytes(b"junk")
         paths.v2_key_path().write_text("AGE-SECRET-KEY-1X\n")
-        code, out, err = run_gate("status", "--report")
-        assert "gateway: migration failed" in err, "gate triggers migration and reports failure"
-        assert "waiting to be migrated" in out and "last attempt" in out
-        code, out, _ = run_gate("status")
-        assert "Migration from 0.6 failed" in out
+        code, out, err = run_gate("status")
+        assert code == 0 and out.count(vault.V06_MESSAGE) == 1, out
+        assert "migrat" not in out + err, (out, err)
+        code, out, err = run_gate("migrate")
+        assert code == 2 and err.strip() == vault.V06_MESSAGE, (code, err)
+        assert "gate migrate" not in gate.USAGE and "--report" not in gate.USAGE
+        assert not paths.vault_path().exists() and paths.v2_store_path().read_bytes() == b"junk"
     with H.gateway_env():
+        code, out, _ = run_gate("status")
+        assert vault.V06_MESSAGE not in out, "no 0.6 vault, no note"
+        code, out, err = run_gate("migrate")
+        assert code == 2 and "unknown or incomplete command: gate migrate" in err, (code, err)
+
+
+def test_gate_status_refuses_flags_and_extra_names():
+    """`gate status [NAME]` and nothing else: an unknown flag (the removed
+    --report among them) or a second name is a usage error, never ignored."""
+    with H.gateway_env() as env:
+        env.write_form(FORM)
+        for args in (["--report"], ["-x"], ["example", "--report"], ["--report", "example"],
+                     ["example", "builder"]):
+            code, out, err = run_gate("status", *args)
+            assert code == 2 and not out and "usage: gate status [NAME]" in err, (args, code, out, err)
+        code, out, _ = run_gate("status", "example")
+        assert code == 0 and "example" in out
+
+
+def test_beside_a_gateway_06_vault_only_read_only_commands_run():
+    """Beside a gateway 0.6 vault every gate command that could ask the user
+    or write the vault, its key or the form is refused with vault.V06_MESSAGE
+    (exit 2) before it asks anything, so `gate check` never ends in "didn't
+    work after 3 tries" and nothing lands beside store.age for gateway 0.10.0's
+    conversion to find. status, log, why, import-ssh, lock and scrub run."""
+    import harness_ux as U
+    from gateway import gate_setup
+    with U.ux_env(U.answers(("ok", gate_setup.SUDO_ASK), ("ok", "a-password-of-20-chars"))) as env:
         paths.ensure_home()
-        H.write_v2_vault(paths.home(), {"version": 2, "secrets": {"K": {"value": "v" * 16, "hosts": ["k.example.com"]}},
-                                        "sudo": {}, "accounts": {}})
-        code, out, _ = run_gate("migrate")
-        assert code == 0 and "migrated your 0.6 vault" in out and "K -> k" in out
-        code, out, _ = run_gate("status", "--report")
-        assert out.startswith("gateway: converted your 0.6 vault")
-        code, out, _ = run_gate("migrate")
-        assert code == 0 and "already migrated" in out
+        paths.v2_store_path().write_bytes(b"age-encryption.org/v1 a 0.6 store")
+        paths.v2_key_path().write_text("AGE-SECRET-KEY-1X\n")
+        refused = (["check", "localhost"], ["check", "all"], ["login", "gh"], ["forget", "localhost"],
+                   ["forget", "localhost", "sudo"], ["rotate", "box"], ["export"],
+                   ["import", str(env.root / "x.age")], ["copy-to", "box"], ["pubkey"],
+                   ["with", "gh", "--", "true"], ["host", "add", "box", "me@10.0.0.9"],
+                   ["host", "set", "box", "sudo", "true"], ["workspace", "add", "box", "w", "/srv"],
+                   ["workspace", "remove", "box", "w"], ["policy", "set", "all", "read", "ask"],
+                   ["accounts"], ["accounts", "--check", "all"], ["secret", "x"], ["nonsense"])
+        for argv in refused:
+            code, out, err = run_gate(*argv)
+            assert code == 2 and not out and err.strip() == vault.V06_MESSAGE, (argv, code, out, err)
+        assert not env.dialog.calls(), env.dialog.calls()
+        for argv in (["status"], ["log"], ["why"], ["import-ssh"], ["lock"]):
+            code, out, err = run_gate(*argv)
+            assert vault.V06_MESSAGE not in err, (argv, err)
+        assert gate.BESIDE_V06 == {"scrub", "status", "log", "why", "import-ssh", "lock"}
+        for p in (paths.vault_path(), paths.key_path(), paths.wrapped_key_path(), paths.form_path()):
+            assert not p.exists(), p
+        assert paths.v2_store_path().read_bytes() == b"age-encryption.org/v1 a 0.6 store"
+        assert paths.v2_key_path().read_text() == "AGE-SECRET-KEY-1X\n"
+    with U.ux_env() as env:                  # no 0.6 vault: pubkey makes the key as usual
+        code, out, err = run_gate("pubkey")
+        assert code == 0 and out.startswith("age1") and paths.key_path().exists(), (code, out, err)
 
 
 def test_log_and_why():
@@ -246,24 +297,24 @@ def test_help_and_unknown():
 
 def test_status_on_a_fresh_install_says_no_form_yet():
     """Round 3: a new user's first `gate status` (before the starter form
-    exists) said "gateway.toml is missing ... (approvals are kept)". It names
-    this computer's sudo as it applies: "ask" on a new install, on for one an
-    older gateway set up."""
+    exists) said "gateway.toml is missing ... (approvals are kept)". PLAN-0.11
+    §1.5: nothing goes through the gateway then (this computer's sudo is the
+    user's own), also with a vault that holds nothing approved."""
     with H.gateway_env():
         assert not paths.form_path().exists() and not vault.exists()
         code, out, _ = run_gate("status")
         assert code == 0 and out.startswith("No gateway.toml yet"), out
         assert "missing" not in out and "approvals are kept" not in out
-        assert "this computer's defaults apply (sudo asks each time)" in out.splitlines()[0], out
-    # an older install (its vault an older gateway made, nothing approved or
-    # kept as the last good form): its default then, sudo on
+        assert "nothing goes through the gateway (your own ssh, git, gh and sudo)" in \
+            out.splitlines()[0], out
+        assert "sudo: your own (not through the gateway)" in out, out      # the localhost row
     with H.gateway_env():
         vault.save({"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {},
                     "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {},
                     "events": [], "events_seen": 0, "migrated": None})
         code, out, _ = run_gate("status")
         assert code == 0 and out.startswith("No gateway.toml yet"), out
-        assert "this computer's defaults apply (sudo on)" in out.splitlines()[0], out
+        assert "nothing goes through the gateway" in out.splitlines()[0], out
 
 
 def test_status_footer_names_the_users_own_hosts():

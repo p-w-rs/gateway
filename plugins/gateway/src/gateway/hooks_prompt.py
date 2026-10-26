@@ -284,14 +284,4 @@ def main(payload: dict) -> dict | None:
         lines = hooks_post.pending_notice(sid, include_open=True)
         if lines:
             out["systemMessage"] = "\n".join(lines)
-    # A conversion from 0.6 that ran mid-session (a stand-in or gate ran it):
-    # its report reaches the user now, not a session later (review round 4).
-    try:
-        from . import migrate
-        report = migrate.take_unshown_report()
-    except Exception:  # noqa: BLE001 - a convenience
-        report = None
-    if report:
-        out["systemMessage"] = report + ("\n" + out["systemMessage"] if out.get("systemMessage")
-                                         else "")
     return out or {"continue": True}

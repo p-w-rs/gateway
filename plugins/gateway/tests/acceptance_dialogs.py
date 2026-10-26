@@ -2,7 +2,7 @@
 """Brief 11.1, 14.9, 14.12 and 14.13 in the real TUI: the gateway's native
 dialogs (PLAN-v4 phase 3), with telemetry on.
 
-    pixi exec --spec python=3.12 --spec pyte python tests/acceptance_dialogs.py \\
+    pixi exec --spec python --spec pyte python tests/acceptance_dialogs.py \\
         --tmp DIR [--keep] [--pixi-cache DIR]
 
 The gateway is installed the normal way through the TUI harness's e2e route
@@ -24,15 +24,19 @@ Scripted, with synthetic canaries generated here (never printed, never in a
 prompt; the fake sudo's password and the fake clipboard are canaries too):
 
   sudo     gate check localhost: the form's sudo = true was written before
-           any vault existed, and a new install's sudo here is "ask" (0.10.0),
-           so the consent dialog asks for that change first (Approve, as a
+           any vault existed; configuring this computer's sudo applies up to
+           "ask" at once and true waits for the OK (PLAN-0.11 §1.5), so the
+           consent dialog asks for that change first, saying what each mode
+           now does ("... now approves without asking you"; Approve, as a
            user would); then the sudo-method choice, then the private
            field. Typing before the click goes to the prompt box (the guard
            holds it back); a wrong canary typed (click, type, Enter) reopens
            the dialog with "That didn't work"; a partial value typed, then
            the focus moved away (Escape): the click that gives the field the
            keys again starts it over, so the partial value is never sealed;
-           the right canary is verified by the fake sudo and stored.
+           the right canary is verified by the fake sudo and stored. The
+           first stored secret brings the vault passphrase offer (PLAN-0.11
+           §8): answered Not now, which the vault keeps.
   clip     a new api-key account: the consent dialog (Approve), then "Paste
            from clipboard": gated reads the clipboard through its test
            override (a program returning a canary) and stores it.
@@ -83,6 +87,7 @@ PLUGIN = HERE.parent
 REPO = PLUGIN.parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
+import acceptance_lib as L  # noqa: E402
 from tui import driver, gwe2e, install, proxy, safety, scan  # noqa: E402
 from tui.fakeapi import FakeAPI  # noqa: E402
 
@@ -199,24 +204,13 @@ def bullets(s: driver.Session) -> int:
     return screen(s).count("•")
 
 
-def focus_field(s: driver.Session, tries: int = 5) -> bool:
+def focus_field(s: driver.Session, tries: int = 5) -> int | None:
     """Click the private field until it takes keys: a probe key must add a
-    bullet (then it is deleted again). A key that went to the prompt box
-    instead is held back by the guard."""
-    for _ in range(tries):
-        try:
-            s.click_text(FIELD)
-        except LookupError:
-            s.pump(1.0)
-            continue
-        s.pump(0.4)
-        n = bullets(s)
-        s.send("x")
-        if wait(s, lambda: bullets(s) > n, 2.0, 0.1):
-            s.key("backspace")
-            wait(s, lambda: bullets(s) == n, 2.0, 0.1)
-            return True
-    return False
+    bullet, and be deleted again before this says yes
+    (acceptance_lib.focus_private_field). A key that went to the prompt box
+    instead is taken back. The bullets on the screen with the field empty
+    (for acceptance_lib.type_private), or None."""
+    return L.focus_private_field(s, lambda: s.click_text(FIELD), lambda: bullets(s), tries)
 
 
 def press(s: driver.Session, label: str, done=None, tries: int = 5, settle: float = 2.0) -> bool:
@@ -235,6 +229,15 @@ def press(s: driver.Session, label: str, done=None, tries: int = 5, settle: floa
         if wait(s, done, settle):
             return True
     return bool(done())
+
+
+def press_button(s, label: str, done=None, settle: float = 3.0) -> bool:
+    """A dialog's button by its drawn form "[ label ]" (the dialog's own text
+    can hold the same words, which a click on the plain label would hit),
+    else the label."""
+    drawn = f"[ {label} ]"
+    return press(s, drawn if drawn in screen(s) else label, done or (lambda: label not in screen(s)),
+                 settle=settle)
 
 
 def env_python() -> str:
@@ -434,6 +437,9 @@ def run(root: Path, env: dict, PY: str, canaries: list[scan.Canary], watcher: Wa
             step_kill(s, gi, killv)
             step_reload(s, gi)
             s.pump(2.0)
+            # nobody answers an offer after step_offer's: one that came would still be open
+            check("passphrase offer: the later stores (clip, killme) brought no offer (none is open)",
+                  not wait(s, lambda: L.OFFER_TITLE in screen(s), 3), s.dump(20))
         finally:
             s.close()
         age = age_binary(gi.root)
@@ -446,6 +452,9 @@ def run(root: Path, env: dict, PY: str, canaries: list[scan.Canary], watcher: Wa
         stored = ((data.get("localhost") or {}).get("sudo") or {}).get(user or "", {}).get("password", "")
         check("broker receipt (typed): the stored sudo password's sha256 is the right canary's",
               bool(stored) and sha(stored) == sha(right.value))
+        check("passphrase offer: Not now is kept in the vault (passphrase_offer \"declined\"), so it isn't "
+              "offered again unasked", data.get("passphrase_offer") == "declined",
+              str(data.get("passphrase_offer")))
         tok = lambda n: (((data.get("accounts") or {}).get(n) or {}).get("token") or {}).get("value", "")
         check("broker receipt (clipboard): the clip account's stored token's sha256 is the clipboard "
               "canary's", sha(tok("clip")) == sha(clip.value))
@@ -475,12 +484,13 @@ def run(root: Path, env: dict, PY: str, canaries: list[scan.Canary], watcher: Wa
 def step_sudo(s, gi, right, wrong, partial, guard_c) -> None:
     print("sudo: consent for sudo = true, choice, guard, wrong value, focus change, right value", flush=True)
     s.submit("please set up sudo on this machine")
-    # 0.10.0: a new install's sudo on this computer is "ask"; the form's sudo = true (FORM, written
-    # before any vault existed) is a widening, so gate check localhost asks for the OK first
+    # PLAN-0.11 §1.5: configuring this computer's sudo applies up to "ask" at once; the form's
+    # sudo = true (FORM, written before any vault existed) waits for the OK, so gate check
+    # localhost asks for it first, each mode's change in plain words (§19.4)
     ok = wait(s, lambda: "Approve" in screen(s) and "localhost" in screen(s), 120)
-    check("sudo: the form's sudo = true waits for the OK on a new install (its default is \"ask\"): gate "
-          "check localhost opens the consent dialog first, naming the change (sudo \"ask\" -> true)",
-          ok and '"ask" -> true' in screen(s) and "Decline" in screen(s), s.dump(30))
+    check("sudo: the form's sudo = true waits for the OK: gate check localhost opens the consent dialog "
+          f"first, saying what changes in each mode (\"... {L.CONSENT_APPROVES}\")",
+          ok and L.shows(screen(s), L.CONSENT_APPROVES) and "Decline" in screen(s), s.dump(30))
     if not ok:
         return
     press(s, "Approve", lambda: "Store the sudo password" in screen(s))
@@ -506,7 +516,7 @@ def step_sudo(s, gi, right, wrong, partial, guard_c) -> None:
           f"{bool(left) and guard_c.value.endswith(left)}")
     check("guard: the status line says to click the field first", GUARD in s.all_text(), s.dump(8))
     # a wrong value, typed into the field after the click
-    check("field: a click gives the private field the keys", focus_field(s), s.dump(20))
+    check("field: a click gives the private field the keys", focus_field(s) is not None, s.dump(20))
     s.type(wrong.value)
     s.pump(0.4)
     check("field: only bullets are drawn while typing", "•" * 8 in screen(s) and wrong.value not in screen(s))
@@ -536,6 +546,22 @@ def step_sudo(s, gi, right, wrong, partial, guard_c) -> None:
               or FIELD not in screen(s), 90)
     check("sudo: the right value is verified (fake sudo) and the dialog closes", ok, s.dump(25))
     wait(s, lambda: "sudo step answered" in s.all_text(), 60)
+    step_offer(s)
+
+
+def step_offer(s) -> None:
+    """PLAN-0.11 §8: the first secret stored without a vault passphrase brings
+    gated's offer (once per session, after the vault lock is free); Not now
+    is kept in the vault, so it never comes back unasked (run() checks the
+    vault's passphrase_offer)."""
+    ok = wait(s, lambda: L.OFFER_TITLE in screen(s), 90)
+    check("passphrase offer: after the first stored secret the gateway offers to protect the vault "
+          f"with a passphrase ({L.OFFER_SET} / {L.OFFER_NOT_NOW})",
+          ok and L.OFFER_SET in screen(s) and L.OFFER_NOT_NOW in screen(s), s.dump(25))
+    if ok:
+        press_button(s, L.OFFER_NOT_NOW, lambda: L.OFFER_TITLE not in screen(s))
+        check("passphrase offer: Not now closes it", wait(s, lambda: L.OFFER_TITLE not in screen(s), 30),
+              s.dump(15))
 
 
 def step_clip(s, gi) -> None:
@@ -665,7 +691,7 @@ def step_main_screen(root: Path, h, gi, env: dict, px, main_guard):
         if not ok:
             return s
         check("main screen: the secret dialog draws no field and says how to type privately "
-              "(fullscreen) or paste", "CLAUDE_CODE_NO_FLICKER=1" in screen(s) and FIELD not in screen(s),
+              "(fullscreen) or paste", "/tui fullscreen" in screen(s) and FIELD not in screen(s),
               s.dump(25))
         s.redact(main_guard.value)
         s.type(main_guard.value)

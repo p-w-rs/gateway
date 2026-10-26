@@ -9,7 +9,6 @@
   unavailable) for popup.py (phase B), via testing.override(dialog=...).
 - make_fake_sudo(): a password sudo (-A/-S/-v/-n/-k, "Sorry, try again",
   NOPASSWD mode).
-- v2 vault builders using v2's own vault.py (tests/fixtures/v2_vault.py, the last v2 on main).
 - run_py()/run_launch(): run run.py or hooks/launch.sh as subprocesses with
   --test and GATEWAY_TEST_ROOT.
 - PYC/PYX: the test run's bytecode folder (under the test temp root) and the
@@ -21,7 +20,6 @@ from __future__ import annotations
 import atexit
 import base64
 import contextlib
-import importlib.util
 import json
 import os
 import shutil
@@ -195,12 +193,6 @@ def gateway_env(**kw: Any) -> Iterator[GatewayEnv]:
     root = Path(tempfile.mkdtemp(prefix="gwt-", dir=tmp_base()))
     kw.setdefault("machine_id", "TEST-MACHINE-0001")
     kw.setdefault("system_git", True)
-    # The test runner itself usually runs under Claude Code, so the real
-    # process-tree check of `gate secret` (gate_setup.claude_ancestor) would
-    # refuse every terminal flow: in-process tests start with "no Claude Code
-    # ancestor"; the tests of that check set it to None (the real walk, on a
-    # faked process table) or run real trees through tests/entry.py.
-    kw["extra"] = {"claude_ancestor": "", **(kw.get("extra") or {})}
     try:
         with testing.override(root, **kw) as o:
             o.user_home.mkdir(parents=True, exist_ok=True)
@@ -382,59 +374,8 @@ class FakeVisudo:
 
 
 # ---------------------------------------------------------------------------
-# v2 vaults (built with v2's own code)
+# keys
 # ---------------------------------------------------------------------------
-
-_V2_MOD = None
-
-
-def v2_module() -> Any:
-    """v2's vault.py: tests/fixtures/v2_vault.py, byte for byte the last v2
-    vault.py on git main (0.6.0, c75fa82; ad546bc). It used to be read from
-    `git show main:...` first, which since 0.9.0 is on main gives v3's vault.py
-    (a package module that can't load alone), so the fixture is the one source."""
-    global _V2_MOD
-    if _V2_MOD is not None:
-        return _V2_MOD
-    src = (TESTS / "fixtures" / "v2_vault.py").read_text()
-    d = Path(tempfile.mkdtemp(prefix="gwv2-", dir=tmp_base()))
-    atexit.register(shutil.rmtree, d, True)
-    (d / "gw_v2_vault.py").write_text(src)
-    spec = importlib.util.spec_from_file_location("gw_v2_vault", d / "gw_v2_vault.py")
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _V2_MOD = mod
-    return mod
-
-
-@contextlib.contextmanager
-def _v2_env(home: Path) -> Iterator[None]:
-    testing.guard(home, "v2 home")
-    old = {k: os.environ.get(k) for k in ("GATEWAY_HOME", "PATH")}
-    os.environ["GATEWAY_HOME"] = str(home)
-    os.environ["PATH"] = f"{ENV_BIN}:{old['PATH'] or '/usr/bin:/bin'}"
-    try:
-        yield
-    finally:
-        for k, v in old.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-def write_v2_vault(home: Path, data: dict[str, Any]) -> None:
-    """Encrypt `data` as a v2 store.age (+ key.txt) in `home` with v2's code."""
-    v2 = v2_module()
-    with _v2_env(home):
-        v2.save(data)
-
-
-def read_v2_vault(home: Path) -> dict[str, Any]:
-    v2 = v2_module()
-    with _v2_env(home):
-        return v2.load()
 
 
 def ssh_keypair(comment: str = "test") -> tuple[str, str]:
@@ -451,107 +392,3 @@ def fake_host_key(seed: str) -> str:
     """A syntactically valid ssh-ed25519 public key line (not a real key)."""
     blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + (seed.encode() * 32)[:32]
     return "ssh-ed25519 " + base64.b64encode(blob).decode()
-
-
-def users_v2_vault(local_user: str) -> dict[str, Any]:
-    """A v2 vault shaped like the user's: 8 accounts (github:personal,
-    github:work, hf:me, ssh:example with 2 routes incl. a CIDR `when`,
-    azure:work with databricks/storage/acr hosts, mlcat:work, registry:ghcr via
-    github:work, pijul:nest), a jump host (ssh:builder via example), rotated
-    keys, two secrets (one with no hosts) and sudo entries."""
-    k_gh, p_gh = ssh_keypair("gh-work")
-    k_lab, p_lab = ssh_keypair("lab-new")
-    k_old, p_old = ssh_keypair("lab-old")
-    k_bld, p_bld = ssh_keypair("builder")
-    k_pj, p_pj = ssh_keypair("pijul")
-    now = "2026-10-01T10:00:00+0000"
-    return {
-        "version": 2,
-        "secrets": {
-            "OPENAI_API_KEY": {"value": "sk-test-openai-0123456789abcdefghij",
-                               "description": "OpenAI for experiments",
-                               "hosts": ["api.openai.com"], "updated": now},
-            "LEGACY_TOKEN": {"value": "legacy-token-value-123456", "description": "old service",
-                             "hosts": [], "updated": now},
-        },
-        "sudo": {
-            f"{local_user}@localhost": {"user": local_user, "host": "localhost",
-                                        "password": "mac-login-pw-1", "updated": now},
-            "octo@10.0.0.5": {"user": "octo", "host": "10.0.0.5",
-                                "password": "lab-sudo-pw-22", "updated": now},
-            "bob@localhost": {"user": "bob", "host": "localhost", "password": "bobs-pw-333",
-                              "updated": now},
-            "admin@db.internal": {"user": "admin", "host": "db.internal",
-                                  "password": "db-admin-pw-44", "updated": now},
-        },
-        "sudo_enabled": [],
-        "sudo_session": {"localhost": ["sess-1"]},
-        "accounts": {
-            "github:personal": {
-                "kind": "github", "description": "my own GitHub", "host": "github.com",
-                "login": "octocat", "name": "", "email": "", "owners": [],
-                "hosts": ["github.com", "api.github.com"],
-                "secrets": {"token": "gho_personalTOKEN0123456789abcdef"},
-                "token_source": "gh-oauth", "prompts": {}, "updated": now},
-            "github:work": {
-                "kind": "github", "description": "work GitHub (example-org)", "host": "github.com",
-                "login": "octo-work", "name": "Octo Cat", "email": "work@example.com",
-                "owners": ["example-org"], "hosts": ["github.com", "api.github.com"],
-                "secrets": {"token": "ghp_workTOKEN0123456789abcdefghij", "ssh_key": k_gh},
-                "public_key": p_gh, "key_fingerprint": "", "prompts": {"delete": "ask"},
-                "updated": now},
-            "hf:me": {
-                "kind": "hf", "description": "Hugging Face", "host": "huggingface.co",
-                "login": "octocat", "owners": [], "hosts": ["huggingface.co", "hf.co"],
-                "secrets": {"token": "hf_TESTtoken0123456789abcdefgh"}, "prompts": {},
-                "updated": now},
-            "ssh:example": {
-                "kind": "ssh", "description": "the lab box", "host": "lab.example.com",
-                "user": "octo", "port": "2222", "jump": "",
-                "routes": [{"name": "home", "host": "10.0.0.5", "port": "", "when": "10.0.0.0/24"},
-                           {"name": "away", "host": "lab.example.com", "port": "2222", "when": ""}],
-                "hosts": ["10.0.0.5", "lab.example.com"],
-                "secrets": {"ssh_key": k_lab, "old_ssh_keys": [k_old]},
-                "public_key": p_lab, "old_public_keys": [p_old],
-                "known_hosts": "10.0.0.5 " + fake_host_key("labhostkey") + "\n",
-                "host_key_policy": "pinned", "comfort": {"keepalive": 15}, "updated": now},
-            "ssh:builder": {
-                "kind": "ssh", "description": "CI builder", "host": "builder.internal",
-                "user": "ci", "port": "", "jump": "ssh:example", "hosts": ["builder.internal"],
-                "secrets": {"ssh_key": k_bld}, "public_key": p_bld,
-                "known_hosts": "builder.internal " + fake_host_key("builderkey") + "\n",
-                "host_key_policy": "accept-new", "updated": now},
-            "azure:work": {
-                "kind": "azure", "description": "work Azure", "tenant": "example.com",
-                "tenant_id": "11111111-2222-3333-4444-555555555555",
-                "client_id": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-                "login": "work@example.com", "host": "management.azure.com",
-                "hosts": ["management.azure.com", "adb-1234567890.7.azuredatabricks.net",
-                          "examplestore.blob.core.windows.net", "examplestore.dfs.core.windows.net",
-                          "examplecr.azurecr.io", "custom.example.com"],
-                "secrets": {"refresh_token": "0.AAAA-azure-refresh-token-xyz"},
-                "token_source": "entra", "token_refreshed": now, "updated": now},
-            "mlcat:work": {
-                "kind": "mlcat", "description": "ML model catalog",
-                "host": "catalog.example.com", "login": "work@example.com",
-                "client_id": "99999999-8888-7777-6666-555555555555",
-                "tenant_id": "11111111-2222-3333-4444-555555555555",
-                "hosts": ["catalog.example.com"],
-                "secrets": {"refresh_token": "0.BBBB-mlcat-refresh-token-xyz"},
-                "token_source": "entra", "updated": now},
-            "registry:ghcr": {
-                "kind": "registry", "description": "ghcr", "host": "ghcr.io", "login": "",
-                "via": "github:work", "owners": ["example-org", "octocat"], "hosts": ["ghcr.io"],
-                "secrets": {}, "updated": now},
-            "pijul:nest": {
-                "kind": "pijul", "description": "the Nest", "host": "nest.pijul.com",
-                "login": "octocat", "name": "Octo Cat", "email": "j@example.com",
-                "remote_pijul": "/usr/local/bin/pijul", "owners": [],
-                "hosts": ["nest.pijul.com"], "secrets": {"ssh_key": k_pj}, "public_key": p_pj,
-                "known_hosts": "nest.pijul.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA1a+L9qfvbf1boAGRZ2/HTjM5PaoEvDciJ/asgRgIR6",
-                "updated": now},
-        },
-        "account_prompts": {"delete": "refuse"},
-        "grants": {"g1": {"op": "add"}},
-        "ssh_reuse": {"ssh:example": ["sess-1"]},
-    }

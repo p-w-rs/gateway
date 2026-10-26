@@ -1,5 +1,5 @@
 """transfer: export path rules, export -> import round trip with localhost
-remap and host-key-based machine detection, v2 export import, strict
+remap and host-key-based machine detection, formats 1 and 2 refused, strict
 validation, machine-id detection, copy_to against a fake remote gate, the
 --from-peer guards, pubkey."""
 from __future__ import annotations
@@ -232,34 +232,34 @@ def test_export_passphrase_is_never_on_a_dialog_command_line():
             assert json.loads(transfer.decrypt_passphrase(f.read_bytes(), PASS))["gateway_export"] == 3
 
 
-def test_import_of_a_v2_export():
+def test_exports_of_formats_1_and_2_are_refused_as_older():
+    """Only format 3 is read. A gateway 0.6 export (format 1) and a format 2
+    file are refused as from an older gateway, naming 0.10.0 as the one that
+    reads them; nothing is imported (the form and vault stay as they were)."""
+    v1 = {"gateway_export": 1, "created": "2026-10-01", "from_host": "oldmac.local",
+          "secrets": {"K": {"value": "v" * 16, "hosts": ["k.example.com"]}}, "sudo": {},
+          "accounts": {}, "account_prompts": {}}
+    v2 = {"gateway_export": 2, "created": "2026-10-01", "form": "", "vault": {}, "from": {}}
+    assert transfer.FORMATS == (3,)
+    with U.ux_env():
+        for obj in (v1, v2):
+            try:
+                transfer.parse_incoming(json.loads(json.dumps(obj)))
+                raise AssertionError(obj["gateway_export"])
+            except transfer.TransferError as e:
+                msg = str(e)
+                assert f"older gateway (export format {obj['gateway_export']}" in msg, msg
+                assert "nothing was imported" in msg and "0.10.0" in msg, msg
     with _xfer_dir() as x:
-        with U.ux_env(local_user="octo") as env:
-            v2 = H.users_v2_vault("octo")
-            obj = {"gateway_export": 1, "created": "2026-10-01", "from_host": "oldmac.local",
-                   "secrets": v2["secrets"], "sudo": v2["sudo"], "accounts": v2["accounts"],
-                   "account_prompts": v2["account_prompts"]}
-            f = x / "v2.age"
-            f.write_bytes(transfer.encrypt_passphrase(json.dumps(obj).encode(), PASS))
-        none = "None of them (this machine isn't in the file)"
-        with U.ux_env(U.answers(("ok", PASS), ("ok", none), ("ok",)), local_user="octo") as env:
+        f = x / "v1.age"
+        with U.ux_env(U.answers(("ok", PASS)), local_user="octo") as env:
+            f.write_bytes(transfer.encrypt_passphrase(json.dumps(v1).encode(), PASS))
             env.o.extra["etc_ssh"] = str(_etc(env.root, None))
             U.setup(env, "")
+            before = (paths.form_path().read_text(), vault.load())
             rc, out, err = _run(transfer.import_cmd, str(f))
-            assert rc == 0, (out, err)
-            form = env.form()
-            for n in ("example", "builder", "github-personal", "github-work", "hf", "azure", "catalog"):
-                assert n in form.hosts or n in form.accounts, (n, out)
-            assert "oldmac" in form.hosts and form.hosts["oldmac"].ssh is False
-            assert form.hosts["oldmac"].sudo is True, "the 0.6 export's localhost said sudo = true"
-            data = vault.load()
-            assert data["accounts"]["github-work"]["token"]["value"] == "ghp_workTOKEN0123456789abcdefghij"
-            assert "entra" not in data["accounts"]["github-work"], "the old record's sign-in is gone"
-            assert data["accounts"]["github-work"]["kind"] == "github"
-            assert data["hosts"]["example"]["sudo"]["octo"]["password"] == "lab-sudo-pw-22"
-            assert data["accounts"]["azure"]["entra"]["refresh_token"] == "0.AAAA-azure-refresh-token-xyz"
-            calls = env.dialog.calls()
-            assert calls[1]["kind"] == "choice" and "Which host in the file is this machine" in calls[1]["message"]
+            assert rc != 0 and "older gateway (export format 1" in out + err, (rc, out, err)
+            assert (paths.form_path().read_text(), vault.load()) == before
 
 
 def _content(env, **over):
@@ -294,6 +294,11 @@ def test_strict_validation_refuses_bad_files():
         bad(lambda c: c["vault"]["accounts"]["openai"].update(kind="github"), "wrong kind")
         bad(lambda c: c["vault"]["accounts"]["openai"]["bound"].update(hosts=["bad host!"]), "binding")
         bad(lambda c: c["vault"]["accounts"]["openai"].update(sneaky={"x": 1}), "unknown fields")
+        # the vault part holds what an export writes (vault.EXPORT_KEYS), nothing else:
+        # no field older exports wrote, no machine-local record
+        assert set(good["vault"]) <= set(vault.EXPORT_KEYS), sorted(good["vault"])
+        for k in ("events_seen", "events", "approved", "machine", "form_last_good", "migrated"):
+            bad(lambda c, k=k: c["vault"].update({k: 0}), "unknown fields")
         bad(lambda c: c.update(form=c["form"] + '\n[hosts.oops]\nadress = "x"\n'), "has a problem")
         bad(lambda c: c.update(form="[hosts.x\n"), "doesn't parse")
         bad(lambda c: c["vault"]["localhost"]["sudo"].update({"bad user!": {"password": "x"}}), "isn't valid")
@@ -430,15 +435,14 @@ def test_copy_to_pin_age_rules():
         rec.write_text("started=1\n")
         os.utime(rec, (now - 3600, now - 3600))           # this session started an hour ago
         f = transfer.pinned_too_recently
-        assert f("h", {}, {"pinned_at": iso(now - 7200)}) is None, "pinned before this session"
-        assert "in this session" in f("h", {}, {"pinned_at": iso(now - 600)})
-        assert "isn't known" in f("h", {}, {}), "no pinned_at and no migration: unknown"
-        assert f("h", {"migrated": {"at": iso(now - 86400 * 30)}}, {}) is None, "v2 pins: the migration's time"
+        assert f("h", {"pinned_at": iso(now - 7200)}) is None, "pinned before this session"
+        assert "in this session" in f("h", {"pinned_at": iso(now - 600)})
+        assert "isn't known" in f("h", {}), "no pinned_at: unknown (a 0.6 conversion's time no longer counts)"
         with U.env_vars(CLAUDE_CODE_SESSION_ID=None):
-            assert "12 hours" in f("h", {}, {"pinned_at": iso(now - 7200)}), "no session: 12 hours"
-            assert f("h", {}, {"pinned_at": iso(now - 13 * 3600)}) is None
+            assert "12 hours" in f("h", {"pinned_at": iso(now - 7200)}), "no session: 12 hours"
+            assert f("h", {"pinned_at": iso(now - 13 * 3600)}) is None
         os.utime(rec, (now + 7200, now + 7200))            # a record from the future isn't trusted
-        assert "12 hours" in f("h", {}, {"pinned_at": iso(now - 7200)})
+        assert "12 hours" in f("h", {"pinned_at": iso(now - 7200)})
         assert abs(transfer._ts("2026-01-01T00:00:00+0000") - 1767225600) < 1
         assert abs(transfer._ts("2026-01-01T02:00:00+0200") - 1767225600) < 1, "the offset counts"
 

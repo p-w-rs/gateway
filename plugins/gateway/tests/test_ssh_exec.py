@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import contextlib
 import os
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import harness  # noqa: F401
 import harness_ssh as H
+import harness_posture as HP
 from gateway import paths, ssh, ssh_conf, vault
 
 
@@ -171,49 +173,34 @@ def test_ssh_exec_no_command_refused_at_once() -> None:
         r = s.run("ssh", "-t", "box")
         assert r.returncode == 2
         assert t.accepted() == 0
+        # no destination at all: the user's own ssh (none here: 127)
         r = s.run("ssh")
-        assert r.returncode == 2 and "ssh needs a host" in r.stderr
+        assert r.returncode == 127 and "ssh isn't installed here" in r.stderr, r
 
 
-def test_ssh_exec_unknown_host_refused_with_suggestion() -> None:
+def test_ssh_exec_unknown_host_is_the_users_own_ssh() -> None:
+    """PLAN-0.11 §1.4: a host nothing configures runs the user's own ssh
+    (the user_tools fake; never the system_ssh knob), with the full argv;
+    git servers no account covers and this computer too; a configured host
+    keeps the gateway's key."""
     with H.ssh_env() as s:
         t = _box(s, name="example")
         fake = s.root / "system-ssh"
         fake.write_text("#!/bin/sh\necho \"SYSTEM-SSH $*\"\n")
         os.chmod(fake, 0o755)
-        s.set(system_ssh=str(fake))
-        r = s.run("ssh", "exmple", "uptime")
-        assert r.returncode == 2 and "SYSTEM-SSH" not in r.stdout, r
-        assert ("gateway: exmple isn't in gateway.toml. Did you mean example? To add it, "
-                "ask the user (Claude can import it from ~/.ssh/config)") in r.stderr, r.stderr
-        r = s.run("ssh", "elsewhere.example.org", "uptime")
-        assert "elsewhere.example.org isn't in gateway.toml. To add it" in r.stderr
-        r = s.run("ssh", "git@gitlab.com", "git-upload-pack 'a/b.git'")
-        assert "no account for gitlab.com" in r.stderr
-        r = s.run("ssh", "bad‮name", "x")
-        assert "that host isn't in gateway.toml" in r.stderr and "‮" not in r.stderr
-        r = s.run("ssh", "localhost", "id")
-        assert r.returncode == 2 and "localhost is this computer" in r.stderr
+        d = HP.user_tools(s.env, "ssh")
+        s.set(system_ssh=str(fake), user_tools=str(d))
+        for argv in (["exmple", "uptime"], ["elsewhere.invalid", "-v", "uptime"],
+                     ["git@gitlab.invalid", "git-upload-pack 'a/b.git'"], ["localhost", "id"]):
+            r = s.run("ssh", *argv)
+            assert r.returncode == 0 and r.stdout == "fake ssh ran\n", (argv, r)
+            assert HP.runs(d, "ssh")[-1]["argv"] == argv
+        r = s.run("ssh", "bad\u202ename", "x")
+        assert r.returncode == 0
+        assert "SYSTEM-SSH" not in json.dumps(HP.runs(d, with_g=True))
         assert t.accepted() == 0
-
-
-def test_ssh_exec_others_mine_delegates_unknown_hosts() -> None:
-    with H.ssh_env() as s:
-        t = s.sshd("target")
-        s.write_form(f'[settings]\nothers = "mine"\n\n[hosts.box]\naddress = "{t.addr()}"\n')
-        fake = s.root / "system-ssh"
-        fake.write_text("#!/bin/sh\necho \"SYSTEM-SSH $*\"\n")
-        os.chmod(fake, 0o755)
-        s.set(system_ssh=str(fake))
-        # not approved yet: still refused
-        r = s.run("ssh", "elsewhere", "-v", "uptime")
-        assert r.returncode == 2 and "SYSTEM-SSH" not in r.stdout
-        s.approve()
-        s.host("box", t)
-        r = s.run("ssh", "elsewhere", "-v", "uptime")
-        assert r.returncode == 0 and r.stdout == "SYSTEM-SSH elsewhere -v uptime\n", r
-        r = s.run("ssh", "box", "echo mine")   # form hosts still use the gateway's key
-        assert r.stdout == "mine\n" and t.accepted() == 1
+        r = s.run("ssh", "example", "echo mine")   # a configured host: the gateway's key
+        assert r.stdout == "mine\n" and t.accepted() == 1, r
 
 
 def test_ssh_exec_rights_false_and_ask() -> None:
@@ -317,8 +304,12 @@ def test_ssh_exec_forwarding_and_misc_options() -> None:
         assert r.returncode == 0 and r.stdout == "fine\n", r
         r = s.run("ssh", "-n", "box", "cat")     # -n: stdin from /dev/null
         assert r.returncode == 0 and r.stdout == ""
+        # no destination: the user's own ssh (PLAN-0.11 §1.4)
+        d = HP.user_tools(s.env, "ssh")
+        s.set(user_tools=str(d))
         r = s.run("ssh", "-V")
-        assert r.returncode == 0 and "OpenSSH" in r.stderr
+        assert r.returncode == 0 and r.stdout == "fake ssh ran\n" and \
+            HP.runs(d, "ssh")[-1]["argv"] == ["-V"], r
         # a reader that goes away ends the command (stdout isn't held by the stand-in)
         r = subprocess.run(["/bin/sh", "-c", f"{H.sq(s.stub('ssh'))} box yes | head -2"],
                            capture_output=True, text=True, env=s.proc_env(), timeout=60)

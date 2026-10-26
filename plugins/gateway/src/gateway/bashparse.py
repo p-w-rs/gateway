@@ -33,6 +33,9 @@ words alone hide (the hook must never vouch for what it cannot see):
   quotes. `$HOME` / `${HOME}` alone don't count (the hook substitutes them).
 - `globs[i]`: word i contains an unquoted glob or brace expansion
   (`*`, `?`, `[…]`, `{…}`), which the shell expands to other words.
+- `homes[i]`: word i has a `$HOME` / `${HOME}` the shell expands (outside
+  single quotes); `tildes[i]`: word i starts with an unquoted `~`. The
+  approval hook's record of a command spells them out as the shell does.
 """
 from __future__ import annotations
 
@@ -51,14 +54,17 @@ class _Bail(Exception):
 
 
 class Stage(list):
-    """The argv words of one pipeline stage, plus `redirects`, `expands` and
-    `globs` (see the module docstring). Equal to the plain list of words."""
+    """The argv words of one pipeline stage, plus `redirects`, `expands`,
+    `globs`, `homes` and `tildes` (see the module docstring). Equal to the
+    plain list of words."""
 
-    def __init__(self, words=(), expands=(), globs=(), redirects=()):
+    def __init__(self, words=(), expands=(), globs=(), redirects=(), homes=(), tildes=()):
         super().__init__(words)
         self.expands: list[bool] = list(expands) or [False] * len(self)
         self.globs: list[bool] = list(globs) or [False] * len(self)
         self.redirects: list[tuple[str, str]] = list(redirects)
+        self.homes: list[bool] = list(homes) or [False] * len(self)
+        self.tildes: list[bool] = list(tildes) or [False] * len(self)
 
 
 def parse(command: str, comments: bool = True) -> list[list[Stage]] | None:
@@ -82,13 +88,15 @@ class _Word:
     """A word being built: its text plus whether an unknown expansion or an
     unquoted glob/brace character appeared in it."""
 
-    __slots__ = ("buf", "started", "expands", "bare")
+    __slots__ = ("buf", "started", "expands", "bare", "home", "tilde")
 
     def __init__(self) -> None:
         self.buf: list[str] = []
         self.started = False
         self.expands = False
         self.bare: list[str] = []      # unquoted glob/brace characters, in order
+        self.home = False              # a $HOME the shell expands
+        self.tilde = False             # starts with an unquoted ~
 
     def add(self, s: str) -> None:
         self.buf.append(s)
@@ -168,8 +176,9 @@ def _read_target(cmd: str, i: int) -> tuple[str | None, int]:
 
 
 def _tokenize(cmd: str, comments: bool = True) -> list[tuple]:
-    """('word', text, expands, globbed) | ('op', 'semi'|'and'|'or'|'pipe'|'newline')
-    | ('redir', op, target). Anything unsafe raises _Bail."""
+    """('word', text, expands, globbed, home, tilde) | ('op', 'semi'|'and'|
+    'or'|'pipe'|'newline') | ('redir', op, target). Anything unsafe raises
+    _Bail."""
     tokens: list[tuple] = []
     w = _Word()
     i, n = 0, len(cmd)
@@ -177,7 +186,7 @@ def _tokenize(cmd: str, comments: bool = True) -> list[tuple]:
     def flush() -> None:
         nonlocal w
         if w.started:
-            tokens.append(("word", "".join(w.buf), w.expands, w.globbed()))
+            tokens.append(("word", "".join(w.buf), w.expands, w.globbed(), w.home, w.tilde))
         w = _Word()
 
     while i < n:
@@ -207,6 +216,8 @@ def _tokenize(cmd: str, comments: bool = True) -> list[tuple]:
                         raise _Bail()
                     if _dollar_expands(cmd, j, in_dq=True):
                         w.expands = True
+                    elif _HOME_REF.match(cmd, j):
+                        w.home = True
                 if cmd[j] == "\\" and j + 1 < n and cmd[j + 1] in '"\\$`':
                     buf.append(cmd[j + 1])
                     j += 2
@@ -235,6 +246,8 @@ def _tokenize(cmd: str, comments: bool = True) -> list[tuple]:
                 raise _Bail()
             if _dollar_expands(cmd, i):
                 w.expands = True             # $NAME, ${..}, $'..', $"..", $1 ...
+            elif _HOME_REF.match(cmd, i):
+                w.home = True
             if i + 1 < n and cmd[i + 1] == "{":
                 # ${NAME...}: its braces are not a brace expansion. Anything
                 # but a plain name/operator inside is too complex to judge.
@@ -319,6 +332,8 @@ def _tokenize(cmd: str, comments: bool = True) -> list[tuple]:
                 raise _Bail()                # 1> , 2>> , n< , ...
         if c in "*?[]{}":
             w.bare.append(c)
+        if c == "~" and not w.started:
+            w.tilde = True
         w.add(c)
         i += 1
     flush()
@@ -333,8 +348,8 @@ def _command_word(stage: list[str]) -> str:
     return ""
 
 
-def _finish_stage(words: list[tuple[str, bool, bool]], redirects: list[tuple[str, str]]
-                  ) -> Stage | None:
+def _finish_stage(words: list[tuple[str, bool, bool, bool, bool]],
+                  redirects: list[tuple[str, str]]) -> Stage | None:
     """Apply the assignment-prefix rule and the give-up words. None for a
     stage with no command (empty, or assignments only)."""
     i = 0
@@ -346,13 +361,13 @@ def _finish_stage(words: list[tuple[str, bool, bool]], redirects: list[tuple[str
         if redirects:
             raise _Bail()                    # `> file` alone truncates a file
         return None
-    st = Stage([t for t, _, _ in words], [e for _, e, _ in words],
-               [g for _, _, g in words], redirects)
+    st = Stage([w[0] for w in words], [w[1] for w in words], [w[2] for w in words], redirects,
+               [w[3] for w in words], [w[4] for w in words])
     cw = _command_word(st)
     if cw in _GIVEUP_WORDS:
         raise _Bail()
-    if cw in _SHELLS and "-c" in st:
-        raise _Bail()
+    if cw.lower() in _SHELLS and "-c" in st:
+        raise _Bail()                        # (BASH runs bash where names ignore case)
     return st
 
 
@@ -362,7 +377,7 @@ _CONTINUES = (("op", "pipe"), ("op", "and"), ("op", "or"))
 def _parse(cmd: str, comments: bool = True) -> list[list[Stage]]:
     out: list[list[Stage]] = []
     seg: list[Stage] = []
-    words: list[tuple[str, bool, bool]] = []
+    words: list[tuple[str, bool, bool, bool, bool]] = []
     redirects: list[tuple[str, str]] = []
 
     def end_stage() -> None:
@@ -385,7 +400,7 @@ def _parse(cmd: str, comments: bool = True) -> list[list[Stage]]:
             continue                         # bash continues after `|`, `&&` or `||` at a line end
         prev = tok
         if tok[0] == "word":
-            words.append((tok[1], tok[2], tok[3]))
+            words.append((tok[1], tok[2], tok[3], tok[4], tok[5]))
         elif tok[0] == "redir":
             redirects.append((tok[1], tok[2]))
         elif tok[1] == "pipe":

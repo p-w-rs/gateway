@@ -59,17 +59,22 @@ to gated and gets bounded JSON back.
   platform's (`KEEP_NAMES`: HOME USER LOGNAME LANG LC_* TERM TMPDIR TZ XDG_*
   __CF_USER_TEXT_ENCODING SHLVL PWD OLDPWD COLUMNS LINES; so TMUX and TMUX_PANE go:
   a pane's programs can't drive the gateway's tmux by its variables), then exports
-  the plan: PATH from the managed shell's conf (`managed.conf_path()`: stand-ins,
-  runtime tools, approved import_path folders, system dirs), HOME, USER, LOGNAME,
-  SHELL (the env's bash), LANG, the platform variables and approved imports the caller
-  (the gw MCP server, from Claude Code's environment) passed, never a
-  credential-looking name unless it is one of the user's own "mine" names under
-  `others = "mine"`; `GW_TERMINAL=<id>`; `CLAUDE_PID=$$` (the stand-ins' direct rule:
+  the plan: the caller's variables (the gw MCP server's, which are Claude Code's:
+  the user's own environment since 0.11.0; for `POST /v1/jobs` the `env` the
+  consumer sent, feature `job_env`, which checkpoint fills with its own
+  environment; `env_kept`: the first `ENV_MAX` shell names, each value at most
+  `ENV_VALUE_MAX` characters of UTF-8 without NUL, anything else skipped) minus the
+  managed shell's removals (`managed.dropped`: Claude Code's credentials, the startup
+  variables, `GW_*`) and the names the start file sets itself (`PANE_SETS`);
+  PATH: the stand-ins, the caller's PATH, the approved `import_path` folders;
+  HOME, USER, LOGNAME, SHELL (the env's bash), LANG; `GW_TERMINAL=<id>`;
+  `CLAUDE_PID=$$` (the stand-ins' direct rule:
   what runs there is direct as in Claude's shell, a program between it and the stand-in
   not; never "typed": a `CLAUDE_PID` naming a shell is never Claude Code, so an `"ask"`
-  right or policy is refused in a pane, `ancestry.TERMINAL`); then it
-  sources the managed rc (`managed.rc_path()`: the env file's stand-ins and git setup,
-  never the user's rc), removes itself, `cd`s into the cwd. A terminal also gets no
+  right or policy is refused in a pane, `ancestry.TERMINAL`, and a per-mode value is
+  read with the modeless rule); then it
+  sources the managed rc (`managed.rc_path()`: the env file's stand-ins and the
+  unshadowing tail; never the user's rc), removes itself, `cd`s into the cwd. A terminal also gets no
   history file (`unset HISTFILE`), `histexpand` off and a plain prompt.
 - Values never reach a command line (any local user can read those): they go in the
   start file, which the pane removes once read (a test checks `ps` and the run dir).
@@ -291,6 +296,10 @@ STOP or TSTP is refused (Draining, above).
 
 ## Password prompts
 
+Since 0.11.0 this computer's sudo is the user's own unless gateway.toml
+configures it: in a pane it then prompts on the tty like any program, and
+the dialog below passes the answer once (this dialog never stores anything).
+
 Each tick reads every live pane's tty mode (`tty_mode`: the pane's tty opened
 `O_NOCTTY|O_NONBLOCK`, owner-checked, `tcgetattr`, closed at once, since a slave held
 open would keep a dead pane's tty from hanging up). ECHO off with canonical input
@@ -334,7 +343,9 @@ skips the askpass path (sudo then asks on its own tty, as anywhere).
 
 `job_start {argv | command, cwd, host, workspace, on_pause, idempotency_key, task_ref}`
 (agent plane) and `POST /v1/jobs` (contract plane, `idempotency_key` required, `session`
-must be the caller's). The same key within 24 h (per session) returns the job it started
+must be the caller's, `env` optional: CONTRACT-v1's `job_env`; `server._job_env`
+refuses only an `env` that isn't an object of strings or whose kept part is over
+256 KiB). The same key within 24 h (per session) returns the job it started
 (`new: false`). States: `running`, `waiting_auth`, `suspended`, `exited` (with `exit` or
 `signal`), `canceled` (a stop was asked and took effect), `unknown` (tmux lost it; `gone:
 true`; or, remote, a start whose answer was lost: `start_confirmed: false`, still asked

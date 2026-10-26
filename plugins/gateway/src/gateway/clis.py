@@ -11,7 +11,11 @@ and writes one audit line.
 
 `gate with NAME -- CMD` (with_main) runs CMD with the account's credential in
 the account's `env` variable (opt-in), the rest of the environment inherited,
-output scrubbed.
+output scrubbed, while the account's use and credential policy allow it in
+the session's mode ("ask": the approval hook's record, _with_refused).
+
+For the approval hook: `chosen` (the account a command line will use, the
+stand-in's own choice) and `ask_accounts` (that account, when it is "ask").
 """
 from __future__ import annotations
 
@@ -155,18 +159,40 @@ def child_env(extra: dict[str, str]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+_UNREADABLE: dict[str, str] = {}
+
+
 def _load() -> tuple[formmod.Form, Any, dict[str, Any]]:
+    """The form, the effective rights in the session's mode (the one the hook
+    recorded for a command Claude typed, modes.current_for; else the
+    modeless rule) and the vault. A vault that can't be read (locked) still
+    classifies through the configured list; its refusal text is kept for a
+    configured target (_UNREADABLE)."""
+    from . import modes
+    _UNREADABLE.clear()
+    locked = False
     try:
         data = vault.load()
-    except vault.VaultError:
-        data = vault.empty()
+    except vault.VaultLocked as e:
+        data, locked = None, True
+        _UNREADABLE["message"] = str(e)
+    except vault.VaultError as e:
+        data = None
+        _UNREADABLE["message"] = f"gateway: the vault can't be read ({e}); run gate status"
     form = consent.load_form(data)
+    if data is not None:
+        try:
+            consent.ratchet(form)
+            data = vault.load()
+        except Exception:  # noqa: BLE001
+            pass
     try:
-        consent.ratchet(form)
-        data = vault.load()
-    except Exception:  # noqa: BLE001
-        pass
-    eff = consent.compute(form, data)
+        mode = modes.current_for("standin")
+    except Exception:  # noqa: BLE001 - the modeless rule
+        mode = None
+    _CALL["mode"] = modes.audit_word(mode)      # for its audit lines (lead decision 19.8)
+    eff = consent.compute(form, data, mode, locked=locked)
+    data = data if data is not None else vault.empty()
     try:
         scrub.note_vault(data)
     except Exception:  # noqa: BLE001
@@ -174,9 +200,56 @@ def _load() -> tuple[formmod.Form, Any, dict[str, Any]]:
     return form, eff, data
 
 
+# The command this stand-in call serves (main sets it): an account that is
+# "ask" is used only with the approval hook's record of this very command
+# (asks.standin; lead decision 19.14).
+_CALL: dict[str, Any] = {}
+CLI_ASK_SCRIPT = ("gateway: {what} is set to \"ask\", and Claude Code can only ask about a "
+                  "command Claude runs itself; run `{tool} ...` as its own command (not inside a "
+                  "script, sh -c or a wrapper).")
+
+
+# "use" or "credential" when an account is "ask" in a mode (consent's, so
+# the approval hook and SessionStart need not import this module)
+_ask_verb = consent.account_ask_verb
+
+
+def _unasked(name: str, verb: str) -> str | None:
+    """None when Claude Code asked about this very command for account
+    `name`: a command Claude typed (ancestry.typed_by_claude) with the
+    approval hook's record of it (asks.standin); else why it can't be used."""
+    from . import ancestry, asks
+    tool, argv = str(_CALL.get("tool", "")), list(_CALL.get("argv", []))
+    phrase = consent.ask_phrase(name, verb)
+    try:
+        typed, culprit = ancestry.typed_by_claude()
+    except Exception:  # noqa: BLE001 - fail closed
+        typed, culprit = False, "?"
+    if not typed:
+        if culprit == ancestry.CHECKPOINT:
+            return consent.job_ask_message([phrase])
+        if culprit == ancestry.TERMINAL:
+            return consent.pane_ask_message([phrase])
+        return CLI_ASK_SCRIPT.format(what=phrase, tool=tool)
+    got = asks.standin(tool, argv, ("accounts", name))
+    return None if got == "ok" else asks.refusal(got, [phrase], f"{tool} ...")
+
+
 def _select(kind: str | tuple[str, ...], host: str, owner: str | None, form: formmod.Form,
             eff: Any, data: dict[str, Any]) -> acctmod.Selection:
-    return acctmod.select(kind, host, owner, form, effective=eff, vault=data, env=os.environ)
+    """accounts.select in the session's mode, as if Claude Code had asked
+    about every account that is "ask" there; the one it chooses then needs
+    that ask proved (_unasked), else the selection is that refusal."""
+    mode = getattr(eff, "mode", None)
+    kinds = (kind,) if isinstance(kind, str) else tuple(kind)
+    asking = {n for n, a in form.accounts.items() if a.kind in kinds and _ask_verb(eff, n, mode)}
+    sel = acctmod.select(kind, host, owner, form, effective=eff, vault=data, env=os.environ,
+                         mode=mode, asked=asking)
+    if sel.account is not None and sel.error is None and sel.account.name in asking:
+        why = _unasked(sel.account.name, _ask_verb(eff, sel.account.name, mode) or "use")
+        if why:
+            return acctmod.Selection(candidates=list(sel.candidates or []), error=why)
+    return sel
 
 
 def _check_direct(tool: str, account: formmod.Account, eff: Any) -> None:
@@ -193,15 +266,22 @@ def _check_direct(tool: str, account: formmod.Account, eff: Any) -> None:
                        f"{account.name}")
 
 
+def _audit_mode() -> str:
+    """The mode for this call's audit lines (lead decision 19.8): the one
+    _load resolved with, else the recorded mode, else "modeless"."""
+    from . import modes
+    return modes.standin_audit_mode(_CALL)
+
+
 def _refuse(tool: str, target: str | None, msg: str) -> int:
-    audit.refusal(tool, target, msg)
+    audit.refusal(tool, target, msg, mode=_audit_mode())
     print(msg, file=sys.stderr)
     return 2
 
 
 def _run(tool: str, real: str, argv: list[str], env: dict[str, str], secrets: list[str],
          account: str, target: str, users: tuple[str, ...] = (), cwd: str | None = None) -> int:
-    audit.use(tool, target, account, argv=[tool, *argv], secrets=secrets)
+    audit.use(tool, target, account, argv=[tool, *argv], secrets=secrets, mode=_audit_mode())
     try:
         return scrub.run([real, *argv], secrets, env=env, cwd=cwd, users=users)
     except OSError as e:
@@ -255,6 +335,12 @@ def gh_owner(argv: list[str], cwd: str | None) -> str | None:
 
 def _remote_owner(cwd: str | None, kind: str) -> str | None:
     """The owner of the cwd's upstream remote, else origin."""
+    where = _remote_where(cwd, kind)
+    return where[1] if where else None
+
+
+def _remote_where(cwd: str | None, kind: str) -> tuple[str, str] | None:
+    """(host, owner) of the cwd's upstream remote, else origin."""
     if not cwd:
         return None
     git = _system_git()
@@ -275,7 +361,7 @@ def _remote_owner(cwd: str | None, kind: str) -> str | None:
             if u.returncode == 0:
                 o = acctmod.owner_from_url(u.stdout.strip(), kind)
                 if o and o[1]:
-                    return o[1]
+                    return (o[0] or "").lower(), o[1]
         except (OSError, subprocess.TimeoutExpired):
             return None
     return None
@@ -284,7 +370,7 @@ def _remote_owner(cwd: str | None, kind: str) -> str | None:
 def _system_git() -> str | None:
     from . import envfile
     try:
-        return envfile.system_git()
+        return envfile.user_tool("git")
     except Exception:  # noqa: BLE001
         return None
 
@@ -446,23 +532,30 @@ def _gh_host_refused(argv: list[str], a: formmod.Account, host: str,
     return None
 
 
+def _gh_pick(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any],
+             cwd: str | None, select: Any) -> acctmod.Selection:
+    """The github account a gh command line uses (`select`: _select, or the
+    approval hook's probe in `chosen`): each github host the form knows
+    (github.com first), so a single GHES account is found too; GATE_ACCOUNT
+    is handled inside select."""
+    owner = gh_owner(argv, cwd)
+    gh_hosts = sorted({a.host or "github.com" for a in form.accounts.values() if a.kind == "github"},
+                      key=lambda h: (0 if h == "github.com" else 1, h))
+    sel = select("github", "github.com", owner, form, eff, data)
+    for h in (gh_hosts or ["github.com"]):
+        s = select("github", h, owner, form, eff, data)
+        if s.account is not None or s.error:
+            return s
+        sel = s
+    return sel
+
+
 def _gh(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any],
         cwd: str | None) -> int:
     refuse = _gh_refused(argv)
     if refuse:
         return _refuse("gh", None, refuse)
-    owner = gh_owner(argv, cwd)
-    # try each github host the form knows (github.com first), so a single GHES
-    # account is found too; GATE_ACCOUNT is handled inside select.
-    gh_hosts = sorted({a.host or "github.com" for a in form.accounts.values() if a.kind == "github"},
-                      key=lambda h: (0 if h == "github.com" else 1, h))
-    sel = _select("github", "github.com", owner, form, eff, data)
-    for h in (gh_hosts or ["github.com"]):
-        s = _select("github", h, owner, form, eff, data)
-        if s.account is not None or s.error:
-            sel = s
-            break
-        sel = s
+    sel = _gh_pick(argv, form, eff, data, cwd, _select)
     if sel.error:
         return _refuse("gh", "github.com", sel.error)
     if sel.account is None:
@@ -518,12 +611,16 @@ def _hf_refused(argv: list[str]) -> str | None:
     return None
 
 
+def _hf_target(argv: list[str]) -> tuple[str, str, str | None]:
+    """(kind, host, owner) hf's account is chosen by."""
+    return "huggingface", "huggingface.co", hf_owner(argv)
+
+
 def _hf(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any], cwd: str | None) -> int:
     refuse = _hf_refused(argv)
     if refuse:
         return _refuse("hf", None, refuse)
-    owner = hf_owner(argv)
-    sel = _select("huggingface", "huggingface.co", owner, form, eff, data)
+    sel = _select(*_hf_target(argv), form, eff, data)
     if sel.error:
         return _refuse("hf", "huggingface.co", sel.error)
     if sel.account is None:
@@ -607,20 +704,25 @@ def _db_workspace(argv: list[str], account: formmod.Account, cwd: str | None) ->
     return None
 
 
+def _db_ws(argv: list[str], form: formmod.Form, cwd: str | None) -> str | None:
+    """The workspace host a databricks command line goes to, when an azure
+    account lists it (the account is chosen by the workspace host it
+    lists); else None."""
+    azs = [a for a in form.accounts.values() if a.kind == "azure"]
+    listed = {h.lower() for a in azs for h in a.databricks}
+    for a in azs:
+        cand = _db_workspace(argv, a, cwd)
+        if cand and cand in listed:
+            return cand
+    return None
+
+
 def _databricks(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any],
                 cwd: str | None) -> int:
     refuse = _db_refused(argv)
     if refuse:
         return _refuse("databricks", None, refuse)
-    # the azure account is chosen by the workspace host it lists.
-    azs = [a for a in form.accounts.values() if a.kind == "azure"]
-    listed = {h.lower() for a in azs for h in a.databricks}
-    ws = None
-    for a in azs:
-        cand = _db_workspace(argv, a, cwd)
-        if cand and cand in listed:
-            ws = cand
-            break
+    ws = _db_ws(argv, form, cwd)
     if not ws:
         return _refuse("databricks", None, "gateway: name the workspace with DATABRICKS_HOST (one "
                        "of the azure account's databricks hosts)")
@@ -636,7 +738,7 @@ def _databricks(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, A
                        f"{a.name} while the user is here")
     _check_direct("databricks", a, eff)
     try:
-        token = entra.access_token(a.name, "databricks")
+        token = entra.access_token(a.name, "databricks", mode=_audit_mode())
     except entra.EntraError as e:
         return _refuse("databricks", ws, str(e) if str(e).startswith("gateway:")
                        else f"gateway: {e}")
@@ -686,6 +788,18 @@ def _crane(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any], 
         _rmtree(tmp)
 
 
+def _crane_target(host: str, owner: str | None) -> tuple[str, str, str | None]:
+    """(kind, host, owner) the account for an image on `host` is chosen by:
+    ghcr.io -> a github account by the image's owner; *.azurecr.io -> an
+    azure account by the registry; else a registry account."""
+    bare = host.split(":", 1)[0].lower()
+    if bare == "ghcr.io":
+        return "github", "ghcr.io", owner
+    if bare.endswith(".azurecr.io"):
+        return "azure", host, None
+    return "registry", host, owner
+
+
 def _crane_credential(host: str, owner: str | None, form: formmod.Form, eff: Any,
                       data: dict[str, Any]):
     """(user, secret, account, kind). The image owner picks the account:
@@ -693,7 +807,7 @@ def _crane_credential(host: str, owner: str | None, form: formmod.Form, eff: Any
     registry account. Returns an int refusal code in the first slot on error."""
     bare = host.split(":", 1)[0].lower()
     if bare == "ghcr.io":
-        sel = _select("github", "ghcr.io", owner, form, eff, data)
+        sel = _select(*_crane_target(host, owner), form, eff, data)
         if sel.error:
             return _refuse("crane", host, sel.error), "", "", ""
         if sel.account is None:
@@ -709,7 +823,7 @@ def _crane_credential(host: str, owner: str | None, form: formmod.Form, eff: Any
             return _refuse("crane", host, f"gateway: {a.name} has no token; run gate check {a.name}"), "", "", ""
         return (a.login or "x-access-token"), tok["value"], a.name, "github"
     if bare.endswith(".azurecr.io"):
-        sel = _select("azure", host, None, form, eff, data)
+        sel = _select(*_crane_target(host, owner), form, eff, data)
         if sel.error:
             return _refuse("crane", host, sel.error), "", "", ""
         if sel.account is None:
@@ -721,11 +835,11 @@ def _crane_credential(host: str, owner: str | None, form: formmod.Form, eff: Any
                            f"check {a.name}"), "", "", ""
         _check_direct("crane", a, eff)
         try:
-            rt = entra.acr_token(host, a.name)
+            rt = entra.acr_token(host, a.name, mode=_audit_mode())
         except entra.EntraError as e:
             return _refuse("crane", host, str(e) if str(e).startswith("gateway:") else f"gateway: {e}"), "", "", ""
         return entra.ACR_USER, rt, a.name, "azure"
-    sel = _select("registry", host, owner, form, eff, data)
+    sel = _select(*_crane_target(host, owner), form, eff, data)
     if sel.error:
         return _refuse("crane", host, sel.error), "", "", ""
     if sel.account is None:
@@ -749,6 +863,13 @@ def _crane_credential(host: str, owner: str | None, form: formmod.Form, eff: Any
 PIJUL_REFUSED = {"identity", "id", "key", "client"}
 
 
+def _pijul_target(form: formmod.Form) -> tuple[str, str, None]:
+    """(kind, host, owner) pijul's account is chosen by: the first pijul
+    account's host."""
+    pijuls = [a for a in form.accounts.values() if a.kind == "pijul"]
+    return "pijul", (pijuls[0].host if pijuls else "nest.pijul.com"), None
+
+
 def _pijul(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any], cwd: str | None) -> int:
     if not argv or argv[0].startswith("-"):
         return _refuse("pijul", None, "gateway: put the pijul command first, e.g. pijul log")
@@ -756,8 +877,7 @@ def _pijul(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any], 
         return _refuse("pijul", None, f"gateway: 'pijul {argv[0]}' is managed by the gateway")
     if any(a == "--config" or a.startswith("--config=") for a in argv):
         return _refuse("pijul", None, "gateway: the gateway sets pijul's config; drop --config")
-    pijuls = [a for a in form.accounts.values() if a.kind == "pijul"]
-    sel = _select("pijul", (pijuls[0].host if pijuls else "nest.pijul.com"), None, form, eff, data)
+    sel = _select(*_pijul_target(form), form, eff, data)
     if sel.error:
         return _refuse("pijul", None, sel.error)
     if sel.account is None:
@@ -992,19 +1112,35 @@ AZ_DIRECT = ("gateway: az account get-access-token gives a token only to a progr
              "tool with account \"{name}\"")
 
 
-def _az(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any]) -> int:
+def _az_account(form: formmod.Form, eff: Any) -> formmod.Account | None:
+    """The azure account the az stand-in serves: the first with an approved
+    `env`."""
     azs = [a for a in form.accounts.values() if a.kind == "azure"]
     enabled = [a for a in azs if (eff.accounts.get(a.name) and eff.accounts[a.name].env)]
-    if not enabled:
+    return enabled[0] if enabled else None
+
+
+def _az(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any]) -> int:
+    a = _az_account(form, eff)
+    if a is None:
         return _refuse("az", None, "gateway: the az stand-in is available only when an azure "
                        "account has env set (and the user has OK'd it)")
-    a = enabled[0]
+    if not eff.accounts[a.name].use:
+        # its use is off, waiting, or "ask": an "ask" only for a command
+        # Claude typed that the approval hook asked about (a program's
+        # token request never is one)
+        why = (_unasked(a.name, "use") if _ask_verb(eff, a.name, getattr(eff, "mode", None))
+               == "use" else f"gateway: {a.name} has use = false (or is waiting for the user's "
+               f"OK); see gate status {a.name}")
+        if why:
+            return _refuse("az", a.name, why)
     if argv[:2] == ["account", "show"]:
         who = {"environmentName": "AzureCloud", "tenantId": "", "user": {"name": a.login, "type": "user"}}
         e = (data.get("accounts") or {}).get(a.name, {}).get("entra") or {}
         who["tenantId"] = e.get("tenant_id", "")
         print(json.dumps(who, indent=2))
-        audit.use("az", "management.azure.com", a.name, argv=["account", "show"])
+        audit.use("az", "management.azure.com", a.name, argv=["account", "show"],
+                  mode=_audit_mode())
         return 0
     if argv[:2] == ["account", "get-access-token"]:
         resource = _flag_value(argv, "--resource")
@@ -1023,7 +1159,7 @@ def _az(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any]) -> 
             return _refuse("az", None, AZ_DIRECT.format(name=a.name))
         tok_scope = az_scope(a, eff.accounts[a.name], data, resource, scope)
         try:
-            token = entra.access_token(a.name, tok_scope)
+            token = entra.access_token(a.name, tok_scope, mode=_audit_mode())
         except entra.EntraError as ex:
             return _refuse("az", None, str(ex) if str(ex).startswith("gateway:") else f"gateway: {ex}")
         import time
@@ -1032,7 +1168,7 @@ def _az(argv: list[str], form: formmod.Form, eff: Any, data: dict[str, Any]) -> 
                "tokenType": "Bearer",
                "expires_on": int(time.time()) + 3600}
         audit.use("az", tok_scope, a.name,
-                  argv=["account", "get-access-token"], secrets=[token])
+                  argv=["account", "get-access-token"], secrets=[token], mode=_audit_mode())
         # Phase C decision (docs/dev/phaseB-requests/RESOLUTION.md), narrowed in
         # review round 2: the raw token is printed only to a program started
         # by Claude's command (an SDK's AzureCliCredential parses accessToken,
@@ -1055,11 +1191,220 @@ def _split_cwd() -> str | None:
     return cwd if os.path.isdir(cwd) else None
 
 
+# ---------------------------------------------------------------------------
+# Is the destination configured? (PLAN-0.11 §1.4: each stand-in resolves it
+# the way the tool itself would; a covered destination takes the gated path,
+# an uncovered one that can be told passes through to the user's own tool
+# with the user's own GH_TOKEN and the like, and one that can't be told takes
+# the gated path whenever an account of that kind exists for that host:
+# never the user's full-scope token there.)
+# ---------------------------------------------------------------------------
+
+_URLISH = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:)")
+
+
+def _hits(eff: Any, kinds: tuple[str, ...], host: str, owner: str | None) -> list[str]:
+    """The configured accounts of these kinds that cover (host, owner): its
+    destinations or ssh endpoints, and the owner by login and owners, the
+    default, the only account of its kind there, or no owner named (the
+    shared git resolver's rule, gitroute.Targets.hits)."""
+    from . import gitroute
+    c = getattr(eff, "configured", None)
+    if c is None or not host:
+        return []
+    where = gitroute.parse_url(f"https://{host}/{owner}/x" if owner else f"https://{host}/")
+    names = {n for sect, n in c.git_targets().hits(where) if sect == "accounts"}
+    return [r.name for r in c.reaches() if r.kind in kinds and r.name in names]
+
+
+def _env_host(var: str) -> str | None:
+    v = (os.environ.get(var) or "").strip()
+    if not v:
+        return None
+    return v.split("://", 1)[-1].split("/", 1)[0].lower() or None
+
+
+# gh commands that act on the current repository when none is named (its
+# remote's host and owner then decide, before GH_HOST)
+_GH_REPO_CONTEXT = frozenset({"pr", "issue", "release", "run", "workflow", "secret", "variable",
+                              "cache", "label", "browse", "ruleset", "attestation"})
+_GH_REPO_SUBS = frozenset({"view", "edit", "sync", "rename", "archive", "unarchive", "delete",
+                           "set-default", "deploy-key", "autolink", "fork"})
+
+
+def _gh_dest(argv: list[str], cwd: str | None) -> tuple[str, str | None]:
+    """(host, owner) a gh command line goes to, as gh resolves them: a host
+    on the command line (--hostname, -R HOST/OWNER/REPO, a URL), GH_REPO's,
+    the current repository's remote for a command that acts on it when no
+    repository is named, GH_HOST, else github.com (gh's default; PLAN-0.11
+    §1.4); the owner from -R, GH_REPO, a URL, an API path or an OWNER/REPO
+    argument, else that remote's (None: it can't be told)."""
+    hosts = [h for h in gh_hosts(argv) if h]
+    repo_env = (os.environ.get("GH_REPO") or "").strip()
+    host = hosts[0].lower() if hosts else None
+    if host is None and repo_env.count("/") >= 2:
+        host = repo_env.split("/", 1)[0].lower()
+    named = gh_owner(argv, None)
+    owner = named
+    if owner is None and repo_env:
+        parts = repo_env.split("/")
+        owner = parts[-2] if len(parts) >= 2 else None
+    top = argv[0] if argv else ""
+    sub = argv[1] if len(argv) > 1 else ""
+    if named is None and not repo_env and (
+            top in _GH_REPO_CONTEXT or (top == "repo" and sub in _GH_REPO_SUBS)):
+        where = _remote_where(cwd, "github")
+        if where:
+            host = host or where[0] or None
+            owner = where[1]
+    return host or _env_host("GH_HOST") or "github.com", owner
+
+
+def destination(tool: str, argv: list[str], cwd: str | None, eff: Any) -> tuple[bool, str | None]:
+    """(covered, target) for an account CLI's command line: covered False
+    only when the destination can be told and no configured account covers
+    it (the user's own tool runs); `target` is the host or owner for the
+    pass-through's audit line."""
+    if tool == "gh":
+        host, owner = _gh_dest(argv, cwd)
+        # an account's api. host counts as its own (the gated path decides
+        # whether it is bound)
+        api = host[4:] if host.startswith("api.") else None
+        return bool(_hits(eff, ("github",), host, owner) or
+                    (api and _hits(eff, ("github",), api, owner))), owner or host
+    if tool == "hf":
+        host = _env_host("HF_ENDPOINT") or "huggingface.co"
+        owner = hf_owner(argv)
+        return bool(_hits(eff, ("huggingface",), host, owner)), owner or host
+    if tool == "databricks":
+        ws = _env_host("DATABRICKS_HOST")
+        if ws is None and cwd and not _flag_value(argv, "--profile", "-p"):
+            try:
+                m = re.search(r"host:\s*(\S+)", (Path(cwd) / "databricks.yml").read_text())
+                ws = m.group(1).split("://", 1)[-1].split("/", 1)[0].lower() if m else None
+            except OSError:
+                ws = None
+        if ws is None:
+            return True, None                 # can't be told: the gated path decides
+        return bool(_hits(eff, ("azure",), ws, None)), ws
+    if tool == "crane":
+        host, owner = crane_owner(argv)
+        if not host:
+            return True, None
+        return bool(_hits(eff, ("github", "azure", "registry"), host, owner)), host
+    if tool == "pijul":
+        hosts = []
+        for a in argv[1:]:
+            if _URLISH.match(a):
+                o = acctmod.owner_from_url(a, "pijul")
+                if o:
+                    hosts.append((o[0], o[1]))
+        if not hosts:
+            return True, None
+        return any(_hits(eff, ("pijul",), h, o) for h, o in hosts), hosts[0][0]
+    if tool == "az":
+        tenant = _flag_value(argv, "--tenant", "-t")
+        if tenant:
+            known = {(a.tenant or "").lower() for a in eff.accounts.values() if a.kind == "azure"}
+            if tenant.lower() not in known:
+                return False, None
+        return True, None
+    return True, None
+
+
+CLI_KINDS = consent.CLI_KINDS
+
+
+def _cli_entries(tool: str, eff: Any) -> list[str]:
+    c = getattr(eff, "configured", None)
+    return [r.name for r in (c.reaches() if c is not None else [])
+            if r.kind in CLI_KINDS.get(tool, ())]
+
+
+def chosen(tool: str, argv: list[str], cwd: str | None, eff: Any, mode: str | None,
+           account: str | None = None) -> list[str]:
+    """The account this stand-in would use for `TOOL ARGV` in `cwd` (as
+    _select sees it: every account that is "ask" in `mode` counted as asked
+    about), with GATE_ACCOUNT = `account` (a name, aliases already
+    followed); [] when it would use none (it refuses, or runs without one).
+    The same choice the stand-in makes (_gh_pick, _hf_target, _db_ws,
+    _crane_target, _pijul_target, _az_account), but no record is taken and
+    no credential bound check is made. `eff` is computed for `mode`."""
+    form = eff.form
+    env = {"GATE_ACCOUNT": account} if account else {}
+
+    def probe(kind: str | tuple[str, ...], host: str, owner: str | None, form: formmod.Form,
+              eff: Any, data: dict[str, Any]) -> acctmod.Selection:
+        kinds = (kind,) if isinstance(kind, str) else tuple(kind)
+        asking = {n for n, a in form.accounts.items() if a.kind in kinds and _ask_verb(eff, n, mode)}
+        return acctmod.select(kind, host, owner, form, effective=eff, vault=None, env=env,
+                              mode=mode, asked=asking)
+    if tool == "gh":
+        sel = _gh_pick(argv, form, eff, {}, cwd, probe)
+    elif tool == "hf":
+        sel = probe(*_hf_target(argv), form, eff, {})
+    elif tool == "databricks":
+        ws = _db_ws(argv, form, cwd)
+        if not ws:
+            return []
+        sel = probe("azure", ws, None, form, eff, {})
+    elif tool == "crane":
+        host, owner = crane_owner(argv)
+        if not host:
+            return []
+        sel = probe(*_crane_target(host, owner), form, eff, {})
+    elif tool == "pijul":
+        sel = probe(*_pijul_target(form), form, eff, {})
+    elif tool == "az":
+        a = _az_account(form, eff)
+        return [a.name] if a is not None else []
+    else:
+        return []
+    return [sel.account.name] if sel.account is not None and sel.error is None else []
+
+
+def ask_accounts(tool: str, argv: list[str], cwd: str | None, eff: Any,
+                 mode: str | None, account: str | None = None,
+                 known: bool = True) -> list[tuple[str, str]]:
+    """For the approval hook (lead decision 19.14): (account, "use" or
+    "credential") for the account this command line will use (chosen: the
+    stand-in's own choice, with GATE_ACCOUNT = `account`) when it is "ask"
+    in `mode` and the destination is covered (destination: this stand-in's
+    own rule). The hook asks about the command and records it, so the
+    stand-in may use that account after the user's OK (_select). A
+    GATE_ACCOUNT the hook can't spell out (`known` False): every "ask"
+    account of the tool's kinds, since any may be the one named. `eff` is
+    computed for `mode`."""
+    kinds = CLI_KINDS.get(tool, ())
+    verbs = {n: v for n, ea in eff.accounts.items()
+             if ea.kind in kinds and (v := _ask_verb(eff, n, mode))}
+    if not verbs:
+        return []                     # nothing "ask": no destination to work out
+    covered, _target = destination(tool, argv, cwd, eff)
+    if not covered:
+        return []
+    names = list(verbs) if not known else chosen(tool, argv, cwd, eff, mode, account)
+    return [(n, verbs[n]) for n in names if n in verbs]
+
+
 def main(tool: str, argv: list[str]) -> int:
-    """Stand-in for tool in gh|hf|databricks|crane|pijul|az (SPEC 9.5)."""
+    """Stand-in for tool in gh|hf|databricks|crane|pijul|az (SPEC 9.5;
+    PLAN-0.11 §1.4): a destination no configured account covers runs the
+    user's own tool (envfile.pass_through); everything else as before."""
+    from . import asks
+    asks.reset()
+    _CALL.clear()
+    _CALL.update(tool=tool, argv=list(argv))
     cwd = _split_cwd()
     try:
         form, eff, data = _load()
+        covered, target = destination(tool, argv, cwd, eff)
+        if not covered:
+            from . import envfile
+            return envfile.pass_through(tool, list(argv), target,
+                                        entries=_cli_entries(tool, eff))
+        if _UNREADABLE.get("message"):
+            return _refuse(tool, target, _UNREADABLE["message"])
         if tool == "gh":
             return _gh(argv, form, eff, data, cwd)
         if tool == "hf":
@@ -1083,10 +1428,55 @@ def main(tool: str, argv: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 ENV_BY_KIND = {"api-key": None, "huggingface": "HF_TOKEN", "github": "GH_TOKEN"}
+WITH_OFF = ("gateway: {name} has use = false here (or a change to it waits for the user's OK); "
+            "see gate status {name}")
+WITH_ASK_SCRIPT = ("gateway: {what} is set to \"ask\", and Claude Code can only ask about a "
+                   "command Claude runs itself; run `gate with {name} -- ...` as its own command "
+                   "(not inside a script, sh -c or a wrapper).")
+
+
+def _with_refused(name: str, ea: Any, eff: Any, words: list[str]) -> str | None:
+    """Why `gate with NAME -- CMD` may not hand over NAME's key (the
+    reviewer's MF2): its use in the session's mode is off or waits for the
+    user's OK; its credential policy refuses (policy.decide); or either is
+    "ask" and this isn't a command Claude typed that the approval hook asked
+    about (asks.standin: its record of `gate WORDS`, that is `gate with NAME
+    -- CMD`, taken once). None: hand it over."""
+    from . import ancestry, asks, policy
+    mode = getattr(eff, "mode", None)
+    try:
+        use = eff.word(name, "use", mode)
+        cred = policy.decide(eff, "credential", account=name, mode=mode)
+    except (AttributeError, KeyError, ValueError):
+        return WITH_OFF.format(name=name)
+    if use != "ask" and not ea.use:
+        return WITH_OFF.format(name=name)
+    if cred.word is not True and cred.word != "ask":
+        return cred.message(f"using {name}'s credential")
+    verb = "use" if use == "ask" else ("credential" if cred.word == "ask" else None)
+    if verb is None:
+        return None
+    phrase = consent.ask_phrase(name, verb)
+    try:
+        typed, culprit = ancestry.typed_by_claude()
+    except Exception:  # noqa: BLE001 - fail closed
+        typed, culprit = False, "?"
+    if not typed:
+        if culprit == ancestry.CHECKPOINT:
+            return consent.job_ask_message([phrase])
+        if culprit == ancestry.TERMINAL:
+            return consent.pane_ask_message([phrase])
+        return WITH_ASK_SCRIPT.format(what=phrase, name=name)
+    got = asks.standin("gate", words, ("accounts", name))
+    return None if got == "ok" else asks.refusal(got, [phrase], f"gate with {name} -- ...")
 
 
 def with_main(argv: list[str]) -> int:
-    """`gate with NAME -- CMD` (SPEC 9.7)."""
+    """`gate with NAME -- CMD` (SPEC 9.7): the account's key in its `env`
+    variable for CMD, only while its use and credential policy allow it in
+    the session's mode ("ask": the approval hook's record, _with_refused)."""
+    from . import asks
+    asks.reset()
     if "--" not in argv or argv.index("--") == 0:
         print("gateway: usage: gate with NAME -- COMMAND ...", file=sys.stderr)
         return 2
@@ -1122,6 +1512,9 @@ def with_main(argv: list[str]) -> int:
         print(f"gateway: `gate with` only gives the key to Claude's own command; {resolved} would "
               "need scripts = true to reach a program it starts", file=sys.stderr)
         return 2
+    why = _with_refused(resolved, ea, eff, ["with", *argv])
+    if why:
+        return _refuse("with", resolved, why)
     rec = (data.get("accounts") or {}).get(resolved) or {}
     tok = rec.get("token") or {}
     if tok.get("stale"):
@@ -1134,7 +1527,8 @@ def with_main(argv: list[str]) -> int:
     var = a.env  # the form's variable name (validated)
     env = dict(os.environ)
     env[var] = value
-    audit.use("with", resolved, resolved, argv=["with", resolved, "--", *cmd[:8]], secrets=[value])
+    audit.use("with", resolved, resolved, argv=["with", resolved, "--", *cmd[:8]], secrets=[value],
+              mode=_audit_mode())
     try:
         return scrub.run(cmd, [value], env=env, cwd=_split_cwd())
     except FileNotFoundError:

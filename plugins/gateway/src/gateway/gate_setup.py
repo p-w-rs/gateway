@@ -19,10 +19,18 @@ check NAME (the eager setup, idempotent):
      ssh.verify_remote_sudo); an account's token (a GitHub personal access
      token, a Hugging Face token, an API key) or an Azure service principal's
      client secret, verified where the kind allows (GitHub GET /user, Hugging
-     Face whoami, an Entra client-credentials token). Browser and device-code
-     sign-ins are unavailable (popup.signin_unavailable says what works);
-     an existing refresh token keeps working;
-  4. one status line. An entry already set up prints its status and exits 0.
+     Face whoami, an Entra client-credentials token);
+  4. an azure account with sign_in = "browser", or an ml-catalog account,
+     that needs a sign-in: the browser sign-in (PLAN-0.11 §7), after the
+     consent step, from this process (it runs below the session): a sign-in
+     lease from gated (entra.signin_start), whose confirm dialog (Open /
+     Cancel) is gated's own; gated opens the system browser, takes the
+     callback on 127.0.0.1 and stores the tokens itself; this waits for the
+     fixed outcome (entra.signin_wait) within the command's budget (exit 75
+     after it: gated finishes the sign-in on its own). Where it can't run:
+     popup.signin_unavailable. A refresh token an older gateway stored is
+     never used: the account signs in again;
+  5. one status line. An entry already set up prints its status and exits 0.
 
 A request the user cancelled in this session isn't reopened by `gate check`
 until the user writes again (the prompt hook clears the marker).
@@ -35,7 +43,8 @@ secret NAME  removed (it was a terminal prompt): says where credentials are
 
 Where no native dialog can open (claude -p, the Agent SDK, mods off, mobile,
 VS Code, Remote Control), `gate check` asks nothing and says so; nothing is
-ever asked in a terminal, a browser or an OS dialog.
+ever asked in a terminal or an OS dialog, and the system browser opens only
+for the browser sign-in, after the person's Open in the gateway's dialog.
 
 Each command returns an exit code and prints its own status line.
 """
@@ -204,6 +213,11 @@ def status_line(name: str, form: formmod.Form, eff: consent.Effective, data: dic
         e = eff.hosts[name]
         h = form.hosts[name]
         if e.is_local:
+            if "sudo" not in e.modes:
+                # PLAN-0.11 §1.5: nothing configures this computer's sudo
+                return ("gateway: localhost: sudo here is your own (not through the gateway); "
+                        "to have the gateway ask for its password in its dialog, set "
+                        "[hosts.localhost] sudo (gate host set localhost sudo ask)")
             user = paths.local_user()
             st = meta["localhost"]["sudo"].get(user)
             extra = ""
@@ -242,10 +256,14 @@ def status_line(name: str, form: formmod.Form, eff: consent.Effective, data: dic
         e = eff.accounts[name]
         a = form.accounts[name]
         am = meta["accounts"].get(name) or {}
+        ent = am.get("entra_info") or {}
         if am.get("stale"):
             st = "token rejected"
-        elif am.get("entra"):
-            st = "signed in" + (f" as {a.login}" if a.login else "")
+        elif a.kind in ("azure", "ml-catalog") and acctmod.entra_stored(ent):
+            # the one rule gate check and use follow: an older gateway's
+            # sign-in, or one for settings that changed since, isn't one
+            st = ("signed in" + (f" as {a.login}" if a.login else "")
+                  if acctmod.entra_fits(a, ent) else "needs a new sign-in")
         elif am.get("token"):
             st = ("signed in" if am.get("token_source") == "gh-oauth" else "token saved") + (
                 f" as {a.login}" if a.login and a.kind in ("github", "huggingface") else "")
@@ -261,8 +279,14 @@ def status_line(name: str, form: formmod.Form, eff: consent.Effective, data: dic
     if name == "settings":
         sh = eff.shell
         imports = ", ".join(sh.import_path + sh.import_env) or "none"
-        return (f"gateway: settings: others = \"{eff.others}\"; managed shell \"{sh.managed}\"; "
-                f"imports: {imports}")
+        return f"gateway: settings: managed shell \"{sh.managed}\"; imports: {imports}"
+    if name in eff.hosts or name in eff.accounts:
+        # a removed entry whose approval still gates (PLAN-0.11 §1.1)
+        return (f"gateway: {name} is gone from gateway.toml but still goes through the gateway "
+                f"until the user's OK (gate check {name})")
+    if name not in eff.configured:
+        return (f"gateway: {name} no longer goes through the gateway: Claude uses the user's own "
+                "tools for it now")
     return f"gateway: {name}: nothing to do"
 
 
@@ -274,7 +298,7 @@ def status_line(name: str, form: formmod.Form, eff: consent.Effective, data: dic
 @dataclass
 class Plan:
     name: str
-    section: str                       # hosts | accounts | settings
+    section: str                       # hosts | accounts | settings | removed
     changes: list[consent.Change] = field(default_factory=list)
     scanned: list[str] = field(default_factory=list)
     pinned: list[str] = field(default_factory=list)
@@ -285,6 +309,7 @@ class Plan:
     needs_sudo: bool = False
     needs_signin: bool = False
     force_signin: bool = False
+    browser: bool = False              # the sign-in is the browser one (gated runs it)
     notes: list[str] = field(default_factory=list)
     error: str | None = None           # stop before any pop-up (exit 1) with this message
 
@@ -356,16 +381,13 @@ def _relogin(name: str) -> tuple[bool, bool]:
 
 
 def _account_has_credential(a: formmod.Account, rec: dict[str, Any]) -> bool:
+    """A usable credential of the kind the account's settings ask for (an
+    Entra one: accounts.entra_fits, the rule the status lines use too)."""
     tok = rec.get("token") or {}
     if a.kind in ("github", "huggingface", "registry", "api-key"):
         return bool(tok.get("value")) and not tok.get("stale")
     if a.kind in ("azure", "ml-catalog"):
-        ent = rec.get("entra") or {}
-        if not ent.get("refresh_token") and not (a.kind == "azure" and ent.get("client_secret")):
-            return False
-        if a.kind == "ml-catalog" and not (rec.get("bound") or {}).get("scope"):
-            return False
-        return True
+        return acctmod.entra_fits(a, vault.entra_info(rec))
     if a.kind == "pijul":
         return bool((rec.get("ssh_key") or {}).get("private"))
     return True
@@ -382,6 +404,10 @@ def plan_for(name: str, form: formmod.Form, eff: consent.Effective, data: dict[s
              *, force_signin: bool = False) -> Plan:
     if name == "settings":
         return Plan(name, "settings", changes=eff.pending_for("settings"))
+    if name not in form.hosts and name not in form.accounts:
+        # a configured entry the form no longer names (PLAN-0.11 §1.1): only
+        # its removal to approve (the dialog says it leaves the gateway)
+        return Plan(name, "removed", changes=eff.pending_for(name))
     if name in form.hosts:
         p = Plan(name, "hosts", changes=eff.pending_for(name))
         h = form.hosts[name]
@@ -396,8 +422,8 @@ def plan_for(name: str, form: formmod.Form, eff: consent.Effective, data: dict[s
             wants_ssh = h.ssh is not False
             if wants_ssh:
                 # Every gate check reads the host key, also for a host that is
-                # set up (round 3): a changed key goes to the host-key pop-up
-                # here (and `gate secret NAME` answers a pending one this way).
+                # set up (round 3): a changed key goes to the host-key dialog
+                # here.
                 p.scanned, why = _keyscan(name, h)
                 if not p.scanned:
                     why = why or f"couldn't read {name}'s host key"
@@ -434,7 +460,9 @@ def plan_for(name: str, form: formmod.Form, eff: consent.Effective, data: dict[s
                         p.notes.append(f"{name} refused Claude's key; it will be installed again")
                     elif not ok:
                         p.notes.append(f"couldn't log in to {name} to check Claude's key")
-        if h.sudo is not False:
+        if h.sudo is not False and h.mode_value("sudo") is not None:
+            # (this computer's sudo that nothing configures is the user's own:
+            # nothing to set up; PLAN-0.11 §1.5)
             user = paths.local_user() if h.is_local else h.user()
             st = vault.sudo_entry(data, name, user)
             have = bool(st and st.get("password") and not st.get("stale"))
@@ -458,12 +486,33 @@ def plan_for(name: str, form: formmod.Form, eff: consent.Effective, data: dict[s
     # stored under that name before (consent.drops_credential): ask anew
     p.needs_signin = (force_signin or not _account_has_credential(a, rec)
                       or bool(p.changes and consent.drops_credential(data, a)))
-    # A sign-in only a browser or a device code could do: say so before any
-    # dialog (nothing to approve that couldn't be used), with what works.
-    if p.needs_signin and (a.kind == "ml-catalog" or (
-            a.kind == "azure" and (not a.client_id or a.client_id == formmod.AZURE_CLI_CLIENT_ID))):
-        p.error = popup.signin_unavailable(a.kind, name)
+    if a.kind == "ml-catalog" and not p.needs_signin and a.host \
+            and consent.bound_ok(data, name, a.host):
+        # PLAN-0.11 §7.4: a catalog that names another client id than the one
+        # pinned at the sign-in needs a new one (its dialog shows the change)
+        try:
+            now = str(catalog_config(a.host).get("clientId") or "")
+        except Exception:  # noqa: BLE001 - unreachable now: nothing learned
+            now = ""
+        if now and now != str((rec.get("entra") or {}).get("client_id") or ""):
+            p.needs_signin = True
+            p.notes.append(f"the catalog now names another client id than {name} signed in "
+                           "with; it signs in again")
+    p.browser = p.needs_signin and acctmod.browser_sign_in(a)
+    # A service principal needs its own app registration: say so before any
+    # dialog (nothing to approve that couldn't be used)
+    if p.needs_signin and a.kind == "azure" and not p.browser and (
+            not a.client_id or a.client_id == formmod.AZURE_CLI_CLIENT_ID):
+        p.error = SP_NEEDS_CLIENT.format(name=name)
     return p
+
+
+SP_NEEDS_CLIENT = (
+    "gateway: {name} signs in with a service principal (the default), which needs the service "
+    "principal's own client_id (its application id, not the Azure CLI's) in [accounts.{name}]; "
+    "add it (only if the user agrees), then run gate check {name}. To sign in as the user in "
+    "the browser instead, the account needs sign_in = \"browser\" and a public client's "
+    "client_id.")
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +572,9 @@ def _consent_step(p: Plan) -> None:
             break
         oc = popup.consent(p.name, changes, extra_lines=extra)
         if oc != popup.Outcome.OK:
-            raise _Stop(oc, popup.message(oc, p.name, "consent"))
+            # (failed with no dialog: more changes than CONSENT_PARTS dialogs show)
+            raise _Stop(oc, popup.message(oc, p.name, "consent",
+                                          popup._LAST_REASON if oc == popup.Outcome.FAILED else ""))
         form, eff, _data = _reload()
         try:
             if changes:
@@ -547,11 +598,15 @@ def _consent_step(p: Plan) -> None:
 
 
 def _ensure_key(name: str) -> None:
+    made = False
     with vault.edit() as data:
         rec = vault.host_record(data, name)
         if not vault.live_keys(rec):
             priv, pub = vault.generate_ssh_key(vault.key_comment(name, data))
             rec["keys"].append(vault.key_record(priv, pub))
+            made = True
+    if made:
+        popup.offer_passphrase()             # PLAN-0.11 §8 (the vault's lock is released)
 
 
 def _key_step(name: str, form: formmod.Form) -> list[str]:
@@ -631,8 +686,8 @@ def sudo_question(name: str, user: str, local: bool, have: bool) -> str:
     where = "this machine" if local else name
     q = (f"sudo on {where} asks {user}'s password. Store it now (encrypted in the gateway's "
          "vault; Claude's own sudo commands get it through a one-time helper), or leave it to "
-         "the gateway's dialog each time a command needs sudo (its Remember it box keeps it then, "
-         "unticked it is used once).")
+         "the gateway's dialog each time a command needs sudo (used once, unless you tick its "
+         "Remember it box, which starts unticked).")
     if not local:
         q += (f" A password is placed briefly on {name} for each sudo command, where other "
               "commands Claude runs there could read it.")
@@ -649,8 +704,8 @@ def sudo_check(name: str, local: bool) -> dict[str, Any]:
 def _sudo_step(name: str) -> list[str]:
     form, eff, data = _reload()
     h = form.hosts[name]
-    if eff.hosts[name].sudo is False:
-        return []
+    if eff.hosts[name].sudo is False or "sudo" not in eff.hosts[name].modes:
+        return []          # off, or this computer's sudo that nothing configures
     if not h.is_local and eff.hosts[name].ssh is False:
         return []          # remote sudo runs over ssh, which is off for this host
     local = h.is_local
@@ -693,6 +748,7 @@ def _store_token(name: str, kind: str, value: str, source: str, login: str | Non
             rec["login"] = login
     vault.cache_clear(name) if paths.cache_path().exists() else None
     audit.log("secret_saved", entry=name, what="token", source=source)
+    popup.offer_passphrase()                 # PLAN-0.11 §8 (the vault's lock is released)
 
 
 def _fill_login(name: str, a: formmod.Account, login: str | None) -> None:
@@ -824,12 +880,12 @@ def _signin_step(name: str) -> list[str]:
         if oc != popup.Outcome.OK or not tok:
             raise _Stop(oc, popup.message(oc, name, "token"))
         _store_token(name, a.kind, tok, "pasted")
-    elif a.kind == "azure":
+    elif a.kind == "azure" and not acctmod.browser_sign_in(a):
         # A service principal (the account's own app registration: tenant and
-        # client_id in gateway.toml) and its client secret. Browser and
-        # device-code sign-ins are unavailable (brief section 11).
+        # client_id in gateway.toml) and its client secret or certificate. The
+        # browser sign-in never runs here (check_one: gated runs it).
         if not a.tenant or not a.client_id or a.client_id == formmod.AZURE_CLI_CLIENT_ID:
-            raise _Stop(popup.Outcome.FAILED, popup.signin_unavailable("azure", name))
+            raise _Stop(popup.Outcome.FAILED, SP_NEEDS_CLIENT.format(name=name))
         tenant, client = a.tenant, a.client_id
         # PLAN-v4 phase 7: a client secret or a certificate (both the
         # service principal's own credentials; a certificate's private key
@@ -855,15 +911,16 @@ def _signin_step(name: str) -> list[str]:
                                 lazy=False, check=_account_check(a), pem=cert)
         if oc != popup.Outcome.OK:
             raise _Stop(oc, popup.message(oc, name, what))
-    elif a.kind == "ml-catalog":
-        raise _Stop(popup.Outcome.FAILED, popup.signin_unavailable("ml-catalog", name))
     elif a.kind == "pijul":
         with vault.edit() as data:
             rec = vault.account_record(data, name, "pijul")
-            if not (rec.get("ssh_key") or {}).get("private"):
+            made = not (rec.get("ssh_key") or {}).get("private")
+            if made:
                 priv, pub = vault.generate_ssh_key(vault.key_comment(name, data))
                 rec["ssh_key"] = {"private": priv, "public": pub, "fingerprint": vault.fingerprint_of(pub)}
             pub = rec["ssh_key"]["public"]
+        if made:
+            popup.offer_passphrase()         # PLAN-0.11 §8 (the vault's lock is released)
         oc, _ = popup.text(name, f"Add this public key to your account on {a.host or 'nest.pijul.com'} "
                            "(profile > SSH keys), then press OK.", default=pub, what="public key")
         if oc != popup.Outcome.OK:
@@ -901,10 +958,11 @@ def _job(p: Plan) -> tuple[str, str]:
                                 f"from here?), so Claude's key wasn't installed; run gate check "
                                 f"{p.name} again when it is")
                 notes += _key_step(p.name, form)
-            if h.sudo is not False and (p.needs_sudo or p.needs_key):
+            if h.sudo is not False and h.mode_value("sudo") is not None \
+                    and (p.needs_sudo or p.needs_key):
                 notes += _sudo_step(p.name)
         elif p.section == "accounts":
-            if p.needs_signin:
+            if p.needs_signin and not p.browser:
                 notes += _signin_step(p.name)
         form, eff, data = _reload()
         return popup.Outcome.OK, with_notes(status_line(p.name, form, eff, data), notes)
@@ -932,7 +990,18 @@ def settings_clash(form: formmod.Form) -> str | None:
     return None
 
 
-def _resolve(name: str, form: formmod.Form, data: dict[str, Any]) -> str | None:
+def removed_entries(form: formmod.Form, eff: consent.Effective) -> list[str]:
+    """Configured entries the form no longer names whose removal waits for
+    the user's OK (PLAN-0.11 §1.1: the approved entry keeps gating until
+    then); `gate check NAME` and `gate check all` bring them to the dialog."""
+    return [n for n in eff.pending_names()
+            if n != "settings" and n not in form.hosts and n not in form.accounts
+            and (n in eff.hosts and eff.hosts[n].removed or n in eff.accounts
+                 and eff.accounts[n].removed)]
+
+
+def _resolve(name: str, form: formmod.Form, data: dict[str, Any],
+             eff: consent.Effective | None = None) -> str | None:
     if name == "settings":
         clash = settings_clash(form)
         if clash:
@@ -943,6 +1012,8 @@ def _resolve(name: str, form: formmod.Form, data: dict[str, Any]) -> str | None:
     if not formmod.safe(real) or not formmod.NAME_RE.fullmatch(real):
         _err("gateway: that isn't a valid entry name (see gate status)")
         return None
+    if eff is not None and real in removed_entries(form, eff):
+        return real                 # its removal waits for the OK: the dialog brings it
     if real not in form.hosts and real not in form.accounts:
         if form.is_disabled(real, "hosts") or form.is_disabled(real, "accounts"):
             _err(f"gateway: {real} is off because of a mistake in gateway.toml:")
@@ -961,7 +1032,7 @@ def _resolve(name: str, form: formmod.Form, data: dict[str, Any]) -> str | None:
 
 def check_one(name: str, *, force_signin: bool = False) -> int:
     form, eff, data = _load()
-    real = _resolve(name, form, data)
+    real = _resolve(name, form, data, eff)
     if real is None:
         if name == "settings" or not (form.is_disabled(name, "hosts")
                                       or form.is_disabled(name, "accounts")):
@@ -973,7 +1044,7 @@ def check_one(name: str, *, force_signin: bool = False) -> int:
     p = plan_for(real, form, eff, data, force_signin=force_signin)
     if p.error:
         _err(p.error)
-        audit.refusal("gate", real, p.error)
+        audit.refusal("gate", real, p.error, mode="modeless")   # gate: the modeless rule
         return 1
     for n in p.notes:
         _err(f"gateway: {n}")
@@ -988,23 +1059,91 @@ def check_one(name: str, *, force_signin: bool = False) -> int:
         _err(f"gateway: the user cancelled the gateway dialog for {real} in this session; ask "
              f"them before running gate check {real} again")
         return 1
-    try:
-        outcome, line = popup.run(real, "setup", lambda: _job(p), kind="setup",
-                                  digest=p.digest(), lazy=False,
-                                  notice=f"gateway: waiting for the user in the gateway dialog "
-                                         f"for {real} in Claude Code")
-    except popup.StillOpen:
-        return popup.EX_TEMPFAIL
-    if outcome == popup.Outcome.OK:
-        _out(line or status_line(real, *_reload()))
-        return 0
-    if outcome == popup.Outcome.UNAVAILABLE:
-        return 1      # popup printed why no dialog could open
-    if isinstance(line, str) and line:
-        _err(line)
-    else:
-        _err(popup.message(outcome, real, "setup"))
-    return 1
+    if p.changes or p.pin or p.mismatch or p.needs_key or p.needs_sudo or (
+            p.needs_signin and not p.browser):
+        try:
+            outcome, line = popup.run(real, "setup", lambda: _job(p), kind="setup",
+                                      digest=p.digest(), lazy=False,
+                                      notice=f"gateway: waiting for the user in the gateway dialog "
+                                             f"for {real} in Claude Code")
+        except popup.StillOpen:
+            return popup.EX_TEMPFAIL
+        if outcome == popup.Outcome.OK and not p.browser:
+            _out(line or status_line(real, *_reload()))
+            return 0
+        if outcome == popup.Outcome.UNAVAILABLE:
+            return 1      # popup printed why no dialog could open
+        if outcome != popup.Outcome.OK:
+            if isinstance(line, str) and line:
+                _err(line)
+            else:
+                _err(popup.message(outcome, real, "setup"))
+            return 1
+    # the browser sign-in (PLAN-0.11 §7), after the consent: from this
+    # process, which runs below the session (gated asks for Open itself)
+    return _browser_signin(real, key, p.digest())
+
+
+SIGNIN_WAITING = ("gateway: waiting for the user's browser sign-in for {name} (the gateway's "
+                  "dialog in Claude Code: Open, then the browser)")
+SIGNIN_STILL_OPEN = ("gateway: the browser sign-in for {name} is still open (the gateway's dialog "
+                     "in Claude Code, or the browser); tell the user once and carry on with other "
+                     "work. The gateway stores it when it finishes; retry gate check {name} "
+                     "after that.")
+SIGNIN_LOST = ("gateway: the browser sign-in for {name} was lost ({why}); nothing was stored. "
+               "Run gate check {name} again")
+# where a sign-in could run but not now (the dialogs' reason codes)
+SIGNIN_LATER = {
+    "busy": ("gateway: the browser sign-in for {name} can't start now: too many gateway dialogs "
+             "are open. Run gate check {name} again once the user has answered them"),
+    "paused": ("gateway: the browser sign-in for {name} can't start now: the task is paused "
+               "(checkpoint). Run gate check {name} again after the user resumes it"),
+}
+
+
+def _browser_signin(name: str, key: str, digest: str) -> int:
+    """Start the browser sign-in in gated and wait for its fixed outcome
+    within the command's budget (exit 75 after it: gated goes on and stores
+    the tokens itself). The code, the verifier and the tokens stay in gated."""
+    from . import entra
+    from .daemon import client
+    r = entra.signin_start(name)
+    if not r.get("available"):
+        msg = str(r.get("message") or "")
+        if r.get("refused"):
+            text = msg if msg.startswith("gateway:") else f"gateway: {msg}"
+        elif r.get("reason") in SIGNIN_LATER:
+            text = SIGNIN_LATER[str(r.get("reason"))].format(name=name)   # it can, but not now
+        else:
+            text = popup.signin_unavailable(msg)
+        _err(text)
+        audit.refusal("gate", name, text, mode="modeless")
+        return 1
+    lease = str(r.get("lease") or "")
+    _err(SIGNIN_WAITING.format(name=name))
+    end = popup.deadline() or (time.time() + popup.wait_seconds())
+    while True:
+        left = end - time.time()
+        try:
+            w = entra.signin_wait(lease, max(0.0, left))
+        except client.DaemonError as e:
+            _err(SIGNIN_LOST.format(name=name, why=formmod.strip_unsafe(
+                e.message.removeprefix("gateway: "))[:200]))
+            return 1
+        if w.get("state") == "done":
+            oc = w.get("outcome")
+            if oc == "ok":
+                popup.offer_passphrase()     # PLAN-0.11 §8: gated stored the sign-in
+                _out(status_line(name, *_reload()))
+                return 0
+            if oc == "cancelled":
+                popup.mark_cancelled(key, digest)
+            _err(str(w.get("message") or f"gateway: the browser sign-in for {name} didn't "
+                     "complete; nothing was stored"))
+            return 1
+        if left <= 0:
+            _err(SIGNIN_STILL_OPEN.format(name=name))
+            return popup.EX_TEMPFAIL
 
 
 # Claude Code kills a Bash command after 2 minutes by default. gate check
@@ -1034,7 +1173,8 @@ def check(name: str) -> int:
 def _check_all(start: float) -> int:
     form, eff, data = _load()
     names = (["settings"] if eff.pending_for("settings") else []) + \
-        [n for n in [*hosts_jumps_first(form), *form.accounts] if n != "settings"]
+        [n for n in [*hosts_jumps_first(form), *form.accounts] if n != "settings"] + \
+        removed_entries(form, eff)
     clash = settings_clash(form)
     if clash:
         _err(clash)
@@ -1075,8 +1215,8 @@ def hosts_jumps_first(form: formmod.Form) -> list[str]:
 
 def login(name: str) -> int:
     """Ask for an account's credential again: its token, API key or client
-    secret, in the gateway dialog (SPEC 15). Browser and device-code sign-ins
-    are unavailable (popup.signin_unavailable)."""
+    secret, in the gateway dialog (SPEC 15), or a new browser sign-in (azure
+    with sign_in = "browser", ml-catalog: PLAN-0.11 §7)."""
     popup.set_deadline(time.time() + _budget(BUDGET))
     try:
         return check_one(name, force_signin=True)
@@ -1164,9 +1304,9 @@ def forget(name: str, what: str | None) -> int:
 def _older_copies_note() -> str:
     """For `gate forget`, which keeps no copy (forgetting means gone): the
     older copies of the vault in private/backups that may still hold what
-    was forgotten (gate rotate's, an import's backup, the 0.6 conversion's),
-    and how the person deletes them (in their own terminal: Claude's tools
-    can't reach the private folder). "" when there are none."""
+    was forgotten (gate rotate's, an import's backup, a start-over's, the
+    0.6 conversion's), and that `gate forget --backups` deletes them after
+    the person's OK in the gateway's dialog. "" when there are none."""
     try:
         found = vault.older_copies()
     except Exception:  # noqa: BLE001 - a note, never a failure
@@ -1176,9 +1316,79 @@ def _older_copies_note() -> str:
     names = [n for _g, ns in found for n in ns]
     shown = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
     d = paths.describe(paths.backups_dir())
-    return (f". Older copies of the vault in {d} ({shown}: from gate rotate, an import or the "
-            "0.6 conversion) may still hold it; to remove it from them too, the user deletes "
-            f"them in their own terminal: cd {d} && rm -r {' '.join(g for g, _ns in found)}")
+    return (f". Older copies of the vault in {d} ({shown}: from gate rotate, an import, a "
+            f"start-over or the 0.6 conversion) may still hold it; {BACKUPS_HINT}")
+
+
+# Where the older vault copies go (PLAN-0.11 §19.14): one command, the
+# person's OK in the gateway's dialog, never a terminal of their own.
+BACKUPS_HINT = ("gate forget --backups deletes them (it lists them in the gateway's dialog and "
+                "deletes them only after the user's OK)")
+BACKUPS_WHAT = "older vault copies"
+# at most this many in one dialog (one pane, whole names); the rest next time
+BACKUPS_PER_DIALOG = 30
+
+
+def forget_backups() -> int:
+    """`gate forget --backups` (PLAN-0.11 §19.14): the older copies of the
+    vault in private/backups (vault.older_copies: gate rotate's, an import's
+    backup folder, a start-over's folder, the 0.6 conversion's store), listed
+    by name in the gateway's dialog, are deleted only after the person's
+    Delete there, and only those (each still an older copy then:
+    vault.delete_older_copies). Cancel, a timeout or no dialog deletes
+    nothing."""
+    try:
+        found = vault.older_copies()
+    except Exception:  # noqa: BLE001
+        found = []
+    d = paths.describe(paths.backups_dir())
+    names = [n for _g, ns in found for n in ns]
+    if not names:
+        _out(f"gateway: there are no older copies of the vault in {d}; nothing to delete")
+        return 0
+    batch, rest = names[:BACKUPS_PER_DIALOG], names[BACKUPS_PER_DIALOG:]
+    lines = [f"Delete these older copies of the gateway vault from {d}?",
+             "They may still hold secrets that were forgotten or replaced since (each is "
+             "encrypted to the vault key it was made with).", ""]
+    lines += [f"  {n}" + ("/ (a folder)" if (paths.backups_dir() / n).is_dir() else "")
+              for n in batch]
+    if rest:
+        lines += ["", f"{len(rest)} more stay for now; run gate forget --backups again for them."]
+    lines += ["", "Nothing else is touched. Deleted copies can't be brought back; Cancel keeps "
+                  "them all."]
+
+    def job() -> tuple[str, Any]:
+        oc = popup._confirm(f"{popup.TITLE}: delete older vault copies?", "\n".join(
+            popup.clean_line(x, popup.CONFIRM_LINE) for x in lines), "Delete",
+            default_cancel=True, entry="gateway", what=BACKUPS_WHAT)
+        if oc != popup.Outcome.OK:
+            return oc, None
+        gone = vault.delete_older_copies(batch)
+        audit.log("forget_backups", deleted=len(gone), kept=len(batch) - len(gone))
+        msg = (f"gateway: deleted {len(gone)} older cop{'y' if len(gone) == 1 else 'ies'} of the "
+               f"vault from {d}" + (f": {', '.join(gone)}" if gone else ""))
+        if len(gone) < len(batch):
+            msg += (f"; {len(batch) - len(gone)} had changed or gone meanwhile and were left as "
+                    "they are")
+        if rest:
+            msg += f"; {len(rest)} more remain (run gate forget --backups again)"
+        return popup.Outcome.OK, msg
+    try:
+        oc, line = popup.run("gateway", BACKUPS_WHAT, job, kind="confirm", lazy=False,
+                             digest=popup._digest(["backups", *batch]), public=True,
+                             notice="gateway: waiting for the user to confirm deleting the older "
+                                    "vault copies in the gateway dialog in Claude Code")
+    except popup.StillOpen:
+        return popup.EX_TEMPFAIL
+    if oc == popup.Outcome.OK and line:
+        _out(str(line))
+        return 0
+    if oc == popup.Outcome.CANCELLED:
+        _out("gateway: the user kept the older vault copies; nothing was deleted")
+        return 1
+    if oc != popup.Outcome.UNAVAILABLE:          # (popup.run said why it couldn't ask)
+        _err(popup.message(oc, "gateway", BACKUPS_WHAT) + "; nothing was deleted")
+    return 1
 
 
 def _snapshot() -> str:
@@ -1192,7 +1402,7 @@ def _snapshot() -> str:
     if p is None:
         return "there was no vault to keep a copy of"
     return (f"the vault from before is kept in {paths.describe(p)} (encrypted; the newest "
-            f"{vault.SNAPSHOT_KEEP} such copies are kept)")
+            f"{vault.SNAPSHOT_KEEP} such copies are kept; {BACKUPS_HINT})")
 
 
 def remembered_host_keys(rec: dict[str, Any]) -> list[str]:
@@ -1232,21 +1442,3 @@ def rotate(name: str) -> int:
     _out(formmod.strip_unsafe(str(line or f"gateway: {real} has a new key"))
          + (f"; {kept[0]}" if kept else ""))
     return 0
-
-
-# ---------------------------------------------------------------------------
-# gate secret (removed)
-# ---------------------------------------------------------------------------
-
-SECRET_REMOVED = ("gateway: gate secret was removed: the gateway asks for credentials only in its "
-                  "own dialog inside Claude Code (a terminal session or the desktop app), never "
-                  "in a terminal prompt. In Claude Code, ask Claude to run gate check {name} (or "
-                  "type /gate-dialog to show a dialog that is waiting).")
-
-
-def secret_removed(name: str) -> int:
-    """`gate secret NAME`: the terminal path is gone (PLAN-v4 phase 3)."""
-    shown = name if isinstance(name, str) and formmod.NAME_RE.fullmatch(name) and \
-        formmod.safe(name) else "NAME"
-    _err(SECRET_REMOVED.format(name=shown))
-    return 2

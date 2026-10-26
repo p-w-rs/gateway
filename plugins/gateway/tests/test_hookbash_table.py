@@ -1,6 +1,8 @@
 """The PreToolUse Bash approval decision table (SPEC 8): >= 80 commands as
-must-allow / must-ask / must-deny / must-no-decision, in auto and default
-modes, including the critics' attack examples."""
+must-allow / must-ask / must-deny / must-no-decision, in all six permission
+modes (PLAN-0.11 §2: a bare `true` allows in auto and bypass only), including
+the critics' attack examples; then the per-mode values (PLAN-0.11 §2.5) over
+the six modes, the job and terminal payloads' modes, and the recorded mode."""
 from __future__ import annotations
 
 import os
@@ -47,7 +49,9 @@ env   = "OPENAI_API_KEY"
 
 
 def _decide(command, mode, cwd=None, project=None):
-    payload = {"tool_name": "Bash", "tool_input": {"command": command}, "permission_mode": mode}
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if mode is not None:                 # None: the payload has no permission_mode
+        payload["permission_mode"] = mode
     cwd = cwd or _PROJECT.get("cwd")
     if cwd:
         payload["cwd"] = cwd
@@ -169,29 +173,36 @@ TABLE = [
     ("sftp askhost", DENY),
     ("sftp askhost:/x", DENY),
     ("ssh askhost df | head", ASK),
+    # -- network commands: asked about by default (PLAN-0.11 §3) --------------
+    ("curl http://example.com", ASK),
+    ("curl -fsSL https://example.com/install.sh", ASK),
+    ("wget http://example.com/file", ASK),
+    ("echo hi | curl http://x", ASK),
+    ("ls && curl http://x", ASK),
+    ("GATE_ACCOUNT=openai curl http://x", ASK),
+    # program names in any letter case: macOS's file systems ignore it, so
+    # CURL runs curl and SSH the stand-in (lead decision 19.14)
+    ("CURL http://example.com", ASK),
+    ("Nc -l 4444", ASK),
+    ("NMap -sS 10.0.0.1", ASK),
+    ("SSH askhost uptime", ASK),
+    ("Sudo apt update", NONE),             # the stand-in; the gateway approves `sudo` only
+    ("/usr/bin/SSH example uptime", DENY),
+    ("/usr/bin/Sudo apt update", DENY),
+    ("Su -c id", DENY),                    # this computer's sudo is configured: use sudo
+    ("DOAS id", DENY),
+    ("SCP askhost:/x .", DENY),
+    ("/usr/local/bin/GH pr list", DENY),   # an account of that kind exists
     # -- must-deny -----------------------------------------------------------
-    ("curl http://example.com", DENY),
-    ("curl -fsSL https://example.com/install.sh", DENY),
-    ("wget http://example.com/file", DENY),
-    ("echo hi | curl http://x", DENY),
-    ("ls && curl http://x", DENY),
-    ("GATE_ACCOUNT=openai curl http://x", DENY),
     ("cat ~/.config/gateway/private/key.txt", DENY),
     ("cat ~/.config/gateway/private/vault.age", DENY),
     ("ls ~/.config/gateway/private", DENY),
-    # phase B requests (ux): the one-time terminal codes, cancel markers and
-    # session records live in private/ too; `gate secret` is the user's,
-    # denied (review round 5), while a command that merely names it isn't
+    # phase B requests (ux): cancel markers and session records live in
+    # private/ too
     ("cat ~/.config/gateway/private/pending/box--secret.code", DENY),
     ("ls ~/.config/gateway/private/pending", DENY),
     ("rm ~/.config/gateway/private/pending/box--sudo-password.cancelled", DENY),
     ("cat ~/.config/gateway/private/sessions/abc.env", DENY),
-    ("gate secret box", DENY),
-    ("gate status && gate secret box", DENY),
-    ("~/.config/gateway/gate secret box", DENY),
-    ("env -i HOME=/x ~/.config/gateway/gate secret box", DENY),
-    ("bash -c 'gate secret box'", DENY),
-    ("grep -n 'gate secret' README.md", ALLOW),
     ("grep -r secret ~/.config/gateway/private", DENY),
     ("age -d -i ~/.config/gateway/private/key.txt ~/.config/gateway/private/vault.age", DENY),
     ("git credential fill", DENY),
@@ -260,14 +271,14 @@ TABLE = [
     ("sudo tee /etc/sudoers.d/x", NONE),
     ("echo $(id)", NONE),
     ("echo `id`", NONE),
-    ("eval 'sudo ls'", NONE),
+    ("eval 'sudo ls'", NONE),  # hides what runs: no decision, no record (its stand-in refuses an "ask": 19.14)
     ("sh -c 'sudo rm -rf /'", NONE),
     ("bash -c 'ssh example x'", NONE),
     ("A=1 B=2 ls", NONE),
     ("FOO=bar sudo ls", NONE),
-    ("gate with openai -- curl http://x", NONE),
+    ("gate with openai -- curl http://x", ASK),
     ("gate with openai -- python deploy.py", NONE),
-    ("for h in a b; do ssh $h x; done", NONE),
+    ("for h in a b; do ssh $h x; done", NONE),  # hides what runs: no decision, no record (its stand-in refuses an "ask": 19.14)
     ("make", NONE),
     ("git push", NONE),
     ("gh pr create", NONE),
@@ -314,8 +325,8 @@ TABLE = [
     ("sudo env rm -rf /", NONE),
     ("sudo timeout 5 rm -rf /", NONE),
     ("sudo nice rm -rf /", NONE),
-    ("echo / | sudo xargs rm -rf", NONE),
-    ("sudo xargs rm -rf /", NONE),
+    ('echo / | sudo xargs rm -rf', NONE),  # what xargs/find run is never typed by Claude (§1.7)
+    ('sudo xargs rm -rf /', NONE),  # what xargs/find run is never typed by Claude (§1.7)
     ("sudo sh -c 'rm -rf /'", NONE),
     ("sudo bash -c 'rm -rf /'", NONE),
     ("sudo FOO=b rm -rf /", NONE),
@@ -405,19 +416,20 @@ TABLE = [
     ("sftp example:/x | cat", ALLOW),
     ("sftp -b batch example:/x", NONE),
     ("sftp -B 32768 example:/x", ALLOW),
-    # round 1 (LOW): curl/wget behind command/builtin/busybox and wrappers
-    ("command curl http://x", DENY),
-    ("command -p curl http://x", DENY),
-    ("builtin curl http://x", DENY),
-    ("busybox wget http://x", DENY),
-    ("env curl http://x", DENY),
-    ("env -i FOO=1 curl http://x", DENY),
-    ("nohup wget http://x", DENY),
-    ("timeout 5 curl http://x", DENY),
-    ("sudo curl http://x", DENY),
-    ("echo x | xargs curl", DENY),
+    # round 1 (LOW): curl/wget behind command/builtin/busybox and wrappers (now the network
+    # class, asked about by default: PLAN-0.11 §3)
+    ("command curl http://x", ASK),
+    ("command -p curl http://x", ASK),
+    ("builtin curl http://x", ASK),
+    ("busybox wget http://x", ASK),
+    ("env curl http://x", ASK),
+    ("env -i FOO=1 curl http://x", ASK),
+    ("nohup wget http://x", ASK),
+    ("timeout 5 curl http://x", ASK),
+    ("sudo curl http://x", ASK),
+    ("echo x | xargs curl", ASK),         # a network command (xargs alone: no decision)
     ("command -v curl", NONE),
-    ("env -S 'curl http://x'", DENY),
+    ("env -S 'curl http://x'", ASK),
     # the stand-in maps gw-NAME and any case to the host: so does the hook
     ("ssh gw-askhost uptime", ASK),
     ("ssh ASKHOST uptime", ASK),
@@ -433,15 +445,15 @@ TABLE = [
     ("env -uS ssh askhost uptime", ASK),
     ("nice -n 5 ssh askhost uptime", ASK),
     ("if ssh askhost true; then echo y; fi", ASK),
-    ('ssh askhost "$(cat cmd)"', ASK),
-    ("for h in askhost; do ssh $h x; done", ASK),
-    ("H=askhost; ssh $H x", ASK),
+    ('ssh askhost "$(cat cmd)"', DENY),   # no record of its words: the stand-in would refuse
+    ("for h in askhost; do ssh $h x; done", DENY),  # hidden, and names a configured host
+    ("H=askhost; ssh $H x", DENY),               # its host a variable: no record possible
     ("if true; then ssh askhost x; fi", ASK),
     ("while true; do sudo -n true; ssh askhost x; done", ASK),
     ("bash -c 'ssh askhost uptime'", ASK),
     ("env bash -c 'ssh askhost uptime'", ASK),
     ("( ssh askhost uptime )", ASK),
-    ('ssh u@ask.example.com "$(cat cmd)"', ASK),
+    ('ssh u@ask.example.com "$(cat cmd)"', DENY),
     ("ssh askhost x &", ASK),
     # comments: the words judged are the words bash runs (a quote or `;`
     # inside a comment opens or splits nothing)
@@ -450,8 +462,8 @@ TABLE = [
     ("echo a#b", ALLOW),
     ("ls #'\nrm -rf ~/x #'", NONE),
     ("ssh example df #'\nrm -rf ~/x #'", NONE),
-    ('echo ok #"\ncurl http://x #"', DENY),
-    ("curl http://x # fetch it", DENY),
+    ('echo ok #"\ncurl http://x #"', ASK),
+    ("curl http://x # fetch it", ASK),
     ("ssh askhost uptime # check", ASK),
     ("ssh offhost x # c", DENY),
     ("sudo apt update && # refresh\nsudo apt install htop", ALLOW),
@@ -478,7 +490,7 @@ TABLE = [
     ("env az account get-access-token | cat", DENY),
     ("az account show", NONE),
     # (a script sourced into Claude's shell isn't read: a documented limit)
-    ("source ./deploy.sh", NONE),
+    ('source ./deploy.sh', NONE),  # hides what runs: no decision, no record (its stand-in refuses an "ask": 19.14)
     ("echo $(ls . )", NONE),
     # -- round 3: a path runs whatever file is there, not the stand-in or the
     #    benign tool PATH finds (a planted ./ssh was allowed by its basename);
@@ -500,7 +512,7 @@ TABLE = [
     ("./ssh example df | ./cat", DENY),
     ("ssh example df | ./cat", NONE),
     ("./scp ./f example:/srv/f", DENY),
-    ("./curl http://x", DENY),           # the deny side still goes by the basename
+    ("./curl http://x", ASK),           # the network class goes by the basename
     ("./ssh offhost x", DENY),
     ("cat f", ALLOW),
     ("ssh example df | cat", ALLOW),
@@ -630,46 +642,53 @@ TABLE = [
     ("sudo sed -i s/a/b/ /etc/ssh/sshd_config", ALLOW),
     ("sudo sh -c 'cat /etc/pam.d/sudo'", NONE),
     ("sudo grep sudo /etc/pam.d/sudo", NONE),
-    ("sudo bash script.sh /opt/x/ssh", DENY),  # a script's argument: it may run it
+    ('sudo bash script.sh /opt/x/ssh', NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
     ("bash -c 'cp x example:/opt/x/ssh'", NONE),
     ("sudo rm /usr/local/bin/gh", ALLOW),    # rm's operand, in a bin folder or not: data
-    ("bash -c '/opt/tools/ssh box x'", DENY),
-    ("bash -c 'sudo -u root /opt/x/ssh h'", DENY),
+    ("bash -c '/opt/tools/ssh example x'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'sudo -u root /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("eval 'rsync -e /opt/x/ssh d example:/x'", DENY),
-    ("echo '/opt/x/ssh h' | sh", DENY),
-    ("sudo -u root /opt/x/ssh h", DENY),
+    ("echo '/opt/x/ssh example' | sh", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('sudo -u root /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("bash -c 'su root -c \"/opt/x/sudo id\"'", DENY),
-    ("bash -c 'X=1 exec -a x /opt/x/ssh h'", DENY),
-    ("find . -exec /opt/x/ssh {} ';'", DENY),
-    ("sudo bash /opt/x/ssh", DENY),
+    ("bash -c 'X=1 exec -a x /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("find . -exec /opt/x/ssh {} ';'", NONE),  # what xargs/find run is never typed by Claude (§1.7), and names nothing configured
+    ('sudo bash /opt/x/ssh', NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
     ("sudo /usr/bin/ssh example df", DENY),
     # -- GW-UX-4 round 2: in hidden text a path is data only as an operand of
     #    a command that never runs it (cat, cp, rm, ...); anything else may run
     #    it (an unknown runner, a -c cluster, `--`, xargs -a, exec with a
     #    redirection, a ProxyCommand, a program option, su -s)
-    ("bash -c -- '/opt/x/ssh h'", DENY),
-    ("bash -c 'bash -ce \"nice /opt/x/ssh h\"'", DENY),
-    ("bash -c '$(echo /opt/x/ssh) h'", DENY),
-    ("bash -c 'ssh -o \"ProxyCommand /opt/x/ssh -W %h:%p j\" h'", DENY),
-    ("bash -c 'su bob -s /opt/x/ssh'", DENY),
-    ("bash -c 'su -c \"cat x\" -s /opt/x/ssh bob'", DENY),
-    ("bash -c 'runuser -u bob -- /opt/x/ssh h'", DENY),
-    ("bash -c 'xargs -a hosts /opt/x/ssh'", DENY),
-    ("bash -c 'exec 3</dev/null /opt/x/ssh h'", DENY),
-    ("bash -c 'sshpass -p x /opt/x/ssh h'", DENY),
-    ("bash -c 'strace -f /opt/x/ssh h'", DENY),
-    ("bash -c 'arch -arm64 /opt/x/ssh h'", DENY),
-    ("bash -c 'ssh-agent /opt/x/ssh h'", DENY),
-    ("bash -c 'flock /tmp/l /opt/x/ssh h'", DENY),
-    ("bash -c 'script -q /dev/null /opt/x/ssh h'", DENY),
-    ("bash -c 'unbuffer /opt/x/ssh h'", DENY),
-    ("bash -c 'chroot / /opt/x/ssh h'", DENY),
-    ("bash -c 'tmux new \"/opt/x/ssh h\"'", DENY),
-    ("bash -c 'strace ./ssh h'", DENY),
+    ("bash -c -- '/opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'bash -ce "nice /opt/x/ssh example"\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c '$(echo /opt/x/ssh) h'", NONE),  # hides what runs: no decision, no record (its stand-in refuses an "ask": 19.14)
+    # a computed -c string or osascript script in any letter case, in text the
+    # parser follows or not, naming a configured host (19.14: case)
+    ("BASH -c '$(echo /opt/x/ssh) example'", DENY),
+    ('(BASH -c "$C" example)', DENY),
+    ('(OSASCRIPT -e "$S" example)', DENY),
+    ('(OSASCRIPT -e "$S"; echo example)', DENY),
+    ('bash -c \'ssh -o "ProxyCommand /opt/x/ssh -W %h:%p j" example\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'su bob -s /opt/x/ssh'", DENY),  # su while this computer's sudo goes through the gateway (§9.5)
+    ('bash -c \'su -c "cat x" -s /opt/x/ssh bob\'', DENY),  # su (§9.5)
+    ('bash -c \'su -c "cat example" -s /opt/x/ssh bob\'', DENY),  # su's -s shell is the program: it names a configured host
+    ("bash -c 'runuser -u bob -- /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'xargs -a hosts /opt/x/ssh'", NONE),  # what xargs/find run is never typed by Claude (§1.7)
+    ("bash -c 'exec 3</dev/null /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'sshpass -p x /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'strace -f /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'arch -arm64 /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'ssh-agent /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'flock /tmp/l /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'script -q /dev/null /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'unbuffer /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'chroot / /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'tmux new "/opt/x/ssh example"\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'strace ./ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("bash -c 'rsync --rsh=/opt/x/ssh a example:/b'", DENY),   # a glued value
-    ("bash -c 'sed \"1e /opt/x/ssh h\" notes.txt'", DENY),       # GNU sed's e command
-    ("sudo sort --compress-program /opt/x/ssh notes.txt", DENY),
-    ("xargs -a urls curl", DENY),             # xargs -a takes a file: curl is the program
+    ('bash -c \'sed "1e /opt/x/ssh example" notes.txt\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('sudo sort --compress-program /opt/x/ssh notes.txt', NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
+    ("xargs -a urls curl", ASK),             # a network command (xargs alone: no decision)
     ("sudo bash -c 'ls -l /opt/x/ssh'", NONE),
     ("sudo bash -ce 'cat /opt/x/ssh'", NONE),
     ("bash -c -- 'cat /opt/x/ssh'", NONE),
@@ -677,7 +696,7 @@ TABLE = [
     ("sudo bash -c 'cd /etc/ssh && ls'", NONE),
     ("bash -c 'grep -e /opt/x/ssh build.log'", NONE),
     ("bash -c 'awk \"{print}\" /opt/x/gh'", NONE),
-    ("bash -c '{ /opt/x/ssh h; }'", DENY),
+    ("bash -c '{ /opt/x/ssh example; }'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("sudo chmod 755 /usr/local/bin/gh", ALLOW),
     # -- round 3 MF1: grep's recursion spellings. getopt abbreviates --recursive
     #    and --dereference-recursive, and -d/--directories ACTION recurses unless
@@ -703,28 +722,29 @@ TABLE = [
     #    text except as a plain operand of a command that never runs it; a
     #    here-string into a shell, a sed `e` command, awk's/vim's/less's script,
     #    and the known runners count for a non-bin path too
-    ("bash <<< '/usr/bin/ssh h'", DENY),
+    ("bash <<< '/usr/bin/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("sh -s <<< '/usr/local/bin/gh repo list'", DENY),
-    ("bash <<< '/opt/x/ssh h'", DENY),
-    ("bash <<<'/opt/x/ssh h'", DENY),
-    ("bash -c 'awk \"BEGIN{\\\"/usr/bin/ssh h\\\" | getline}\"'", DENY),
-    ("bash -c 'vim -es -c \"! /usr/bin/ssh h\" -c q'", DENY),
-    ("bash -c 'sed \"1~2e /usr/bin/ssh h\" f'", DENY),
-    ("bash -c 'sed \"0,/x/e /usr/bin/ssh h\" f'", DENY),
-    ("bash -c 'sed \"1{e /usr/bin/ssh h\" -e \"}\" f'", DENY),
-    ("bash -c 'less \"+! /usr/bin/ssh h\" f'", DENY),
-    ("bash -c 'cat <<< /usr/bin/ssh'", DENY),   # a here-string isn't an operand
-    ("bash -c 'strace -f /opt/x/ssh h'", DENY),
-    ("bash -c 'sshpass -p x /opt/x/ssh h'", DENY),
-    ("bash -c 'flock /tmp/l /opt/x/ssh h'", DENY),
-    ("bash -c 'chroot / /opt/x/ssh h'", DENY),
-    ("bash -c 'tar -I /opt/x/ssh -cf x.tgz src'", DENY),
-    ("strace /opt/x/ssh h", DENY),              # a known runner, top-level too
-    ("sshpass -p x /opt/x/ssh h", DENY),
+    ("bash <<< '/opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash <<<'/opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'awk "BEGIN{\\"/usr/bin/ssh example\\" | getline}"\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'vim -es -c "! /usr/bin/ssh example" -c q\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'sed "1~2e /usr/bin/ssh example" f\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'sed "0,/x/e /usr/bin/ssh example" f\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'sed "1{e /usr/bin/ssh example" -e "}" f\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c \'less "+! /usr/bin/ssh example" f\'', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'cat <<< /usr/bin/ssh'", NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
+    ("bash -c 'strace -f /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'sshpass -p x /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'flock /tmp/l /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'chroot / /opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ("bash -c 'tar -I /opt/x/ssh -cf x.tgz src'", NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
+    ("bash -c 'tar -I /opt/x/ssh -cf x.tgz example'", DENY),  # tar -I runs it: the text names a configured host
+    ('strace /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('sshpass -p x /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     # -- round 3 SF3: a data command piped into a shell, and su's -s shell
     #    inside an option cluster that also carries -c
-    ("bash -c 'grep -h /opt/x/ssh cmds | sh'", DENY),
-    ("bash -c 'su -c \"cat x\" -ms /opt/x/ssh bob'", DENY),
+    ("bash -c 'grep -h /opt/x/ssh cmds | sh'", NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
+    ('bash -c \'su -c "cat x" -ms /opt/x/ssh bob\'', DENY),  # su (§9.5)
     # a plain operand of a command that never runs it stays data (the balance)
     ("bash -c 'cat /opt/x/ssh'", NONE),
     ("bash -c 'rm -f /usr/local/bin/gh'", NONE),
@@ -749,9 +769,9 @@ TABLE = [
     ("bash -c 'echo /opt/x/ssh'", NONE),
     ("bash -c 'git add cmd/gh'", NONE),
     # an option that names a program still reaches the text scan under sudo
-    ("sudo sort --compress-program /opt/x/ssh notes.txt", DENY),
-    ("sudo strace -f /opt/x/ssh h", DENY),
-    ("sudo chroot / /opt/x/ssh h", DENY),
+    ('sudo sort --compress-program /opt/x/ssh notes.txt', NONE),  # reaches nothing configured: the user's own (PLAN-0.11 §1.7)
+    ('sudo strace -f /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('sudo chroot / /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     # -- round 3 SF1: a wrapper that changes directory (env -C/--chdir, sudo -D)
     #    is tracked as a per-command cd for the private-folder deny, and a plain
     #    reader under it isn't vouched for
@@ -780,22 +800,25 @@ TABLE = [
     ("cat deploy_rsa.pub", ALLOW),              # a public key is fine
     # -- round 4 MF1: only a shell's or su's -c string is read as a command;
     #    any other program's -c is its own option, so these loops and psql get
-    #    no decision. A shell's -c string held in a variable is still refused
-    #    in managed mode (the gateway can't see what it runs)
+    #    no decision. A shell's -c string held in a variable gets none either
+    #    (no record: its stand-in refuses an "ask", 19.14), and is refused
+    #    when the text names a configured target (§1.7)
     ('for f in *.txt; do wc -c "$f"; done', NONE),
     ('for f in *.c; do gcc -c "$f"; done', NONE),
+    ('for f in *.c; do gcc -c "$f" -I example; done', NONE),  # gcc's -c hides nothing
+    ('bash -c "$CMD" example', DENY),
     ('for p in TODO FIXME; do grep -c "$p" src/app.py; done', NONE),
     ('for f in *.log; do gzip -c "$f" > "$f.gz"; done', NONE),
     ('sudo -u postgres psql -c "$QUERY"', NONE),
-    ("find . -name '*.c' -exec sh -c 'gcc -c \"$1\"' _ {} \\;", NONE),
-    ('bash -c "$CMD"', DENY),
-    ('sh -lc "$CMD"', DENY),
+    ('find . -name \'*.c\' -exec sh -c \'gcc -c "$1"\' _ {} \\;', NONE),  # what xargs/find run is never typed by Claude (§1.7)
+    ('bash -c "$CMD"', NONE),  # hides what runs: no decision, no record (its stand-in refuses an "ask": 19.14)
+    ('sh -lc "$CMD"', NONE),
     ('su -c "$CMD" bob', DENY),
     ("bash -c 'make test'", NONE),
     # -- round 4 MF2: GNU sed's e command glued to the path it runs
-    ("bash -c \"sed '1e/usr/bin/ssh h' f\"", DENY),
-    ("bash -c \"sed -e '1e/usr/bin/ssh h' f\"", DENY),
-    ("bash -c \"sed '1e/opt/x/ssh h' f\"", DENY),
+    ('bash -c "sed \'1e/usr/bin/ssh example\' f"', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c "sed -e \'1e/usr/bin/ssh example\' f"', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('bash -c "sed \'1e/opt/x/ssh example\' f"', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("bash -c \"sed -n '/x/p' /opt/x/ssh\"", NONE),
     ("bash -c 'grep 1e/opt/x/ssh f'", NONE),    # not sed: a pattern
     # -- round 4 MF4: the tracers, sandboxes and wrappers that exec a command
@@ -806,7 +829,7 @@ TABLE = [
     ("sudo apt install strace", ALLOW),
     ("sudo apt install sshpass", ALLOW),
     ("sudo dnf install fakeroot", ALLOW),
-    ("nice -n 5 strace -f /opt/x/ssh h", DENY),  # behind a wrapper it is still the program
+    ('nice -n 5 strace -f /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("sudo strace -f make install", NONE),       # never vouched for under sudo
     ("sudo ln -sf /opt/homebrew/bin/tmux /usr/local/bin/tmux", ALLOW),  # reviewer: operands
     ("sudo rm /usr/local/bin/tmux", ALLOW),
@@ -816,14 +839,14 @@ TABLE = [
     # -- round 4 SF1: env -C lasts for its own command only; a here-string into
     #    a shell is a script whatever the shell's options
     ("env -C ~/.config ls && cat gateway/private/key.txt", NONE),
-    ("bash -c '' <<< '/opt/x/ssh h'", DENY),
+    ("bash -c '' <<< '/opt/x/ssh example'", DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("bash -c 'cat' <<< '/opt/x/ssh h'", NONE),  # the here-string feeds cat
     # -- round 4: macOS's arch is a wrapper the hook looks through, like nice
     ("sudo arch -arm64 make install", ALLOW),
     ("sudo arch -arch x86_64 make install", ALLOW),
-    ("arch -arm64 /opt/x/ssh h", DENY),
-    ("arch -arch x86_64 /opt/x/ssh h", DENY),
-    ("sudo arch -arm64 /opt/x/ssh h", DENY),
+    ('arch -arm64 /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('arch -arch x86_64 /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
+    ('sudo arch -arm64 /opt/x/ssh example', DENY),  # reaches a configured host (PLAN-0.11 §1.7)
     ("sudo arch -arm64 rm -rf /", NONE),         # the destructive list sees through it
     ("sudo arch -e LD_PRELOAD=/tmp/x.dylib make install", NONE),  # sets a variable, like env's
     ("arch -e PATH=/tmp ssh example df", DENY),
@@ -832,12 +855,20 @@ TABLE = [
 ]
 
 
-def _expected(auto):
-    # default mode: allow becomes no-decision; deny/ask/none unchanged.
-    return auto, (None if auto == ALLOW else auto)
+# Claude Code's payload strings for its six modes (PLAN-0.11 §2.1), and the
+# spellings that mean one of them; where a bare `true` (and a right-less
+# benign or gate stage) is allowed
+PAYLOAD_MODES = ("default", "plan", "acceptEdits", "auto", "bypassPermissions", "dontAsk")
+ALLOW_MODES = ("auto", "bypassPermissions", "bypass")
 
 
-def test_decision_table_auto_and_default():
+def _expected(auto, mode="default"):
+    # a bare true's allow is auto and bypass only; deny/ask/none are the same
+    # in every mode
+    return None if (auto == ALLOW and mode not in ALLOW_MODES) else auto
+
+
+def _table_in(modes_: tuple, aliases: tuple = ()) -> None:
     with H.gateway_env() as env:
         _project(env)
         env.write_form(FORM)
@@ -845,20 +876,36 @@ def test_decision_table_auto_and_default():
         consent.approve_all(env.form())
         failures = []
         for cmd, auto in TABLE:
-            exp_auto, exp_default = _expected(auto)
-            got_auto = _decide(cmd, "auto")
-            got_default = _decide(cmd, "default")
-            if got_auto != exp_auto:
-                failures.append(f"auto  {cmd!r}: got {got_auto} want {exp_auto}")
-            if got_default != exp_default:
-                failures.append(f"def   {cmd!r}: got {got_default} want {exp_default}")
+            # (the other spellings change only the allow step: checked where auto allows)
+            for mode in modes_ + (aliases if auto == ALLOW else ()):
+                want = _expected(auto, mode or "default")
+                got = _decide(cmd, mode)
+                if got != want:
+                    failures.append(f"{mode!s:17} {cmd!r}: got {got} want {want}")
         assert not failures, "\n".join(failures)
-        # sanity: the table is large and covers every category.
-        assert len(TABLE) >= 80
-        assert sum(1 for _, a in TABLE if a == ALLOW) >= 10
-        assert sum(1 for _, a in TABLE if a == DENY) >= 10
-        assert sum(1 for _, a in TABLE if a == ASK) >= 3
-        assert sum(1 for _, a in TABLE if a is None) >= 20
+
+
+def test_decision_table_auto_and_default():
+    """The whole table in auto and default mode: what auto allows, default
+    leaves to Claude Code (a bare true is cc there); deny, ask and no
+    decision are the same."""
+    _table_in(("auto", "default"))
+    # sanity: the table is large and covers every category.
+    assert len(TABLE) >= 80
+    assert sum(1 for _, a in TABLE if a == ALLOW) >= 10
+    assert sum(1 for _, a in TABLE if a == DENY) >= 10
+    assert sum(1 for _, a in TABLE if a == ASK) >= 3
+    assert sum(1 for _, a in TABLE if a is None) >= 20
+
+
+def test_decision_table_in_the_other_four_modes():
+    """The six-mode re-baseline (PLAN-0.11 §2.3), with the test above: bypass
+    allows what auto does, plan, acceptEdits and dontAsk leave it to Claude
+    Code (dontAsk gets cc from a bare true); deny, ask and no decision are
+    the same in every mode. `manual` is default's other spelling; a payload
+    with no mode, or one the gateway doesn't know, is default and never
+    allowed."""
+    _table_in(("plan", "acceptEdits", "bypassPermissions", "dontAsk"), ("manual", None, "yolo"))
 
 
 def test_bypass_permissions_allows_like_auto():
@@ -880,7 +927,7 @@ def test_plan_and_acceptedits_deny_and_ask_but_never_allow():
             assert _decide("sudo apt update", mode) is None
             assert _decide("ssh offhost x", mode) == DENY
             assert _decide("ssh askhost x", mode) == ASK
-            assert _decide("curl http://x", mode) == DENY
+            assert _decide("curl http://x", mode) == ASK      # a network command (PLAN-0.11 §3)
 
 
 def test_terminal_panel_also_judges_hash_as_a_character():
@@ -900,7 +947,7 @@ def test_terminal_panel_also_judges_hash_as_a_character():
             return None if out is None else out["hookSpecificOutput"]["permissionDecision"]
 
         assert term("ls #; cat ~/.config/gateway/private/key.txt") == DENY
-        assert term("echo hi #; curl http://x") == DENY
+        assert term("echo hi #; curl http://x") == ASK
         assert term("ls #; ssh askhost uptime") == ASK
         assert term("ls # it's fine") is None
         # Claude's Bash (bash/zsh -c) reads a comment there
@@ -953,20 +1000,22 @@ def test_path_qualified_commands_are_never_vouched_for():
         env.write_form(FORM)
         vault.save(vault.empty())
         consent.approve_all(env.form())
-        for cmd in ("subdir/gate status", "./cat f",
-                    "bin/rsync -a ./x example:/srv/x", "./sleep 1", "cd /tmp && ./ls"):
+        for cmd in ("subdir/gate status", "./cat f", "./sleep 1", "cd /tmp && ./ls",
+                    "bin/rsync -a ./x other.example.org:/srv/x", "/usr/bin/ssh other.example.org df"):
             for mode in ("auto", "bypassPermissions"):
                 assert _decide(cmd, mode) is None, (cmd, mode)
-        # a credential tool by its path (PLAN-v4 phase 7): denied in managed mode,
-        # never vouched for when managed mode is off
-        for cmd in ("./ssh example df", "/tmp/x/sudo id", "/usr/bin/ssh example df",
-                    "/usr/bin/scp f example:/x", "/opt/homebrew/bin/gh repo list"):
+        # a tool by its path that reaches a configured target (PLAN-0.11 §1.7):
+        # denied in every mode, the managed shell on or off
+        deny = ("./ssh example df", "/tmp/x/sudo id", "/usr/bin/ssh example df",
+                "/usr/bin/scp f example:/x", "/opt/homebrew/bin/gh repo list",
+                "bin/rsync -a ./x example:/srv/x")
+        for cmd in deny:
             for mode in ("auto", "bypassPermissions"):
                 assert _decide(cmd, mode) == "deny", (cmd, mode)
         env.write_form(FORM + '\n[shell]\nmanaged = "off"\n')
         consent.approve_all(env.form())
-        for cmd in ("./ssh example df", "/tmp/x/sudo id", "/usr/bin/ssh example df"):
-            assert _decide(cmd, "auto") is None, cmd
+        for cmd in deny:
+            assert _decide(cmd, "auto") == "deny", cmd
         env.write_form(FORM)
         for cmd in ("ssh example df", "sudo id", "gate status", "cat f", "sleep 1"):
             assert _decide(cmd, "auto") == ALLOW, cmd
@@ -1142,43 +1191,41 @@ def test_tilde_prefixes_credential_folders_and_letter_case():
             assert _decide(f"cat {env.root / 'PROJECT' / 'src' / 'app.py'}", "auto") == ALLOW
 
 
-def test_a_route_refusal_names_the_way_out_for_a_real_need():
-    """GW-UX-4 round 2: the alternate-route refusals say how the user gets
-    the system's own tool back when it is really needed ([shell] managed =
-    "off", a widening the user approves)."""
+def test_a_route_refusal_names_the_stand_in_route():
+    """PLAN-0.11 §1.7: a route around a stand-in to a configured target is
+    refused with the stand-in's own route as the way (`ssh HOST ...`: the
+    stand-in supplies the key); the escape through [shell] managed = "off"
+    is gone (the route checks hold in every mode, managed off included)."""
     with H.gateway_env() as env:
         _project(env)
         env.write_form(FORM)
         vault.save(vault.empty())
         consent.approve_all(env.form())
-        for cmd in ("bash -c 'sshpass -p x /opt/x/ssh h'", "/usr/bin/ssh example df"):
-            why = _why(cmd)
-            assert why and '[shell] managed = "off"' in why and "ask them first" in why, (cmd, why)
-            assert "from the next session" in why, (cmd, why)   # the change isn't retroactive
+        for cmd in ("/usr/bin/ssh example x", "env -i ssh example x", "PATH=/x ssh example x",
+                    "bash -c 'sshpass -p x /opt/x/ssh example'", "rsync -e /usr/bin/ssh a example:"):
+            why = _why(cmd, "default")
+            assert why and "example goes through the gateway" in why, (cmd, why)
+            assert "use `ssh example ...`" in why or "use `rsync example ...`" in why, (cmd, why)
+            assert "managed = \"off\"" not in why, (cmd, why)
 
 
-def test_a_shell_string_in_a_variable_is_refused_with_the_reason_and_the_way_out():
-    """Round 4 (the lead's decision on the round-3 review's item 5): `bash -c
-    "$CMD"` stays refused in managed mode, since whatever the variable holds
-    runs unseen (ssh or sudo by a path included). The refusal says so and
-    names the way out: the command written in the -c string, or run as its
-    own command; a written-out -c string gets no decision. With managed mode
-    off nothing is refused."""
+def test_a_shell_string_in_a_variable_gets_no_decision_while_an_entry_is_ask():
+    """`bash -c "$CMD"` hides whatever the variable holds. Lead decision
+    19.14: it is no longer asked about while some configured entry is "ask"
+    (askhost here): it gets no record, so a stand-in it reaches refuses the
+    "ask" itself (asks.py). A prompt for another reason (a network command)
+    doesn't mention it; a written-out -c string is judged as itself."""
     with H.gateway_env() as env:
         _project(env)
         env.write_form(FORM)
         vault.save(vault.empty())
         consent.approve_all(env.form())
-        for cmd in ('bash -c "$CMD"', 'sh -c "$(cat cmd.txt)"', 'su -c "$CMD" bob'):
-            assert _decide(cmd, "auto") == DENY, cmd
-            why = _why(cmd)
-            assert "-c string is a variable or a command's output" in why, (cmd, why)
-            assert "write the command itself in the -c string" in why, (cmd, why)
-            assert "or run it as its own command" in why, (cmd, why)
-        assert _decide("bash -c 'make test'", "auto") is None
-        env.write_form(FORM + '\n[shell]\nmanaged = "off"\n')
-        consent.approve_all(env.form())
-        assert _decide('bash -c "$CMD"', "auto") is None
+        for cmd in ('bash -c "$CMD"', "sh -c \"$(cat cmd.txt)\"", 'eval "$CMD"'):
+            assert _decide(cmd, "default") is None, (cmd, _why(cmd, "default"))
+        why = _why("builtin source ./x.sh && curl https://example.com", "default")
+        assert "curl" in why and "hides" not in why and "askhost" not in why, why
+        assert _decide("bash -c 'make test'", "default") is None
+        assert _decide("bash -c 'ssh askhost id'", "default") == ASK   # written out: itself
 
 
 def test_a_recursive_grep_from_the_home_folder_searches_its_operands():
@@ -1203,3 +1250,848 @@ def test_a_recursive_grep_from_the_home_folder_searches_its_operands():
         for cmd in ("grep -r --context 3 TODO", "grep -rn --context 3 TODO notes .",
                     "grep -r TODO"):
             assert _decide(cmd, "auto", cwd=home) == DENY, cmd
+
+
+# ---------------------------------------------------------------------------
+# Per-mode values (PLAN-0.11 §2, WS-2): each word's own meaning in each mode
+# ---------------------------------------------------------------------------
+
+MODE_FORM = """
+[hosts.localhost]
+sudo = { default = "ask", auto = true, plan = false, dontAsk = "allow" }
+
+[hosts.localhost.policy]
+elevation = { default = "allow", dontAsk = "cc" }
+
+[hosts.modal]
+address = "u@modal.example.com"
+ssh  = { default = true, acceptEdits = "cc", bypass = "ask", plan = false }
+sudo = { default = false, auto = true }
+
+[hosts.ccbox]
+address = "u@cc.example.com"
+ssh  = true
+sudo = true
+
+[hosts.ccbox.policy]
+exec  = { default = "allow", auto = "cc" }
+write = { default = "allow", bypass = "ask" }
+"""
+
+# (command, then its decision in default, plan, acceptEdits, auto,
+# bypassPermissions, dontAsk): deny refuses, ask asks, cc gives no decision,
+# allow is the allow step (a table's allow approves in its own mode, plan
+# never; a restriction's cc or ask withholds it in its mode)
+MODE_TABLE = [
+    ("sudo apt update", ASK, DENY, ASK, ALLOW, ASK, NONE),      # dontAsk: elevation's cc
+    ("sudo -n true", ASK, DENY, ASK, ALLOW, ASK, NONE),
+    ("ssh modal uptime", ALLOW, DENY, NONE, ALLOW, ASK, ALLOW),
+    ("ssh modal sudo reboot", DENY, DENY, DENY, ALLOW, DENY, DENY),
+    ("scp notes.txt modal:", ALLOW, DENY, NONE, ALLOW, DENY, ALLOW),
+    ("ssh modal uptime && echo done", NONE, DENY, NONE, ALLOW, ASK, NONE),
+    ("ssh ccbox uptime", NONE, NONE, NONE, NONE, ALLOW, NONE),
+    ("scp notes.txt ccbox:", NONE, NONE, NONE, ALLOW, DENY, NONE),
+    ("echo hi", NONE, NONE, NONE, ALLOW, ALLOW, NONE),
+]
+
+
+def _mode_rig(env, form=MODE_FORM):
+    _project(env)
+    (env.root / "project" / "notes.txt").write_text("notes\n")
+    env.write_form(form)
+    vault.save(vault.empty())
+    consent.approve_all(env.form())
+
+
+def test_per_mode_values_in_every_mode():
+    """PLAN-0.11 §2.5 in the hook: a right or a policy restriction written
+    as a per-mode table means its own word in each of the six modes. A
+    table's true approves in its mode (Manual included: an explicit per-mode
+    allow), never in plan; "cc" leaves it to Claude Code; a benign command
+    still needs auto or bypass, so it withholds the allow of a pipeline in
+    Manual mode."""
+    with H.gateway_env() as env:
+        _mode_rig(env)
+        failures = []
+        for cmd, *want in MODE_TABLE:
+            for mode, w in zip(PAYLOAD_MODES, want):
+                got = _decide(cmd, mode)
+                if got != w:
+                    failures.append(f"{mode:18} {cmd!r}: got {got} want {w}")
+            if _decide(cmd, "manual") != want[0]:
+                failures.append(f"manual             {cmd!r}: not default's")
+        assert not failures, "\n".join(failures)
+        # the reasons name the word's own source
+        assert "sudo is off for modal" in _why("ssh modal sudo reboot", "default")
+        assert "ssh is off for modal" in _why("ssh modal uptime", "plan")
+        assert '"ask"' in _why("ssh modal uptime", "bypassPermissions")
+        assert "host/account rights" in _why("ssh modal uptime", "default")
+
+
+def test_an_unknown_or_missing_mode_never_allows_even_an_explicit_default_allow():
+    """§2.1: a payload with no permission_mode, an empty one or one Claude
+    Code doesn't send (gateway.toml's own `bypass` included) reads as default
+    for deny and ask, and is never allowed, even where default's word is an
+    explicit allow."""
+    with H.gateway_env() as env:
+        _mode_rig(env)
+        assert _decide("ssh modal uptime", "default") == ALLOW
+        # (bypass is gateway.toml's spelling, never a payload string Claude Code sends)
+        for mode in (None, "", "yolo", "Default", "bypasspermissions", "bypass"):
+            assert _decide("ssh modal uptime", mode) is None, mode
+            assert _decide("sudo apt update", mode) == ASK, mode           # default's ask
+            assert _decide("ssh modal sudo reboot", mode) == DENY, mode    # default's deny
+
+
+def test_a_per_mode_allow_waiting_for_the_ok_approves_nothing():
+    """A table that raises a mode (bare true approved, `{ default = true }`
+    written) waits for the user's OK: meanwhile the effective word there is
+    the approved one (cc in Manual mode: no decision, never the form's
+    allow, never a deny); after the OK the gateway approves in that mode."""
+    with H.gateway_env() as env:
+        _mode_rig(env, '[hosts.box]\naddress = "u@box.example.com"\nssh = true\n')
+        env.write_form('[hosts.box]\naddress = "u@box.example.com"\nssh = { default = true }\n')
+        assert _decide("ssh box uptime", "default") is None
+        assert _decide("ssh box uptime", "auto") == ALLOW
+        consent.approve_all(env.form())
+        assert _decide("ssh box uptime", "default") == ALLOW
+        assert _decide("ssh box uptime", "plan") is None                # plan never approves
+
+
+def test_this_computers_unconfigured_sudo_is_the_users_own():
+    """This computer's sudo with nothing configuring it (PLAN-0.11 §1.5): the
+    user's own sudo (no stand-in, or one that passes it through), so the hook
+    gives no decision in any mode and never allows (UNCONFIGURED_SUDO);
+    configured, it is judged as its word says."""
+    with H.gateway_env() as env:
+        _mode_rig(env, '[hosts.box]\naddress = "u@box.example.com"\n')
+        for mode in PAYLOAD_MODES:
+            assert _decide("sudo apt update", mode) is None, mode
+            assert _decide("sudo -S rm -rf /", mode) is None, mode
+        _mode_rig(env, '[hosts.localhost]\nsudo = "ask"\n')
+        for mode in PAYLOAD_MODES:
+            assert _decide("sudo apt update", mode) == ASK, mode
+
+
+def _gw(tool, ti, mode):
+    payload = {"tool_name": tool, "tool_input": ti, "cwd": _PROJECT["cwd"]}
+    if mode is not None:
+        payload["permission_mode"] = mode
+    out = hooks_bash.main(payload)
+    return (None, "") if out is None else (out["hookSpecificOutput"]["permissionDecision"],
+                                           out["hookSpecificOutput"]["permissionDecisionReason"])
+
+
+def test_jobs_and_terminals_take_the_stricter_of_their_mode_and_the_modeless_rule():
+    """A job (checkpoint's job_start, the gateway's job_start, a remote job)
+    and what is typed into a gateway terminal (terminal_send) are judged at
+    their payload's mode and at the modeless rule the stand-ins use inside
+    them (nothing there is typed by Claude): a right only some modes give
+    is refused before anything runs (JOB_MODES), "ask" in either is the job
+    refusal, deny in the payload's mode is "off"; never an allow."""
+    with H.gateway_env() as env:
+        _mode_rig(env)
+        tools = (hooks_bash.JOB_TOOL, hooks_bash.GW_JOB_TOOL)
+        for tool in tools:
+            d, why = _gw(tool, {"command": "ssh modal uptime"}, "auto")
+            assert d == DENY and "gives it only in some permission modes" in why, (tool, why)
+            d, why = _gw(tool, {"command": "ssh modal uptime"}, "plan")
+            assert d == DENY and "ssh is off for modal" in why, (tool, why)
+            d, why = _gw(tool, {"command": "sudo apt update"}, "auto")
+            assert d == DENY and "gives it only in some permission modes" in why, (tool, why)
+            d, why = _gw(tool, {"command": "sudo apt update"}, "default")
+            assert d == DENY and "a job can't use the \"ask\" right" in why, (tool, why)
+            # a restriction "ask" in another mode: the modeless rule's ask
+            d, why = _gw(tool, {"command": "scp notes.txt ccbox:"}, "auto")
+            assert d == DENY and "a job can't use the \"ask\" right" in why, (tool, why)
+            # a bare true (cc in the modeless rule): no decision, never allow
+            for mode in PAYLOAD_MODES:
+                assert _gw(tool, {"command": "ssh ccbox uptime"}, mode)[0] is None, (tool, mode)
+        # a remote job is `ssh HOST CMD`; terminal_send types into a shell
+        d, why = _gw(hooks_bash.GW_JOB_TOOL, {"host": "modal", "command": "uptime"}, "auto")
+        assert d == DENY and "gives it only in some permission modes" in why, why
+        d, why = _gw(hooks_bash.GW_SEND_TOOL, {"id": "t_x", "seq": 1, "text": "sudo apt update\n"},
+                     "auto")
+        assert d == DENY and "gives it only in some permission modes" in why, why
+        assert _gw(hooks_bash.GW_SEND_TOOL, {"id": "t_x", "seq": 1, "text": "ssh ccbox uptime\n"},
+                   "auto")[0] is None
+
+
+def test_the_hook_records_the_mode_only_when_a_stand_in_would_see_a_difference():
+    """§2.4: the hook posts the session's mode to gated (modes.record) when a
+    per-mode value's word as the stand-ins see it (deny, ask, or cc and
+    allow alike) differs between the modes other than plan; a form of bare
+    words, a table that differs only in plan, or only between cc and allow,
+    needs no record (the modeless rule says the same)."""
+    from gateway import modes
+    seen: list = []
+    real = modes.record
+    modes.record = lambda pm: seen.append(pm) or True
+    try:
+        with H.gateway_env() as env:
+            _mode_rig(env, FORM)
+            _decide("ssh example df", "auto")
+            assert seen == []
+            for table, want in (('{ default = true, plan = false }', False),
+                                ('{ default = "cc", auto = "allow" }', False),
+                                ('{ default = "ask", auto = true }', True),
+                                ('{ default = false, dontAsk = "cc" }', True)):
+                seen.clear()
+                env.write_form(FORM.replace('[hosts.offhost]\naddress = "u@off.example.com"\n'
+                                            'ssh  = false', '[hosts.offhost]\naddress = '
+                                            f'"u@off.example.com"\nssh  = {table}'))
+                consent.approve_all(env.form())
+                _decide("ssh example df", "bypassPermissions")
+                assert seen == (["bypassPermissions"] if want else []), (table, seen)
+            # a policy table counts too, and so does the gw job tools' payload
+            seen.clear()
+            _mode_rig(env, MODE_FORM)
+            _gw(hooks_bash.JOB_TOOL, {"command": "ls"}, "plan")
+            assert seen == ["plan"], seen
+            # an account's use table alone counts (the gh stand-in reads the record)
+            seen.clear()
+            _mode_rig(env, FORM.replace('kind   = "github"\n', 'kind   = "github"\n'
+                                        'use    = { default = false, auto = true }\n'))
+            _decide("ssh example df", "auto")
+            assert seen == ["auto"], seen
+            # a command the parser can't read records it too
+            seen.clear()
+            _decide("(ls)", "dontAsk")
+            assert seen == ["dontAsk"], seen
+    finally:
+        modes.record = real
+
+
+# ---------------------------------------------------------------------------
+# WS-2 review fixes: the epoch marker, jobs in the modeless rule, the words
+# ---------------------------------------------------------------------------
+
+WS2_FORM = """
+[hosts.box]
+address = "u@box.example.com"
+ssh = { default = "ask", auto = true }
+
+[hosts.rsu]
+address = "u@rsu.example.com"
+ssh  = true
+sudo = { default = false, auto = true }
+
+[hosts.ccssh]
+address = "u@ccssh.example.com"
+ssh = { default = true, auto = "cc" }
+
+[hosts.ccsudo]
+address = "u@ccsudo.example.com"
+ssh  = true
+sudo = "cc"
+"""
+
+
+def test_the_epoch_marker_is_kept_exactly_while_the_mode_matters():
+    """PLAN-0.11 §2.4, review must-fix 3: while the effective form makes the
+    mode matter the hook keeps the epoch marker (so pre_bash.sh sends every
+    call to Python and gated's record can't go stale), made before the first
+    record and kept with the same epoch; a form where the mode doesn't
+    matter takes it out (no record counts any more)."""
+    from gateway import modes, paths
+    old = paths.ENTRY_MODE
+    paths.ENTRY_MODE = "hook-bash"                    # (only a hook records)
+    try:
+        with H.gateway_env() as env:
+            _mode_rig(env, WS2_FORM)
+            marker = paths.mode_epoch_path()
+            assert not marker.exists()
+            _decide("ssh box uptime", "auto")         # no gated here: posted nowhere
+            epoch = modes.marker_epoch()
+            assert epoch is not None and marker.exists()
+            _decide("ssh box uptime", "default")
+            assert modes.marker_epoch() == epoch, "the epoch stays while the mode matters"
+            _mode_rig(env, FORM)
+            _decide("ssh example df", "auto")
+            assert not marker.exists(), "a form where the mode doesn't matter keeps no marker"
+    finally:
+        paths.ENTRY_MODE = old
+
+
+def test_a_jobs_gate_unparsable_command_and_remote_sudo_take_the_modeless_rule_too():
+    """Review item 8: what a job runs is judged at its payload's mode and at
+    the modeless rule the stand-ins use inside it, for every stage: a `gate`
+    login, a command the parser can't read (its "ask" right found in the
+    text) and a remote sudo, as for ssh itself; Claude's own command in that
+    mode keeps its decision."""
+    with H.gateway_env() as env:
+        _mode_rig(env, WS2_FORM)
+        for tool in (hooks_bash.JOB_TOOL, hooks_bash.GW_JOB_TOOL):
+            d, why = _gw(tool, {"command": "gate check box"}, "auto")
+            assert d == DENY and "gives it only in some permission modes" in why, (tool, why)
+            d, why = _gw(tool, {"command": "(ssh box uptime)"}, "auto")
+            assert d == DENY and "a job can't use the \"ask\" right" in why, (tool, why)
+            d, why = _gw(tool, {"command": "ssh rsu sudo reboot"}, "auto")
+            assert d == DENY and "gives it only in some permission modes" in why, (tool, why)
+            assert _gw(tool, {"command": "ssh rsu uptime"}, "auto")[0] is None, tool
+        assert _decide("gate check box", "auto") == ALLOW
+        assert _decide("(ssh box uptime)", "auto") is None
+        assert _decide("ssh rsu sudo reboot", "auto") == ALLOW
+
+
+def test_a_remote_sudo_needs_the_hosts_sudo_allow_in_the_mode_too():
+    """The allow step for `ssh HOST sudo CMD`: the host's ssh and its sudo
+    must both be allow in the payload's mode; sudo "cc" there leaves the
+    command to Claude Code (no decision), though plain ssh is allowed."""
+    with H.gateway_env() as env:
+        _mode_rig(env, WS2_FORM)
+        assert _decide("ssh ccsudo uptime", "auto") == ALLOW
+        assert _decide("ssh ccsudo sudo reboot", "auto") is None
+        assert _decide("ssh rsu sudo reboot", "auto") == ALLOW
+        assert _decide("ssh rsu sudo reboot", "bypassPermissions") == DENY      # default's false
+
+
+def test_gate_rotate_logs_in_only_where_ssh_is_allow_in_the_mode():
+    """gate rotate and copy-to log in at once: allowed only where the host's
+    ssh is allow in the payload's mode, never where it is cc there."""
+    with H.gateway_env() as env:
+        _mode_rig(env, WS2_FORM)
+        for sub in ("rotate", "copy-to"):
+            assert _decide(f"gate {sub} ccssh", "auto") is None, sub
+            assert _decide(f"gate {sub} rsu", "auto") == ALLOW, sub
+            assert _decide(f"gate {sub} ccssh", "default") is None, sub     # a bare true's modes
+
+
+def test_a_per_mode_deny_names_its_mode_and_every_refusal_is_audited_with_one():
+    """Review items 6 and 11: a right that a per-mode table turns off is off
+    in the call's mode, and the reason says which (a bare false names none);
+    the hook's refusals are audited with the mode they were decided in, a
+    job's modeless refusal with "modeless"."""
+    import json
+    from gateway import paths
+    with H.gateway_env() as env:
+        _mode_rig(env)
+        why = _why("ssh modal uptime", "plan")
+        assert "ssh is off for modal in Plan mode (gateway.toml)" in why, why
+        why = _why("ssh modal sudo reboot", "default")
+        assert "sudo is off for modal in Manual mode" in why, why
+
+        def last():
+            recs = [json.loads(x) for x in paths.audit_path().read_text().splitlines()]
+            return [r for r in recs if r.get("event") == "refusal"][-1]
+        assert last()["mode"] == "default", last()
+        _why("ssh modal uptime", "plan")
+        assert last()["mode"] == "plan", last()
+        _gw(hooks_bash.JOB_TOOL, {"command": "ssh modal uptime"}, "auto")
+        assert last()["mode"] == "modeless", last()
+        _why("ssh modal uptime", None)
+        _decide("ssh modal sudo reboot", None)
+        assert last()["mode"] == "default", last()                   # no mode: default's
+        _mode_rig(env, FORM)
+        why = _why("ssh offhost uptime", "auto")
+        assert "ssh is off for offhost (gateway.toml)" in why, why
+        assert last()["mode"] == "auto", last()
+
+
+# ---------------------------------------------------------------------------
+# WS-1: the posture (PLAN-0.11 §1.7, §1.8, §9.5). A target nothing configures
+# gets no decision (the user's own tool runs); a configured one keeps every
+# guard; a route around a stand-in is refused only when it reaches a
+# configured target, in every mode, managed shell on or off; a command that
+# hides its program or host is refused while some configured entry is "ask"
+# in the mode or its text names a configured target.
+# ---------------------------------------------------------------------------
+
+POSTURE_FORM = """
+[hosts.box]
+address = "octo@box.example.com"
+also = ["10.20.30.40"]
+
+[accounts.gh]
+kind = "github"
+login = "octo"
+"""
+
+# (command, decision in every mode) with POSTURE_FORM approved: nothing is
+# "ask", this computer's sudo isn't configured
+POSTURE_TABLE = [
+    # unconfigured targets: the user's own tools, by any route
+    ("sudo apt update", NONE),
+    ("sudo -S id", NONE),
+    ("/usr/bin/sudo id", NONE),
+    ("su -c id", NONE),
+    ("doas id", NONE),
+    ("pkexec id", NONE),
+    ("ssh other.example.org uptime", NONE),
+    ("ssh -F cfg -i key -A other.example.org uptime", NONE),
+    ("/usr/bin/ssh other.example.org uptime", NONE),
+    ("env -i ssh other.example.org uptime", NONE),
+    ("command -p ssh other.example.org uptime", NONE),
+    ("sudo ssh other.example.org uptime", NONE),
+    ("PATH=/x ssh other.example.org uptime", NONE),
+    ("bash -l -c 'ssh other.example.org uptime'", NONE),
+    ("rsync -e /usr/bin/ssh f other.example.org:/x", NONE),
+    ("scp -S /usr/bin/ssh f other.example.org:/x", NONE),
+    ("ssh -J jump.example.org other.example.org true", NONE),
+    ("eval \"$CMD\"", NONE),
+    ("bash -c \"$CMD\"", NONE),
+    ("source ./venv/bin/activate", NONE),
+    ("ls | xargs -n1 echo", NONE),
+    ("/usr/bin/ssh-add -l", NONE),
+    ("/usr/bin/ssh -o HostName=other.example.org x uptime", NONE),
+    ("/usr/bin/rsync -J box other.example.org:/x", NONE),       # rsync's -J isn't a hop
+    ("rsync -e 'ssh -o HostName=box.example.com' f x:/y", NONE),  # the ssh stand-in judges it
+    ("env GIT_SSH_COMMAND=ssh git ls-remote x:r", NONE),
+    ("(sudo apt update; ssh box uptime)", NONE),                # the bare ssh is the stand-in
+    ("(sudo ssh other.example.org id)", NONE),
+    ("(sudo cat /etc/ssh/sshd_config)", NONE),
+    ("trap 'rm -f /tmp/x' EXIT", NONE),
+    ("alias ll='ls -la'", NONE),
+    ("coproc sleep 1", NONE),
+    ("trap \"$X\" EXIT", NONE),
+    ("osascript -e \"$S\"", NONE),
+    # su's -s shell and xargs in a -c string that name nothing configured (the
+    # decision table's own rows deny them: its form configures this computer's
+    # sudo and an "ask" host)
+    ("bash -c 'su bob -s /opt/x/ssh'", NONE),
+    ("bash -c 'su -c \"cat x\" -s /opt/x/ssh bob'", NONE),
+    ("bash -c 'xargs -a hosts /opt/x/ssh'", NONE),
+    # configured targets: every guard
+    ("/usr/bin/ssh box uptime", DENY),
+    ("/opt/homebrew/bin/ssh 10.20.30.40 uptime", DENY),
+    ("env -i ssh box uptime", DENY),
+    ("command -p ssh box uptime", DENY),
+    ("sudo ssh box uptime", DENY),
+    ("PATH=/x ssh box uptime", DENY),
+    ("bash -l -c 'ssh box uptime'", DENY),
+    ("bash -c '/usr/bin/ssh box uptime'", DENY),
+    ("rsync -e /usr/bin/ssh f box:/x", DENY),
+    ("ssh -J box other.example.org true", DENY),
+    ("ssh -o ProxyJump=gw-box other.example.org true", DENY),
+    ("ssh -o 'ProxyCommand=nc 10.20.30.40 22' other.example.org true", DENY),
+    ("/usr/local/bin/gh pr list", DENY),
+    ("./gh repo view octocat/hello", DENY),             # by a path while a github account exists (§19.10)
+    ("/opt/homebrew/bin/hf upload x", NONE),             # no huggingface account: the user's own
+    ("/usr/local/bin/sudoedit /etc/hosts", NONE),        # this computer's sudo isn't configured
+    ("sudoedit /etc/hosts", NONE),
+    ("huggingface-cli upload x", NONE),                 # no huggingface account: the user's own
+    ("/usr/local/bin/huggingface-cli upload x", NONE),
+    ("env -i gh pr list", DENY),
+    # every other way a plain name finds the system's tool (WS-8 review must-fix 1)
+    ("command -p gh pr list", DENY),
+    ("builtin command -p gh pr list", DENY),
+    ("PATH=/usr/bin gh pr list", DENY),
+    ("env PATH=/usr/bin gh repo view", DENY),
+    ("export PATH=/usr/bin; gh pr list", DENY),
+    ("unset PATH; gh pr list", DENY),
+    ("env - gh pr list", DENY),                          # env's lone - is -i
+    ("env -u PATH gh pr list", DENY),
+    ("env -uPATH gh pr list", DENY),
+    ("env -P /usr/bin gh pr list", DENY),                # macOS env's search path
+    ("(env - gh pr list)", DENY),
+    ("env - ssh box uptime", DENY),
+    ("env - ssh other.example.org uptime", NONE),
+    ("env FOO=1 gh pr list", NONE),                      # the stand-in, by its name
+    ("command gh pr list", NONE),
+    ("env -i hf upload x", NONE),                        # no huggingface account
+    ("eval 'ssh box uptime'", DENY),
+    ("for h in box; do ssh $h uptime; done", DENY),
+    # a HostName naming a configured host, in every spelling ssh takes (review must-fix 1)
+    ("/usr/bin/ssh -o HostName=box.example.com x uptime", DENY),
+    ("/usr/bin/ssh -oHostname=10.20.30.40 x uptime", DENY),
+    ("/usr/bin/ssh -o \"HostName 10.20.30.40\" x uptime", DENY),
+    ("/usr/bin/scp -o HostName=box.example.com f x:/y", DENY),
+    ("/usr/bin/sftp -o HostName=10.20.30.40 x", DENY),
+    ("/usr/bin/ssh-copy-id -o HostName=box.example.com x", DENY),
+    ("sudo ssh -o HostName=box.example.com x uptime", DENY),
+    ("rsync -e '/usr/bin/ssh -o HostName=box.example.com' f x:/y", DENY),
+    ("env GIT_SSH_COMMAND='/usr/bin/ssh -o HostName=box.example.com' git ls-remote x:r", DENY),
+    ("env GIT_SSH_COMMAND='ssh -o HostName=box.example.com' git ls-remote x:r", DENY),
+    ("export GIT_SSH_COMMAND='/usr/bin/ssh -J box'; git ls-remote x:r", DENY),
+    ("git -c core.sshCommand='/usr/bin/ssh -o HostName=box.example.com' ls-remote x:r", DENY),
+    # su - is a login shell for its -c string (review should-fix 7, R9)
+    ("su - octo -c 'ssh box id'", DENY),
+    # plain sudo in text the parser can't follow (review should-fix 5)
+    ("(sudo ssh box id)", DENY),
+    ("(sudo -u octo bash -c 'cd /tmp && ssh box id')", DENY),
+    # command strings that run later, written out: judged like the outer command
+    ("trap '/usr/bin/ssh box id' EXIT", DENY),
+    ("alias b='/usr/bin/ssh box'", DENY),
+    ("coproc /usr/bin/ssh box id", DENY),
+    # `gate with NAME -- CMD` runs CMD: judged as a stage of its own (WS-8,
+    # PLAN-0.11 §1.7), parsed and in text the parser can't follow; the
+    # account's name is no ssh target
+    ("gate with gh -- /usr/bin/ssh box id", DENY),
+    ("gate with gh -- env -i ssh box id", DENY),
+    ("gate with gh -- bash -l -c 'ssh box id'", DENY),
+    ("sudo gate with gh -- /usr/bin/ssh box id", DENY),
+    ("gate with gh -- gate with gh -- /usr/bin/ssh 10.20.30.40 id", DENY),
+    ("gate with a -- gate with b -- gate with c -- gate with d -- /usr/bin/ssh box id", DENY),
+    ("env -S 'gate with gh -- ssh -J box other.example.org true'", DENY),
+    ("(gate with gh -- /opt/x/ssh box id)", DENY),
+    # only an entry's name after `gate with` is an account's: a glued word
+    # may hide a target (WS-8 review must-fix 3)
+    ("(gate with x;{/usr/bin/ssh,box} -- id)", DENY),
+    ("bash -c 'gate with x;{/usr/bin/ssh,box} -- id'", DENY),
+    ("gate with gh -- ssh box id", NONE),
+    ("gate with gh -- /usr/bin/ssh other.example.org id", NONE),
+    ("(gate with gh -- /opt/x/ssh other.example.org id)", NONE),
+    # slogin is ssh by another name with no stand-in of its own: by its bare
+    # name too it is the system's ssh (WS-8)
+    ("slogin box uptime", DENY),
+    ("nohup slogin 10.20.30.40 uptime", DENY),
+    ("(slogin box uptime)", DENY),
+    ("slogin other.example.org uptime", NONE),
+    ("(slogin other.example.org uptime)", NONE),
+    # su's -s shell after its -c string is the program, while this computer's
+    # sudo isn't configured (so su itself isn't refused, §9.5) (WS-8: the
+    # decision table's own rows can't tell, its form configures sudo)
+    ("bash -c 'su -c \"cat box\" -s /opt/x/ssh bob'", DENY),
+    ("(su -c 'cat box' -s /opt/x/ssh bob)", DENY),
+    # a brace expansion or glob as the program, watch's command (sh -c)
+    ("{/usr/bin/ssh,box} id", DENY),
+    ("{/usr/bin/ssh,other.example.org} id", NONE),
+    ("watch /usr/bin/ssh box id", DENY),
+    ("watch -n 5 /usr/bin/ssh 10.20.30.40 id", DENY),
+    ("watch -n 5 ssh box id", NONE),
+    ("watch -n 5 /usr/bin/ssh other.example.org id", NONE),
+    # program names in any letter case: macOS's file systems ignore it, so
+    # /usr/bin/SSH is the system's ssh and ENV is env (lead decision 19.14)
+    ("/usr/bin/SSH box uptime", DENY),
+    ("/opt/x/Ssh 10.20.30.40 uptime", DENY),
+    ("ENV -i ssh box uptime", DENY),
+    ("env -i SSH box uptime", DENY),
+    ("COMMAND -p ssh box uptime", DENY),
+    ("Sudo SSH box uptime", DENY),
+    ("(/usr/bin/SSH box uptime)", DENY),
+    ("BASH -l -c 'ssh box uptime'", DENY),
+    ("/usr/local/bin/GH pr list", DENY),
+    ("SLOGIN box uptime", DENY),
+    ("(SLogin box uptime)", DENY),
+    ("Rsync -e /usr/bin/SSH f box:/x", DENY),
+    ("alias SSH=/opt/x/ssh; SSH box uptime", DENY),
+    ("hash -p /opt/x/ssh SSH; SSH box uptime", DENY),
+    ("/usr/bin/SSH other.example.org uptime", NONE),
+    ("/usr/bin/Sudo apt update", NONE),                  # this computer's sudo isn't configured
+]
+
+
+def test_posture_unconfigured_targets_get_no_decision_and_configured_ones_keep_every_guard():
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(POSTURE_FORM)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        failures = []
+        for cmd, want in POSTURE_TABLE:
+            for mode in PAYLOAD_MODES:
+                got = _decide(cmd, mode)
+                if got != want:
+                    failures.append(f"{mode:18} {cmd!r}: got {got} want {want}")
+        assert not failures, "\n".join(failures)
+        why = _why("/usr/bin/ssh box uptime", "default")
+        assert "box goes through the gateway" in why and "use `ssh box ...`" in why, why
+        assert "managed = \"off\"" not in why, "the escape through managed off is gone"
+        # slogin has no stand-in of its own: the way is ssh's (WS-8 review should-fix 1)
+        why = _why("slogin box uptime", "default")
+        assert "around the gateway's ssh stand-in" in why and "use `ssh box ...`" in why, why
+        assert "slogin stand-in" not in why, why
+        # an account CLI by its path: its stand-in passes an unconfigured
+        # destination to the user's own tool (PLAN-0.11 §19.10)
+        why = _why("/usr/local/bin/gh pr list", "default")
+        assert "run `gh` by its bare name" in why and \
+            "passes any other to the user's own gh" in why, why
+        assert "user's own ssh" not in _why("/usr/bin/ssh box uptime", "default")
+
+
+def test_posture_route_checks_hold_with_the_managed_shell_off():
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(POSTURE_FORM + '\n[shell]\nmanaged = "off"\n')
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        for cmd, want in POSTURE_TABLE:
+            assert _decide(cmd, "default") == want, cmd
+
+
+# Commands that hide what runs in Claude's own command shell (a sourced file,
+# eval, exec, a function, a variable as the program or -c string, a computed
+# trap, alias or callback): no decision while an entry is "ask" in the mode
+# (lead decision 19.14: what they run gets no record, so a stand-in refuses
+# an "ask" there)
+HIDDEN_IN_SHELL = (
+    "eval \"$CMD\"", "bash -c \"$CMD\"", "source ./venv/bin/activate", "$TOOL --version",
+    "f() { echo; }; f",
+    # review should-fix 6: trap, coproc, an alias, a -C callback
+    "trap \"$X\" EXIT", "(trap \"$X\" EXIT)", "coproc $X", "alias a=\"$X\"; a",
+    "(alias a=\"$X\"; a)", "mapfile -C \"$X\" arr", "mapfile -tC \"$X\" arr",
+    "readarray -C \"$X\" arr", "complete -C \"$X\" x", "compgen -C \"$X\" x",
+    # eval or source inside a written-out -c string; a computed osascript
+    "bash -c 'source ./x'", "nohup bash -c 'source ./x'",
+    "osascript -e \"$S\"", "(osascript -e \"$S\")",
+    # `gate with NAME -- CMD` runs CMD (WS-8), also in text
+    "(gate with work -- $TOOL x)", "bash -c 'gate with work -- gate with work -- source ./x'",
+    # WS-9 review M1: what everyday use looks like (a prompt, never a refusal)
+    "source .venv/bin/activate && pytest", ". .venv/bin/activate", "eval \"$(pyenv init -)\"",
+    "eval \"$(direnv export bash)\"", "source ~/.nvm/nvm.sh && nvm use 20",
+    # WS-9 review M2: builtin and command, after reserved words, time, !, a case arm
+    "builtin source ./deploy.sh", "builtin . ./deploy.sh", "command source ./deploy.sh",
+    "command . ./deploy.sh", "command eval \"$X\"", "command -- source ./deploy.sh",
+    "[ -f x ] && builtin source ./deploy.sh", "set -e; builtin . ./deploy.sh",
+    "if true; then source ./deploy.sh; fi", "if [ -f d.sh ]; then . ./d.sh; fi",
+    "for f in *.sh; do source \"$f\"; done", "while read l; do eval \"$l\"; done < f",
+    "until false; do eval \"$X\"; done", "! source ./deploy.sh", "time source ./deploy.sh",
+    "time -p eval \"$X\"", "case x in x) source ./deploy.sh;; esac",
+    "case $1 in a|b) . ./x;; *) eval \"$X\";; esac",
+    # the same where the parser gives up (an assignment, a subshell): the text scan
+    "x=$(date); if true; then source ./deploy.sh; fi", "x=$(date); builtin source ./deploy.sh",
+    "x=$(date); command . ./deploy.sh", "x=$(date); time eval x", "x=$(date); ! source ./x",
+    "x=$(date); for f in *.sh; do source \"$f\"; done", "(gate with work -- source ./x)",
+    "x=$(date); exec ./deploy.sh",
+    # exec of a script, a shell or a variable replaces Claude's command shell
+    "exec ./deploy.sh", "exec bash deploy.sh", "exec sh deploy.sh", "exec -- bash deploy.sh",
+    "exec -a foo \"$X\"", "exec bash -c \"$CMD\"", "builtin exec ./deploy.sh",
+    "if true; then exec ./deploy.sh; fi",
+    # a shell option that takes a value before -c
+    "bash -o posix -c \"$CMD\"", "bash -O extglob -c \"$CMD\"", "bash --rcfile F -c \"$CMD\"",
+    "sh -o errexit -c \"$CMD\"", "bash +o posix -c \"$CMD\"", "bash -eo pipefail -c \"$CMD\"",
+    "bash -o posix -lc \"$CMD\"", "bash -o posix -lc 'source ./x'", "bash -O extglob -lc 'eval x'",
+)
+# Commands whose hidden part runs below xargs, parallel or find, never a
+# command Claude typed (a stand-in refuses an "ask" there): no decision
+HIDDEN_BELOW_A_CHILD = (
+    "ls | xargs -n1 echo", "ls | xargs wc -l", "git ls-files | xargs grep -n foo",
+    "find . -name x -exec echo {} +", "find . -name '*.pyc' -exec rm {} +",
+    "find . -name '*.py' -exec grep -l TODO {} \\;", "xargs -a cmds.txt -I{} sh -c {}",
+    "ls | xargs -I{} sh -c 'source {}'", "parallel echo ::: a b",
+    "gate with work -- xargs ssh", "(gate with work -- xargs ssh)",
+    "(gate with work -- find . -exec ssh {} +)", "(cd /tmp && gate with work -- xargs ssh)",
+    # scp, sftp and rsync start ssh themselves; git's "ask" needs the hook's record
+    "rsync -a ./x \"$H\":/srv", "scp f \"$H\":/tmp", "git commit -m \"$MSG\"",
+    # the same where the parser gives up: the text scan
+    "x=$(date); ls | xargs wc -l", "x=$(pwd); find . -name '*.pyc' -exec rm {} +",
+    "(ls | xargs -n1 echo)",
+)
+
+
+def test_posture_a_hidden_command_gets_no_decision_while_something_is_ask_in_the_mode():
+    """PLAN-0.11 §1.7, lead decision 19.14: a command that hides what runs in
+    Claude's own shell (what it runs looks typed by Claude to a stand-in)
+    gets no decision while an entry is "ask" in the mode: it gets no record
+    of an ask, so a stand-in it reaches refuses the "ask" itself (asks.py),
+    and venvs and pyenv need no prompt. One whose hidden part runs below
+    xargs, parallel or find gets none either. Either is refused when its text
+    names a configured target."""
+    form = POSTURE_FORM + '\n[hosts.askbox]\naddress = "u@ask.example.com"\nssh = { default = "ask", auto = true }\n'
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(form)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        for cmd in HIDDEN_IN_SHELL:
+            for mode in ("default", "auto"):
+                assert _decide(cmd, mode) is None, (cmd, mode, _why(cmd, mode))
+            # the same naming a configured target: it may reach it unseen
+            named = cmd + "\necho askbox"
+            assert _decide(named, "default") == DENY and \
+                "its text names askbox" in _why(named, "default"), named
+        for cmd in HIDDEN_BELOW_A_CHILD:
+            for mode in ("default", "auto"):
+                assert _decide(cmd, mode) is None, (cmd, mode)
+        # naming a configured target: refused, below a child too
+        for cmd in ("find . -name x -exec ssh askbox {} \\;", "ls | xargs -I{} sh -c '{} box'",
+                    "source ./deploy-box.sh box", "exec ./run.sh askbox"):
+            assert _decide(cmd, "default") == DENY and "its text names" in _why(cmd, "default"), cmd
+        # exec with redirections only runs nothing; a value option isn't a script
+        for cmd in ("exec >log 2>&1", "exec 3>&-", "exec 2>/dev/null; make", "exec {fd}>log",
+                    "bash -o posix deploy.sh", "bash -O extglob ./x.sh", "echo then source x",
+                    "git commit -m \"case in a) source x\"", "command -v source"):
+            assert _decide(cmd, "default") is None, cmd
+        # (so beside a named "ask" target it hides nothing: asked about, with a record)
+        assert _decide("exec 2>/dev/null; ssh askbox id", "default") == ASK
+        # a written-out command is judged as itself
+        assert _decide("bash -c 'make test'", "default") is None
+        assert _decide("echo hi | sh", "default") is None
+        # a written-out command string that runs later: an "ask" right it names is asked
+        assert _decide("trap 'ssh askbox id' EXIT", "default") == ASK
+        assert _decide("alias a='ssh ask.example.com id'", "default") == ASK
+        for cmd in ("trap 'rm -f \"$tmp\"' EXIT", "(x=$(mktemp); trap 'rm -f \"$x\"' EXIT; echo hi)",
+                    "alias ll='ls -la'", "trap - EXIT", "trap -p", "mapfile arr < /dev/null",
+                    "coproc sleep 1", "osascript -e 'display notification \"hi\"'",
+                    # `gate with NAME --` starts a command only at a command's
+                    # start (WS-8 review should-fix 2): here it is text
+                    "(git commit -m \"docs: gate with work -- xargs\")",
+                    "(echo \"run gate with work -- source ./env\")",
+                    "(echo gate with work -- eval)"):
+            assert _decide(cmd, "default") is None, cmd
+        # (so beside a named target they hide nothing: no refusal for hiding)
+        for cmd in ("(git commit -m \"docs: gate with work -- xargs\")",
+                    "(echo \"run gate with work -- source ./env\")",
+                    "(echo gate with work -- eval)"):
+            named = cmd + "\necho askbox"
+            assert "its text names" not in (_why(named, "default") or ""), named
+
+
+def test_posture_other_elevation_tools():
+    """§9.5: su, doas, pkexec, runuser, sudoedit (WS-9: sudo's own binary,
+    but no stand-in supplies its password) and osascript's administrator
+    privileges are refused while this computer's sudo is configured ("use
+    sudo"); with only an elevation restriction its deny refuses and its ask
+    asks; otherwise they are the user's own. Never allowed."""
+    cmds = ("su -c id", "su - root", "doas id", "pkexec id", "runuser -u x id", "sudo su -",
+            "osascript -e 'do shell script \"id\" with administrator privileges'",
+            # review must-fix 2: text the parser can't follow, exec, -c strings,
+            # AppleScript's labelled form, a script from stdin
+            "(pkexec id)", "echo $(pkexec id)", "exec pkexec id", "exec su -c id",
+            "bash -c 'su -c id'", "sh -c \"pkexec id\"", "nohup sh -c 'doas id'",
+            "(osascript -e 'do shell script \"id\" with administrator privileges')",
+            "bash -c \"osascript -e 'do shell script \\\"id\\\" with administrator privileges'\"",
+            "osascript -e 'do shell script \"id\" administrator privileges true'",
+            "echo 'do shell script \"id\" with administrator privileges' | osascript",
+            "trap 'su -c id' EXIT", "coproc doas id", "eval 'su -c id'", "bash <<< 'pkexec id'",
+            "watch -n1 su -c id", "find / -exec su -c id \\;", "echo 'su -c id' | sh",
+            "sudo -u root su",
+            # `gate with NAME -- CMD` runs CMD (WS-8)
+            "gate with work -- su -c id", "gate with work -- bash -c 'doas id'",
+            "(gate with work -- pkexec id)", "GATE_ACCOUNT=x nohup gate with work -- runuser -u x id",
+            "gate with work -- osascript -e 'do shell script \"id\" with administrator privileges'",
+            # sudoedit by its bare name (WS-9)
+            "sudoedit /etc/hosts", "sudo sudoedit /etc/hosts", "nohup sudoedit -u root /etc/hosts",
+            "bash -c 'sudoedit /etc/hosts'", "(sudoedit /etc/hosts)", "gate with work -- sudoedit /etc/x",
+            # any letter case (lead decision 19.14)
+            "Su -c id", "DOAS id", "PkExec id", "/usr/bin/Su -c id", "(Su -c id)", "SudoEdit /etc/x",
+            "OSAScript -e 'do shell script \"id\" with administrator privileges'")
+    with H.gateway_env() as env:
+        _project(env)
+        for sudo in ('"ask"', "true"):
+            env.write_form(f'[hosts.localhost]\nsudo = {sudo}\n')
+            vault.save(vault.empty())
+            consent.approve_all(env.form())
+            for cmd in cmds:
+                for mode in PAYLOAD_MODES:
+                    assert _decide(cmd, mode) == DENY, (sudo, cmd, mode)
+        assert "use sudo; the gateway supplies its password" in _why("doas id", "default")
+        assert "use sudo; the gateway supplies its password" in _why("(pkexec id)", "default")
+        why = _why("sudoedit /etc/hosts", "auto")
+        assert why.startswith("gateway: sudoedit isn't used") and "use sudo; the gateway supplies" in why, why
+        for cmd in ("osascript -e 'display dialog \"hi\"'", "(grep -c su /etc/passwd)",
+                    "git commit -m 'su: fix'", "echo su"):
+            assert _decide(cmd, "default") is None, cmd
+        env.write_form('[hosts.localhost.policy]\nelevation = { default = "ask", auto = "deny" }\n')
+        consent.approve_all(env.form())
+        assert _decide("doas id", "default") == ASK
+        assert _decide("doas id", "auto") == DENY
+        assert _decide("(doas id)", "default") == ASK
+        assert _decide("(doas id)", "auto") == DENY
+        assert _decide("sudoedit /etc/hosts", "default") == ASK
+        assert _decide("sudoedit /etc/hosts", "auto") == DENY
+        env.write_form(POSTURE_FORM)
+        consent.approve_all(env.form())
+        for cmd in cmds:
+            assert _decide(cmd, "auto") is None, cmd
+
+
+def test_posture_huggingface_cli_is_refused_with_the_way_through_hf():
+    """WS-9: huggingface-cli is hf's older name and has no stand-in, so by any
+    name (bare, by its path, behind a wrapper, in a -c string or text the
+    parser can't follow) it is the user's own tool: while a huggingface
+    account exists it is refused, pointing at `hf` (whose stand-in gates
+    it), never at a huggingface-cli stand-in that doesn't exist. Without one
+    it is the user's own; naming it as data is never refused."""
+    hug = '[accounts.hug]\nkind = "huggingface"\nlogin = "octocat"\n'
+    cmds = ("huggingface-cli upload octocat/x .", "/usr/local/bin/huggingface-cli download x",
+            "./huggingface-cli whoami", "env HF_HUB_OFFLINE=0 huggingface-cli upload x",
+            "nohup huggingface-cli upload x", "sudo huggingface-cli upload x",
+            "(huggingface-cli upload x)", "bash -c 'huggingface-cli upload x'",
+            "X=1; eval huggingface-cli upload x", "gate with hug -- huggingface-cli upload x",
+            "echo $(huggingface-cli whoami)")
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(hug)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        for cmd in cmds:
+            for mode in PAYLOAD_MODES:
+                assert _decide(cmd, mode) == DENY, (cmd, mode)
+        for cmd in ("huggingface-cli upload x", "/usr/local/bin/huggingface-cli upload x",
+                    "bash -c 'huggingface-cli upload x'"):
+            why = _why(cmd, "default")
+            assert "run the same command as `hf ...`" in why and "hf stand-in" in why and \
+                "user's own hf" in why and "hug goes through the gateway" in why, (cmd, why)
+            assert "huggingface-cli` by its bare name" not in why and \
+                "huggingface-cli stand-in" not in why, (cmd, why)
+        for cmd in ("echo huggingface-cli", "pip install huggingface-cli", "which huggingface-cli",
+                    "man huggingface-cli", "hf upload x"):
+            assert _decide(cmd, "default") is None, cmd
+        env.write_form(POSTURE_FORM)
+        consent.approve_all(env.form())
+        assert _decide(cmds[0], "default") == DENY, "its approved entry gates until the removal's OK"
+        consent.approve("hug", form=env.form())
+        for cmd in cmds:
+            assert _decide(cmd, "default") is None, cmd
+
+
+def test_posture_without_the_managed_shell_commands_are_judged_with_a_notice_once():
+    """§1.8: no blanket refusal without the mod's prefix; the person is
+    told once per session (managed "on"), and the command is judged as
+    usual."""
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(POSTURE_FORM)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        old = os.environ.pop("CLAUDE_CODE_SHELL_PREFIX", None)
+        try:
+            p = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s-posture-1",
+                 "permission_mode": "default", "cwd": _PROJECT["cwd"]}
+            out = hooks_bash.main(p)
+            assert out and "your commands run in your own shell" in out.get("systemMessage", "")
+            assert "hookSpecificOutput" not in out, "never a refusal"
+            assert hooks_bash.main(p) is None, "once per session"
+            out = hooks_bash.main({**p, "tool_input": {"command": "/usr/bin/ssh box x"},
+                                   "session_id": "s-posture-2"})
+            assert out["hookSpecificOutput"]["permissionDecision"] == DENY
+            assert "your own shell" in out["systemMessage"]
+        finally:
+            if old is not None:
+                os.environ["CLAUDE_CODE_SHELL_PREFIX"] = old
+
+
+def test_posture_a_git_transport_change_is_refused_only_where_a_configured_remote_is():
+    """§1.7: GIT_SSH_COMMAND, git -c core.sshCommand= and an exported
+    GIT_SSH_COMMAND before git go around the ssh stand-in; refused only in a
+    repository whose remote the gateway handles, the user's own elsewhere."""
+    import subprocess
+    git = str(H.ENV_BIN / "git")
+    with H.gateway_env() as env:
+        _project(env)
+        env.write_form(POSTURE_FORM)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        genv = {"PATH": f"{H.ENV_BIN}:/usr/bin:/bin", "HOME": str(env.user_home),
+                "GIT_CONFIG_NOSYSTEM": "1", "LANG": "C"}
+        repos = {}
+        for name, url in (("ours", "octo@box.example.com:srv/x.git"),
+                          ("theirs", "git@other.example.org:o/x.git")):
+            d = env.root / "repos" / name
+            d.mkdir(parents=True)
+            for args in (["init", "-q"], ["remote", "add", "origin", url]):
+                r = subprocess.run([git, *args], cwd=str(d), env=genv, capture_output=True,
+                                   text=True, timeout=30)
+                assert r.returncode == 0, r.stderr
+            repos[name] = str(d)
+        cmds = ("GIT_SSH_COMMAND=/usr/bin/ssh git fetch", "git -c core.sshCommand=/usr/bin/ssh fetch",
+                "export GIT_SSH_COMMAND=/usr/bin/ssh; git fetch",
+                "env GIT_SSH_COMMAND=/usr/bin/ssh git fetch", "git -ccore.sshCommand=/usr/bin/ssh fetch",
+                "git config core.sshCommand /usr/bin/ssh")
+        for cmd in cmds:
+            for mode in ("default", "auto"):
+                assert _decide(cmd, mode, cwd=repos["ours"]) == DENY, (cmd, mode)
+                assert _decide(cmd, mode, cwd=repos["theirs"]) is NONE, (cmd, mode)
+        why = _why(cmds[1], "default", cwd=repos["ours"])
+        assert "goes around the gateway's ssh stand-in" in why and "box" in why, why
+        # in a repository the gateway doesn't handle, a transport line whose own
+        # words reach a configured host is refused by the route check (WS-4's
+        # git judge refuses the forms above first in ours; WS-8)
+        for cmd in ("git -ccore.sshCommand='/usr/bin/ssh -J box' fetch",
+                    "git config core.sshCommand '/usr/bin/ssh -o HostName=box.example.com'"):
+            for mode in ("default", "auto"):
+                assert _decide(cmd, mode, cwd=repos["theirs"]) == DENY, (cmd, mode)
+            assert "goes around the gateway's ssh stand-in" in _why(cmd, "default", cwd=repos["theirs"])
+        assert _decide("git -ccore.sshCommand='/usr/bin/ssh -J jump.example.org' fetch", "default",
+                       cwd=repos["theirs"]) is NONE

@@ -59,7 +59,9 @@ def test_gh_enterprise_uses_enterprise_token():
         _fakes(env, gh="gh")
         form = '[accounts.ghe]\nkind = "github"\nhost = "github.acme.com"\nlogin = "me"\n'
         HA.build_vault(env, form, tokens={"ghe": GHTOK})
-        rc, out, err = HA.run_cli("gh", ["repo", "list", "acme/x"])
+        # the enterprise host named (gh's default is github.com, which no
+        # account covers here: that would be the user's own gh, PLAN-0.11 §1.4)
+        rc, out, err = HA.run_cli("gh", ["pr", "list", "-R", "github.acme.com/acme/x"])
         assert rc == 0, err
         j = _first_json(out)
         assert j["env"].get("GH_HOST") == "github.acme.com"
@@ -113,7 +115,9 @@ def test_gh_never_sends_the_token_to_another_host():
     gh attaches to every host but github.com (GH_TOKEN goes to any *.ghe.com);
     --hostname, a full-URL `gh api` endpoint, -R HOST/OWNER/REPO and URL
     arguments named another host. Only the account's host (and its api. host,
-    when bound) may be named."""
+    when bound) gets the token; another host named on the command line is
+    no configured destination, so the user's own gh runs there with the
+    user's own login (PLAN-0.11 §1.4; this machine has none: 127)."""
     with H.gateway_env() as env:
         HA.set_direct((True, ""))
         _fakes(env, gh="gh")
@@ -130,22 +134,31 @@ def test_gh_never_sends_the_token_to_another_host():
                      ["pr", "view", "https://evil.example/acme/x/pull/1"],
                      ["repo", "clone", "evil.example/acme/x"],
                      ["repo", "view", "git@evil.example:acme/x.git"],
-                     ["api", "--hostname", "github.com", "/user"],
-                     ["api", "--hostname", "api.github.acme.com", "/user"]):
+                     ["api", "--hostname", "github.com", "/user"]):
             rc, out, err = HA.run_cli("gh", argv)
-            assert rc == 2 and "isn't its host (github.acme.com)" in err, (argv, rc, err)
+            assert rc == 127 and "gh isn't installed here" in err, (argv, rc, err)
             assert "TOKEN-SEEN" not in out, argv
+        # the account's own api. host takes the gated path, which refuses it unbound
+        rc, out, err = HA.run_cli("gh", ["api", "--hostname", "api.github.acme.com", "/user"])
+        assert rc == 2 and "isn't its host (github.acme.com)" in err, (rc, err)
+        assert "TOKEN-SEEN" not in out
         for argv in (["api", "--hostname", "github.acme.com", "/user"],
                      ["api", "https://github.acme.com/api/v3/user"],
-                     ["pr", "list", "-R", "github.acme.com/acme/x"],
-                     ["pr", "list", "-R", "acme/x"],
-                     ["release", "upload", "v1", "dist/a/b.tar.gz"]):
+                     ["pr", "list", "-R", "github.acme.com/acme/x"]):
             rc, out, err = HA.run_cli("gh", argv)
             assert rc == 0, (argv, err)
+        # no host named: GH_HOST (outside a repository whose remote decides)
+        os.environ["GH_HOST"] = "github.acme.com"
+        try:
+            for argv in (["pr", "list", "-R", "acme/x"], ["release", "upload", "v1", "dist/a/b.tar.gz"]):
+                rc, out, err = HA.run_cli("gh", argv, cwd=str(env.root))
+                assert rc == 0, (argv, err)
+        finally:
+            os.environ.pop("GH_HOST", None)
         # a github.com account: GH_TOKEN would go to any *.ghe.com host
         HA.build_vault(env, TWO_GH, tokens={"github-personal": PTOK, "github-work": GHTOK})
         rc, out, err = HA.run_cli("gh", ["api", "--hostname", "acme.ghe.com", "/user"])
-        assert rc == 2 and "isn't its host (github.com)" in err, err
+        assert rc == 127 and "gh isn't installed here" in err, err      # the user's own gh
         rc, out, err = HA.run_cli("gh", ["api", "https://api.github.com/user"])
         assert rc == 0, err
 
@@ -251,9 +264,10 @@ def test_databricks_unlisted_workspace_refused():
         import os
         os.environ["DATABRICKS_HOST"] = "https://adb-999.9.azuredatabricks.net"
         try:
+            # no configured account covers that workspace: the user's own databricks
+            # (PLAN-0.11 §1.4; none on this machine: 127), never the account's token
             rc, out, err = HA.run_cli("databricks", ["clusters", "list"])
-            assert rc == 2 and ("name the workspace" in err or "no azure account" in err or
-                                "isn't bound" in err), err
+            assert rc == 127 and "databricks isn't installed here" in err, err
         finally:
             os.environ.pop("DATABRICKS_HOST", None)
 
@@ -408,6 +422,22 @@ def test_az_account_show_and_get_token():
         assert '"tokenType": "Bearer"' in out
 
 
+def test_az_honours_the_accounts_use():
+    """Lead decision 19.14: az used no account's `use` at all. `use = false`
+    refuses; `use = "ask"` passes only for a command Claude typed that the
+    approval hook asked about, which a program's token request never is."""
+    tok = "ARM-TOKEN-ABCDEF123456"
+    with H.gateway_env() as env:
+        for use, words in (("false", "has use = false"),
+                           ('"ask"', "can only ask about a command Claude runs itself")):
+            HA.build_vault(env, AZ_ENV + "scripts = true\n" + f"use = {use}\n", entra=ENTRA)
+            with vault.locked():
+                vault.cache_put("azure", entra.SCOPES["arm"], tok, time.time() + 3600)
+            HA.set_direct((False, "node"))      # an SDK Claude's command started
+            rc, out, err = HA.run_cli("az", ["account", "get-access-token"])
+            assert rc == 2 and tok not in out + err and words in err, (use, rc, out, err)
+
+
 def test_az_never_gives_claudes_own_command_a_raw_token():
     """Review round 2: a direct caller (Claude's command shell, a wrapper, a
     Monitor command) got the raw Entra token on stdout, which Claude reads;
@@ -442,7 +472,7 @@ def test_az_mints_only_scopes_of_approved_destinations():
         minted: list[str] = []
         real = entra.access_token
 
-        def fake(account, scope):
+        def fake(account, scope, mode="modeless"):
             minted.append(entra.resolve_scope(scope))
             return "TOKEN-FOR-" + entra.resolve_scope(scope).replace("/", "_")
         entra.access_token = fake

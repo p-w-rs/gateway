@@ -1,22 +1,27 @@
-"""PostToolUse: scrub tool output, validate edits of the form, show pending
-no-screen requests (SPEC 12, 6).
+"""PostToolUse: scrub tool output and validate edits of the form (SPEC 12).
 
-hooks/post.sh runs this for every response once a vault exists (its values
-have no shape the sh prefilter could match), and otherwise only when the tool
-response matches a token shape, when an Edit/Write/MultiEdit touched
-gateway.toml, or when a pending pop-up request is newer than what this
-session was shown.
+hooks.json sends every tool's response to hooks/post.sh (matcher ".*",
+PLAN-0.11 §9.1), which skips the tools whose response is fixed text or
+Claude's own input (SKIP_TOOLS) and runs this for every other response once
+a vault exists (its values have no shape the sh prefilter could match), and
+otherwise only when the tool response matches a token shape, holds the
+value of one of the credential variables (envfile.MASK_ENV_NAMES), or when
+an Edit/Write/MultiEdit touched gateway.toml.
 
 - Scrub: `updatedToolOutput` = the tool response with every string passed
-  through scrub.scrub_text (token shapes and vault values); same shape as the
-  response (dict stays dict, list stays list, string stays string).
+  through scrub.scrub_text (token shapes, vault values, and the values of
+  the user's credential variables in this hook's environment, which is
+  Claude Code's: env_secrets); same shape as the response (dict stays dict,
+  list stays list, string stays string). With a passphrase-protected vault
+  the values come from gated (vault.load is brokered: the hooks' scope is
+  every secret class); a locked vault masks shapes and variables only.
 - Form edits: validate, persist narrowings (consent.ratchet) and return
   `additionalContext` with the result, so Claude fixes its own mistake in the
   same turn: `gateway: form OK; example: new address needs the user's OK
   - run gate check example`.
-- Pending requests that can't open a pop-up (no screen): a `systemMessage`
-  (shown to the user; the model can't alter it) with the fixed terminal
-  command and its one-time code, once per request per session.
+- `pending_notice` (not called here): the fixed line SessionStart and the
+  prompt hook show once per session for an open gateway dialog ("waiting in
+  Claude Code (/gate-dialog shows it)"); the mod draws the dialog itself.
 
 PostToolUseFailure (round 3): Claude Code sends a failed tool call (a Bash
 command that exited non-zero, timed out or was killed) there, with the
@@ -25,8 +30,7 @@ the gateway doesn't change how Claude's commands exit, DECISIONS "Rolled
 back"). So when the text holds a stored secret or a token shape, Claude is
 told never to repeat or use it (additionalContext), the user is told which
 entry to replace (systemMessage, never the value), and an audit event is
-written. Pending no-screen notices are shown here too, so a failing `gate
-check` without a screen still shows its one-time code.
+written.
 """
 from __future__ import annotations
 
@@ -43,6 +47,56 @@ from . import paths
 # Python pays for every import (review round 5).
 
 FORM_TOOLS = ("Edit", "Write", "MultiEdit")
+# Tools whose response is fixed text or Claude's own input: hooks/post.sh
+# never starts Python for them (its SKIP_TOOLS; tests compare the two). Not
+# TaskOutput or Task/Agent: their responses carry output.
+SKIP_TOOLS = ("TodoWrite", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "EnterPlanMode",
+              "ExitPlanMode")
+# The credential variables whose values are masked in what Claude reads
+# (PLAN-0.11 §1.6: Claude's shell keeps the user's environment): the one
+# list, envfile.MASK_ENV_NAMES, which hooks/post.sh writes out (a test
+# compares); here every variable named like a credential is masked too
+# (env_secrets).
+_CRED_NAME = re.compile(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_KEY|"
+                        r"PRIVATE_KEY|CONNECTION_STRING)$")
+MIN_ENV_VALUE = 8      # scrub.MIN_LITERAL: a shorter value masked by literal would be revealed
+
+
+def env_secrets(environ: Any = None) -> list[tuple[str, str]]:
+    """(name, value) of each credential variable in this hook's environment
+    (Claude Code's): MASK_ENV_NAMES, and every name ending like a credential
+    (_TOKEN, _SECRET, _PASSWORD, _API_KEY, ...), with a value of 8 or more
+    characters. A value that starts with "/" counts too: a base64 secret
+    (AWS_SECRET_ACCESS_KEY, AZURE_STORAGE_KEY) does about one time in 64.
+    Values only the shell snapshot exports aren't here (a stated limit)."""
+    from .envfile import MASK_ENV_NAMES
+    env = os.environ if environ is None else environ
+    out: list[tuple[str, str]] = []
+    for n, v in env.items():
+        if not isinstance(n, str) or not isinstance(v, str):
+            continue
+        if n not in MASK_ENV_NAMES and not _CRED_NAME.search(n.upper()):
+            continue
+        if len(v) < MIN_ENV_VALUE or not v.strip():
+            continue
+        out.append((n, v))
+    return out
+
+
+def env_values() -> list[str]:
+    return [v for _n, v in env_secrets()]
+
+
+def env_hits(text: str) -> list[str]:
+    """The names of the credential variables whose value, in any form the
+    scrubber masks, appears in `text` (names only; never the value)."""
+    try:
+        from . import scrub
+    except Exception:  # noqa: BLE001
+        return []
+    raw = text.encode("utf-8", "surrogatepass")
+    return [n for n, v in env_secrets() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", n)
+            and any(f and f in raw for f in scrub.expand([v]))]
 
 
 # ---------------------------------------------------------------------------
@@ -60,29 +114,33 @@ def _vault_values() -> list[str]:
         return []
 
 
-def scrub_text(text: str) -> str:
+def scrub_text(text: str, env: list[str] | None = None) -> str:
+    """Token shapes, vault values and the credential variables' values
+    (`env`: env_values(), read here when not given) masked."""
+    env = env_values() if env is None else env
     try:
         from . import scrub
-        return scrub.scrub_text(text)
+        return scrub.scrub_text(text, extra=env)
     except NotImplementedError:
         from . import audit
-        return audit._fallback_scrub(text, _vault_values())
+        return audit._fallback_scrub(text, _vault_values() + env)
 
 
-def scrub_obj(obj: Any) -> tuple[Any, bool]:
+def scrub_obj(obj: Any, env: list[str] | None = None) -> tuple[Any, bool]:
     """(scrubbed copy, changed?) for a tool response of any JSON shape."""
+    env = env_values() if env is None else env
     if isinstance(obj, str):
-        new = scrub_text(obj)
+        new = scrub_text(obj, env)
         return new, new != obj
     if isinstance(obj, dict):
         out, changed = {}, False
         for k, v in obj.items():
-            nv, c = scrub_obj(v)
+            nv, c = scrub_obj(v, env)
             out[k] = nv
             changed = changed or c
         return out, changed
     if isinstance(obj, list):
-        items = [scrub_obj(v) for v in obj]
+        items = [scrub_obj(v, env) for v in obj]
         return [v for v, _ in items], any(c for _, c in items)
     return obj, False
 
@@ -171,6 +229,10 @@ def _form_context() -> str | None:
     except Exception:  # noqa: BLE001
         pass
     eff = consent.compute(form, data)
+    # the stand-ins on PATH follow the configured set (PLAN-0.11 §1.2; WS-1)
+    from . import envfile
+    envfile.sync_standins(form, eff)
+    consent.sync_network_words(eff)          # pre_bash.sh's extra trigger words (WS-3)
     return form_report(form, eff, narrowed)
 
 
@@ -322,17 +384,27 @@ def failure_notice(payload: dict) -> tuple[str | None, str | None]:
         return None, None
     matches = secret_matches(text)
     hits = [(n, w) for n, w, _sec, _f in matches]
-    shaped = scrub_text(text) != text
-    if not hits and not shaped:
+    envs = env_hits(text)
+    shaped = scrub_text(text, []) != text
+    if not hits and not shaped and not envs:
         return None, None
     tool = payload.get("tool_name") if isinstance(payload.get("tool_name"), str) else ""
     try:
         from . import audit
         from . import form as formmod
         audit.log("leak", tool=formmod.safe(tool) or "a tool", entries=[f"{e} {w}" for e, w in hits],
-                  shaped=shaped and not hits, where="PostToolUseFailure")
+                  variables=envs, shaped=shaped and not hits, where="PostToolUseFailure")
     except Exception:  # noqa: BLE001
         pass
+    if envs and not hits:
+        names = ", ".join(envs[:4])
+        ctx = ("gateway: the output of that failed command held the value of one of the user's "
+               "credential variables, which Claude Code shows unmasked for failed commands; never "
+               "repeat, store or use it.")
+        msg = (f"gateway: the output of a failed command held the value of your {names} "
+               "variable. Claude Code doesn't let the gateway mask a failed command's output, so "
+               "Claude saw it; consider replacing it.")
+        return ctx, msg
     if hits:
         names = "; ".join(f"{e}'s {w}" for e, w in hits[:4])
         ctx = ("gateway: the output of that failed command held a stored secret, which Claude Code "

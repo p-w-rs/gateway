@@ -69,7 +69,8 @@ gated ── RemoteHost(NAME) ── Conn (ssh_conf: the vault's key, pinned hos
 
 ## Connecting, rights and identity (RemoteHost)
 
-- **Rights**: the host's effective ssh right must be `true` (`"ask"` can't be asked per
+- **Rights**: the host's modeless ssh right (PLAN-0.11 §2.4: the strictest over every
+  mode but plan) must be cc or allow, i.e. `true` (`"ask"` can't be asked per
   command for a terminal or job: refused with the remedy; `false` refused with the form's
   wording; a host waiting for the user's OK refused). The link is `ssh._build_link(...,
   checked=True, on_mismatch=...)`: the same address choice, pins, keys and jump chain as

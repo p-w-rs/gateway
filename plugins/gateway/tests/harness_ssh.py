@@ -401,13 +401,24 @@ class SshEnv:
 
     def set(self, direct: bool | str | None = None, culprit: str | None = None,
             popup: dict[str, list] | None = None, lfs_parent: bool | None = None,
-            typed: bool | str | None = None, **override: Any) -> None:
+            typed: bool | str | None = None, asked: bool | str | None = None,
+            mode: str | None = None, **override: Any) -> None:
         """Knobs for the stand-in subprocesses (and in-process patches).
-        `typed` (ancestry.typed_by_claude) follows `direct` unless set."""
+        `typed` (ancestry.typed_by_claude) follows `direct` unless set;
+        `asked` (asks.standin: the approval hook's record of the command)
+        follows `typed` unless set ("real": the record files themselves);
+        `mode` is the session's mode the hook recorded, which a stand-in
+        Claude typed reads back (modes.current_for; "" unsets it)."""
         if direct is not None:
             self.cfg["direct"] = direct
         if typed is not None:
             self.cfg["typed"] = typed
+        if asked is not None:
+            self.cfg["asked"] = asked
+        if mode == "":
+            self.cfg.pop("mode", None)
+        elif mode is not None:
+            self.cfg["mode"] = mode
         if lfs_parent is not None:
             self.cfg["lfs_parent"] = lfs_parent
         if culprit is not None:
@@ -756,6 +767,41 @@ def patch_modules(root: Path, cfg: dict[str, Any]) -> list[tuple[Any, str, Any]]
         c = json.loads((Path(root) / "ssh-entry.json").read_text())
         return bool(c.get("lfs_parent", False))
 
+    from gateway import asks
+    real_standin = getattr(asks.standin, "_real", asks.standin)
+
+    def standin(tool: str, argv: Any, entry: tuple[str, str]) -> str:
+        # "asked" follows "typed": a command the test makes typed by Claude
+        # has the approval hook's record too, unless asked=False (no record:
+        # "none") or "real" (the record files in the run folder)
+        c = json.loads((Path(root) / "ssh-entry.json").read_text())
+        a = c.get("asked", c.get("typed", c.get("direct", True)))
+        if a == "real":
+            return real_standin(tool, argv, entry)
+        return "ok" if a else "none"
+
+    standin._real = real_standin  # type: ignore[attr-defined]
+    saved.append((asks, "standin", asks.standin))
+    asks.standin = standin
+    from gateway import modes
+    real_current = getattr(modes.current_for, "_real", modes.current_for)
+
+    def current_for(caller: str) -> str | None:
+        # "mode": the session's mode the hook recorded, read back for a
+        # stand-in Claude typed; unset: the real lookup (a test has no epoch
+        # marker: None, the modeless rule)
+        c = json.loads((Path(root) / "ssh-entry.json").read_text())
+        if "mode" not in c:
+            return real_current(caller)
+        try:
+            typed = caller == "standin" and ancestry.typed_by_claude()[0]
+        except Exception:  # noqa: BLE001 - can't tell: not typed
+            typed = False
+        return c["mode"] if typed else None
+
+    current_for._real = real_current  # type: ignore[attr-defined]
+    saved.append((modes, "current_for", modes.current_for))
+    modes.current_for = current_for
     from gateway import ssh
     saved.append((ssh, "_started_by_git_lfs", ssh._started_by_git_lfs))
     ssh._started_by_git_lfs = lfs_parent

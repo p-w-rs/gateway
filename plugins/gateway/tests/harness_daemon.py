@@ -78,6 +78,11 @@ def python_at(d: Path, name: str = "python3.12") -> Path:
     if sys.platform == "darwin":
         subprocess.run(["/usr/bin/codesign", "-s", "-", "-f", str(exe)], capture_output=True,
                        timeout=60, check=True)
+    # A new binary's first exec is slow on macOS (~0.5 s native; under Rosetta
+    # the copy is translated first, 1.5-2.5 s): pay it here, where the copy is
+    # made, never inside a test's timed window (a daemon's idle_exit).
+    subprocess.run([str(exe), "-I", "-S", *H.PYX, "-c", ""], env=py_env(),
+                   capture_output=True, timeout=120)
     return exe
 
 
@@ -128,6 +133,17 @@ class FakeClaude:
         r = self._ask({"op": "run", "argv": [str(a) for a in argv], "env": env, "input": input,
                        "timeout": timeout, "cwd": cwd})
         return subprocess.CompletedProcess(argv, r["rc"], r["stdout"], r["stderr"])
+
+    def asked(self, tool: str, argv: list[str], entries: list[tuple[str, str]],
+              cwd: str | None = None) -> None:
+        """The approval hook's record that this Claude Code asked about `TOOL
+        ARGV` typed in `cwd` (the fake's own folder by default: this test's),
+        as hooks_bash writes it when it answers "ask" (asks.record; lead
+        decision 19.14). A stand-in it runs passes an "ask" only with one."""
+        from gateway import ancestry, asks
+        start = ancestry.started_at(self.pid)
+        asks.record(tool, f"{self.pid}@{int(start) if start else 0}", cwd or os.getcwd(),
+                    [str(a) for a in argv], entries)
 
     def spawn(self, argv: list[str], env: dict[str, str] | None = None) -> int:
         return int(self._ask({"op": "spawn", "argv": [str(a) for a in argv], "env": env})["pid"])
@@ -458,7 +474,7 @@ def write_driver(env: H.GatewayEnv, run: Path, **override: Any) -> Path:
     d.mkdir(exist_ok=True)
     drv = d / "gw_entry.py"
     drv.write_text(DRIVER.format(src=str(H.PLUGIN / "src"), plugin=str(H.PLUGIN), pyc=H.PYC))
-    knobs = {"run": str(run), "extra": {"claude_ancestor": ""}, **override}
+    knobs = {"run": str(run), **override}
     (env.root / "entry-knobs.json").write_text(json.dumps(knobs))
     paths.bin_dir().mkdir(parents=True, exist_ok=True)
     ap = paths.bin_dir() / "gate-askpass"

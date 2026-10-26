@@ -3,8 +3,42 @@
 SPEC 9.2 (ssh, scp, sftp, rsync, git over ssh), 9.3 (remote sudo, hardened:
 see "Remote sudo") and the ssh side of `gate check` (SPEC 15). Stdlib only.
 Binaries come from `paths.tool()` (the pixi OpenSSH: ssh, scp, sftp,
-ssh-agent, ssh-add, ssh-keygen, ssh-keyscan), never from PATH, except
-`others = "mine"`, which execs the system ssh (`/usr/bin/ssh`) unchanged.
+ssh-agent, ssh-add, ssh-keygen, ssh-keyscan), never from PATH, for a
+configured target. Since 0.11.0 (PLAN-0.11 §1.4) the stand-ins exist only
+while something configured is reachable over ssh, and an unconfigured target
+runs the user's own ssh, scp or sftp, found on PATH by
+`envfile.user_tool` (skipping every stand-in folder), with the full argv and
+the environment unchanged.
+
+## Classify first (PLAN-0.11 §1.4)
+
+Before anything below, `main` classifies the target:
+
+- a lenient parse (`ssh_args.parse_lenient`) finds the destination and
+  options without refusing anything;
+- a **direct hit** on the destination word (a configured host's name,
+  `gw-NAME`, an address or `also` host, from the configured set: the form,
+  the approval and `private/configured.json`), or an account's ssh endpoint
+  whose owner an account covers (git-over-ssh: the owner comes from the
+  remote command, `git-receive-pack 'org/repo.git'`), takes the **gated
+  path** (the steps below);
+- otherwise the user's own `ssh -G` with the full argv (1.5 s, `G_TIMEOUT`),
+  every ProxyJump hop (followed with `-G` too), the ProxyCommand's words and
+  the resolved addresses (`getaddrinfo`, 1.5 s, same port) are checked: a
+  configured target found only there is **refused with a hint** (`_hint`:
+  "gateway: X reaches homelab, which goes through the gateway (...); use
+  `ssh homelab`"), never routed: the hook judged the words and couldn't
+  have asked about an "ask" right;
+- no hit: **pass-through** (`envfile.pass_through`: one `passthrough` audit
+  line with a validated host name, never argv; `GW_PASSTHRU` stops a loop;
+  127 when the user has no such tool).
+
+scp and sftp classify each remote operand: all configured (the gated path),
+none (the user's own), or a mix (refused: copy in two steps). A locked vault
+still classifies (the configured list); only a configured target is then
+refused. Rights are read in the session's recorded mode for a command Claude
+typed (`modes.current_for`), else the modeless rule. Known limit: other IP
+spellings, and DNS aliases when `-G` or the lookup times out, fail open.
 
 ## Public API (`gateway.ssh`)
 
@@ -68,20 +102,14 @@ step does nothing there.
    `-p`): form host by exact name first, then `gw-NAME` as NAME's alias
    (only when no host is called `gw-NAME`), then by address/also (host +
    port), two hosts on one address = refused; account endpoint
-   (`accounts.is_ssh_endpoint`); `localhost` = refused (run it directly);
-   unknown = `gateway: X isn't in gateway.toml. Did you mean Y? To add it,
-   ask the user (Claude can import it from ~/.ssh/config)` (git commands:
-   `gateway: no account for X; ask the user to add one`). With an approved
-   `others = "mine"` the system ssh is exec'd with the argv unchanged —
-   unless the system ssh's own view (`ssh -G` with the user's config:
-   aliases, HostName) is a form host's address and port, by name or by IP
-   address (resolved with a 1.5 s deadline): then `gateway: myalias is box
-   in gateway.toml (same address); run `ssh box CMD` so its rights apply`.
-   A user other than the form's is refused.
+   (`accounts.is_ssh_endpoint`); a host the form no longer names gates with
+   its approved entry until the user approves the removal; a disabled entry
+   is refused. A user other than the form's is refused. (An unknown host
+   never gets here: it passed through above.)
 3. **No command and no `-N`**: `gateway: pass a command; interactive ssh
    can't work here (ssh NAME CMD)`.
 4. **Rights** from `consent.compute` (after `consent.ratchet` when the form
-   narrowed): `false` → off message; `"ask"` (ssh, or sudo for a command with
+   narrowed), in the recorded mode or the modeless rule: deny → off message; `"ask"` (ssh, or sudo for a command with
    a sudo word) needs `ancestry.typed_by_claude()`: Claude's own command
    shell (or a fork of it) started this ssh with nothing in between, since
    Claude Code can only ask about a command Claude typed (round 1: git,
@@ -193,7 +221,10 @@ step does nothing there.
    endpoints, `ssh NAME CMD...` summary, address, via, master reuse, remote
    sudo, why that address); the session id comes from audit.py. The gate
    process's own logins (`run`, `test_login`, `probe_remote_nopasswd`,
-   `verify_remote_sudo`, `rotate`) write one too, with tool `gate`.
+   `verify_remote_sudo`, `rotate`) write one too, with tool `gate`. Every
+   use and refusal (`_refuse`) is audited with the mode the stand-in decided
+   in (`_audit_mode`: `_CALL["mode"]`, set by `_load`; "modeless" for the
+   modeless rule).
 9. **Run** ssh as a child: stdin inherited, stdout passed through (scrubbed
    when a sudo password was sent), the remote's stderr streamed through the
    stand-in (after ssh exits, read until 0.5 s of quiet or 5 s at most, so
@@ -214,8 +245,10 @@ scp/sftp: refused options checked (`-S -F -i -J -A -D`, scp `-T -f -t -M`,
 sftp `-s` (round 1: a server path runs that command on the host, sudo
 included), the same `-o` allowlist), then `exec <pixi scp|sftp> -S <bin/ssh> ARGS`; the
 ssh stand-in they run does everything else (they pass
-`-oControlMaster=no`, so they reuse a master but never start one). rsync uses
-`RSYNC_RSH`.
+`-oControlMaster=no`, so they reuse a master but never start one). rsync is
+no stand-in: it starts `ssh` through PATH, which is the ssh stand-in while
+one exists (`RSYNC_RSH` left Claude's shell in 0.11.0; an `-e` or
+`RSYNC_RSH=` that reaches a configured host is refused by the hook).
 
 ## git over ssh (account endpoints)
 
@@ -319,15 +352,16 @@ staged), but the gateway never installs a sudoers rule (it used to offer
 one; a rule like that gives root to every program running as that user
 there, which is worse than the residual risk above). `gate check` offers
 "Store the sudo password" or "Ask me each time a command needs it"; a
-command's dialog has Remember it (untick: used for that command only), and
+command's dialog has Remember it (unticked at first since 0.11.0: used for
+that command only; `ssh_sudo.REMEMBER_DEFAULT`), and
 the host's `elevation` policy (`"ask"`, `"deny"`) limits sudo further. The
 pop-up tells the user that Claude's commands on the host could read the
 password while sudo uses it.
 
 The sudo password a command asks for (`_sudo_password`): its dialog names
 the host's ssh and sudo rights for gated's recheck (`host_check(name, "ssh",
-"sudo")`; the re-entry dialog too) and offers "Remember it", ticked
-(unticked: used for this command, never stored); after a dialog gave it,
+"sudo")`; the re-entry dialog too) and offers "Remember it", unticked at
+first (unticked: used for this command, never stored; PLAN-0.11 §9.1); after a dialog gave it,
 `_rights_after_dialog` reads the rights again before anything is staged on
 the host (PLAN-v4 phase 3 review).
 
@@ -384,7 +418,7 @@ copy so concurrent test runs never see a mutated file; all killed).
 - Hosts behind `via` aren't probed; `when` is evaluated from this machine.
 - `install_key("my-login")` from Claude's Bash finds the user's agent only
   if `SSH_AUTH_SOCK` is set or (macOS) `launchctl getenv SSH_AUTH_SOCK`
-  knows it (others = "refuse" unsets it in Claude's env).
+  knows it (since 0.11.0 Claude's shell keeps the user's own agent).
 - The remote login shell must be POSIX for remote sudo; `-tt` (a remote pty)
   makes remote sudo prompt on the pty instead of using the askpass. A
   remote whose sudo doesn't run as root while asking (sudo-rs without
@@ -395,9 +429,10 @@ copy so concurrent test runs never see a mutated file; all killed).
   position (more staging or refusals, never fewer passwords given out);
   sudo reached through `eval`, an alias or a name built at run time isn't
   seen (under scripts = false it gets no password).
-- The others = "mine" alias check compares the address the user's ssh
-  config resolves to; a name that only DNS (not the form) maps to a form
-  host's address is caught by IP when it resolves within 1.5 s.
+- The alias check compares the address the user's ssh config resolves to
+  (`ssh -G`); a name that only DNS (not the form) maps to a configured
+  host's address is caught by IP when it resolves within 1.5 s, and passes
+  through otherwise.
 - `git-lfs-authenticate` trusts an ancestor whose executable file is named
   `git-lfs` (the same by-path trust model as ancestry.py).
 - A signal (SIGTERM/SIGINT/SIGHUP) is forwarded and the stand-in ends at
@@ -515,8 +550,8 @@ copy so concurrent test runs never see a mutated file; all killed).
 - Account endpoints: the account's `credential` and `write` (a push) are
   decided before the key is used.
 - The remote passwordless setup is gone (no sudoers rule is ever installed); the
-  sudo dialog's note says "Untick Remember it to use it for this command
-  only".
+  sudo dialog's note says "Tick Remember it to keep it for later commands
+  (unticked, it is used for this command only)." (`ssh_sudo.REMEMBER_NOTE`).
 - Tests: `test_policy` (exec, read, write each on its own, workspaces,
   agent/X11/remote forwarding against a local sshd, remote sudo's elevation
   policy, an account's write policy on a push); mutations in

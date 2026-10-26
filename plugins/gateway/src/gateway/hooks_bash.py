@@ -2,15 +2,9 @@
 
 Decision order (reasons always start with `gateway:`):
 
-1. **deny** `curl`/`wget` in command position (any segment), also behind a
-   wrapper (`command`, `builtin`, `busybox`, `env`, `nohup`, `timeout`,
-   `sudo`, `xargs`, ...). Also (review round 5) `gate secret` for every
-   tool, Bash, Monitor and the Terminal panel alike (the user's command:
-   also behind a wrapper, or named in a shell string, eval, loop or `find
-   -exec`), and `gate export|import|copy-to` typed into the user's Terminal
-   panel (without a screen they ask there for the user's one-time code; the
-   panel's shells run under the desktop app, which `gate secret`'s
-   process-tree check doesn't see).
+1. **deny** `gate export|import|copy-to` typed into the user's Terminal
+   panel or run as a job (they ask the user in the gateway's dialog, which
+   only a command Claude runs with the Bash tool can open).
 2. **deny** reading/naming `~/.config/gateway/private` (or the v2 key/store),
    `age -d` on them, a direct `git credential` / helper / askpass run, or
    setting `GIT_TRACE_REDACT` to anything but a clear true. Every word is
@@ -21,37 +15,72 @@ Decision order (reasons always start with `gateway:`):
    expanded as the shell does it (`~+` the stage's working directory, an
    unknown user's `~name/x` a relative path); a word starting with `~-` or
    `~N` names a folder the hook can't know and is denied (DENY_TILDE).
-3. **deny** a gateway verb whose target right is `false` in the form (looked
-   up behind exec-style wrappers: `env`, `nohup`, `nice`, `command`, ...),
-   and one the form gives but the user hasn't approved yet (the effective
-   right is off: a widening waiting, a new host, a jump host not set up),
-   with the next step (`gate check NAME`; round 3).
+3. **deny** a gateway verb whose target right is deny in the payload's mode
+   in the form (looked up behind exec-style wrappers: `env`, `nohup`,
+   `nice`, `command`, ...), and one the form gives but the user hasn't
+   approved yet (the effective right is deny in that mode: a widening
+   waiting, a new host, a jump host not set up), with the next step (`gate
+   check NAME`; round 3).
    Remote sudo counts too: `sudo` in command position in what the remote
    runs (ssh's command, rsync's `--rsync-path`, or a scp / rsync remote path,
    which old rsync and `scp -O` hand to the remote shell) needs the host's
    sudo right (`ssh builder sudo x` with sudo = false: `gateway: sudo is off
    for builder`). Also denied: git's `--upload-pack` / `--receive-pack` /
    `--exec` / `remote.*.uploadpack` with a sudo word, and `sftp -s`.
+   git in a repository the gateway handles (PLAN-0.11 §6.5, _git_judge, the
+   shared resolver gitroute, in the folder the stage runs in, with git's
+   variables set before it): a `!` alias or unreadable settings, a -c pair
+   that would come after the gateway's settings (a credential helper, an
+   include, git's ssh; also an alias's own), a `git config` write of a
+   guarded key (credentials, ssh, URL rewrites, remote URLs, a remote's
+   proxy, includes, hooks, fsmonitor; also by --file into the repository's
+   own config) are denied; a command that touches a remote is denied or
+   asked about by each configured entry's right and restrictions in this
+   mode (a host's ssh and read/write, an account's use, credential and
+   write, the account GATE_ACCOUNT names too), so a push to an "ask" host
+   is asked about before it runs, and the hook's record of it (asks.record)
+   lets the git stand-in pass the approval on to its ssh and credential
+   helper (githelper.gated_parent). git the hook can't
+   follow (a subshell, $(...), a shell string, after an assignment or a
+   stage that sets up the repository or remote, a folder it can't tell) is
+   denied while an entry git may reach is "ask": the stand-in would refuse
+   it after the prompt.
 4. **ask** when a gateway verb's target right is `"ask"` in the form or in
    effect (deny and ask go by the stricter of the two: an approved "ask"
    edited to `true` stays "ask" until the user's OK; round 3) (ssh, local
-   sudo, or the remote host's sudo for a remote command with a `sudo` word). The
-   stand-ins give an "ask" right only to a command Claude typed
-   (ancestry.typed_by_claude), relying on this prompt; so scp, sftp and
+   sudo, or the remote host's sudo for a remote command with a `sudo` word;
+   an account CLI whose chosen account's use or credential is "ask":
+   _cli_asks; `gate with NAME --` for such an account: _with_asks; `gate
+   check|rotate|copy-to` on an "ask" host).
+   The stand-ins give an "ask" right only to a command Claude typed
+   (ancestry.typed_by_claude) that this hook asked about: for each stand-in
+   stage it asks about it writes a record of the exact words, folder and
+   entries (asks.record; lead decision 19.14; dontAsk too), and a stage
+   whose words or folder it can't spell out is denied instead (_pend). A
+   record lives until the session's next Bash or Monitor call, whose hook
+   first drops it (_drop_asks: a declined prompt's, a stage that never
+   ran). So scp, sftp and
    rsync on an "ask" right (they start ssh themselves, which can't be asked
    about) are denied with the way to do it instead (asked in the user's own
    Terminal panel), and a command the parser can't read, or one that hides
    how it calls them (a shell behind a wrapper, a loop, a target in a
    variable), is asked about when its text names a host with an "ask" right
-   (or has a sudo word and localhost sudo is "ask"). A script sourced into
-   Claude's shell, or a name computed at run time, isn't seen.
-5. **allow** (only in auto / bypassPermissions) when every segment is an
-   allowed shape run by its bare name (a path such as `./ssh` runs whatever
-   file is there, not the stand-in PATH finds; round 3): a gateway verb on a
-   host with the right `true` (effective; remote
-   sudo also needs the host's effective sudo `true`), a `gate`
-   subcommand (never `forget`, which deletes stored secrets: GW-DATA-1), or
-   a benign command; one that reads files (cat, grep, ls, ...) only when
+   (or has a sudo word and localhost sudo is "ask"), beside other asks too,
+   with records for the ssh, sudo, account-CLI and `gate with` commands it
+   can read in the text (_fallback_records), or denied when it can't. A
+   script sourced into Claude's shell, or a name
+   computed at run time, gets no record: its stand-in refuses the "ask".
+   Program names are compared without letter case (_prog).
+5. **allow** when every segment is an allowed shape run by its bare name (a
+   path such as `./ssh` runs whatever file is there, not the stand-in PATH
+   finds; round 3) and the payload names a known mode: a gateway verb on a
+   host whose effective right is allow in that mode, with every policy
+   decision for what it does allow too (remote sudo also needs the host's
+   effective sudo allow; PLAN-0.11 §2: a bare `true` is allow in auto and
+   bypass only, an explicit per-mode allow approves in its own mode, never
+   plan), and in auto / bypass only a `gate` subcommand (never `forget`,
+   which deletes stored secrets: GW-DATA-1) or a benign command; one that
+   reads files (cat, grep, ls, ...) only when
    everything it may read is a plain file of the project (CLAUDE_PROJECT_DIR,
    else the cwd; not the home folder or above) or a temp folder (never in
    the home): no hidden or credential-like name (.env*, *.pem, *.key, id_*,
@@ -74,6 +103,15 @@ Decision order (reasons always start with `gateway:`):
    `date` that could set the clock (`-s`, `--set`, `-f`, a BSD operand).
 6. otherwise no decision (Claude Code's mode decides).
 
+Network commands (PLAN-0.11 §3, lead decision 19.1; _network): one class,
+curl and wget ordinary members, judged in every mode at the stricter of
+`[network] commands` ("ask" when unwritten) and this computer's `network`
+policy (plus a configured host's own for its `ssh HOST CMD`): deny joins
+step 3 (before every ask), ask joins step 4's asks, cc gives no decision,
+and only an explicit allow in the mode lets step 5 approve a network
+command. Any hit short of that keeps step 5 off the whole command (`sudo
+nmap` included); under `gate with` anything above ask is ask.
+
 Monitor and `run_in_background` calls are judged like any Bash command: the
 gateway doesn't change how Claude's ordinary commands run (DECISIONS,
 "Rolled back"). Their raw output (Monitor's lines, a background task's
@@ -87,19 +125,50 @@ the Terminal panel), an "ask" right of step 4 denied instead (nobody can be
 asked while a job runs), and never step 5 (nor any ask): only a deny or no
 decision.
 
-Managed mode (PLAN-v4 phase 4, docs/dev/modules/managed.md), before step 1:
-pre_bash.sh sends every Bash and Monitor call here with GW_MANAGED_CHECK=1
-when CLAUDE_CODE_SHELL_PREFIX isn't this plugin's hooks/gate-sh (the mod
-sets it at session start; so mods are off, Claude Code is older than
-2.1.287, another prefix replaced it, or the session started before managed
-mode was switched on). With the effective `[shell] managed` "on" the call
-is denied ("managed shell unavailable", the reason and what to do); "warn"
-lets it run in the user's own shell with a notice once per session, then
-judges it as below; "off" just judges it.
+Managed mode (PLAN-v4 phase 4; PLAN-0.11 §1.8, docs/dev/modules/managed.md):
+without this plugin's hooks/gate-sh as CLAUDE_CODE_SHELL_PREFIX (mods off,
+another prefix, a session started before managed mode was switched on)
+Claude's commands run in the user's own shell and are judged as below; with
+the effective `[shell] managed` "on" the person is told once per session
+(MANAGED_NOTICE). There is no blanket refusal.
 
-Steps 1-4 run in every permission mode; only step 5 is gated on auto/bypass.
-Refusals are audited (so `gate why` can explain the last one). When a command
-could edit `gateway.toml` (e.g. `sed -i`), narrowings are ratcheted first.
+Posture (PLAN-0.11 §1.7): the route checks (a tool by its path, a login
+shell or PATH-resetting wrapper, a PATH or transport change, a ProxyJump or
+ProxyCommand) refuse only what reaches a configured target, in every mode;
+a command that hides its program or host is refused when its text names a
+configured target; whatever else it runs gets no record, so a stand-in it
+reaches refuses an "ask" (asks.py: no prompt for `source .venv/bin/activate
+&& pytest` any more). su, doas, pkexec,
+runuser, sudoedit and osascript's administrator privileges are refused
+while this computer's sudo is configured (§9.5). A target nothing
+configures gets no decision: the user's own tool runs.
+
+Per mode (PLAN-0.11 §2): every right and policy key is read in the
+payload's `permission_mode` (modes.from_payload: empty, missing or a
+string Claude Code doesn't send is default, and then never allow). Steps 1-4 run in every mode, with each
+word's own meaning: deny refuses, ask asks, cc gives no decision, allow is
+step 5's approval. A job or gateway terminal (the job tools,
+terminal_send) is judged at the stricter of its payload's mode and the
+modeless rule, which the stand-ins use inside it (nothing run there is
+typed by Claude): a right that only some modes give is refused up front
+there (JOB_MODES); the network class, which nothing re-checks when the job
+runs, at its payload's mode alone ("ask" refused there too). This computer's unconfigured sudo is the user's own: no
+decision (UNCONFIGURED_SUDO; PLAN-0.11 §1.5), only an elevation restriction
+applies.
+
+When the effective form has a per-mode value whose stand-in word differs
+between modes (other than plan), the hook records the session's mode in
+gated (record_mode), so a stand-in for a command Claude typed reads it
+(modes.current_for); else the modeless rule already says the same. It keeps
+the epoch marker meanwhile (modes.set_marker), so pre_bash.sh sends every
+call to Python, a call without a trigger word to `hook-mode`
+(modes.hook_main: record only, no decision), and the record never goes
+stale.
+
+Refusals are audited (so `gate why` can explain the last one) with the mode
+they were decided in ("modeless" for a job's modeless check; §2.4), and a
+right a per-mode table turns off says in which mode. When a command could
+edit `gateway.toml` (e.g. `sed -i`), narrowings are ratcheted first.
 """
 from __future__ import annotations
 
@@ -115,7 +184,7 @@ import sys
 import unicodedata
 from typing import Any
 
-from . import audit, bashparse, consent, paths, ssh_args, testing
+from . import audit, bashparse, consent, modes, paths, ssh_args, testing
 from . import form as formmod
 from . import vault
 
@@ -138,22 +207,15 @@ GLOB_MAX = 500           # matches of one glob checked against the protected set
 # stored secrets for good (no dialog, no backup), so the reviewer or a prompt
 # decides (GW-DATA-1); nor `with` (an account's credential to any program).
 GATE_SUBCMDS = frozenset({"status", "check", "login", "rotate", "why", "log",
-                          "export", "import", "copy-to", "migrate", "scrub"})
+                          "export", "import", "copy-to", "scrub"})
 # gate subcommands that log in to a host with Claude's key (the sudo probe,
 # the key install, the rotation, copy-to's transfer): judged like ssh to it.
 GATE_SSH_SUBCMDS = frozenset({"check", "rotate", "copy-to"})
-# Review round 5: `gate secret` is the user's (a secret, a consent or a
-# device code typed in their own terminal after the one-time code); denied
-# for every tool. Its process-tree check doesn't see the desktop app's
-# Terminal panel (its shells run under the app's helper), which Claude can
-# type into with mcp__terminal__run_in_terminal, so the subcommands with a
-# terminal path behind the code (export, import, copy-to without a screen)
-# are denied there too; in Claude's Bash they use pop-ups or say "ask the user".
-GATE_USER_SUBCMD = "secret"
+# gate subcommands that ask the user in the gateway's dialog, which only a
+# command Claude runs with the Bash tool can open: denied in the desktop
+# app's Terminal panel (mcp__terminal__run_in_terminal, whose shells run
+# under the app's helper) and as a job.
 GATE_TERMINAL_SUBCMDS = frozenset({"export", "import", "copy-to"})
-DENY_GATE_SECRET = ("gateway: gate secret was removed: credentials are typed only into the "
-                    "gateway's own dialog in Claude Code, which `gate check NAME` opens. Don't "
-                    "ask for a secret any other way.")
 # The checkpoint plugin's job tool (plugin "check", MCP server "jobs"): it runs
 # `command` (a shell string) or `argv` (shlex-joined) with /bin/sh -c as a
 # detached job of checkpoint's MCP server, with the session's environment
@@ -232,28 +294,35 @@ def _out(decision: str, reason: str) -> dict[str, Any]:
                                    "permissionDecisionReason": reason}}
 
 
+# The mode the call is judged in (main sets it from the payload): every
+# refusal's audit line names it (PLAN-0.11 §2.4); a refusal decided in the
+# modeless rule (a job's) says "modeless" instead.
+_JUDGED: dict[str, str] = {}
+
+
 def _deny(reason: str, tool: str = "bash", target: str | None = None,
-          fix: str | None = None) -> dict[str, Any]:
+          fix: str | None = None, mode: str | None = None) -> dict[str, Any]:
     try:
-        audit.refusal(tool, target, reason, fix)
+        audit.refusal(tool, target, reason, fix, mode=mode or _JUDGED.get("mode"))
     except Exception:  # noqa: BLE001 - never fail the hook because of the audit
         pass
     return _out("deny", reason)
 
 
-def _deny_curl(tool: str) -> dict[str, Any]:
-    return _deny(f"gateway: use the http tool (or download / WebFetch) instead of {tool}; it "
-                 "adds account keys (Claude Code's permission mode decides whether it asks, as "
-                 "for any tool). If the http tool isn't available in this "
-                 "session (the gateway was still setting up when it started), ask the user to "
-                 "reconnect gw in /mcp or start a new session.", tool=tool)
-
-
-def _deny_right(name: str, verb: str) -> dict[str, Any]:
+def _deny_right(name: str, verb: str, form: formmod.Form | None = None,
+                mode: str | None = None) -> dict[str, Any]:
+    """A right the form turns off. One whose value differs between the modes
+    (a per-mode table) is off in the call's mode, and the reason says which."""
+    h = form.hosts.get(name) if form is not None else None
+    mv = h.mode_value(verb) if h is not None else None
+    when = (f" in {modes.DISPLAY[modes.normalize(mode)]} mode"
+            if mode is not None and mv is not None and not mv.uniform else "")
     if name == "localhost" and verb == "sudo":
-        r = "gateway: sudo is off on this machine (gateway.toml); ask the user if it should be on."
+        r = (f"gateway: sudo is off on this machine{when} (gateway.toml); ask the user if it "
+             "should be on.")
     else:
-        r = (f"gateway: {verb} is off for {name} (gateway.toml); ask the user if it should be on.")
+        r = (f"gateway: {verb} is off for {name}{when} (gateway.toml); ask the user if it should "
+             "be on.")
     return _deny(r, tool=verb, target=name)
 
 
@@ -261,19 +330,34 @@ _ask_phrase = consent.ask_phrase
 
 
 def _ask(name: str, verb: str, more: list[tuple[str, str]] | None = None,
-         in_job: bool = False) -> dict[str, Any]:
+         in_job: bool = False, net: str = "") -> dict[str, Any]:
     """The prompt's reason names every "ask" right the command uses (the user
-    approves all of them at once, root on a host included). For a checkpoint
-    job: a deny instead (nobody can be asked while it runs)."""
-    rights = list(dict.fromkeys([(name, verb), *(more or [])]))
+    approves all of them at once, root on a host included) and `net`, the
+    network class's ask (_network; then `name` may be "" for no right). For
+    a checkpoint job: a deny instead (nobody can be asked while it runs)."""
+    rights = list(dict.fromkeys(([(name, verb)] if name else []) + list(more or [])))
     shown = [_ask_phrase(n, v) for n, v in rights]
-    what = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
-    # a locked vault: sudo here asks until it is unlocked (consent.LOCKED_SUDO_NOTE)
-    note = _LOCKED.get("sudo", "") if ("localhost", "sudo") in rights else ""
+    what = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1] \
+        if shown else ""
     if in_job:
-        return _deny(consent.job_ask_message(shown) + note, tool=verb, target=name)
+        if not shown:
+            return _deny(NET_JOB.format(net=net), tool="network")
+        return _deny(consent.job_ask_message(shown), tool=verb, target=name)
+    if not shown:
+        return _out("ask", f"gateway: {net}; approve it to run.")
     are = "is" if len(shown) == 1 else "are"
-    return _out("ask", f'gateway: {what} {are} set to "ask"; approve it to run.{note}')
+    also = f", and {net}" if net else ""
+    return _out("ask", f'gateway: {what} {are} set to "ask"{also}; approve it to run.')
+
+
+def _locked_sudo(asks: list[tuple[str, str]]) -> dict[str, Any] | None:
+    """While the vault is locked, this computer's configured sudo is refused
+    up front with the vault's own message, like the configured hosts and
+    accounts (PLAN-0.11 §19.16): the sudo stand-in needs the vault, so an
+    "ask" would only lead to a refusal after the user's OK. None otherwise."""
+    if ("localhost", "sudo") in asks and _LOCKED.get("message"):
+        return _deny(_LOCKED["message"], tool="sudo", target="localhost")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -646,10 +730,11 @@ _RUNNERS = _SHELLS | frozenset({"su", "runuser", "sudo", "sudoedit", "doas", "pk
 # The tracers, sandboxes and wrappers that exec a command (also _TEXT_RUNNER
 # below): a runner only as the program itself (the stage's first word, or a
 # word by its path), so `sudo apt install tmux` names tmux as data. (macOS's
-# `arch -arm64 CMD` isn't one: the hook looks through it like nice.)
+# `arch -arm64 CMD` isn't one: the hook looks through it like nice.) watch
+# runs its words through `sh -c`.
 _EXEC_RUNNERS = frozenset({"sshpass", "strace", "ltrace", "dtruss", "flock", "script", "unbuffer",
                            "chroot", "tmux", "screen", "ssh-agent", "nsenter", "setarch",
-                           "catchsegv", "proot", "fakeroot"})
+                           "catchsegv", "proot", "fakeroot", "watch"})
 _FIND_RUN = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 _GNU_PREFIXED = {"grm": "rm", "gdd": "dd", "gchmod": "chmod", "gchown": "chown",
                  "gshred": "shred"}
@@ -664,8 +749,15 @@ _DISKUTIL_ERASE = frozenset({"erasedisk", "erasevolume", "reformat", "zerodisk",
 _STRING_MAX_DEPTH = 3
 
 
+def _prog(word: str) -> str:
+    """A program word's name as the hook compares it: its basename, without
+    letter case (macOS's file systems ignore it, so `CURL`, `Sudo` and
+    `/usr/bin/SSH` run curl, sudo and ssh: lead decision 19.14)."""
+    return os.path.basename(word).lower()
+
+
 def _prog_name(word: str) -> str:
-    base = os.path.basename(word)
+    base = _prog(word)
     return _GNU_PREFIXED.get(base, base)
 
 
@@ -955,11 +1047,13 @@ def _sudo_structure_ok(argv: list[str], cwds: list[str] | None = None) -> bool:
 # builtins), so the program they run looks, to the stand-in's ancestry check,
 # exactly like one Claude's shell started: the hook looks through them for
 # deny and ask. (`command -v X` only looks X up.) Forking wrappers (timeout,
-# xargs, sudo) are looked through only for the curl/wget rule: the stand-ins
-# see them as an intermediate anyway. macOS's `arch -arm64 CMD` execs its
-# command too (its options: _ARCH_VALUE).
+# xargs, sudo) are looked through for the network class, the alternate routes
+# and the text scan (fork=True): the stand-ins see them as an intermediate
+# anyway. macOS's `arch -arm64 CMD` execs its
+# command too (its options: _ARCH_VALUE). bash's `coproc CMD` runs CMD in a
+# subshell of Claude's own shell (a simple command takes no NAME).
 _EXEC_WRAPPERS = frozenset({"command", "builtin", "busybox", "env", "nohup", "nice", "stdbuf",
-                            "time", "ionice", "chrt", "taskset", "setsid", "arch"})
+                            "time", "ionice", "chrt", "taskset", "setsid", "arch", "coproc"})
 _FORK_WRAPPERS = frozenset({"timeout", "gtimeout", "xargs", "sudo", "doas", "caffeinate"})
 # Shell reserved words bashparse leaves at the start of a stage; the command
 # follows them. A loop or case (`for h in a b; do ssh $h x; done`) names its
@@ -997,18 +1091,20 @@ def _env_split_string(argv: list[str], i: int) -> tuple[str, int] | None:
     return None
 
 
-def _unwrap(argv: list[str], fork: bool = False) -> list[str]:
+def _unwrap(argv: list[str], fork: bool = False,
+            stop: frozenset[str] = frozenset()) -> list[str]:
     """argv from the program the leading wrappers run (`env A=1 nohup ssh h`
     -> `ssh h`; `env -S 'ssh h x'` -> `ssh h x`); [] when nothing runs
-    (`command -v curl`, `env` alone)."""
+    (`command -v curl`, `env` alone). `stop`: wrappers to stop at instead
+    (the network class reads `busybox APPLET` itself)."""
     i, n = 0, len(argv)
     for _ in range(12):
         while i < n and argv[i] in _RESERVED_PREFIX:
             i += 1                         # `if ssh h x; then sudo y; fi`, `do ssh $h x`
         if i >= n:
             return []
-        w = os.path.basename(argv[i])
-        if w not in _EXEC_WRAPPERS and not (fork and w in _FORK_WRAPPERS):
+        w = _prog(argv[i])
+        if w in stop or (w not in _EXEC_WRAPPERS and not (fork and w in _FORK_WRAPPERS)):
             break
         vals = _WRAPPER_VALUE_OPTS.get(w, "")
         i += 1
@@ -1019,8 +1115,8 @@ def _unwrap(argv: list[str], fork: bool = False) -> list[str]:
                 break
             if w == "command" and a.startswith("-") and any(c in a[1:] for c in "vV"):
                 return []
-            if w == "env" and _ASSIGN.match(a):
-                i += 1
+            if w == "env" and (_ASSIGN.match(a) or a == "-"):
+                i += 1                     # a lone `-` is -i (`env - CMD`)
                 continue
             if w == "env":
                 split = _env_split_string(argv, i)
@@ -1058,7 +1154,42 @@ def _command(stage: list[str], fork: bool = False) -> tuple[list[str], str]:
     """(argv, basename of the program) of a stage, after GATE_ACCOUNT and the
     exec-style wrappers."""
     argv = _unwrap(_strip_gate_account(stage), fork)
-    return argv, (os.path.basename(argv[0]) if argv else "")
+    return argv, (_prog(argv[0]) if argv else "")
+
+
+def _gate_with_inner(stage: list) -> list | None:
+    """The command a `gate with NAME -- CMD` stage runs (behind GATE_ACCOUNT
+    and the wrappers, sudo's and timeout's too), as a stage of its own that
+    keeps its words' expansion flags; else None. CMD runs as a program of
+    its own, so the route checks, the hidden-command rule and the other
+    elevation tools judge it like a stage (PLAN-0.11 §1.7; the network class
+    reads it the same way, _net_argv). (No other assignment comes first:
+    bashparse gives up on one, and CMD is exec'd, never a shell's. A `gate
+    with` inside env -S's string goes to the text scan, which takes env -S
+    for a PATH change.)"""
+    words, exp, glb = _argv_meta(stage)
+    run = _unwrap(words, fork=True)
+    if len(run) < 4 or _prog(run[0]) != "gate" or run[1] != "with" or \
+            "--" not in run[2:] or words[len(words) - len(run):] != run:
+        return None
+    sep = run.index("--", 2)
+    if sep + 1 >= len(run):
+        return None
+    at = len(words) - len(run) + sep + 1               # a suffix: the words keep their flags
+    return bashparse.Stage(words[at:], exp[at:], glb[at:], getattr(stage, "redirects", None) or [])
+
+
+def _with_inners(stages: list) -> list[tuple[int, list]]:
+    """(index of the stage it came from, stage) for each stage and, after a
+    `gate with NAME -- CMD` stage, the stage CMD is (nested ones too, however
+    deep: each unwrap drops at least `gate with NAME --`, so it ends)."""
+    out: list[tuple[int, list]] = []
+    for k, st in enumerate(stages):
+        cur: list | None = st
+        while cur is not None:
+            out.append((k, cur))
+            cur = _gate_with_inner(cur)
+    return out
 
 
 _GIT_GLOBAL_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
@@ -1119,6 +1250,463 @@ def _git_remote_programs(argv: list[str]) -> list[str]:
     return out
 
 
+# gitroute's answers within one hook call (main clears it): the route check
+# (_reaches) and the git judge read the same stage's repository once.
+_GIT_ROUTES: dict[tuple[Any, ...], Any] = {}
+# The stand-in stages this hook call asked about (ssh, sudo, the account
+# CLIs, git): (tool, folder, words after the program, entries). main writes
+# the approval hook's record for each once its answer is "ask" (asks.record):
+# a stand-in passes an "ask" only for a command that has one (lead decision
+# 19.14).
+_ASK_PENDING: list[tuple[str, str, list[str], frozenset[tuple[str, str]]]] = []
+# The variables that change which repository, config or account a git
+# command reaches (an `env NAME=...` before it, an `export` earlier in the
+# command): the hook's resolver reads them as the stand-in will. Not git's
+# command-line config by environment (GIT_CONFIG_COUNT/KEY_n/VALUE_n,
+# GIT_CONFIG_PARAMETERS): the route check judges what they change, and a
+# remote they would add the stand-in finds (no record: refused).
+_GIT_ENV = re.compile(r"(?!GIT_CONFIG_(?:COUNT|KEY_|VALUE_|PARAMETERS))"
+                      r"(GIT_[A-Z0-9_]+|HOME|XDG_CONFIG_HOME|GATE_ACCOUNT)\Z")
+
+GIT_HIDDEN = ("gateway: with {entries} set to \"ask\", this command runs git where the gateway "
+              "can't follow it (in a subshell, a group, exec, a background job, $(...), a shell "
+              "string, after a variable assignment or with a variable in its words), so Claude "
+              "Code couldn't ask you about the push or fetch it makes; run `git push ...` (or "
+              "fetch, pull, ...) as its own command.")
+GIT_SEQUENCE = ("gateway: with {entries} set to \"ask\", run `git {first} ...` first and `git "
+                "{command} ...` as a command of its own: the gateway judges a whole command before "
+                "any of it runs, so it can't tell where what `git {first}` sets up leads, or ask "
+                "you about it.")
+GIT_WHERE = ("gateway: {what} {are} set to \"ask\", and the gateway can't tell which folder this "
+             "git command runs in (a `cd` to a variable, or to a folder it can't resolve); cd "
+             "there first, then run `git {command} ...` as its own command.")
+
+
+def _git_route(args: list[str], cwd: str | None, targets: Any,
+               env: dict[str, str | None] | None = None) -> Any:
+    """gitroute.resolve for one git stage's arguments in `cwd`, once per
+    hook call (two git config reads each), with the stage's own variables
+    (`env`: a value, or None for one it unsets) over this process's."""
+    from . import gitroute
+    over = tuple(sorted((env or {}).items(), key=lambda kv: kv[0]))
+    key = (tuple(args), cwd, tuple(sorted(targets.hosts.items())), targets.accounts, over)
+    if key not in _GIT_ROUTES:
+        genv = None
+        if over:
+            genv = dict(os.environ)
+            for k, v in over:
+                if v is None:
+                    genv.pop(k, None)
+                else:
+                    genv[k] = v
+        _GIT_ROUTES[key] = gitroute.resolve(args, cwd, targets=targets, env=genv)
+    return _GIT_ROUTES[key]
+
+
+def _git_ask_entries(eff: consent.Effective, mode: str | None, in_job: bool = False) -> list[str]:
+    """The entries a git command may reach that are "ask" in `mode` (a job:
+    also in the modeless rule), as phrases: a host's ssh and its read and
+    write restrictions (its workspaces' too), a git account's use and its
+    credential and write restrictions, and [policy]'s read, write and
+    credential."""
+    from . import githelper
+    out: list[str] = []
+    for m in ([mode, None] if in_job else [mode]):
+        for n, e in eff.hosts.items():
+            if e.is_local:
+                continue
+            try:
+                if eff.word(n, "ssh", m) == "ask":
+                    out.append(_ask_phrase(n, "ssh"))
+            except KeyError:
+                pass
+            for k in ("read", "write"):
+                mv = e.policy_modes.get(k)
+                if mv is not None and mv.word(m) == "ask":
+                    out.append(f"{k} on {n}")
+            for wn, w in e.workspaces.items():
+                for k in ("read", "write"):
+                    mv = w.policy_modes.get(k)
+                    if mv is not None and mv.word(m) == "ask":
+                        out.append(f"{k} in {n}'s workspace {wn}")
+        for n, a in eff.accounts.items():
+            if a.kind not in githelper.GIT_KINDS:
+                continue
+            if eff.word(n, "use", m) == "ask":
+                out.append(f"{n}'s use")
+            for k in ("credential", "write"):
+                mv = a.policy_modes.get(k)
+                if mv is not None and mv.word(m) == "ask":
+                    out.append(f"{k} with {n}")
+        for k in ("read", "write", "credential"):
+            mv = eff.policy_modes.get(k)
+            if mv is not None and mv.word(m) == "ask":
+                out.append(f"[policy] {k}")
+    return list(dict.fromkeys(out))
+
+
+def _entries_shown(asks: list[str]) -> str:
+    return asks[0] if len(asks) == 1 else ", ".join(asks[:3]) + (" and more" if len(asks) > 3
+                                                                 else "")
+
+
+def _git_may_reach(argv: list[str]) -> bool:
+    """A git stage that may touch a remote, by its words alone: a remote
+    command (gitroute's list), or a word that isn't a git command (an alias
+    may stand for one)."""
+    from . import gitroute
+    _keep, cmd, args, bad = gitroute.split_globals(argv[1:])
+    if bad or not cmd:
+        return False
+    return gitroute._is_remote(cmd, args) or cmd not in gitroute.KNOWN
+
+
+def _git_sets_up(argv: list[str]) -> str:
+    """The subcommand when a git stage may change which repository, remotes
+    or settings a later one reaches (init, clone, worktree, a remote or
+    submodule change, a config write), else ""."""
+    from . import githelper, gitroute
+    _keep, cmd, args, bad = gitroute.split_globals(argv[1:])
+    if bad:
+        return ""
+    first = next((a for a in args if not a.startswith("-")), "")
+    if cmd in ("init", "clone", "worktree"):
+        return cmd
+    if cmd == "remote" and first not in ("", "show", "get-url"):
+        return cmd
+    if cmd == "submodule" and first not in ("", "status", "summary"):
+        return cmd
+    if cmd == "config" and githelper.config_writes(args):
+        return cmd
+    return ""
+
+
+def _stage_env(stage: list[str]) -> dict[str, str | None]:
+    """The variables a stage sets for its own command (_GIT_ENV's names):
+    the GATE_ACCOUNT prefix and `env NAME=VALUE` / `env -u NAME` before it."""
+    words = list(stage)
+    out: dict[str, str | None] = {}
+    i = 0
+    while i < len(words) and _ASSIGN.match(words[i]):
+        k, _, v = words[i].partition("=")
+        out[k] = v
+        i += 1
+    while i < len(words):
+        w = _prog(words[i])
+        if w in _RESERVED_PREFIX or (w in _EXEC_WRAPPERS and w != "env"):
+            i += 1
+            continue
+        if w != "env":
+            break
+        i += 1
+        while i < len(words):
+            a = words[i]
+            if _ASSIGN.match(a):
+                k, _, v = a.partition("=")
+                out[k] = v
+            elif a in ("-u", "--unset") and i + 1 < len(words):
+                out[words[i + 1]] = None
+                i += 1
+            elif a.startswith("--unset="):
+                out[a[len("--unset="):]] = None
+            elif a.startswith("-u") and len(a) > 2:
+                out[a[2:]] = None
+            elif not a.startswith("-") or a == "-":
+                break
+            i += 1
+    return {k: v for k, v in out.items() if _GIT_ENV.match(k)}
+
+
+def _one_dir(cands: list[str] | None) -> str | None:
+    """The one existing folder every spelling in `cands` resolves to, else
+    None."""
+    if not cands:
+        return None
+    real = {os.path.realpath(c) for c in cands}
+    if len(real) != 1:
+        return None
+    d = real.pop()
+    return d if os.path.isdir(d) else None
+
+
+def _git_tilde(argv: list[str]) -> list[str]:
+    """git's words as the shell hands them to it: a word that is `~` or
+    starts with `~/` names the home ($HOME; bashparse keeps it as written),
+    so `git -C ~/repo push` is judged, and recorded, where it runs."""
+    homes = _home_dirs()
+    if not homes:
+        return list(argv)
+    return [homes[0] + w[1:] if (w == "~" or w.startswith("~/")) else w for w in argv]
+
+
+def _git_word(argv: list[str]) -> str:
+    """A git stage's subcommand, for a message ("push" when there is none)."""
+    from . import gitroute
+    return gitroute.split_globals(argv[1:])[1] or "push"
+
+
+def _stage_contexts(stages: list, cwd: str | None
+                    ) -> list[tuple[str | None, dict[str, str | None], list[int]]]:
+    """For each stage: the folder it runs in when every `cd` before it (and
+    its own `env -C`) worked, None when that can't be told (_one_dir); the
+    git variables (_GIT_ENV) exported or unset before it; and the indexes of
+    the git stages before it that set up a repository, remote or setting
+    (_git_sets_up)."""
+    out: list[tuple[str | None, dict[str, str | None], list[int]]] = []
+    exact = _one_dir([cwd]) if cwd and os.path.isabs(cwd) else None
+    exported: dict[str, str | None] = {}
+    setups: list[int] = []
+    for k, st in enumerate(stages):
+        raw = _argv_meta(st)[0]
+        here = exact
+        if raw and exact is not None:
+            chd = _wrapper_chdir(raw, [exact])
+            if chd is not None:
+                here = _one_dir(chd)
+        out.append((here, dict(exported), list(setups)))
+        if not raw:
+            continue
+        b = os.path.basename(raw[0])
+        if b in ("cd", "pushd", "popd"):
+            exact = _one_dir(_cd_targets(raw, [exact])) if exact else None
+        elif b == "export":
+            for w in raw[1:]:
+                key, eq, v = w.partition("=")
+                if eq and _GIT_ENV.match(key):
+                    exported[key] = v
+        elif b == "unset":
+            for w in raw[1:]:
+                if _GIT_ENV.match(w):
+                    exported[w] = None
+        argv, base = _command(st)
+        if base == "git" and _git_sets_up(argv):
+            setups.append(k)
+    return out
+
+
+def _git_setup_reaches(st: list, ctx: tuple[str | None, dict[str, str | None], list[int]],
+                       cwd: str | None, eff: consent.Effective) -> bool:
+    """A git stage that sets up a repository, remote or setting reaches
+    something configured: its repository or an operand URL (`git remote add
+    h box:repo`, `git clone box:repo`), or its folder can't be read (made by
+    the command itself). A later git stage may then reach it, which the hook
+    can't judge before the command runs."""
+    from . import githelper, gitroute
+    argv = _git_tilde(_command(st)[0])
+    here = ctx[0] or cwd
+    if not here or not os.path.isdir(here):
+        return True
+    targets = eff.configured.git_targets()
+    try:
+        r = _git_route(argv[1:], here, targets, {**ctx[1], **_stage_env(st)})
+    except Exception:  # noqa: BLE001 - can't tell
+        return True
+    if r.gated or r.refusal:
+        return True
+    if r.command == "config":
+        # a remote's URL or a URL rewrite set to a configured target
+        for key, val in githelper._config_sets(r.args):
+            k = githelper._key_norm(key)
+            url = k[4:-len(".insteadof")] if k.startswith("url.") and k.endswith(".insteadof") \
+                else val if githelper._matches(k, ("remote.*.url", "remote.*.pushurl")) else ""
+            if url and targets.hits(gitroute.parse_url(url)):
+                return True
+    return False
+
+
+def _git_judge(argv: list[str], cwds: list[str], exact: str | None, eff: consent.Effective,
+               mode: str, in_job: bool = False, env: dict[str, str | None] | None = None
+               ) -> tuple[dict[str, Any] | None, list[tuple[str, str]]]:
+    """A git stage the gateway handles (PLAN-0.11 §6.5; the shared resolver,
+    gitroute, as the git stand-in reads it), in the folder it runs in when
+    every `cd` before it worked (`exact`), else (None: that can't be told)
+    in every folder it may run in (`cwds`), with its own variables (`env`):
+    the resolver's fixed refusal (a `!` alias, unreadable settings), a -c
+    pair that would come after the gateway's settings (the command line's,
+    or an alias's own), a `git config` write of a guarded key (also through
+    --file into the repository's own config), and for a command that
+    touches a remote (push, fetch, pull, clone, ls-remote, remote update,
+    submodule update, lfs ...) each configured entry's right and
+    restrictions in this mode (githelper.git_decisions: a host's ssh and
+    read/write, an account's use, credential and write, the account
+    GATE_ACCOUNT names included): deny denies, "ask" asks (a job: also in the
+    modeless rule, where an "ask" is denied). Never allow (git has no allow
+    shape). So a push to an "ask" host is asked about before it runs, and
+    then runs: the stage's record goes to _ASK_PENDING (the git stand-in
+    needs it); an "ask" the stand-in would refuse after the prompt is denied
+    here instead (an alias, a folder that can't be told). (deny or None, the
+    "ask" rights to add.) Nothing configured, or a repository the gateway
+    doesn't handle: (None, [])."""
+    from . import githelper
+    if not _anything_configured(eff):
+        return None, []
+    targets = eff.configured.git_targets()
+    if not targets:
+        return None, []
+    argv = _git_tilde(argv)
+    chosen = (env or {}).get("GATE_ACCOUNT") or None
+    asks: list[tuple[str, str]] = []
+    need: dict[tuple[str, str], None] = {}
+    aliased = command = ""
+    # the folder it runs in when that is known (the stand-in refuses an "ask"
+    # it finds anywhere else: no record), else every folder it may run in
+    for c in dict.fromkeys([exact] if exact else cwds):
+        if not c or not os.path.isdir(c):
+            continue                       # made by the command itself: the stand-in decides
+        try:
+            r = _git_route(argv[1:], c, targets, env)
+        except Exception:  # noqa: BLE001 - the stand-in refuses what it can't classify
+            continue
+        if not (r.gated or r.refusal):
+            held = githelper.config_file_held(argv[1:], c, targets, r.args) \
+                if r.command == "config" else None
+            if held is not None:
+                return _deny(githelper.GIT_CONFIG_REFUSED.format(key=held[1]), tool="git",
+                             target=held[0]), []
+            continue
+        ents = r.entries()
+        target = ents[0][1] if ents else None
+        if r.refusal:
+            return _deny(r.refusal, tool="git", target=target), []
+        bad = githelper.guarded_c(argv[1:]) or githelper.guarded_c(r.alias_globals)
+        if bad:
+            return _deny(githelper.GIT_C_REFUSED.format(key=formmod.safe(bad[0]) or "that key"),
+                         tool="git", target=target), []
+        if r.command == "config":
+            shown = githelper.config_refused(r.args)
+            if shown:
+                return _deny(githelper.GIT_CONFIG_REFUSED.format(key=shown), tool="git",
+                             target=target), []
+        if not r.remote:
+            continue
+        what = f"git {r.command}"
+        for m in ([mode, None] if in_job else [mode]):
+            for gd in githelper.git_decisions(r, eff, m, chosen):
+                if gd.value == "deny" or gd.word is False:
+                    if m is None and not gd.refusal:
+                        return _deny_job_modes(gd.name, gd.verb()), []
+                    return _deny(gd.message(what), tool="git", target=gd.name,
+                                 mode=m or "modeless"), []
+                if gd.word == "ask":
+                    asks.append((gd.name, gd.verb()))
+                    need[(gd.sect, gd.name)] = None
+                    aliased = aliased or r.alias
+                    command = command or r.command
+    asks = list(dict.fromkeys(asks))
+    if asks and not in_job:
+        phrases = list(dict.fromkeys(_ask_phrase(n, v) for n, v in asks))
+        shown = phrases[0] if len(phrases) == 1 else ", ".join(phrases[:-1]) + " and " + phrases[-1]
+        are = "is" if len(phrases) == 1 else "are"
+        if aliased:
+            return _deny(githelper.GIT_ASK_ALIAS.format(
+                what=shown, are=are, alias=formmod.safe(aliased) or "that alias", command=command),
+                tool="git", target=asks[0][0]), []
+        if exact is None:
+            return _deny(GIT_WHERE.format(what=shown, are=are, command=command), tool="git",
+                         target=asks[0][0]), []
+        _ASK_PENDING.append(("git", exact, list(argv[1:]), frozenset(need)))
+    return None, asks
+
+
+def _git_hidden_text(command: str) -> bool:
+    """Text the parser can't follow that runs git with a word that touches a
+    remote, or with a variable for its subcommand: `(git push)`, `x=$(git
+    fetch)`, `bash -c 'git pull'`, `GIT_DIR=x git push`, `p=push; git $p`
+    (not `git commit -m "$(cat msg)"`)."""
+    return bool(_TEXT_GIT.search(_QUOTES.sub("", _drop_heredoc_data(command))))
+
+
+_TEXT_GIT = re.compile(
+    r"(?<![\w./-])(?i:git)(?:(?![\w-])[^;&|\n]*?(?<![\w-])(?:push|fetch|pull|clone|ls-remote|remote|"
+    r"submodule|lfs|archive|fetch-pack|send-pack|request-pull|http-fetch|http-push|"
+    r"remote-[a-z]+)(?![\w-])|\s+[$`])")
+
+
+_TEXT_GIT_SPLIT = re.compile(r"\$\(|[;&|(){}`\n]")
+
+
+def _git_text_stages(command: str) -> list[tuple[dict[str, str | None], list[str]]] | None:
+    """The git commands text the parser can't follow runs, read leniently
+    (quotes taken out, split at the shell's separators and $(...)): each
+    one's assignments before it (_GIT_ENV's names) and its words; None when
+    the folder or the words can't be told (a cd, pushd or popd anywhere, a
+    variable or command substitution in git's words or its assignments)."""
+    text = _QUOTES.sub("", _drop_heredoc_data(command))
+    out: list[tuple[dict[str, str | None], list[str]]] = []
+    for piece in _TEXT_GIT_SPLIT.split(text):
+        words = piece.split()
+        if any(w in ("cd", "pushd", "popd") for w in words):
+            return None
+        low = [w.lower() for w in words]          # GIT runs git where names ignore case
+        if "git" not in low:
+            continue
+        i = low.index("git")
+        argv: list[str] = []
+        skip = False
+        for w in words[i:]:
+            if skip:
+                skip = False
+                continue
+            if _TEXT_REDIR.match(w):
+                skip = bool(_TEXT_REDIR.fullmatch(w)) and not w.endswith(("&", ">&"))
+                continue
+            argv.append(w)
+        env: dict[str, str | None] = {}
+        j = i - 1
+        while j >= 0 and _ASSIGN.match(words[j]):
+            key, _, val = words[j].partition("=")
+            if _GIT_ENV.match(key):
+                env.setdefault(key, val)
+            j -= 1
+        if any("$" in w for w in argv) or any("$" in (v or "") for v in env.values()):
+            return None
+        out.append((env, argv))
+    return out
+
+
+def _git_hidden(command: str, eff: consent.Effective, mode: str, in_job: bool,
+                cwd: str | None) -> dict[str, Any] | None:
+    """The refusal for git the hook can't follow (_git_hidden_text) where it
+    may reach an entry that is "ask" in this mode (GIT_HIDDEN: the stand-in
+    would refuse it after the prompt, with no record of an ask), or None.
+    The git commands in the text are read leniently (_git_text_stages) and
+    judged in the session's folder: one that reaches only what nothing
+    configures, or entries no "ask" decides, is the stand-in's to judge;
+    when they can't be read, any "ask" entry git may reach counts."""
+    from . import githelper
+    asks = _git_ask_entries(eff, mode, in_job)
+    if not asks:
+        return None
+    stages = _git_text_stages(command)
+    here = cwd if cwd and os.path.isdir(cwd) else None
+    if stages is None or here is None:
+        return _deny(GIT_HIDDEN.format(entries=_entries_shown(asks)), tool="git", target="hidden")
+    targets = eff.configured.git_targets()
+    found: list[str] = []
+    for env, argv in stages:
+        argv = _git_tilde(argv)
+        try:
+            r = _git_route(argv[1:], here, targets, env)
+        except Exception:  # noqa: BLE001 - can't tell: any "ask" counts
+            return _deny(GIT_HIDDEN.format(entries=_entries_shown(asks)), tool="git",
+                         target="hidden")
+        if r.refusal:
+            return _deny(r.refusal, tool="git", target="hidden")
+        if not (r.gated and r.remote):
+            continue
+        for m in ([mode, None] if in_job else [mode]):
+            for gd in githelper.git_decisions(r, eff, m, env.get("GATE_ACCOUNT")):
+                if gd.value == "deny" or gd.word is False:
+                    return _deny(gd.message(f"git {r.command}"), tool="git", target=gd.name,
+                                 mode=m or "modeless")
+                if gd.word == "ask":
+                    found.append(_ask_phrase(gd.name, gd.verb()))
+    if found:
+        return _deny(GIT_HIDDEN.format(entries=_entries_shown(list(dict.fromkeys(found)))),
+                     tool="git", target="hidden")
+    return None
+
+
 # Words that make a stage run code its words don't show, in Claude's own
 # shell or one exec'd in its place (so the stand-ins can't tell it from a
 # command Claude typed): a shell, eval, exec, source / `.`.
@@ -1132,16 +1720,17 @@ _SUDO_NAMES = frozenset({"sudo", "sudoedit"})
 _FB_SSH_WORDS = _SSH_FAMILY | {"gate"}
 
 
-def _gate_hosts(argv: list[str], form: formmod.Form) -> list[str]:
+def _gate_hosts(argv: list[str], form: formmod.Form, mode: str | None = None) -> list[str]:
     """The remote form hosts a `gate check|rotate|copy-to` stage logs in to:
     its operand (any spelling the ssh stand-in accepts), or for `gate check
-    all` every remote host whose ssh isn't off."""
+    all` every remote host whose ssh isn't deny in `mode`."""
     sub = argv[1] if len(argv) > 1 else ""
     if sub not in GATE_SSH_SUBCMDS:
         return []
     ops = [a for a in argv[2:] if not a.startswith("-")]
     if sub == "check" and "all" in ops:
-        return [n for n, h in form.hosts.items() if not h.is_local and h.ssh is not False]
+        return [n for n, h in form.hosts.items()
+                if not h.is_local and _form_word(form, n, "ssh", mode) != "deny"]
     out = []
     for op in ops:
         name = _resolve_host(op, form)
@@ -1150,29 +1739,36 @@ def _gate_hosts(argv: list[str], form: formmod.Form) -> list[str]:
     return out
 
 
-def _fallback_ask(command: str, form: formmod.Form,
-                  eff: consent.Effective | None = None) -> tuple[str, str] | None:
+def _fallback_asks(command: str, form: formmod.Form, eff: consent.Effective | None = None,
+                   mode: str | None = None, in_job: bool = False) -> list[tuple[str, str]]:
     """For a command the parser can't read (or one that runs a shell, eval or
-    exec, a loop, or a verb whose target is a variable): an "ask" right it may
-    use, as (host, verb). The stand-ins give an "ask" right only to a command
-    Claude typed, trusting that Claude Code asked; this keeps that true when
-    the command hides how it calls them: a host with an "ask" right named in
-    its text (quotes removed) with an ssh-family or git word (or, for sudo =
-    "ask", a sudo word), or localhost sudo = "ask" with a sudo word. Text it
-    can't see (a script sourced into Claude's shell, a name computed at run
-    time) isn't covered: a guardrail, like the prefilter. The right is the
-    stricter of the form's and the effective one (_right), so an approved
-    "ask" whose widening to true still waits counts as "ask"."""
+    exec, a loop, or a verb whose target is a variable): every "ask" right it
+    may use, as (host, verb): localhost sudo = "ask" with a sudo word, and
+    each host with an "ask" right named in its text (quotes removed) with an
+    ssh-family or git word (or, for sudo = "ask", a sudo word). The hook asks
+    about them (the prompt names each one) with the records of what it can
+    read there (_fallback_records), since a stand-in passes an "ask" only
+    with one; text it can't see (a script sourced into Claude's shell, a
+    name computed at run time) gets no record, and its stand-in refuses the
+    "ask". The right is the stricter of the form's and the effective one
+    (_right) in `mode`, so an approved "ask" whose widening to true still
+    waits counts as "ask"; for a job (in_job) in the modeless rule too."""
     text = _QUOTES.sub("", command)
     words = [w for w in _TEXT_SPLIT.split(text) if w]
     low = {w.lower() for w in words}
 
     def asks(name: str, verb: str) -> bool:
-        if eff is None:
-            return _form_right(form, name, verb) == "ask"
-        return _right(form, eff, name, verb) == "ask"
+        for m in (mode, None) if in_job else (mode,):
+            if eff is None:
+                w = _form_word(form, name, verb, m)
+                if (UNCONFIGURED_SUDO if w == modes.UNCONFIGURED else w) == "ask":
+                    return True
+            elif _right(form, eff, name, verb, m) == "ask":
+                return True
+        return False
+    out: list[tuple[str, str]] = []
     if low & _SUDO_NAMES and "localhost" in form.hosts and asks("localhost", "sudo"):
-        return "localhost", "sudo"
+        out.append(("localhost", "sudo"))
     for name, h in form.hosts.items():
         if h.is_local:
             continue
@@ -1182,54 +1778,670 @@ def _fallback_ask(command: str, form: formmod.Form,
                 continue
             names = {name, f"gw-{name}"} | {a.host.lower() for a in h.addresses()}
             if low & names:
-                return name, verb
+                out.append((name, verb))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The approval hook's records (asks.py; lead decision 19.14): for each
+# stand-in stage it answers "ask" for, the exact words the stand-in will
+# get, so it passes the "ask" after the user's OK; a stage whose words or
+# folder can't be told is denied instead (its stand-in would refuse after
+# the prompt)
+# ---------------------------------------------------------------------------
+
+# the account CLIs with a stand-in of their own (huggingface-cli has none)
+_CLI_STANDINS = frozenset({"gh", "hf", "databricks", "crane", "pijul", "az"})
+ASK_WORDS = ("gateway: {what} {are} set to \"ask\", and this command's words hold a variable, a "
+             "glob or a `~` the gateway can't spell out, so it couldn't note exactly what Claude "
+             "Code asks you about (the stand-in would refuse it after your OK); write the words "
+             "out and run `{example}` as its own command.")
+ASK_WHERE = ("gateway: {what} {are} set to \"ask\", and the gateway can't tell which folder this "
+             "command runs in (a `cd` to a variable, or to a folder it can't resolve); cd there "
+             "first, then run `{example}` as its own command.")
+ASK_HIDDEN = ("gateway: {what} {are} set to \"ask\", and this command runs {tool} where the "
+              "gateway can't spell out its words (a variable, a loop, $(...), a glob) or tell "
+              "its folder, so Claude Code couldn't ask you about exactly what runs (the stand-in "
+              "would refuse it after your OK); run `{example}` as its own command, its words "
+              "written out.")
+
+
+def _hook_cwd() -> str | None:
+    """This hook's own folder (Claude Code starts it in the session's), for
+    a payload that names none."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def _ask_words(asked: list[tuple[str, str]]) -> tuple[str, str]:
+    phrases = list(dict.fromkeys(_ask_phrase(n, v) for n, v in asked))
+    shown = phrases[0] if len(phrases) == 1 else ", ".join(phrases[:-1]) + " and " + phrases[-1]
+    return shown, "is" if len(phrases) == 1 else "are"
+
+
+def _record_words(st: list, argv: list[str]) -> list[str] | None:
+    """The words after the program as the shell hands them to the stand-in
+    (its argv), or None when the hook can't spell them out: a variable or a
+    glob (bashparse's flags; in env -S's own string a `$` or a backslash),
+    a `~` other than the home's (`~user`, `~+`, or after `=`, which
+    bash spells out only outside POSIX mode). `$HOME` and a leading `~` are
+    the home folder, as the shell gives them."""
+    words = list(st)
+    n = len(argv)
+    if n == 0:
+        return None
+    if n > len(words) or words[len(words) - n:] != list(argv):
+        # env -S's own split of one plain string: exact only with no
+        # expansion anywhere (env -S expands ${NAME} and escapes itself)
+        if any(getattr(st, "expands", None) or []) or any(getattr(st, "globs", None) or []) \
+                or any(c in w for w in argv for c in "$\\"):
+            return None
+        return list(argv[1:])
+
+    def flags(name: str) -> list[bool]:
+        f = list(getattr(st, name, None) or [False] * len(words))
+        return f[len(words) - n + 1:]
+    if any(flags("expands")) or any(flags("globs")):
+        return None
+    homes = _home_dirs()
+    out: list[str] = []
+    for w, home, tilde in zip(argv[1:], flags("homes"), flags("tildes")):
+        if home:
+            if not homes:
+                return None
+            w = w.replace("${HOME}", homes[0]).replace("$HOME", homes[0])
+        if tilde:
+            if not homes or not (w == "~" or w.startswith("~/")):
+                return None
+            w = homes[0] + w[1:]
+        elif "~" in w and _ASSIGN.match(w):
+            return None
+        out.append(w)
+    return out
+
+
+def _pend(tool: str, st: list, argv: list[str], here: str | None,
+          entries: list[tuple[str, str]], asked: list[tuple[str, str]],
+          example: str = "") -> dict[str, Any] | None:
+    """Note the record for one stand-in stage the hook asks about
+    (_ASK_PENDING; main writes it once its answer is "ask"), or the deny
+    when the stage's words (_record_words) or folder (`here`, None when a
+    `cd` before it can't be told) can't be: the stand-in would refuse after
+    the prompt. `example`: the command the refusal says to run."""
+    shown, are = _ask_words(asked)
+    example = example or (f"ssh {asked[0][0]} ..." if tool == "ssh" else f"{tool} ...")
+    words = _record_words(st, argv)
+    if words is None:
+        return _deny(ASK_WORDS.format(what=shown, are=are, example=example), tool=tool,
+                     target=asked[0][0])
+    if here is None:
+        return _deny(ASK_WHERE.format(what=shown, are=are, example=example), tool=tool,
+                     target=asked[0][0])
+    _ASK_PENDING.append((tool, here, words, frozenset(entries)))
     return None
 
 
+def _with_asks(argv: list[str], form: formmod.Form, eff: consent.Effective,
+               ms: list[str | None]) -> list[tuple[str, str]]:
+    """For `gate with NAME -- CMD`: [(NAME, "use" | "credential")] when the
+    account (a vault alias followed) is usable or "ask" in one of the modes
+    `ms` and its use, else its credential policy, is "ask" there (the gate
+    CLI then hands its key over only with this command's record:
+    clis._with_refused); else []. A use that is off gets no prompt: the gate
+    CLI refuses it."""
+    if argv[1:2] != ["with"] or len(argv) < 3:
+        return []
+    from . import accounts as acctmod
+    name = acctmod.resolve_name(argv[2], _ALIASES, form)
+    if name not in form.accounts:
+        return []
+    for m in ms:
+        try:
+            if eff.word(name, "use", m) == "deny":
+                continue
+        except (AttributeError, KeyError, ValueError):
+            continue
+        v = consent.account_ask_verb(eff, name, m)
+        if v:
+            return [(name, v)]
+    return []
+
+
+def _gate_account(env: dict[str, str | None] | None, form: formmod.Form
+                  ) -> tuple[str | None, bool]:
+    """(GATE_ACCOUNT the command's stand-in gets, whether the hook knows it):
+    the stage's own (an assignment before it, `env NAME=...`, an `export`
+    earlier; `env -u` unsets it), else the one Claude Code's shell inherits
+    (this hook's environment); a value with a `$` or a backquote is
+    unknown. A vault alias is followed."""
+    from . import accounts as acctmod
+    if env is not None and "GATE_ACCOUNT" in env:
+        v = env["GATE_ACCOUNT"]
+    else:
+        v = os.environ.get("GATE_ACCOUNT")
+    v = (v or "").strip()
+    if any(c in v for c in "$`"):
+        return None, False
+    return (acctmod.resolve_name(v, _ALIASES, form) if v else None), True
+
+
+def _eff_in(form: formmod.Form, mode: str | None) -> consent.Effective:
+    """The effective rights computed for `mode`, as the stand-in computes them
+    for the session's mode (clis._load): its legacy attributes (an account's
+    `use`) then say what that mode allows. Once per mode per hook call."""
+    if mode not in _EFF_MODE:
+        data, locked = _VAULT.get("data"), bool(_VAULT.get("locked"))
+        try:
+            _EFF_MODE[mode] = consent.compute(form, data, mode, locked=locked)
+        except Exception:  # noqa: BLE001 - as _load_rights
+            _EFF_MODE[mode] = consent.compute(form, None, mode, locked=locked)
+    return _EFF_MODE[mode]
+
+
+def _cli_asks(base: str, argv: list[str], cwd: str | None, eff: consent.Effective,
+              mode: str | None, env: dict[str, str | None] | None = None
+              ) -> list[tuple[str, str]]:
+    """(account, "use" | "credential") for the account an account-CLI
+    command line will use when that is "ask" in `mode` (clis.ask_accounts:
+    the stand-in's own destination rules and choice, with the stage's
+    GATE_ACCOUNT, `env`); [] when nothing configured covers its destination
+    or nothing of its kinds is "ask". An error asks about nothing: the
+    stand-in then refuses the "ask" (no record)."""
+    if not _anything_configured(eff):
+        return []
+    try:
+        kinds = consent.CLI_KINDS.get(base, ())
+        if not any(ea.kind in kinds and consent.account_ask_verb(eff, n, mode)
+                   for n, ea in eff.accounts.items()):
+            return []
+        from . import clis
+        account, known = _gate_account(env, eff.form)
+        return clis.ask_accounts(base, argv[1:], cwd, _eff_in(eff.form, mode), mode,
+                                 account, known)
+    except Exception:  # noqa: BLE001 - see above
+        return []
+
+
+_LENIENT_DEPTH = 3
+_LENIENT_REDIR = re.compile(r"<<<|<<-|<<|<>|<&|<|>>|>\||>&|>|&>>|&>")
+
+
+def _lenient_commands(text: str, depth: int = 0) -> list[list[tuple[str, bool]]]:
+    """The simple commands in text the parser can't follow, read the way the
+    shell splits them, for the approval hook's records: each command's words
+    with whether the hook knows them exactly. Quotes and backslashes as the
+    shell reads them; `;`, `&`, `|`, `(`, `)`, a lone `{` or `}` and a
+    newline end a command; redirections and their targets, here-document
+    bodies and comments are dropped; `$HOME` and a leading `~/` are the
+    home folder; a word with another expansion, a glob or brace, `$(...)` or
+    backquotes is unknown (the commands inside `$(...)` and backquotes are
+    read too)."""
+    out: list[list[tuple[str, bool]]] = []
+    cur: list[tuple[str, bool]] = []
+    st = {"buf": [], "known": True, "started": False, "tilde": False, "drop": "", "strip": False}
+    heredocs: list[tuple[str, bool]] = []
+    homes = _home_dirs()
+    i, n = 0, len(text)
+
+    def end_word() -> None:
+        if st["started"]:
+            w, k = "".join(st["buf"]), st["known"]
+            if st["tilde"]:
+                if homes and (w == "~" or w.startswith("~/")):
+                    w = homes[0] + w[1:]
+                else:
+                    k = False
+            if st["drop"] == "heredoc":
+                heredocs.append((w, bool(st["strip"])))
+            elif st["drop"]:
+                pass                           # a redirection's target or a here-string
+            elif w in ("{", "}") and k:
+                end_cmd_words()
+            else:
+                cur.append((w, k))
+            st["drop"] = ""
+        st.update(buf=[], known=True, started=False, tilde=False)
+
+    def end_cmd_words() -> None:
+        nonlocal cur
+        if cur:
+            out.append(cur)
+        cur = []
+
+    def end_cmd() -> None:
+        end_word()
+        end_cmd_words()
+
+    def add(s: str) -> None:
+        st["buf"].append(s)
+        st["started"] = True
+
+    def closing(j: int, opener: str, closer: str) -> int:
+        """The index of the closer that ends what opened just before j
+        (nested openers counted, single quotes and backslashes skipped); n
+        when nothing does."""
+        d = 1
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == "'" and closer != "`":
+                k = text.find("'", j + 1)
+                j = n if k < 0 else k + 1
+                continue
+            if c == closer:
+                d -= 1
+                if d == 0:
+                    return j
+            elif c == opener and opener != closer:
+                d += 1
+            j += 1
+        return n
+
+    def inner(s: str) -> None:
+        if depth < _LENIENT_DEPTH:
+            out.extend(_lenient_commands(s, depth + 1))
+
+    def dollar(j: int) -> int:
+        """A `$` at j outside single quotes: its expansion read; the index after it."""
+        if j + 1 >= n or text[j + 1] in " \t\n;|&<>)\"":
+            add("$")
+            return j + 1
+        m = re.compile(r"\$(?:HOME(?![A-Za-z0-9_])|\{HOME\})").match(text, j)
+        if m:
+            if homes:
+                add(homes[0])
+            else:
+                add(m.group(0))
+                st["known"] = False
+            return m.end()
+        st["known"] = False
+        st["started"] = True
+        if text.startswith("$((", j):
+            return closing(j + 3, "(", ")") + 2
+        if text.startswith("$(", j):
+            e = closing(j + 2, "(", ")")
+            inner(text[j + 2:e])
+            return e + 1
+        if text.startswith("${", j):
+            e = text.find("}", j + 2)
+            return n if e < 0 else e + 1
+        if text[j + 1] == "'":
+            e = text.find("'", j + 2)
+            return n if e < 0 else e + 1
+        m = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])").match(text, j)
+        return m.end() if m else j + 1
+
+    while i < n:
+        c = text[i]
+        if c == "#" and not st["started"]:
+            e = text.find("\n", i)
+            i = n if e < 0 else e
+            continue
+        if c == "'":
+            e = text.find("'", i + 1)
+            if e < 0:
+                st["known"] = False
+                add(text[i + 1:])
+                i = n
+                continue
+            add(text[i + 1:e])
+            i = e + 1
+            continue
+        if c == '"':
+            j = i + 1
+            add("")
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '"\\$`\n':
+                    if text[j + 1] != "\n":
+                        add(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] == "$":
+                    j = dollar(j)
+                    continue
+                if text[j] == "`":
+                    e = closing(j + 1, "`", "`")
+                    inner(text[j + 1:e])
+                    st["known"] = False
+                    j = e + 1
+                    continue
+                add(text[j])
+                j += 1
+            if j >= n:
+                st["known"] = False
+            i = j + 1
+            continue
+        if c == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                add(text[i + 1])
+            i += 2
+            continue
+        if c == "$":
+            i = dollar(i)
+            continue
+        if c == "`":
+            e = closing(i + 1, "`", "`")
+            inner(text[i + 1:e])
+            st["known"] = False
+            st["started"] = True
+            i = e + 1
+            continue
+        if c in "<>" and text.startswith("(", i + 1):
+            e = closing(i + 2, "(", ")")       # <(...) / >(...): a file name, and commands
+            inner(text[i + 2:e])
+            st["known"] = False
+            st["started"] = True
+            i = e + 1
+            continue
+        if c in "<>" or (c == "&" and text.startswith(">", i + 1)):
+            if st["started"] and not "".join(st["buf"]).isdigit():
+                end_word()
+            st.update(buf=[], known=True, started=False, tilde=False)   # an fd number: dropped
+            m = _LENIENT_REDIR.match(text, i)
+            op = m.group(0) if m else c
+            i += len(op)
+            if op in (">&", "<&"):
+                m2 = re.compile(r"[0-9]+-?|-").match(text, i)
+                if m2:
+                    i = m2.end()
+                    continue
+            st["drop"] = "heredoc" if op in ("<<", "<<-") else "target"
+            st["strip"] = op == "<<-"
+            while i < n and text[i] in " \t":
+                i += 1
+            continue
+        if c in " \t":
+            end_word()
+            i += 1
+            continue
+        if c == "\n":
+            end_cmd()
+            i += 1
+            for delim, strip in heredocs:
+                while i < n:
+                    e = text.find("\n", i)
+                    line = text[i:n if e < 0 else e]
+                    i = n if e < 0 else e + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+            heredocs.clear()
+            continue
+        if c in ";&|()":
+            end_cmd()
+            i += 1
+            continue
+        if c in "*?[" or (c in "{}" and st["started"]):
+            st["known"] = False
+        if c == "~" and not st["started"]:
+            st["tilde"] = True
+        add(c)
+        i += 1
+    end_cmd()
+    return out
+
+
+def _cli_ask_possible(eff: consent.Effective | None, ms: list[str | None]) -> bool:
+    """Is some configured account "ask" (its use or credential) in one of the
+    modes `ms`? (Then an account CLI or `gate with` in text the parser can't
+    follow may need a record.)"""
+    if eff is None or not _anything_configured(eff):
+        return False
+    try:
+        return any(consent.account_ask_verb(eff, n, m) for n in eff.accounts for m in ms)
+    except Exception:  # noqa: BLE001 - nothing to ask about
+        return False
+
+
+def _lenient_gate_account(words: list[str], known: list[bool], upto: int
+                          ) -> dict[str, str | None]:
+    """The GATE_ACCOUNT a lenient command sets for its program (an assignment
+    before it, or `env GATE_ACCOUNT=...` among the wrappers: words before
+    `upto`), for _gate_account: {} when none, a `$` value when the hook
+    can't spell it out."""
+    out: dict[str, str | None] = {}
+    for w, k in zip(words[:upto], known[:upto]):
+        if w.startswith("GATE_ACCOUNT="):
+            out["GATE_ACCOUNT"] = w.split("=", 1)[1] if k else "$"
+    return out
+
+
+def _fallback_records(command: str, form: formmod.Form, eff: consent.Effective | None,
+                      mode: str | None, cwd: str | None, skip: bool,
+                      fbs: list[tuple[str, str]], in_job: bool = False
+                      ) -> tuple[dict[str, Any] | None, list[tuple[str, str]]]:
+    """For a command the parser can't follow (or one that hides what it
+    runs): the records for the stand-in commands in it, read leniently
+    (_lenient_commands; eval's words, a shell's -c string and trap's action
+    too), so their stand-ins pass the "ask" after the user's OK: the ssh and
+    sudo commands when its text names an "ask" target (`fbs`, from
+    _fallback_asks), and each account CLI or `gate with NAME --` whose
+    account is "ask" in `mode` (the account it will choose: _cli_asks,
+    _with_asks). A command the structured judge recorded already (the same
+    tool and words) isn't recorded twice. A deny when one that may reach
+    something configured can't be read exactly or its folder can't be told
+    (a `cd` in the text): its stand-in would refuse after the prompt.
+    skip: a job or the user's Terminal panel (nothing there is typed by
+    Claude: no record, nothing denied for it here). Returns (the deny or
+    None, the account asks found, for the prompt's reason)."""
+    ms: list[str | None] = [mode, None] if in_job else [mode]
+    clis_too = _cli_ask_possible(eff, ms)
+    if not fbs and not clis_too:
+        return None, []
+    cwd = cwd if cwd and os.path.isdir(cwd) else _hook_cwd()
+    here = _one_dir([cwd]) if cwd and os.path.isabs(cwd) else None
+    found: list[tuple[str, list[str], list[tuple[str, str]], str]] = []   # tool, words, entries, example
+    bad: list[tuple[str, str]] = []                                      # (tool, example)
+    accts: list[tuple[str, str]] = []
+    moved = False
+    todo = [(c, 0) for c in _lenient_commands(command)]
+    while todo:
+        cmd, depth = todo.pop(0)
+        words = [w for w, _k in cmd]
+        known = [k for _w, k in cmd]
+        j = 0
+        while j < len(words) and (_ASSIGN.match(words[j]) or words[j] in _RESERVED_PREFIX):
+            j += 1
+        argv = _unwrap(words[j:])
+        if not argv or words[len(words) - len(argv):] != argv:
+            continue
+        at = len(words) - len(argv)
+        allk, known = known, known[at:]
+        prog = _prog(argv[0]) if known[0] else ""
+        if prog in ("cd", "pushd", "popd"):
+            moved = True
+            continue
+        if depth < _LENIENT_DEPTH and all(known):
+            if prog == "eval":
+                todo += [(c, depth + 1) for c in _lenient_commands(" ".join(argv[1:]))]
+                continue
+            if prog in _SHELLS and "-c" in argv[1:-1]:
+                s = argv[argv.index("-c") + 1]
+                todo += [(c, depth + 1) for c in _lenient_commands(s)]
+                continue
+            if prog == "trap" and len(argv) > 2 and not argv[1].startswith("-"):
+                todo += [(c, depth + 1) for c in _lenient_commands(argv[1])]   # runs later
+                continue
+        if prog == "ssh" and fbs:
+            marked = [w if k else "\x00" for w, k in zip(argv, known)]
+            targets, _ = _scan_ssh(marked)
+            if any(t == "\x00" for t in targets):
+                bad.append(("ssh", "ssh HOST ..."))
+                continue
+            names = [x for x in (_resolve_host(t, form) for t in targets) if x is not None]
+            if not names:
+                continue
+            if not all(known):
+                bad.append(("ssh", f"ssh {names[0]} ..."))
+                continue
+            found.append(("ssh", argv[1:], [("hosts", x) for x in names], f"ssh {names[0]} ..."))
+        elif prog == "sudo" and fbs and "localhost" in form.hosts:
+            if not all(known):
+                bad.append(("sudo", "sudo ..."))
+                continue
+            found.append(("sudo", argv[1:], [("hosts", "localhost")], "sudo ..."))
+        elif clis_too and eff is not None and (
+                prog in _CLI_STANDINS or (prog == "gate" and argv[1:2] == ["with"])):
+            if prog == "gate":
+                if len(argv) < 3 or not all(known[:3]):
+                    continue                   # an account the hook can't name: no prompt
+                acc = _with_asks(argv, form, eff, ms)
+                example = f"gate with {argv[2]} -- ..."
+            else:
+                acc = _cli_asks(prog, argv, None if moved else here, eff, mode,
+                                _lenient_gate_account(words, allk, at))
+                example = f"{prog} ..."
+            if not acc:
+                continue
+            accts += acc
+            if not all(known):
+                bad.append((prog, example))
+                continue
+            found.append((prog, argv[1:], [("accounts", n) for n, _v in acc], example))
+    accts = list(dict.fromkeys(accts))
+    if skip:
+        return None, accts
+    # the structured judge's own records of these very words (its folder may
+    # differ after a `cd` it followed): not written twice
+    have: dict[tuple[str, tuple[str, ...]], int] = {}
+    for t, _c, w, _e in _ASK_PENDING:
+        have[(t, tuple(w))] = have.get((t, tuple(w)), 0) + 1
+    rest = []
+    for f in found:
+        key = (f[0], tuple(f[1]))
+        if have.get(key, 0) > 0:
+            have[key] -= 1
+            continue
+        rest.append(f)
+    if rest and (moved or here is None):
+        bad.append((rest[0][0], rest[0][3]))
+    if bad:
+        tool, example = bad[0]
+        what, are = _ask_words(list(dict.fromkeys(fbs + accts)))
+        return _deny(ASK_HIDDEN.format(what=what, are=are, tool=tool, example=example),
+                     tool=tool, target=(fbs + accts)[0][0]), accts
+    for tool, words, entries, _ex in rest:
+        _ASK_PENDING.append((tool, here or "", words, frozenset(entries)))
+    return None, accts
+
+
 # ---------------------------------------------------------------------------
-# Rights (the stricter of form and effective for deny/ask, effective for
-# allow) and host resolution
+# Rights per mode (the stricter of form and effective for deny/ask, effective
+# for allow) and host resolution
 # ---------------------------------------------------------------------------
 
-
-def _form_right(form: formmod.Form, host: str, verb: str) -> Any:
-    h = form.hosts.get(host)
-    return getattr(h, verb) if h is not None else None
-
-
-def _eff_right(eff: consent.Effective, host: str, verb: str) -> Any:
-    h = eff.hosts.get(host)
-    return getattr(h, verb) if h is not None else False
-
-
+# The modes where a stage with no right of its own (a benign command, a gate
+# subcommand) is allowed: where a bare `true` is allow (PLAN-0.11 §2.3).
+BARE_ALLOW_MODES = ("auto", "bypass")
+# This computer's sudo when nothing configures it (PLAN-0.11 §1.5): the
+# user's own sudo (no sudo stand-in, or one that passes it through): no
+# decision here (None), as for any tool the gateway doesn't handle. An
+# elevation restriction still applies (_policy_hits).
+UNCONFIGURED_SUDO = None
 WAIT = "wait"
 
 
-def _right(form: formmod.Form, eff: consent.Effective, host: str, verb: str) -> Any:
-    """The right deny and ask go by: the stricter of the form's and the
-    effective one (round 3). The stand-ins use the effective right and give
-    an "ask" right to a command Claude typed, trusting that this hook asked:
-    with `ssh = "ask"` approved and the form edited to `true` (the change
-    waits for the user's OK), the effective right is still "ask", so the hook
-    must ask too. None: not a form host. False: off in the form. WAIT: the
-    form allows more than the user approved and the effective right is off
-    (a widening waiting, a brand-new host, a jump host not set up). "ask"
-    when either is "ask"; True only when both are true."""
-    f = _form_right(form, host, verb)
+def _mode(payload: dict) -> tuple[str, bool]:
+    """(the mode key, whether the payload named a mode Claude Code sends):
+    §2.1's payload column (modes.from_payload); empty, missing or unknown,
+    gateway.toml's own `bypass` included, is "default", and then the hook
+    never allows."""
+    return modes.from_payload(payload.get("permission_mode"))
+
+
+def _form_word(form: formmod.Form, host: str, verb: str, mode: str | None) -> str | None:
+    """The form's own word for a host's ssh or sudo in `mode` (None: the
+    modeless rule): None when the form has no such host, "unconfigured" for
+    this computer's sudo when the form doesn't configure it."""
+    h = form.hosts.get(host)
+    if h is None:
+        return None
+    mv = h.mode_value(verb)
+    return modes.UNCONFIGURED if mv is None else mv.word(mode)
+
+
+def _right(form: formmod.Form, eff: consent.Effective, host: str, verb: str,
+           mode: str | None = None) -> str | None:
+    """The word deny and ask go by in `mode` (None: the modeless rule): the
+    stricter of the form's and the effective one (round 3). The stand-ins
+    use the effective word and give an "ask" right to a command Claude
+    typed, trusting that this hook asked: with `ssh = "ask"` approved and the
+    form edited to `true` (the change waits for the user's OK), the effective
+    word is still "ask", so the hook must ask too. None: not a form host.
+    "deny": deny in the form. WAIT: the form gives more than the user
+    approved and the effective word is deny (a widening waiting, a
+    brand-new host, a jump host not set up). Else "ask", "cc" or "allow"
+    (this computer's unconfigured sudo: UNCONFIGURED_SUDO, None: the user's
+    own, no decision)."""
+    f = _form_word(form, host, verb, mode)
     if f is None:
         return None
-    if f is False:
-        return False
-    e = _eff_right(eff, host, verb)
-    if e is False:
+    if f == "deny":
+        return "deny"
+    e = eff.word(host, verb, mode)
+    if e == "deny":
         return WAIT
-    if e == "ask" or f == "ask":
-        return "ask"
-    return True
+    w = modes.wmin(f, e)
+    return UNCONFIGURED_SUDO if w == modes.UNCONFIGURED else w
 
 
-def _deny_wait(name: str, verb: str, form: formmod.Form, eff: consent.Effective
-               ) -> dict[str, Any]:
+def _job_short(form: formmod.Form, eff: consent.Effective, host: str, verb: str) -> bool:
+    """A job or gateway terminal: the right is short of cc in the modeless
+    rule, which the stand-ins use inside it (nothing there is typed by
+    Claude), though the payload's mode gives it."""
+    return _right(form, eff, host, verb, None) in ("deny", "ask", WAIT)
+
+
+JOB_MODES = ("gateway: a job or gateway terminal can't use {what}: gateway.toml gives it only in "
+             "some permission modes, and nothing run there has a mode (the strictest of them "
+             "applies); run it with the Bash tool as its own command, or ask the user to change "
+             "it.")
+
+
+def _deny_job_modes(name: str, verb: str) -> dict[str, Any]:
+    return _deny(JOB_MODES.format(what=_ask_phrase(name, verb)), tool=verb, target=name,
+                 mode="modeless")
+
+
+def _mode_matters(eff: consent.Effective) -> bool:
+    """Does the effective form hold a per-mode value whose word as the
+    stand-ins see it (deny, ask, or cc and allow alike: today's true)
+    differs between the modes other than plan? Only then does the session's
+    mode change what a stand-in does (else the modeless rule says the same)."""
+    def differs(mv: Any) -> bool:
+        if not isinstance(mv, modes.ModeValue) or mv.uniform:
+            return False
+        return len({"cc" if w == "allow" else w for w in (mv.word(m) for m in modes.MODELESS)}) > 1
+    vals: list[Any] = list(eff.policy_modes.values())
+    for h in eff.hosts.values():
+        vals += list(h.modes.values()) + list(h.policy_modes.values())
+        for w in h.workspaces.values():
+            vals += list(w.policy_modes.values())
+    for a in eff.accounts.values():
+        vals += list(a.modes.values()) + list(a.policy_modes.values())
+    return any(differs(v) for v in vals)
+
+
+def record_mode(permission_mode: Any, eff: consent.Effective) -> bool:
+    """Record the session's mode in gated (modes.record, which makes the
+    epoch marker first) when the effective form makes it matter
+    (_mode_matters); else take the marker out, so no record counts any more
+    and pre_bash.sh stops sending every call here. True once gated holds it.
+    Never fails the hook."""
+    try:
+        if _mode_matters(eff):
+            return modes.record(permission_mode)
+        modes.drop_marker()
+        return False
+    except Exception:  # noqa: BLE001 - a record is a guardrail; the modeless rule applies
+        return False
+
+
+def _deny_wait(name: str, verb: str, form: formmod.Form, eff: consent.Effective,
+               mode: str | None = None) -> dict[str, Any]:
     """A right the form gives but the user hasn't approved yet: the stand-in
     would refuse it, so say what to do before anything runs."""
     if _LOCKED.get("message"):
@@ -1237,7 +2449,7 @@ def _deny_wait(name: str, verb: str, form: formmod.Form, eff: consent.Effective
     what = "sudo on this machine" if (name == "localhost" and verb == "sudo") else f"{verb} on {name}"
     h = form.hosts.get(name)
     via = h.via if h is not None else None
-    if via and verb == "ssh" and _eff_right(eff, via, "ssh") is False:
+    if via and verb == "ssh" and eff.word(via, "ssh", mode) == "deny":
         r = (f"gateway: {what} waits for the user's OK (it goes through {via}, which isn't set "
              f"up yet); run gate check {via}, then gate check {name}, while the user is here.")
     else:
@@ -1382,7 +2594,7 @@ def _wrapper_chdir(words: list[str], cwds: list[str]) -> list[str] | None:
             i += 1
         if i >= n:
             return None
-        w = os.path.basename(words[i])
+        w = _prog(words[i])
         letter = {"env": "C", "sudo": "D", "sudoedit": "D", "doas": None}.get(w)
         if w not in _EXEC_WRAPPERS and w not in _FORK_WRAPPERS:
             return None
@@ -1651,7 +2863,7 @@ def _deny_sensitive(stages: list[list[str]], cwd: str | None,
         if not argv:
             stage_cwds.append(list(cwds))
             continue
-        base = os.path.basename(argv[0])
+        base = _prog(argv[0])
         # A wrapper that changes directory (env -C/--chdir, sudo -D) runs this
         # stage's command there: resolve its paths (and the destructive list)
         # from that folder too, so `env -C ~/.config/gateway cat private/x` is
@@ -2066,9 +3278,32 @@ def _reads_plain(base: str, argv: list[str], cwds: list[str],
     return True
 
 
+def _hits_allow(base: str, argv: list[str], form: formmod.Form, eff: consent.Effective,
+                mode: str) -> bool:
+    """Every policy restriction on what an ssh-family stage or a local sudo
+    does is allow in `mode`: a restriction's "cc" or "ask" there withholds
+    the gateway's allow (a decision whose rule is a right itself, ssh, sudo
+    or a new entry's, is the right's own: _stage_allowed checks those)."""
+    return all(d.value == "allow" for _n, _a, d in _policy_hits(base, argv, form, eff, mode)
+               if _POLICY_RULE.match(d.rule))
+
+
 def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
                    cwds: list[str] | None = None, first: bool = True,
-                   roots: tuple[list[str], list[str], str, list[str]] | None = None) -> bool:
+                   roots: tuple[list[str], list[str], str, list[str]] | None = None,
+                   mode: str | None = None, top: bool = True,
+                   net: frozenset[str] = frozenset()) -> bool:
+    """May the gateway allow this stage in `mode` (a mode key; None, the
+    modeless rule, never allows)? A right's shape on the effective word allow
+    in that mode; a stage with no right of its own (gate, a benign command)
+    only where a bare `true` is allow (auto, bypass), except a plain reader
+    under an allowed sudo (`top` False). `net`: the network class's names
+    when [network] commands explicitly allows in this mode (lead decision
+    19.1): a network command by its bare name, with nothing else to vouch
+    for, is then allowed too (never an ssh-family tool, sudo, gate, git or a
+    plain reader the user put in the class: their own rules decide)."""
+    if mode is None:
+        return False
     argv, exp, glb = _argv_meta(stage)
     if not argv:
         return False
@@ -2086,8 +3321,10 @@ def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
         return False
     base = os.path.basename(argv[0])
     if base == "sudo":
-        if _eff_right(eff, "localhost", "sudo") is not True or not _sudo_structure_ok(argv, cwds):
+        if eff.word("localhost", "sudo", mode) != "allow" or not _sudo_structure_ok(argv, cwds):
             return False
+        if not _hits_allow(base, argv, form, eff, mode):
+            return False               # an elevation restriction below allow in this mode
         # a plain reader under sudo reads as root: the same rule as without it
         # (GW-UX-1), but never when a wrapper changed its directory (env -C /
         # sudo -D): the read rule resolves the file from the stage's cwd (SF1)
@@ -2095,7 +3332,7 @@ def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
         if cmd and os.path.basename(cmd[0]) in BENIGN_READERS:
             if _wrapper_chdir(argv, cwds or [os.getcwd()]) is not None:
                 return False
-            return _stage_allowed(cmd, form, eff, cwds, first, roots)
+            return _stage_allowed(cmd, form, eff, cwds, first, roots, mode, top=False)
         return True
     if base in ("ssh", "scp", "sftp", "rsync"):
         targets, safe = _scan_family(base, argv)
@@ -2106,18 +3343,25 @@ def _stage_allowed(stage: list[str], form: formmod.Form, eff: consent.Effective,
         _, sudo_word = _remote_sudo(base, argv)
         for t in targets:
             name = _resolve_host(t, form)
-            if name is None or _eff_right(eff, name, "ssh") is not True:
+            if name is None or eff.word(name, "ssh", mode) != "allow":
                 return False
-            if sudo_word and _eff_right(eff, name, "sudo") is not True:
+            if sudo_word and eff.word(name, "sudo", mode) != "allow":
                 return False           # remote sudo needs the host's sudo right too
+        if not _hits_allow(base, argv, form, eff, mode):
+            return False               # a restriction below allow in this mode
         return base == "ssh" or _transfer_paths_ok(_scan_transfer(base, argv), cwds)
+    if net and base not in BENIGN | ROUTE_TOOLS | {"gate", "git"} and \
+            _net_member(argv, net) is not None:
+        return True                    # [network] commands' explicit allow in this mode
+    if top and mode not in BARE_ALLOW_MODES:
+        return False                   # no right of its own: a bare true's modes only
     if base == "gate":
         sub = argv[1] if len(argv) > 1 else ""
         if sub == "with" or sub not in GATE_SUBCMDS:
             return False
         if sub in ("rotate", "copy-to"):
-            # they log in at once: only to a host whose ssh is approved true
-            return all(_eff_right(eff, n, "ssh") is True for n in _gate_hosts(argv, form))
+            # they log in at once: only to a host whose ssh is approved allow
+            return all(eff.word(n, "ssh", mode) == "allow" for n in _gate_hosts(argv, form, mode))
         return True
     if base in BENIGN:
         if base == "sleep":
@@ -2149,32 +3393,56 @@ def _names_form(command: str) -> bool:
 
 # The gateway daemon's refusal when a wrapped vault key is locked (PLAN-v4
 # phase 2): the rights are in the vault, so a right the hook can't read is
-# denied with this instead of "waits for the user's OK".
+# denied with this instead of "waits for the user's OK", and so is this
+# computer's configured sudo instead of an "ask" (_locked_sudo).
 _LOCKED: dict[str, str] = {}
+# The vault's account aliases (github:work -> github-work), for the name in
+# `gate with NAME` and GATE_ACCOUNT=NAME (accounts.resolve_name)
+_ALIASES: dict[str, str] = {}
+# What _load_rights read (the vault's data, whether it was locked), and the
+# effective rights computed from it for one mode (_eff_in), within one hook
+# call (main clears them)
+_VAULT: dict[str, Any] = {}
+_EFF_MODE: dict[str | None, consent.Effective] = {}
 
 
 def _load_rights() -> tuple[formmod.Form, consent.Effective]:
+    """The form and the effective rights (modeless; the per-mode words come
+    from Effective.word). A locked vault still classifies through the
+    configured list (compute(locked=True): its refusals say "locked"). The
+    stand-ins on PATH follow the configured set (envfile.sync_standins:
+    a host just added to gateway.toml gets its ssh stand-in before the
+    command that uses it runs)."""
     _LOCKED.clear()
+    _ALIASES.clear()
+    locked = False
     try:
         data = vault.load() if vault.exists() else None
     except vault.VaultLocked as e:
         _LOCKED["message"] = str(e)
-        data = None
+        data, locked = None, True
     except Exception:  # noqa: BLE001
         data = None
+    aliases = (data or {}).get("aliases") if isinstance(data, dict) else None
+    if isinstance(aliases, dict):
+        _ALIASES.update({str(k): str(v) for k, v in aliases.items()})
+    _VAULT.clear()
+    _VAULT.update(data=data, locked=locked)
+    _EFF_MODE.clear()
     form = consent.load_form(data)
     try:
-        eff = consent.compute(form, data)
+        eff = consent.compute(form, data, locked=locked)
     except Exception:  # noqa: BLE001
-        eff = consent.compute(form, None)
-    if _LOCKED:
-        _LOCKED["sudo"] = consent.locked_sudo_note(form)     # _ask says how to get it back
+        eff = consent.compute(form, None, locked=locked)
+    from . import envfile
+    envfile.sync_standins(form, eff)
+    consent.sync_network_words(eff)          # pre_bash.sh's extra trigger words (§3.4)
     return form, eff
 
 
 def _gate_sub(argv: list[str]) -> str:
     """A `gate` stage's subcommand (the gate CLI takes it as its first word)."""
-    return argv[1] if len(argv) > 1 and os.path.basename(argv[0]) == "gate" else ""
+    return argv[1] if len(argv) > 1 and _prog(argv[0]) == "gate" else ""
 
 
 def _deny_gate_terminal(sub: str, in_job: bool = False) -> dict[str, Any]:
@@ -2189,37 +3457,21 @@ def _deny_gate_terminal(sub: str, in_job: bool = False) -> dict[str, Any]:
                  target=sub)
 
 
-def _names_gate_secret(command: str) -> bool:
-    """The command's text (quotes removed) has `gate secret` as two words, for
-    commands whose words hide what runs (a shell string, eval, a loop,
-    `find -exec`, ...)."""
-    words = [w for w in _TEXT_SPLIT.split(_QUOTES.sub("", command)) if w]
-    return any(a == "gate" and b == GATE_USER_SUBCMD for a, b in zip(words, words[1:]))
-
-
-def _deny_gate_user(stages: list, command: str, in_user_terminal: bool,
-                    in_job: bool = False) -> dict[str, Any] | None:
-    """`gate secret` for any tool (also behind a wrapper, or named in a command
-    the words hide), and gate export/import/copy-to in the Terminal panel and
-    in a checkpoint job."""
-    hidden = False
+def _deny_gate_dialogs(stages: list, in_user_terminal: bool,
+                       in_job: bool = False) -> dict[str, Any] | None:
+    """gate export/import/copy-to (also behind a wrapper) in the Terminal
+    panel and in a job: their dialogs need a command Claude runs with the
+    Bash tool."""
     for st in stages:
         for fork in (False, True):
             argv, base = _command(st, fork=fork)
             if base != "gate":
                 continue
             sub = _gate_sub(argv)
-            if sub == GATE_USER_SUBCMD:
-                return _deny(DENY_GATE_SECRET, tool="gate", target=GATE_USER_SUBCMD)
             if in_user_terminal and sub in GATE_TERMINAL_SUBCMDS:
                 return _deny_gate_terminal(sub)
             if in_job and sub in GATE_TERMINAL_SUBCMDS:
                 return _deny_gate_terminal(sub, in_job=True)
-        runner = _command(st, fork=True)[1]
-        if runner in _HIDDEN_RUNNERS or runner in _LOOP_WORDS or _runs_hidden(list(st)):
-            hidden = True
-    if hidden and _names_gate_secret(command):
-        return _deny(DENY_GATE_SECRET, tool="gate", target=GATE_USER_SUBCMD)
     return None
 
 
@@ -2235,21 +3487,54 @@ def _deny_transfer_ask(base: str, name: str, verb: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Alternate routes in managed mode (PLAN-v4 phase 7, docs/dev/modules/managed.md):
-# a credential tool run by its path (/usr/bin/ssh, /opt/homebrew/bin/gh, ...)
-# is the system's binary with the user's own keys, logins and config, around
-# the gateway's stand-ins and gateway.toml; so is one run after the PATH was
-# taken away (`command -p`, `env -i`, PATH=...), or ssh named as the program
-# rsync/git start (-e, --rsh, GIT_SSH_COMMAND, core.sshCommand). git and
-# rsync by path are routed (the env file's GIT_SSH_COMMAND, RSYNC_RSH and git
-# include reach any git and rsync binary), so they pass. A guardrail on the
-# command Claude typed: a script or a program can still exec the binary by
-# path (the same-user limit, stated in the docs).
+# Alternate routes (PLAN-0.11 §1.7; docs/dev/modules/managed.md): a tool run
+# around its stand-in (by its path, /usr/bin/ssh; after the PATH was rebuilt,
+# by a login shell, sudo's secure_path, `su -`, `doas`, `env -i`, `command
+# -p`, PATH=...; or ssh named as the program rsync or git start: -e, --rsh,
+# GIT_SSH_COMMAND, core.sshCommand, a ProxyJump or ProxyCommand) is refused
+# only when it reaches a configured target (a configured host's name,
+# gw-NAME, address or `also` host, an account's ssh endpoint, this computer's
+# configured sudo, an account CLI of a configured kind), in every mode:
+# managed shell on or off, mods on or off. Anything else is the user's own.
+# A command that hides its program or host (a variable or computed -c
+# string, trap action, alias value or -C callback, a variable as the program,
+# find -exec, xargs, a script a shell reads, a target in a variable, a
+# variable osascript script; whatever the parser can't follow) is refused
+# while some configured entry is "ask" in the call's mode, or when its text
+# names a configured target: the stand-ins trust that an "ask" right reached
+# them only through a command the hook asked about (invariant 6). A
+# guardrail on the command Claude typed: a script or a program can still
+# exec a binary by path (the same-user limit, stated in the docs).
 # ---------------------------------------------------------------------------
 
 ROUTE_TOOLS = frozenset({"ssh", "scp", "sftp", "slogin", "ssh-add", "ssh-agent", "ssh-copy-id",
                          "sudo", "sudoedit", "gh", "hf", "huggingface-cli", "az", "databricks",
-                         "crane", "pijul", "dvc"})
+                         "crane", "pijul", "dvc", "rsync", "su", "doas", "pkexec", "runuser",
+                         "git"})
+# What each kind of tool reaches (_reaches): this computer's elevation; an
+# account CLI of a configured kind; no target at all (an agent, its keys).
+_ELEVATORS = frozenset({"sudo", "sudoedit", "su", "doas", "pkexec", "runuser"})
+_ACCOUNT_TOOLS = {"gh": ("github",), "hf": ("huggingface",), "huggingface-cli": ("huggingface",),
+                  "az": ("azure",), "databricks": ("azure",),
+                  "crane": ("github", "azure", "registry"), "pijul": ("pijul",),
+                  "dvc": ("ml-catalog",)}
+_NO_TARGET = frozenset({"ssh-add", "ssh-agent"})
+# ssh-family tools without a stand-in of their own: they go to a host through
+# the ssh stand-in. slogin is ssh by another name, so even by its bare name it
+# is the system's ssh (WS-8).
+_NO_STANDIN_SSH = frozenset({"rsync", "slogin", "ssh-copy-id"})
+SLOGIN_WHY = "slogin (ssh by another name, with no stand-in of its own)"
+_TEXT_SLOGIN = re.compile(r"(?<![\w./-])slogin(?![\w./-])", re.I)
+# huggingface-cli is hf's older name, with no stand-in of its own: by any
+# name it is the user's own tool, so while a huggingface account exists it
+# is refused with the way through hf's stand-in
+HF_CLI_WHY = "huggingface-cli (it has no stand-in of its own)"
+_TEXT_HF_CLI = re.compile(r"(?<![\w./-])huggingface-cli(?![\w./-])", re.I)
+# `gate with NAME --` in text: the NAME (an account, never a host), only an
+# entry's name (form.NAME_RE): any other word there may hide a target
+# (`gate with x;{/usr/bin/ssh,box} -- id`)
+_TEXT_WITH_NAME = re.compile(
+    r"(?<![\w./-])((?i:gate)\s+with\s+)[a-z][a-z0-9-]{0,31}(?=\s+--(?:\s|$))")
 # Variables that steer which binary a tool name finds (PATH) or what git,
 # rsync and sudo start as their transport or askpass; also git's
 # configuration from the environment (GIT_CONFIG_COUNT/KEY_n/VALUE_n,
@@ -2260,6 +3545,9 @@ _ROUTE_ASSIGN = re.compile(rf"^({_ROUTE_VAR})\+?=")
 _ROUTE_NAME = re.compile(rf"({_ROUTE_VAR})\Z")
 # git keys that choose the ssh git runs (setting one reroutes its transport)
 _GIT_SSH_KEYS = ("core.sshcommand", "ssh.variant")
+# the variables that hold a transport's whole command line (its words say
+# where ssh goes: _transport_target), and the tool each steers
+_TRANSPORT_VARS = {"GIT_SSH_COMMAND": "git", "RSYNC_RSH": "rsync"}
 # The tools a changed variable reroutes.
 _ROUTED_BY = {"PATH": ROUTE_TOOLS, "SUDO_ASKPASS": frozenset({"sudo", "sudoedit"}),
               "RSYNC_RSH": frozenset({"rsync"})}
@@ -2270,7 +3558,7 @@ _ROUTED_BY = {"PATH": ROUTE_TOOLS, "SUDO_ASKPASS": frozenset({"sudo", "sudoedit"
 # /etc/pam.d/sudo` and `sudo rm /usr/local/bin/gh` name data), or a
 # transport/PATH change together with a tool word.
 _TOOL_ALT = "|".join(sorted((re.escape(x) for x in ROUTE_TOOLS), key=len, reverse=True))
-_TEXT_TOOL_PATH = re.compile(rf"[~$A-Za-z0-9_.{{}}/+-]*/({_TOOL_ALT})(?![A-Za-z0-9_./-])")
+_TEXT_TOOL_PATH = re.compile(rf"[~$A-Za-z0-9_.{{}}/+-]*/((?i:{_TOOL_ALT}))(?![A-Za-z0-9_./-])")
 # Programs that run the next word (after their options) as a program, beside
 # the wrappers _unwrap looks through; and those whose -c takes a command string.
 _TEXT_RUN_NEXT = frozenset({"eval", "exec", "source", ".", "pkexec", "watch", "parallel"})
@@ -2328,87 +3616,555 @@ _TEXT_PROGRAM_OPT = re.compile(
 _TEXT_REDIR = re.compile(r"\A(?:[0-9]+|&)?(?:>>?\|?|<<<|<<?-?|<>|>&|<&)")
 # a pipe into a shell (`echo '/opt/x/ssh h' | sh`): every word may be a program
 _TEXT_PIPE_SHELL = re.compile(
-    r"\|&?\s*(?:(?:sudo|doas|env|nohup|command|exec|nice|time|arch)(?:\s+-\S*)*\s+)*"
-    r"(?:\S*/)?(?:" + "|".join(sorted(_SHELLS | {"xargs", "parallel"})) + r")(?![A-Za-z0-9_.-])")
-_TEXT_TOOL_WORD = re.compile(rf"(?<![A-Za-z0-9_./-])({_TOOL_ALT}|git|rsync)(?![A-Za-z0-9_-])")
+    r"\|&?\s*(?:(?i:sudo|doas|env|nohup|command|exec|nice|time|arch)(?:\s+-\S*)*\s+)*"
+    r"(?:\S*/)?(?i:" + "|".join(sorted(_SHELLS | {"xargs", "parallel"})) + r")(?![A-Za-z0-9_.-])")
+# (program names without letter case, as everywhere the hook reads one: _prog)
+_TEXT_TOOL_WORD = re.compile(rf"(?<![A-Za-z0-9_./-])((?i:{_TOOL_ALT}|git|rsync))(?![A-Za-z0-9_-])")
 # a word in command position (after a separator, a reserved word, or the
 # wrappers that exec their command): `_program_word` reads a `$(...)` or
 # backtick there as "$" (a computed program managed mode refuses)
 _TEXT_CMD_WORD = re.compile(
     r"(?:^|[;&|\n(]|\b(?:then|do|else|elif|if|while|until)\b|!)\s*"
-    r"(?:(?:exec|eval|command|builtin|nohup|time|nice|env|xargs|setsid|stdbuf|arch)\s+"
-    r"(?:-[^\s;&|]*\s+|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*\s+)*)*"
+    r"(?:(?:(?i:exec|eval|command|builtin|nohup|time|nice|env|xargs|setsid|stdbuf|arch|coproc)\s+"
+    r"(?:-[^\s;&|]*\s+|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*\s+)*)|(?i:gate)\s+with\s+[^\s;&|]+\s+--\s+)*"
     r"([^\s;&|()<>]+)")
 # the first word of a shell's or su's -c string (`bash -c '$(echo /x/ssh) h'`,
-# `bash -c "$CMD"`); only theirs: any other program's -c is its own option
-# (`gcc -c "$f"`, `psql -c "$Q"`)
+# `bash -c "$CMD"`, also after an option that takes a value: `bash -o posix
+# -c "$CMD"`, `+O extglob`, `--rcfile F`); only theirs: any other program's -c
+# is its own option (`gcc -c "$f"`, `psql -c "$Q"`)
 _TEXT_SHELL_C = re.compile(
-    r"(?<![\w./-])(?:\S*/)?(?:" + "|".join(sorted(_SHELLS | {"su", "runuser"})) +
-    r")(?:\s+-\S+)*?\s+-[A-Za-z]*c\b\s*([^\s;&|()<>]+)")
+    r"(?<![\w./-])(?:\S*/)?(?i:" + "|".join(sorted(_SHELLS | {"su", "runuser"})) +
+    r")(?:\s+(?:[-+][A-Za-z]*[oO]\s+[^\s;&|()<>]+|--(?:rcfile|init-file)\s+[^\s;&|()<>]+"
+    r"|[-+]\S+))*?\s+-[A-Za-z]*c\b\s*([^\s;&|()<>]+)")
 _TEXT_STEER = [
     (re.compile(rf"(?<![A-Za-z0-9_])({_ROUTE_VAR})\+?="), "{0} changed"),
     (re.compile(rf"\bunset\b[^;&|\n]*?(?<![A-Za-z0-9_])({_ROUTE_VAR})(?![A-Za-z0-9_])"),
      "{0} unset"),
     (re.compile(r"\bhash\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*p"), "hash -p"),
-    (re.compile(rf"\balias\s+[^;&|\n]*?(?<![A-Za-z0-9_-])({_TOOL_ALT}|git|rsync)="), "alias {0}"),
-    (re.compile(rf"(?<![A-Za-z0-9_-])({_TOOL_ALT}|git|rsync)\s*\(\s*\)"), "a function named {0}"),
-    (re.compile(rf"\bfunction\s+({_TOOL_ALT}|git|rsync)(?![A-Za-z0-9_-])"), "a function named {0}"),
+    (re.compile(rf"\balias\s+[^;&|\n]*?(?<![A-Za-z0-9_-])((?i:{_TOOL_ALT}|git|rsync))="),
+     "alias {0}"),
+    (re.compile(rf"(?<![A-Za-z0-9_-])((?i:{_TOOL_ALT}|git|rsync))\s*\(\s*\)"),
+     "a function named {0}"),
+    (re.compile(rf"\bfunction\s+((?i:{_TOOL_ALT}|git|rsync))(?![A-Za-z0-9_-])"),
+     "a function named {0}"),
     (re.compile(rf"\b(?:printf\s+-v|read\b[^;&|\n]*?)\s*(?<![A-Za-z0-9_])({_ROUTE_VAR})"
                 r"(?![A-Za-z0-9_])"), "{0} read into"),
-    (re.compile(r"\bcommand\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*p"), "command -p"),
-    (re.compile(r"\benv\b[^;&|\n]*?\s(?:-[A-Za-z]*[iuS]|--ignore-environment|--unset|"
-                r"--split-string)"), "env without the PATH"),
+    (re.compile(r"\b(?i:command)\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*p"), "command -p"),
+    (re.compile(r"\b(?i:env)\b[^;&|\n]*?\s(?:-[A-Za-z0-9]*[iuSP]|-(?=\s)|--ignore-environment|"
+                r"--unset|--split-string)"), "env without the PATH"),
 ]
 # git's ssh setting reroutes git wherever it stands in the text
 _TEXT_GIT_SSH = re.compile(r"(?i)core\.sshcommand|ssh\.variant|--config-env")
 
 
-# the way out for a real need of the system's own tool (a widening: the user's OK)
-_ROUTE_OFF = (" If the user really needs the system's own tool, they can set [shell] managed = "
-              "\"off\" in gateway.toml (approved in the gateway's dialog; it applies from the "
-              "next session); ask them first.")
+def _route_deny(word: str, base: str, target: str, why: str = "") -> dict[str, Any]:
+    """A route around a stand-in that reaches `target` (a configured entry):
+    refused with the stand-in's own route as the way (PLAN-0.11 §1.7)."""
+    if base in ("ssh", "slogin", "scp", "sftp", "rsync", "ssh-copy-id") and \
+            formmod.NAME_RE.fullmatch(target or ""):
+        use = f"use `{'ssh' if base in ('slogin', 'ssh-copy-id') else base} {target} ...`"
+    elif base in _ELEVATORS:
+        use = "use plain `sudo CMD` as its own command"
+    elif base == "huggingface-cli":
+        use = "run the same command as `hf ...` (huggingface-cli is hf's older name)"
+    else:
+        use = f"run `{base}` by its bare name as its own command"
+    # rsync, slogin and ssh-copy-id reach a host through the ssh stand-in (they
+    # have none); su, doas, pkexec, runuser and sudoedit have none: sudo's is the way
+    stand = "ssh" if base in _NO_STANDIN_SSH else "sudo" if base in _ELEVATORS else base
+    if base == "huggingface-cli":
+        stand = "hf"                 # none either: hf's stand-in is the way
+    # an account CLI's stand-in decides by destination (PLAN-0.11 §19.10)
+    how = (f"it supplies the key for a configured destination and passes any other to the "
+           f"user's own {stand}" if base in _ACCOUNT_TOOLS else "it supplies the key")
+    return _deny(f"gateway: {why or word} goes around the gateway's {stand} stand-in, and {target} "
+                 f"goes through the gateway; {use}: the gateway's stand-in is first on PATH, and "
+                 f"{how}. (A script that runs a tool by path is a known limit of the "
+                 "gateway with code running as you.)", tool=base, target=word[:60])
 
 
-def _route_deny(word: str, base: str, why: str = "") -> dict[str, Any]:
-    return _deny(f"gateway: {why or word} runs the system's {base} around the gateway (with your "
-                 "own keys, logins and config, outside gateway.toml's hosts and rights); run "
-                 f"`{base}` by its bare name: the gateway's stand-in is first on PATH. (A script "
-                 "that runs it by path is a known limit of the gateway with code running as "
-                 "you.)" + _ROUTE_OFF, tool=base, target=word)
+# A command that hides its program or host (PLAN-0.11 §1.7): refused when
+# its text names a configured target (an "ask" it may reach otherwise needs
+# a record it can't get: asks.py).
+HIDDEN_NAMED = ("gateway: this command hides the program or host it runs, and its text names "
+                "{name}, which goes through the gateway; spell the command out (for example "
+                "`{example}`) so the gateway can judge it.")
 
 
-# the way out of a refused `bash -c "$CMD"`: the command written out
-_SHELL_C_RUN = ("write the command itself in the -c string (`bash -c 'make test'`, not `bash -c "
-                "\"$CMD\"`), or run it")
+def _anything_configured(eff: consent.Effective) -> bool:
+    c = eff.configured
+    return bool(c.hosts or c.accounts or c.other_kinds or c.disabled or c.localhost_sudo
+                or c.local_elevation)
 
 
-def _route_deny_hidden(base: str | None, why: str, run: str = "") -> dict[str, Any]:
-    """A command whose use of a credential tool the hook can't follow
-    (managed mode): denied, never left to Claude Code's own mode. `base`
-    None: the program itself can't be told (a variable). `run`: the way out,
-    when it isn't running the tool or the program by its name."""
-    tool = base or "credential tool (ssh, sudo, gh, ...)"
-    run = run or (f"run `{base}` by its bare name" if base else "name the program itself")
-    return _deny(f"gateway: this command may run the system's {tool} around the gateway ({why}; "
-                 "the gateway can't follow a shell string, eval or exec, a function, find -exec, "
-                 "a variable as the program, or PATH or ssh settings changed earlier in the "
-                 "command), which would use your own keys, logins and config outside "
-                 f"gateway.toml's hosts and rights; {run} as its own command: the gateway's "
-                 "stand-ins are first on PATH. (A script that runs a tool by path is a known "
-                 "limit of the gateway with code running as you.)"
-                 + _ROUTE_OFF, tool=base or "shell", target=why[:60])
+def _names_configured(command: str, eff: consent.Effective) -> tuple[str, str] | None:
+    """(configured name, kind) the command's text names (quotes removed): a
+    configured host's name, gw-NAME, address or `also` host ("host"), or a
+    configured account's name ("account")."""
+    c = eff.configured
+    words = c.host_words()
+    accts = {r.name for r in c.reaches()} | set(c.disabled)
+    for w in _TEXT_SPLIT.split(_QUOTES.sub("", command)):
+        if not w:
+            continue
+        lw = w.lower().rstrip(".")
+        if lw in words:
+            return words[lw], "host"
+        if w in accts:
+            return w, "account"
+    return None
+
+
+def _hidden_rule(command: str, eff: consent.Effective) -> dict[str, Any] | None:
+    """For a command that hides its program or host (PLAN-0.11 §1.7): the
+    refusal when its text names a configured target, else None. Whatever
+    else it runs reaches no "ask" unasked: a stand-in passes an "ask" only
+    with the approval hook's record of the exact command (asks.py), which
+    nothing hidden gets."""
+    hit = _names_configured(command, eff)
+    if hit is not None:
+        name, kind = hit
+        example = f"ssh {name} CMD" if kind == "host" else f"gh ... (account {name})"
+        return _deny(HIDDEN_NAMED.format(name=name, example=example), tool="shell", target=name)
+    return None
+
+
+# Text the parser can't split that hides what it runs (PLAN-0.11 §1.7). In
+# Claude's own command shell (what it runs looks typed by Claude: "shell"):
+# eval, a sourced file (source, `.`), exec running a program (it replaces
+# that shell), a function defined, a computed command string that runs later
+# (trap's action, an alias's value, the -C callback of
+# mapfile/readarray/complete/compgen), an osascript -e script that starts
+# with a variable. Below a program that isn't a shell ("child": no command
+# Claude typed, so only a configured target named counts): xargs or
+# parallel, find -exec. A command starts at a separator, a case arm's `)`
+# or as a shell's (or su's) -c string, after reserved words, `time`,
+# `builtin` and `command` there, and after `gate with NAME --` (never in the
+# middle of a command: `git commit -m "gate with x -- xargs"` is a message).
+# (A variable as the program, or as a shell's -c string, _route_text finds.)
+_TEXT_CMD_START = (r"(?:^|[;&|(\n`{]|\$\(|(?:(?<![\w.-])in|;;&?|;&)\s+\(?[^;&()\n]*\)"
+                   r"|(?<![\w./-])(?:\S*/)?(?i:" +
+                   "|".join(sorted(_SHELLS | {"su", "runuser"})) +
+                   r")(?:\s+[^\s;&|()]+)*?\s+-[A-Za-z]*c\s)"
+                   r"(?:\s*(?:then|do|else|elif|if|while|until|!|time(?:\s+-p)?|builtin"
+                   r"|(?i:command)(?:\s+--)?)(?=\s)"
+                   r"|\s*(?:\S*/)?(?i:gate)\s+with\s+[^\s;&|]+\s+--(?=\s))*")
+_TEXT_HIDES = re.compile(
+    _TEXT_CMD_START + r"\s*(?:\S*/)?(?:eval|source)(?![\w.-])"
+    r"|" + _TEXT_CMD_START + r"\s*\.(?=\s)"
+    r"|(?:^|[;&\n{])\s*(?:function\s+[\w.-]+|[\w.-]+\s*\(\s*\))\s*[{(]"
+    r"|" + _TEXT_CMD_START + r"\s*trap\s+(?:--\s+)?[$`]"
+    r"|" + _TEXT_CMD_START + r"\s*alias\s+(?:[^\s;&|]+\s+)*?[^\s;&|=]+=[^\s;&|]*[$`]"
+    r"|(?<![\w.-])(?:mapfile|readarray|complete|compgen)\s[^;&|\n]*?-[A-Za-z]*C\s*[$`]"
+    r"|(?<![\w.-])(?i:osascript)\s[^;&|\n]*?-e\s*[$`]")
+_TEXT_HIDES_CHILD = re.compile(
+    _TEXT_CMD_START + r"\s*(?:\S*/)?(?i:xargs|parallel)(?![\w.-])"
+    r"|(?<![\w-])(?i:find)\b[^;&|\n]*\s-(?:exec|execdir|ok|okdir)(?![\w-])")
+_TEXT_EXEC = re.compile(_TEXT_CMD_START + r"\s*(?:\S*/)?exec(?![^\s;&|()<>])")
+# a named file descriptor's redirection (`exec {fd}>log`)
+_NAMED_FD = re.compile(r"\A\{[A-Za-z_][A-Za-z0-9_]*\}(?:>>?|<|<>|>&|<&)")
+
+
+def _exec_program(words: list[str]) -> str | None:
+    """The program `exec WORDS` runs, or None for an exec with redirections
+    only (`exec >log 2>&1`, `exec 3>&-`): exec's own options (-c, -l, -a
+    NAME) and every redirection word skipped."""
+    i, n, opts = 0, len(words), True
+    while i < n:
+        w = words[i]
+        m = _TEXT_REDIR.match(w) or _NAMED_FD.match(w)
+        if m:
+            i += 1 if m.end() < len(w) else 2       # `>log` or `> log`
+            continue
+        if opts and w == "--":
+            opts = False
+            i += 1
+            continue
+        if opts and w.startswith("-") and len(w) > 1:
+            i += 2 if w.endswith("a") else 1        # -a NAME (also -ca NAME)
+            continue
+        return w
+    return None
+
+
+def _text_exec(text: str) -> bool:
+    """exec running a program in the text (quotes removed): it replaces
+    Claude's command shell, so whatever a script it runs starts looks typed
+    by Claude."""
+    for m in _TEXT_EXEC.finditer(text):
+        sep = _TEXT_SEP.search(text, m.end())
+        if _exec_program(text[m.end():sep.start() if sep else len(text)].split()) is not None:
+            return True
+    return False
+
+
+def _text_hides(command: str) -> str | None:
+    """"shell" when the text hides what runs in Claude's own command shell,
+    "child" when only xargs, parallel or find -exec hide it, else None."""
+    text = _QUOTES.sub("", _drop_heredoc_data(command))
+    if _TEXT_HIDES.search(text) or _text_exec(text):
+        return "shell"
+    return "child" if _TEXT_HIDES_CHILD.search(text) else None
+
+
+OTHER_ELEVATION = ("gateway: {tool} isn't used for this computer's root work while its sudo goes "
+                   "through the gateway (gateway.toml [hosts.localhost] sudo): use sudo; the "
+                   "gateway supplies its password in its dialog.")
+# (sudoedit is sudo's own binary, but no stand-in supplies its password: by
+# its bare name it is the system's, and refused like su while this
+# computer's sudo goes through the gateway)
+_OTHER_ELEVATORS = frozenset({"su", "doas", "pkexec", "runuser", "sudoedit"})
+# AppleScript's administrator privileges, in both of its forms: `with
+# administrator privileges` and the labelled `administrator privileges true`
+_ADMIN_SCRIPT = re.compile(r"(?i)administrator\s+privileges")
+_OSASCRIPT_WORD = re.compile(r"(?<![\w.-])osascript(?![\w.-])", re.I)
+# Besides _unwrap's wrappers, what runs the next word as its program in a
+# chain of words: exec and eval in Claude's own shell (exec -a NAME), watch
+# through sh -c (watch -n SECS).
+_CHAIN_RUNNERS = {"exec": "a", "eval": "", "watch": "n"}
+
+
+def _elevator_in_chain(words: list[str]) -> str | None:
+    """One of the other elevation tools (_OTHER_ELEVATORS: su, doas, pkexec,
+    runuser, sudoedit) as the program of a wrapper chain (`sudo doas -s`,
+    `nohup su -c x`, `exec pkexec id`, `nice sudoedit f`): the chain _unwrap
+    walks, stopping at each program instead of looking through doas."""
+    i, n = 0, len(words)
+    for _ in range(12):
+        while i < n and (words[i] in _RESERVED_PREFIX or _ASSIGN.match(words[i])):
+            i += 1
+        if i >= n:
+            return None
+        b = _prog_name(words[i])
+        if b in _OTHER_ELEVATORS:
+            return b
+        if b == "gate" and words[i + 1:i + 2] == ["with"]:
+            # `gate with NAME -- CMD` runs CMD (WS-8)
+            if "--" not in words[i + 2:]:
+                return None
+            i = words.index("--", i + 2) + 1
+            continue
+        if b not in _EXEC_WRAPPERS and b not in _FORK_WRAPPERS and b not in _CHAIN_RUNNERS:
+            return None
+        vals = _WRAPPER_VALUE_OPTS.get(b, _CHAIN_RUNNERS.get(b, ""))
+        i += 1
+        while i < n and words[i].startswith("-") and words[i] not in ("-", "--"):
+            a = words[i]
+            if a.startswith("--"):
+                i += 2 if ("=" not in a and a in _WRAPPER_VALUE_LONG) else 1
+                continue
+            body = a[1:]
+            k = next((j for j, c in enumerate(body) if c in vals), -1)
+            i += 2 if k == len(body) - 1 else 1
+        if i < n and words[i] == "--":
+            i += 1
+        if b in ("timeout", "gtimeout") and i < n:
+            i += 1
+    return None
+
+
+def _text_elevator(command: str) -> str | None:
+    """For text the parser can't follow, or a stage that runs code its words
+    don't show: one of the other elevation tools as a program word (a
+    command's first word, behind wrappers, exec or eval, as the start of a
+    shell's or su's -c string or here-string, after find -exec, anywhere in
+    text piped into a shell), or osascript with administrator privileges
+    anywhere in the command (its script may come from -e, stdin, a pipe or a
+    here-document)."""
+    if _OSASCRIPT_WORD.search(command) and _ADMIN_SCRIPT.search(command):
+        return "osascript"
+    text = _QUOTES.sub("", _drop_heredoc_data(command))
+    anywhere = bool(_TEXT_PIPE_SHELL.search(text))
+    for chunk in _TEXT_SEP.split(text):
+        words = chunk.split()
+        for k in range(len(words)):
+            if k and not anywhere and words[k - 1] not in _FIND_RUN and not (
+                    (words[k - 1] == "<<<" or re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", words[k - 1]))
+                    and any(_prog_name(w) in _TEXT_RUN_C for w in words[:k - 1])):
+                continue
+            found = _elevator_in_chain(words[k:])
+            if found is not None:
+                return found
+    return None
+
+
+def _elevation_tool(stages: list, command: str, depth: int = 0) -> str | None:
+    """The other elevation tool a parsed command runs (PLAN-0.11 §9.5): su,
+    doas, pkexec, runuser or sudoedit as a stage's program, behind its
+    wrappers or in its wrapper chain; osascript while the command's text asks for
+    administrator privileges anywhere (`echo '...' | osascript`); inside a
+    written-out command string (a -c string, trap's action, an alias),
+    judged like the outer command; and the text scan (_text_elevator) when a
+    stage runs code its words don't show."""
+    scan = False
+    for _k, st in _with_inners(stages):         # CMD of `gate with NAME -- CMD` too (WS-8)
+        found = _elevator_in_chain(list(_strip_gate_account(st)))
+        if found:
+            return found
+        for forked in (False, True):
+            argv, base = _command(st, fork=forked)
+            if not argv:
+                continue
+            if base in _OTHER_ELEVATORS:
+                return base
+            if base == "osascript" and _ADMIN_SCRIPT.search(command):
+                return base
+            strings = _cmd_strings(st, argv, base)
+            for text, _login, literal in strings:
+                if not literal:
+                    continue
+                segs = bashparse.parse(text) if depth < _STRING_MAX_DEPTH else None
+                found = (_elevation_tool([s for seg in segs for s in seg], text, depth + 1)
+                         if segs is not None else _text_elevator(text))
+                if found:
+                    return found
+            if not strings and (_stage_hidden(st, argv, base) or _hides(st, argv, base)):
+                scan = True
+    return _text_elevator(command) if scan else None
+
+
+def _other_elevation(found: str | None, eff: consent.Effective, mode: str | None,
+                     in_job: bool = False) -> tuple[dict[str, Any] | None, list[tuple[str, str]]]:
+    """su, doas, pkexec, runuser, sudoedit and osascript's administrator
+    privileges (`found`, from _elevation_tool or _text_elevator; PLAN-0.11 §9.5):
+    denied while this computer's sudo is configured ("use sudo"); with only
+    an elevation restriction here, its deny denies and its "ask" asks
+    (denied in a job); otherwise nothing (the user's own). Never allowed
+    (they are no allow shape). (deny or None, the "ask" rights to add)."""
+    if not found:
+        return None, []
+    c = eff.configured
+    if c.localhost_sudo:
+        return _deny(OTHER_ELEVATION.format(tool=found), tool=found, target="localhost"), []
+    if not c.local_elevation:
+        return None, []
+    from . import policy
+    dec = policy.decide(eff, "elevation", mode=mode)
+    if dec.value == "deny":
+        return _deny(dec.message(f"{found} (root)"), tool=found, target="localhost",
+                     mode=dec.mode_label), []
+    if dec.value == "ask":
+        if in_job:
+            return _deny(consent.job_ask_message([_ask_phrase("localhost", "sudo")]),
+                         tool=found, target="localhost"), []
+        return None, [("localhost", "elevation")]
+    return None, []
+
+
+def _host_target(word: str, eff: consent.Effective, command: str = "") -> str | None:
+    """The configured target a destination word ([user@]host) reaches: a
+    host's name, or an account whose ssh endpoint it is (the owner in the
+    remote command covered: gitroute's rule)."""
+    c = eff.configured
+    host = word.rsplit("@", 1)[-1]
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    host = host.lower().rstrip(".")
+    n = c.host_named(host)
+    if n is not None:
+        return n
+    reaches = [r for r in c.reaches() if host in r.ssh_hosts]
+    if not reaches:
+        return None
+    from . import accounts as acctmod
+    from . import gitroute
+    parsed = acctmod.owner_from_git_command(command) if command else None
+    owner = parsed[1] if parsed else None
+    where = gitroute.Where(scheme="ssh", host=host, path=f"{owner}/x" if owner else "")
+    names = [n for sect, n in c.git_targets().hits(where) if sect == "accounts"]
+    return names[0] if names else None
+
+
+_PC_WORD = re.compile(r"[A-Za-z0-9._@\[\]:-]+")
+
+
+def _hop_word(hop: str) -> str:
+    """A ProxyJump hop's host ([user@]host[:port], ssh://...)."""
+    h = hop[6:].rstrip("/") if hop.lower().startswith("ssh://") else hop
+    h = h.rsplit("@", 1)[-1]
+    if h.startswith("["):
+        return h[1:].split("]", 1)[0]
+    return h.split(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _words_target(text: str, eff: consent.Effective) -> str | None:
+    """A configured host (or account endpoint) among a text's words (a
+    ProxyCommand, a transport program's words)."""
+    for w in _PC_WORD.findall(text or ""):
+        w = w.rsplit("@", 1)[-1]
+        if w.count(":") == 1 and not w.startswith("["):
+            w = w.split(":", 1)[0]
+        t = _host_target(w, eff)
+        if t is not None:
+            return t
+    return None
+
+
+def _opts_target(lp: ssh_args.Lenient, eff: consent.Effective) -> str | None:
+    """The configured target an ssh-family line's own options send it to,
+    whatever its destination: a ProxyJump hop (-J, -o ProxyJump), a
+    ProxyCommand's words, or a HostName (-o HostName=, any spelling ssh
+    takes: `-oHostname=X`, `-o "HostName X"`)."""
+    for hop in lp.jumps():
+        t = _host_target(_hop_word(hop), eff)
+        if t is not None:
+            return t
+    for v in lp.o_values("proxycommand"):
+        t = _words_target(v, eff) if v.lower() != "none" else None
+        if t is not None:
+            return t
+    for v in lp.o_values("hostname"):
+        t = _host_target(v, eff)
+        if t is not None:
+            return t
+    return None
+
+
+def _ssh_line_target(args: list[str], eff: consent.Effective) -> str | None:
+    """The configured target an ssh command line (its arguments) reaches:
+    its destination word, or where its options send it (_opts_target)."""
+    lp = ssh_args.parse_lenient(args)
+    if lp.dest:
+        w = lp.dest
+        if w.lower().startswith("ssh://"):
+            w = _hop_word(w)
+        t = _host_target(w, eff, lp.command_text)
+        if t is not None:
+            return t
+    return _opts_target(lp, eff)
+
+
+def _transport_target(value: str, eff: consent.Effective) -> str | None:
+    """The configured target a transport command line reaches by its own
+    words (rsync -e, RSYNC_RSH, GIT_SSH_COMMAND, core.sshCommand): a
+    destination it names, a HostName, a hop or a ProxyCommand. A line shlex
+    can't split: any configured host among its words."""
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return _words_target(value, eff)
+    return _ssh_line_target(words[1:], eff) if words else None
+
+
+def _short_values(args: list[str], letter: str) -> list[str]:
+    """Every value of a one-letter option (`-o V`, `-oV`) among args."""
+    out = []
+    for j, a in enumerate(args):
+        if a == "-" + letter and j + 1 < len(args):
+            out.append(args[j + 1])
+        elif a.startswith("-" + letter) and len(a) > 2:
+            out.append(a[2:])
+    return out
+
+
+def _rsync_transports(argv: list[str]) -> list[str]:
+    """rsync's transport lines: -e/--rsh values (also at the end of a short
+    cluster, `-ae CMD`, `-aeCMD`; a value option before it, B f M T @,
+    takes the rest of the cluster itself)."""
+    out = []
+    for j, a in enumerate(argv[1:], 1):
+        if a in ("-e", "--rsh") and j + 1 < len(argv):
+            out.append(argv[j + 1])
+        elif a.startswith("--rsh="):
+            out.append(a.split("=", 1)[1])
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            body = a[1:]
+            for k, c in enumerate(body):
+                if c in RSYNC_VALUE_SHORT:
+                    if c == "e":
+                        out.append(body[k + 1:] or (argv[j + 1] if j + 1 < len(argv) else ""))
+                    break
+    return out
+
+
+def _reaches(base: str, argv: list[str], eff: consent.Effective,
+             cwd: str | None = None) -> str | None:
+    """The configured target (a name, for the refusal) a stage of `base`
+    reaches, or None: an ssh-family destination, hop or ProxyCommand; a
+    transfer's remote operand; this computer's configured sudo (or an
+    elevation restriction here) for the elevating tools; an account CLI of a
+    configured kind (its destination isn't resolved here: the stand-in does
+    that); git through the shared resolver (gitroute)."""
+    c = eff.configured
+    if base in _NO_TARGET:
+        return None
+    if base in _ELEVATORS:
+        return "this computer's sudo" if (c.localhost_sudo or c.local_elevation) else None
+    if base in _ACCOUNT_TOOLS:
+        kinds = _ACCOUNT_TOOLS[base]
+        names = [r.name for r in c.reaches() if r.kind in kinds]
+        return names[0] if names else None
+    if base in ("ssh", "slogin"):
+        return _ssh_line_target(argv[1:], eff)
+    if base == "ssh-copy-id":
+        ops = [a for a in argv[1:] if not a.startswith("-")]
+        t = _host_target(ops[-1], eff) if ops else None
+        return t if t is not None else _opts_target(ssh_args.Lenient(opts=[
+            ("o", v) for v in _short_values(argv[1:], "o")]), eff)
+    if base in ("scp", "sftp", "rsync"):
+        tr = _scan_transfer(base, argv)
+        for host, _path in tr.remote:
+            t = _host_target(host, eff)
+            if t is not None:
+                return t
+        if base == "rsync":
+            # rsync's own options aren't ssh's (its -J, -o mean other things):
+            # where it goes besides its operands is its transport's line
+            for v in _rsync_transports(argv):
+                t = _transport_target(v, eff)
+                if t is not None:
+                    return t
+            return None
+        return _opts_target(ssh_args.parse_lenient(argv[1:], base), eff)
+    if base == "git":
+        try:
+            r = _git_route(argv[1:], cwd, c.git_targets())
+        except Exception:  # noqa: BLE001 - can't tell while something is configured
+            return "a repository the gateway handles" if c.git_targets() else None
+        if r.gated or r.refusal:
+            ents = r.entries()
+            return ents[0][1] if ents else "a repository the gateway handles"
+        return None
+    return None
+
+
+def _text_reach(tool: str, text: str, eff: consent.Effective,
+                cwd: str | None = None) -> str | None:
+    """For text the parser can't follow: the configured target a tool named
+    there may reach (an ssh-family or git tool: a configured target named in
+    the text, and for git the working directory's repository when a remote
+    there is configured; an elevating tool: this computer's configured sudo;
+    an account CLI: an account of its kind)."""
+    if tool in _ELEVATORS or tool in _ACCOUNT_TOOLS or tool in _NO_TARGET:
+        return _reaches(tool, [tool], eff)
+    if tool == "git" and cwd:
+        # every git command in a repository with a configured remote is gated
+        t = _reaches("git", ["git", "status"], eff, cwd)
+        if t is not None:
+            return t
+    # the account `gate with NAME --` hands its key to is no ssh or git target
+    text = _TEXT_WITH_NAME.sub(r"\1", text)
+    hit = _names_configured(text, eff)
+    if hit is not None:
+        return hit[0]
+    return _words_target(text, eff)
 
 
 def _is_stand_in(word: str, base: str) -> bool:
+    """Is the word a path to this plugin's stand-in `base` (also spelled in
+    another letter case, where the file system ignores it)?"""
     try:
-        return os.path.realpath(word) == os.path.realpath(str(paths.bin_dir() / base))
-    except (OSError, paths.PathError):
+        mine = str(paths.bin_dir() / base.lower())
+        if os.path.realpath(word) == os.path.realpath(mine):
+            return True
+        return os.path.samefile(word, mine)
+    except (OSError, ValueError, paths.PathError):
         return False
 
 
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-_HEREDOC_SHELL = re.compile(r"(?<![A-Za-z0-9_./-])(?:sh|bash|zsh|dash|ksh|ash|mksh|yash|fish|"
-                            r"csh|tcsh|source|eval|\.)(?![A-Za-z0-9_-])")
+_HEREDOC_SHELL = re.compile(r"(?<![A-Za-z0-9_./-])(?:(?i:sh|bash|zsh|dash|ksh|ash|mksh|yash|fish|"
+                            r"csh|tcsh)|source|eval|\.)(?![A-Za-z0-9_-])")
 
 
 def _drop_heredoc_data(command: str) -> str:
@@ -2479,7 +4235,7 @@ _GLUED_STOP = frozenset(" \t\n;&|()`{}")
 # CMD stands between the shell and the here-string, so the content is CMD's.)
 _HERESTRING_SHELL = re.compile(
     r"(?:^|[;&|(`\n])\s*"
-    r"(?:(?:sudo|doas|env|nohup|command|nice|time|setsid|stdbuf|exec|arch)\s+(?:-\S+\s+)*|"
+    r"(?:(?i:sudo|doas|env|nohup|command|nice|time|setsid|stdbuf|exec|arch)\s+(?:-\S+\s+)*|"
     r"[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
     r"([^\s;&|<>]+)(?:\s+-\S+)*\s*<<<\s*\Z")
 
@@ -2491,7 +4247,7 @@ def _herestring_into_shell(text: str, i: int) -> bool:
     m = _HERESTRING_SHELL.search(text[:i])
     if not m:
         return False
-    sh = os.path.basename(m.group(1))
+    sh = _prog(m.group(1))
     return sh in _SHELLS or sh in ("eval", "source", ".")
 
 
@@ -2560,7 +4316,13 @@ def _text_program(words: list[str]) -> str:
             return "data"
         if argv[0] == _TEXT_TARGET:
             return "run"
-        b = os.path.basename(argv[0])
+        b = _prog(argv[0])
+        if b == "gate" and argv[1:2] == ["with"]:
+            # `gate with NAME -- CMD` runs CMD as its program (WS-8)
+            if "--" not in argv[2:]:
+                return "operand"
+            argv = argv[argv.index("--", 2) + 1:]
+            continue
         if b in _TEXT_RUN_NEXT:
             argv = argv[1:]
             while argv and argv[0].startswith("-") and argv[0] != _TEXT_TARGET:
@@ -2660,41 +4422,102 @@ def _text_runs(text: str, m: re.Match[str]) -> bool:
     return is_bin
 
 
-def _route_text(command: str) -> dict[str, Any] | None:
-    """The text scan for a command the parser can't follow (see _TEXT_*): a
-    credential tool by a path that isn't the stand-in, where it can run as a
-    program (_text_runs), or a PATH/transport change (or an alias, a
-    function, `hash -p`, `command -p`, `env -i`, git's ssh setting) with a
-    tool named anywhere. Here-documents that are data aren't read."""
+# a login shell or a PATH-resetting wrapper in text the parser can't follow
+# (PLAN-0.11 §1.7: they rebuild PATH, and on macOS path_helper puts /usr/bin
+# first, so a stand-in name after them counts as a tool by its path)
+_TEXT_RESET = re.compile(
+    r"(?<![\w./-])(?:\S*/)?(?:(?i:bash|zsh|sh|ksh|dash|mksh|yash)\s+(?:-\S*\s+)*"
+    r"(?:-[A-Za-z]*l[A-Za-z]*|--login)"
+    r"|(?i:su)(?:\s+-\S*)*\s+(?:-|-l|--login)|(?i:sudo)\s+(?:-\S+\s+)*-[A-Za-z]*i|(?i:doas))"
+    r"(?![\w-])")
+# plain sudo there: its command runs with sudo's own PATH (secure_path), so a
+# stand-in name in that command (up to the next separator, or anywhere after
+# when a shell follows, whose string runs with that PATH too) is the system's
+_TEXT_SUDO = re.compile(r"(?<![\w./-])(?:\S*/)?sudo(?![\w-])", re.I)
+_TEXT_SHELL_WORD = re.compile(r"(?<![\w./-])(?:\S*/)?(?:" + "|".join(sorted(_SHELLS)) +
+                              r")(?![\w-])", re.I)
+
+
+def _route_text(command: str, eff: consent.Effective, mode: str | None,
+                cwd: str | None = None) -> dict[str, Any] | None:
+    """The text scan for a command the parser can't follow (see _TEXT_*),
+    refusing only what reaches a configured target (PLAN-0.11 §1.7): a tool
+    by a path that isn't its stand-in, where it can run as a program
+    (_text_runs); a stand-in name after a login shell or a PATH-resetting
+    wrapper; a PATH/transport change (or an alias, a function, `hash -p`,
+    `command -p`, `env -i`, git's ssh setting) with a tool named after it. A
+    variable or computed program, or a variable -c string, hides what runs:
+    _hidden_rule. Here-documents that are data aren't read. cwd: where the
+    command runs (git's repository)."""
     text = _QUOTES.sub("", _drop_heredoc_data(command))
     for m in _TEXT_TOOL_PATH.finditer(text):
         word = re.sub(r"^-[A-Za-z]*(?=[/~$.])", "", m.group(0))
         if not _text_runs(text, m):
             continue
-        if not _is_stand_in(word, m.group(1)):
-            return _route_deny_hidden(m.group(1), f"{word[:60]} by its path")
+        name = m.group(1).lower()
+        if not _is_stand_in(word, name):
+            tgt = _text_reach(name, text, eff, cwd)
+            if tgt is not None:
+                return _route_deny(word, name, tgt, f"{word[:60]} by its path")
+    for m in _TEXT_SLOGIN.finditer(text):
+        if _text_program(_TEXT_SEP.split(text[:m.start()])[-1].split() + [_TEXT_TARGET]) == "run":
+            tgt = _text_reach("slogin", text, eff, cwd)
+            if tgt is not None:
+                return _route_deny("slogin", "slogin", tgt, SLOGIN_WHY)
+    for m in _TEXT_HF_CLI.finditer(text):
+        if _text_program(_TEXT_SEP.split(text[:m.start()])[-1].split() + [_TEXT_TARGET]) == "run":
+            tgt = _text_reach("huggingface-cli", text, eff, cwd)
+            if tgt is not None:
+                return _route_deny("huggingface-cli", "huggingface-cli", tgt, HF_CLI_WHY)
+    for m in _TEXT_RESET.finditer(text):
+        tool = _TEXT_TOOL_WORD.search(text, m.end())
+        name = tool.group(1).lower() if tool is not None else ""
+        if name in ROUTE_TOOLS:
+            tgt = _text_reach(name, text, eff, cwd)
+            if tgt is not None:
+                return _route_deny(m.group(0).strip(), name, tgt,
+                                   f"{name} after {m.group(0).strip()[:30]} (its own PATH)")
+    for m in _TEXT_SUDO.finditer(text):
+        sep = _TEXT_SEP.search(text, m.end())
+        end = sep.start() if sep else len(text)
+        if _TEXT_SHELL_WORD.search(text, m.end(), end):
+            end = len(text)
+        tool = _TEXT_TOOL_WORD.search(text, m.end(), end)
+        name = tool.group(1).lower() if tool is not None else ""
+        if name in ROUTE_TOOLS and name not in _ELEVATORS:
+            tgt = _text_reach(name, text, eff, cwd)
+            if tgt is not None:
+                return _route_deny("sudo", name, tgt,
+                                   f"sudo {name} (sudo runs it with its own PATH)")
+    computed = False
     for m in _TEXT_CMD_WORD.finditer(text):
         w = _program_word(text, m.start(1))
         if "$" in os.path.basename(w) or "`" in os.path.basename(w):
-            return _route_deny_hidden(None, f"the program is a variable or a command's output "
-                                            f"({w[:40]})")
+            computed = True
     for m in _TEXT_SHELL_C.finditer(text):
         w = _program_word(text, m.start(1))
         if "$" in os.path.basename(w) or "`" in os.path.basename(w):
-            # `bash -c "$CMD"`: whatever the variable holds runs, unseen
-            return _route_deny_hidden(None, f"the shell's -c string is a variable or a command's "
-                                            f"output ({w[:40]})", _SHELL_C_RUN)
-    if _TEXT_GIT_SSH.search(text) and re.search(r"(?<![A-Za-z0-9_.-])git(?![A-Za-z0-9_-])", text):
-        return _route_deny_hidden("ssh", "git's ssh setting")
+            computed = True
+    if computed:
+        d = _hidden_rule(command, eff)
+        if d is not None:
+            return d
+    if _TEXT_GIT_SSH.search(text) and re.search(r"(?<![A-Za-z0-9_.-])git(?![A-Za-z0-9_-])", text,
+                                                re.I):
+        tgt = _text_reach("git", text, eff, cwd)
+        if tgt is not None:
+            return _route_deny("core.sshCommand", "ssh", tgt, "git's ssh setting")
     # a change steers only the tools after it (`sudo env -i make` is sudo's own business)
     for rx, why in _TEXT_STEER:
         for m in rx.finditer(text):
-            named = m.group(1) if m.groups() and m.group(1) in ROUTE_TOOLS | {"git", "rsync"} \
-                else None
+            g = m.group(1).lower() if m.groups() and m.group(1) else ""
+            named = g if g in ROUTE_TOOLS | {"git", "rsync"} else None
             tool = _TEXT_TOOL_WORD.search(text, m.end()) if named is None else m
             if tool is not None:
-                return _route_deny_hidden(named or tool.group(1),
-                                          why.format(*(m.groups() or ("",))))
+                name = named or tool.group(1).lower()
+                tgt = _text_reach(name, text, eff, cwd)
+                if tgt is not None:
+                    return _route_deny(name, name, tgt, why.format(*(m.groups() or ("",))))
     return None
 
 
@@ -2740,64 +4563,161 @@ def _route_changes(argv: list[str]) -> dict[str, str]:
                 mark(a, f"{a} set by {b} earlier in the command")
     elif b == "hash" and any(a.startswith("-") and "p" in a[1:] for a in args):
         for a in args:
-            if a in ROUTE_TOOLS or a in ("git", "rsync"):
-                out.setdefault(a, f"hash -p {a} earlier in the command")
+            low = a.lower()                # (a name in any letter case: _prog)
+            if low in ROUTE_TOOLS or low in ("git", "rsync"):
+                out.setdefault(low, f"hash -p {a} earlier in the command")
     elif b == "alias":
         for a in args:
             name = a.split("=", 1)[0]
-            if "=" in a and (name in ROUTE_TOOLS or name in ("git", "rsync")):
-                out.setdefault(name, f"an alias for {name} earlier in the command")
+            low = name.lower()
+            if "=" in a and (low in ROUTE_TOOLS or low in ("git", "rsync")):
+                out.setdefault(low, f"an alias for {name} earlier in the command")
     return out
 
 
-def _route_argv(st: list, raw: list[str], fork: bool) -> dict[str, Any] | None:
+def _route_lines(argv: list[str]) -> list[tuple[str, str]]:
+    """The transport lines a builtin stage sets for the stages after it
+    (`export GIT_SSH_COMMAND='...'`, `declare RSYNC_RSH=...`): (tool, line)."""
+    if not argv or argv[0] not in ("export", "declare", "typeset", "readonly", "local"):
+        return []
+    out = []
+    for a in argv[1:]:
+        name, eq, value = a.partition("=")
+        if eq and name.rstrip("+") in _TRANSPORT_VARS:
+            out.append((_TRANSPORT_VARS[name.rstrip("+")], value))
+    return out
+
+
+def _program_globbed(st: list, argv: list[str]) -> bool:
+    """Is a stage's program word (argv[0], after its wrappers) an unquoted
+    glob or brace expansion (`{/usr/bin/ssh,box} id`)? Then the shell makes
+    the program and its first arguments out of it."""
+    words, _exp, glb = _argv_meta(st)
+    at = len(words) - len(argv)
+    return at >= 0 and words[at:] == argv and bool(glb[at])
+
+
+def _env_drops_path(args: list[str]) -> bool:
+    """Do env's options clear its environment, unset PATH or search another
+    path for the command (-i, a lone -, -u PATH, macOS's -P DIRS; also in a
+    cluster: -vi, -uPATH)? Then a tool name finds the system's tool, not its
+    stand-in. (-u NAME of another variable keeps the PATH.)"""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        i += 1
+        if a == "--":
+            return False
+        if a in ("-", "--ignore-environment"):
+            return True
+        if a.startswith("--unset"):
+            if (a.split("=", 1)[1] if "=" in a else nxt) == "PATH":
+                return True
+            continue
+        if not a.startswith("-") or a.startswith("--"):
+            continue
+        body = a[1:]
+        for k, c in enumerate(body):
+            if c in "iP":
+                return True
+            if c == "u" and (body[k + 1:] or nxt) == "PATH":
+                return True
+            if c in "uCS":
+                break                      # its value is the rest of the word or the next one
+    return False
+
+
+_XCRUN_VALUE = frozenset({"-sdk", "--sdk", "--toolchain"})
+
+
+def _xcrun_tool(argv: list[str]) -> list[str]:
+    """The tool and its arguments an `xcrun [OPTIONS] TOOL ARGS` runs; [] for
+    one that only finds or shows (-f/--find, --show-sdk-*)."""
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-f", "--find") or a.startswith("--show-sdk"):
+            return []
+        if a in _XCRUN_VALUE:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return argv[i:]
+    return []
+
+
+def _route_argv(st: list, raw: list[str], fork: bool, eff: consent.Effective,
+                cwd: str | None = None, path_reset: bool = False) -> dict[str, Any] | None:
     """The per-command checks on one stage (the exec view or, fork=True,
-    through sudo, timeout and xargs too)."""
+    through sudo, doas, timeout and xargs too), each refusing only a route
+    that reaches a configured target (_reaches). path_reset: the stage runs
+    in a login shell or after a PATH-resetting wrapper (a bare stand-in name
+    there is the system's tool too)."""
     argv, base = _command(st, fork=fork)
     if not argv:
         return None
+    if base == "xcrun":
+        # Xcode's xcrun runs its own toolchain's TOOL by path, whatever PATH
+        # says (`xcrun git push`): a route around the stand-in (WS-4)
+        tool = _xcrun_tool(argv)
+        if tool and _prog(tool[0]) in ROUTE_TOOLS:
+            tb = _prog(tool[0])
+            tgt = _reaches(tb, tool, eff, cwd)
+            if tgt is not None:
+                return _route_deny(tool[0], tb, tgt, f"xcrun {tb} (Xcode's own {tb}, by its path)")
     lead = raw[:len(raw) - len(argv)] if len(argv) <= len(raw) else []
-    if not fork and ("$" in os.path.basename(argv[0]) or "`" in argv[0]):
-        # (behind sudo, timeout or xargs it is that program's argument: SPEC 8's table)
-        return _route_deny_hidden(None, f"the program is a variable ({argv[0][:40]})")
+    if base in ("ssh", "slogin", "scp", "sftp"):
+        # a ProxyJump hop or a ProxyCommand that reaches a configured target,
+        # whatever the destination (PLAN-0.11 §1.7)
+        lp = ssh_args.parse_lenient(argv[1:], "ssh" if base in ("ssh", "slogin") else base)
+        for hop in lp.jumps():
+            t = _host_target(_hop_word(hop), eff)
+            if t is not None:
+                return _route_deny(hop, base, t, f"a ProxyJump through {hop[:40]}")
+        for v in lp.o_values("proxycommand"):
+            t = _words_target(v, eff) if v.lower() != "none" else None
+            if t is not None:
+                return _route_deny("ProxyCommand", base, t, "a ProxyCommand that reaches it")
     if base in ROUTE_TOOLS:
-        if "/" in argv[0] and not _is_stand_in(argv[0], base):
-            return _route_deny(argv[0], base)
-        for i, w in enumerate(lead):
-            b = os.path.basename(w)
-            if b == "command" and any(x.startswith("-") and "p" in x[1:] for x in lead[i + 1:]):
-                return _route_deny(argv[0], base, f"command -p {base}")
-            if b == "env" and any(x == "-i" or x.startswith("-i") or x == "--ignore-environment"
-                                  or x in ("-u", "--unset") or x.startswith("--unset")
-                                  for x in lead[i + 1:]):
-                return _route_deny(argv[0], base, f"env {base} without the PATH")
-        if any(_ROUTE_ASSIGN.match(w) for w in lead + list(getattr(st, "assigns", []) or [])):
-            return _route_deny(argv[0], base, f"{base} with its PATH replaced")
+        tgt = _reaches(base, argv, eff, cwd)
+        if tgt is not None:
+            if "/" in argv[0] and not _is_stand_in(argv[0], base):
+                return _route_deny(argv[0], base, tgt, f"{argv[0]} by its path")
+            if base == "slogin":
+                return _route_deny(argv[0], base, tgt, SLOGIN_WHY)
+            if base == "huggingface-cli":
+                return _route_deny(argv[0], base, tgt, HF_CLI_WHY)
+            if path_reset and base not in _ELEVATORS:
+                return _route_deny(argv[0], base, tgt, f"{base} in a login shell (its own PATH)")
+            for i, w in enumerate(lead):
+                b = _prog(w)
+                if b == "command" and any(x.startswith("-") and "p" in x[1:] for x in lead[i + 1:]):
+                    return _route_deny(argv[0], base, tgt, f"command -p {base}")
+                if b == "env" and _env_drops_path(lead[i + 1:]):
+                    return _route_deny(argv[0], base, tgt, f"env {base} without the PATH")
+                if b in ("sudo", "doas") and base not in _ELEVATORS:
+                    return _route_deny(argv[0], base, tgt,
+                                       f"{b} {base} (sudo and doas run it with their own PATH)")
+            if any(_ROUTE_ASSIGN.match(w) for w in lead + list(getattr(st, "assigns", []) or [])):
+                return _route_deny(argv[0], base, tgt, f"{base} with its PATH replaced")
     if base in ("rsync", "git", "scp", "sftp"):
         names = [w for w in lead if _ROUTE_ASSIGN.match(w)]
-        if names:
-            return _route_deny(names[0].split("=", 1)[0], base,
-                               f"{names[0].split('=', 1)[0]} set for {base}")
+        transports: list[str] = []
+        # the transport lines this command sets (GIT_SSH_COMMAND=, RSYNC_RSH=,
+        # rsync -e, git -c core.sshCommand=, git config core.sshCommand): where
+        # their own words send ssh counts as where the command goes
+        lines = [w.split("=", 1)[1] for w in names
+                 if w.split("=", 1)[0].rstrip("+") in _TRANSPORT_VARS]
         if base == "git" and _git_sets_ssh(argv):
-            return _route_deny("core.sshCommand", "ssh", "git config setting git's ssh")
+            transports.append("git config setting git's ssh")
+            lines += _git_config_values(argv)
+        vals = _rsync_transports(argv) if base == "rsync" else []
         for j, a in enumerate(argv[1:], 1):
             val = None
-            if base == "rsync":
-                if a in ("-e", "--rsh") and j + 1 < len(argv):
-                    val = argv[j + 1]
-                elif a.startswith("--rsh="):
-                    val = a.split("=", 1)[1]
-                elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
-                    # a short cluster: -e takes the rest, or the next word
-                    # (`-ae /usr/bin/ssh`, `-aze/usr/bin/ssh`); a value option
-                    # before it (B f M T @) takes the rest itself
-                    body = a[1:]
-                    for k, c in enumerate(body):
-                        if c in RSYNC_VALUE_SHORT:
-                            if c == "e":
-                                val = body[k + 1:] or (argv[j + 1] if j + 1 < len(argv) else "")
-                            break
-            elif base == "git":
+            if base == "git":
                 if a == "-c" and j + 1 < len(argv) and argv[j + 1].lower().startswith(
                         tuple(k + "=" for k in _GIT_SSH_KEYS)):
                     val = argv[j + 1].split("=", 1)[1]
@@ -2807,19 +4727,46 @@ def _route_argv(st: list, raw: list[str], fork: bool) -> dict[str, Any] | None:
                 elif a.lower().startswith("--config-env="):
                     val = a
             if val is not None:
-                try:
-                    first = (shlex.split(val) or [""])[0]
-                except ValueError:
-                    first = val
-                if not (os.path.basename(first) == "ssh" and "/" not in first) and \
-                        not _is_stand_in(first, "ssh"):
-                    return _route_deny(first or val, "ssh", f"{base} with its own ssh ({first})")
+                vals.append(val)
+        for val in vals:
+            lines.append(val)
+            try:
+                first = (shlex.split(val) or [""])[0]
+            except ValueError:
+                first = val
+            if not (_prog(first) == "ssh" and "/" not in first) and \
+                    not _is_stand_in(first, "ssh"):
+                transports.append(f"{base} with its own ssh ({first[:40]})")
+        if names or transports:
+            tgt = _reaches(base, argv, eff, cwd)
+            if tgt is None:
+                tgt = next((t for t in (_transport_target(v, eff) for v in lines) if t), None)
+            if tgt is not None:
+                if names:
+                    return _route_deny(names[0].split("=", 1)[0], base, tgt,
+                                       f"{names[0].split('=', 1)[0]} set for {base}")
+                return _route_deny(base, "ssh", tgt, transports[0])
     return None
 
 
 _GIT_CONFIG_READS = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l",
                                "--list", "--unset", "--unset-all", "get", "list", "unset",
                                "--show-origin", "--name-only"})
+
+
+def _git_config_values(argv: list[str]) -> list[str]:
+    """The value(s) a `git config core.sshCommand VALUE` (or `KEY=VALUE`,
+    `git config set KEY VALUE`) writes, for _transport_target."""
+    words = argv[1:]
+    out = []
+    for j, w in enumerate(words):
+        lw = w.lower()
+        if lw in _GIT_SSH_KEYS:
+            nxt = [x for x in words[j + 1:] if not x.startswith("-")]
+            out += nxt[:1]
+        elif lw.startswith(tuple(k + "=" for k in _GIT_SSH_KEYS)):
+            out.append(w.split("=", 1)[1])
+    return out
 
 
 def _git_sets_ssh(argv: list[str]) -> bool:
@@ -2834,36 +4781,210 @@ def _git_sets_ssh(argv: list[str]) -> bool:
     return not any(w in _GIT_CONFIG_READS for w in words)
 
 
-def _alternate_route(stages: list, eff: consent.Effective,
-                     command: str = "") -> dict[str, Any] | None:
-    """A deny for a credential tool reached around the stand-ins (above), or
-    None. Managed mode only ([shell] managed "on" or "warn"). Besides each
-    stage's own words: a tool whose route an earlier stage of the same command
-    changed (PATH, a transport variable, hash -p, an alias), a variable as
-    the program, and, when a stage runs code its words don't show (a shell
-    string, eval, exec, find -exec, xargs, ...), the text scan."""
-    if eff.shell.managed == "off":
+def _c_string(st: list, argv: list[str], base: str) -> tuple[str, bool, bool] | None:
+    """A shell's (or su's) -c string in this stage: (string, login, literal),
+    or None when it has none. login: a login shell (-l, --login, su -),
+    which rebuilds PATH; literal: the string is written out (no expansion
+    in the word itself), so it is judged like the outer command."""
+    if base not in _SHELLS and base not in ("su", "runuser"):
+        return None
+    login = False
+    j = 0
+    while j + 1 < len(argv):
+        j += 1
+        w = argv[j]
+        value = base in _SHELLS and _shell_value_opt(w)   # -o posix, +O extglob, --rcfile F
+        if w in ("--login", "-") or (w.startswith("-") and not w.startswith("--") and "l" in w[1:]):
+            login = True
+        if w.startswith("-") and not w.startswith("--") and "c" in w[1:]:
+            k = j + (2 if value else 1)
+            while base in _SHELLS and k < len(argv) and argv[k][:1] in ("-", "+") and \
+                    argv[k] not in ("-", "--", "+"):
+                k += 2 if _shell_value_opt(argv[k]) else 1
+            if k < len(argv) and argv[k] == "--":
+                k += 1
+            if k >= len(argv):
+                return None
+            exp = list(getattr(st, "expands", None) or [])
+            off = len(exp) - len(argv)
+            literal = not (0 <= off + k < len(exp) and exp[off + k]) and "`" not in argv[k]
+            return argv[k], login, literal
+        if value:
+            j += 1                        # its value is no script operand
+            continue
+        if base in _SHELLS and w.startswith("+") and len(w) > 1:
+            continue                      # +e, +x: options too
+        if not w.startswith("-") and base in _SHELLS:
+            break                         # a shell's script operand (su takes a user here)
+    return None
+
+
+def _shell_value_opt(w: str) -> bool:
+    """A shell option that takes the next word as its value: -o / +o (set's
+    names), -O / +O (shopt's), --rcfile, --init-file."""
+    return w in ("--rcfile", "--init-file") or bool(re.fullmatch(r"[-+][A-Za-z]*[oO]", w))
+
+
+# The value options of the builtins whose -C names a command string
+# (mapfile/readarray's callback, complete/compgen's command), so their
+# clusters are read right (`mapfile -tC CB`, `complete -o default -C CMD`).
+_CALLBACK_VALUES = {"mapfile": "dnOsucC", "readarray": "dnOsucC",
+                    "complete": "oAGWFCXPS", "compgen": "oAGWFCXPS"}
+
+
+def _cmd_strings(st: list, argv: list[str], base: str) -> list[tuple[str, bool, bool]]:
+    """The command strings a stage runs or keeps to run later, each as
+    (string, login, literal) (_c_string's shape): a shell's or su's -c
+    string; trap's action (not `-`, empty or a number: those reset or
+    ignore); an alias's value (it runs wherever a later word uses the
+    alias); the -C command of mapfile, readarray, complete and compgen.
+    literal: written out, so it is judged like the outer command; else a
+    variable or a computed part hides it."""
+    c = _c_string(st, argv, base)
+    if c is not None:
+        return [c]
+    exp = list(getattr(st, "expands", None) or [])
+    off = len(exp) - len(argv)
+
+    def lit(k: int) -> bool:
+        return not (0 <= off + k < len(exp) and exp[off + k]) and "`" not in argv[k]
+    out: list[tuple[str, bool, bool]] = []
+    if base == "trap":
+        k = 1
+        if k < len(argv) and argv[k] == "--":
+            k += 1
+        elif k < len(argv) and argv[k].startswith("-") and argv[k] != "-":
+            return out                    # -l, -p, -P: lists, sets nothing
+        if len(argv) - k >= 2 and argv[k] not in ("-", "") and not argv[k].isdigit():
+            out.append((argv[k], False, lit(k)))
+    elif base == "alias":
+        for k in range(1, len(argv)):
+            if not argv[k].startswith("-") and "=" in argv[k]:
+                out.append((argv[k].split("=", 1)[1], False, lit(k)))
+    elif base in _CALLBACK_VALUES:
+        vals = _CALLBACK_VALUES[base]
+        k = 1
+        while k < len(argv) and argv[k].startswith("-") and argv[k] not in ("-", "--"):
+            body = argv[k][1:]
+            j = next((i for i, ch in enumerate(body) if ch in vals), -1)
+            if j >= 0 and body[j] == "C":
+                if j < len(body) - 1:
+                    out.append((body[j + 1:], False, lit(k)))
+                elif k + 1 < len(argv):
+                    out.append((argv[k + 1], False, lit(k + 1)))
+                return out
+            k += 2 if j == len(body) - 1 else 1
+    return out
+
+
+def _hides(st: list, argv: list[str], base: str) -> str | None:
+    """Does this stage hide its program or host (PLAN-0.11 §1.7's list)?
+    "shell": an ssh-family, git, gate or sudo stage whose target is a
+    variable, or osascript with a variable in its script (it may ask for
+    administrator privileges: PLAN-0.11 §9.5); "child": xargs or parallel
+    anywhere it runs a command (the operands come from stdin), find -exec
+    (what they run is no command Claude typed: _hidden_rule); else None. (A
+    variable as the program, a variable command string, eval, exec, a
+    function and a sourced file the caller finds; a shell running a script
+    forks, which the stand-ins' ancestry check sees.)"""
+    raw = list(_strip_gate_account(st))
+    if base in _FB_SSH_WORDS | _SUDO_NAMES | {"osascript"} and \
+            any(getattr(st, "expands", None) or []):
+        # git's "ask" needs the hook's record of the exact command (GIT_HIDDEN
+        # refuses one it can't write), and scp, sftp and rsync start ssh
+        # themselves (no command Claude typed): only a named target counts
+        return "child" if base in ("git", "scp", "sftp", "rsync") else "shell"
+    if any((j == 0 or _names_program(w)) and _prog_name(w) in ("xargs", "parallel")
+           for j, w in enumerate(raw)):
+        return "child"
+    if base == "find" and any(a in _FIND_RUN for a in argv[1:]):
+        return "child"
+    return None
+
+
+def _alternate_route(stages: list, eff: consent.Effective, command: str = "",
+                     mode: str | None = None, cwds: list[str] | None = None,
+                     path_reset: bool = False, depth: int = 0) -> dict[str, Any] | None:
+    """A deny for a tool reached around its stand-in that reaches a
+    configured target, or for a command hiding its program or host whose
+    text names a configured target (_hidden_rule), else None (PLAN-0.11
+    §1.7: in every mode, managed shell on or off). Besides each stage's own words: a tool
+    whose route an earlier stage of the same command changed (PATH, a
+    transport variable, hash -p, an alias; an exported transport line's own
+    words), a variable as the program, source, `.` or eval behind wrappers
+    and reserved words (`builtin source x`, `then . x`), exec running a
+    program, a written-out command string (a -c string, trap's action, an
+    alias's value, a -C callback: _cmd_strings; judged like the outer
+    command; in a login shell, stand-in names there count as by path; a
+    computed one hides what it runs), and, when a stage runs code its words
+    don't show, the text scan. Nothing configured: nothing to refuse."""
+    if not _anything_configured(eff):
         return None
     rerouted: dict[str, str] = {}
-    hidden = False
-    for st in stages:
+    lines: dict[str, list[str]] = {}       # transport lines set earlier, per tool
+    hides = False                          # it hides what it runs (_hidden_rule)
+    scan = False
+    cwds = list(cwds or [])
+    # `gate with NAME -- CMD`: CMD is judged as a stage of its own (WS-8)
+    for k, st in _with_inners(stages):
         raw = list(_strip_gate_account(st))
+        cwd = cwds[k] if k < len(cwds) else (cwds[0] if cwds else None)
         for forked in (False, True):
             argv, base = _command(st, fork=forked)
             if not argv:
                 continue
+            if not forked and ("$" in os.path.basename(argv[0]) or "`" in argv[0]
+                               or _program_globbed(st, argv)):
+                hides = True               # a variable, a glob or a brace expansion as the program
+                continue
+            if not forked and (base in ("source", ".", "eval") or
+                               (base == "exec" and _exec_program(argv[1:]) is not None)):
+                # runs in Claude's command shell, or replaces it: what it runs looks typed
+                hides = True
             if base in rerouted:
-                return _route_deny_hidden(base, rerouted[base])
-            d = _route_argv(st, raw, forked)
+                tgt = _reaches(base, argv, eff, cwd)
+                if tgt is None:
+                    tgt = next((t for t in (_transport_target(v, eff)
+                                            for v in lines.get(base, [])) if t), None)
+                if tgt is not None:
+                    return _route_deny(argv[0], base, tgt, rerouted[base])
+            d = _route_argv(st, raw, forked, eff, cwd, path_reset)
             if d is not None:
                 return d
-            # a shell string, eval, exec, find -exec, ...: the text scan below (never
-            # for ssh, whose remote command runs on the host and is judged there)
-            hidden = hidden or (base != "ssh" and _stage_hidden(st, argv, base))
+            if not forked:
+                continue
+            strings = _cmd_strings(st, argv, base)
+            for text, login, literal in strings:
+                segs = bashparse.parse(text) if literal and depth < _STRING_MAX_DEPTH else None
+                if segs is None:
+                    if not literal or _text_hides(text):
+                        hides = True       # a variable or computed string, or eval in it
+                    d = _route_text(text, eff, mode, cwd) if literal else None
+                    if d is not None:
+                        return d
+                    if literal:
+                        scan = True
+                else:
+                    d = _alternate_route([s for seg in segs for s in seg], eff, text, mode, [cwd or ""],
+                                         path_reset or login, depth + 1)
+                    if d is not None:
+                        return d
+            if strings:
+                continue
+            if _hides(st, argv, base):
+                hides = True
+            if base != "ssh" and _stage_hidden(st, argv, base):
+                scan = True
         for tool, why in _route_changes(_command(st)[0] or raw).items():
             rerouted.setdefault(tool, why)
-    if hidden and command:
-        return _route_text(command)
+        for tool, line in _route_lines(_command(st)[0] or raw):
+            lines.setdefault(tool, []).append(line)
+    if (scan or hides) and command:
+        d = _route_text(command, eff, mode, cwds[0] if cwds else None)
+        if d is not None:
+            return d
+    if hides:
+        return _hidden_rule(command, eff)
     return None
 
 
@@ -2873,17 +4994,17 @@ _POLICY_RULE = re.compile(r"\[(policy|hosts\.[a-z0-9-]+\.policy|hosts\.[a-z0-9-]
                           r"[a-z0-9-]+|accounts\.[a-z0-9-]+\.policy)\]")
 
 
-def _policy_hits(base: str, argv: list[str], form: formmod.Form,
-                 eff: consent.Effective) -> list[tuple[str, str, Any]]:
+def _policy_hits(base: str, argv: list[str], form: formmod.Form, eff: consent.Effective,
+                 mode: str | None = None) -> list[tuple[str, str, Any]]:
     """(host, action, policy.Decision) for every action an ssh / scp / sftp /
     rsync stage or a local sudo takes (PLAN-v4 phase 7), as the stand-ins will
-    decide them, so a "deny" is refused here with its rule and an "ask" is
-    asked (the stand-ins honour "ask" only for a command Claude typed, which
-    is this one)."""
+    decide them, in `mode` (None: the modeless rule), so a "deny" is refused
+    here with its rule and an "ask" is asked (the stand-ins honour "ask" only
+    for a command Claude typed, which is this one)."""
     from . import policy
     out: list[tuple[str, str, Any]] = []
     if base in _SUDO_NAMES:
-        out.append(("localhost", "elevation", policy.decide(eff, "elevation")))
+        out.append(("localhost", "elevation", policy.decide(eff, "elevation", mode=mode)))
         return out
     acts: dict[str, list[tuple[str, str]]] = {}
     if base == "ssh":
@@ -2937,10 +5058,398 @@ def _policy_hits(base: str, argv: list[str], form: formmod.Form,
         for act, path in dict.fromkeys(lst):
             try:
                 # a path in its workspace and in every one it may reach (as the stand-in)
-                out.append((name, act, ssh_args.decide_path(eff, act, name, path)))
+                out.append((name, act, ssh_args.decide_path(eff, act, name, path, mode)))
             except ValueError:
                 continue
     return out
+
+
+# ---------------------------------------------------------------------------
+# Network commands (PLAN-0.11 §3 and lead decision 19.1; invariant 22)
+# ---------------------------------------------------------------------------
+#
+# One configurable class: the names in [network] (form.NETWORK_BUILTIN, plus
+# `extra`, minus `drop`) in command position, and the structural members,
+# found by their shape and named by a reserved name (form.NETWORK_RESERVED;
+# never a program of that name: `busybox ls` isn't one). Judged for Claude's
+# command tools only (Bash, Monitor, run_in_terminal, both job_starts,
+# terminal_send): behind the wrappers (_unwrap's, `gate with NAME --`, the
+# runners, `find -exec`), in literal command strings, in an `ssh HOST CMD`
+# remote command and, for what the parser can't split, in the text
+# (_net_text: subshells, groups, `&`, `$( )`, backticks, here-strings). A
+# guardrail, not a sandbox: docs/dev/modules/network.md lists the misses.
+
+_NET_RESERVED = frozenset(formmod.NETWORK_RESERVED)
+_NET_OPENSSL = frozenset({"s_client", "s_server", "s_time"})
+_NET_HTTP_MODULES = frozenset({"http.server", "SimpleHTTPServer", "http"})
+_NET_PYTHON = re.compile(r"(?:python|pypy)[0-9.]*\Z")
+_NET_PHP = re.compile(r"php[0-9.]*\Z")
+_NET_RUBY = re.compile(r"ruby[0-9.]*\Z")
+# bash's /dev/tcp and /dev/udp as a redirection's target (a parsed stage's
+# redirects; in the text after an operator: `exec 3<>/dev/tcp/h/80`)
+_NET_DEV = re.compile(r"/dev/(?:tcp|udp)/")
+_NET_DEV_TEXT = re.compile(r"[<>&]\s*/dev/(?:tcp|udp)/")
+# an rsync daemon operand: rsync://... or HOST::MODULE
+_NET_RSYNC = re.compile(r"(?i)rsync://|[^/:]*[^/:\\]::")
+# the class reads `busybox APPLET` itself, so _unwrap stops there
+_NET_STOP = frozenset({"busybox"})
+_NET_WITH = re.compile(r"(?<![\w./-])(?i:gate)\s+with(?![\w-])")
+# the shapes the text scan looks at beside the class's names
+_NET_SHAPES = r"openssl|(?:python|pypy|php|ruby)[0-9.]*|busybox|rsync|ssh"
+_NET_RX: dict[frozenset[str], re.Pattern[str]] = {}
+_NET_SAYS = {"openssl-tls": "openssl's TLS client or server (openssl-tls)",
+             "http-server": "an HTTP server (http-server)",
+             "dev-tcp": "a /dev/tcp or /dev/udp connection (dev-tcp)",
+             "rsync-daemon": "rsync to an rsync daemon (rsync-daemon)",
+             "busybox": "a busybox network applet (busybox)"}
+NET_GATE_WITH = ("under gate with (an account's key goes to it), so it is always asked about, "
+                 "whatever [network] commands says")
+NET_DENY = ("gateway: {head}, and {key} refuses it{when} ({detail}); ask the user if it should "
+            "run (a wider value in gateway.toml needs their OK in the gateway's dialog).")
+NET_ALLOW = ("gateway: allowed ([network] commands in gateway.toml approves network commands in "
+             "this permission mode).")
+NET_JOB = ("gateway: a job or gateway terminal can't be asked about this: {net}, and nobody can "
+           "be asked while it runs; run it with the Bash tool as its own command, or ask the "
+           "user to change it.")
+
+
+def _http_server(b: str, argv: list[str]) -> bool:
+    """`python[3] -m http.server` (or SimpleHTTPServer, http), `php -S`,
+    `ruby -run -e httpd`: an HTTP server (the reserved name http-server)."""
+    if _NET_PYTHON.fullmatch(b):
+        i = 1
+        while i < len(argv):
+            w = argv[i]
+            if w in ("-", "--") or not w.startswith("-"):
+                return False                       # a script, stdin: not a module
+            if w.startswith("--"):
+                i += 1
+                continue
+            body = w[1:]
+            for j, c in enumerate(body):
+                if c == "m":
+                    mod = body[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else "")
+                    return mod in _NET_HTTP_MODULES
+                if c == "c":
+                    return False                   # inline code: a known miss
+                if c in "WX":
+                    i += 0 if body[j + 1:] else 1  # its value: the rest, or the next word
+                    break
+            i += 1
+        return False
+    if _NET_PHP.fullmatch(b):
+        return any(w.startswith("-S") for w in argv[1:])
+    if _NET_RUBY.fullmatch(b):
+        pairs = list(zip(argv[1:], argv[2:] + [""]))
+        return (any(w == "-run" or (w == "-r" and n == "un") for w, n in pairs)
+                and any(w.startswith("-ehttpd") or (w == "-e" and n.startswith("httpd"))
+                        for w, n in pairs))
+    return False
+
+
+def _net_member(argv: list[str], names: frozenset[str]) -> str | None:
+    """The class member `argv` runs (its program first, the wrappers already
+    unwrapped): the program's own name when the class holds it, a structural
+    member's reserved name (openssl s_client/s_server/s_time; an HTTP server;
+    rsync to a daemon; a busybox applet in the class), else None."""
+    if not argv:
+        return None
+    b = _prog(argv[0])
+    if b == "busybox":
+        rest = argv[1:]
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        if not rest or rest[0].startswith("-") or _prog(rest[0]) == "busybox":
+            return None
+        if _prog(rest[0]) == "httpd":
+            return "http-server" if "http-server" in names else None
+        return "busybox" if "busybox" in names and _net_member(rest, names) else None
+    if b in names and b not in _NET_RESERVED:
+        return b
+    if b == "openssl":
+        return "openssl-tls" if (argv[1:2] and argv[1] in _NET_OPENSSL
+                                 and "openssl-tls" in names) else None
+    if "http-server" in names and _http_server(b, argv):
+        return "http-server"
+    if b == "rsync" and "rsync-daemon" in names and any(
+            _NET_RSYNC.match(w) for w in argv[1:] if not w.startswith("-")):
+        return "rsync-daemon"
+    return None
+
+
+@dataclasses.dataclass
+class _NetScan:
+    """What the class found in one command: (member, host) hits, host being
+    the configured host whose `ssh HOST CMD` remote command holds it (None:
+    this computer, or a host nothing configures), and whether `gate with`
+    runs anywhere in the command (an account's key reaches it, or its
+    output through a pipe)."""
+    names: frozenset[str]
+    eff: consent.Effective
+    hits: list[tuple[str, str | None]] = dataclasses.field(default_factory=list)
+    gate_with: bool = False
+    stdin_shell: bool = False          # a shell reads its script from a pipe: scan the text
+
+    def hit(self, member: str, host: str | None) -> None:
+        if (member, host) not in self.hits:
+            self.hits.append((member, host))
+
+
+def _net_stages(stages: list, scan: _NetScan, host: str | None = None, depth: int = 0) -> None:
+    """The class in parsed stages: each one's program after its wrappers,
+    its command strings and remote command, and a /dev/tcp redirection."""
+    for st in stages:
+        if "dev-tcp" in scan.names and any(_NET_DEV.match(t) for _op, t in
+                                           getattr(st, "redirects", None) or []):
+            scan.hit("dev-tcp", host)
+        _net_argv(st, list(_strip_gate_account(st)), scan, host, depth)
+
+
+def _net_argv(st: list, argv: list[str], scan: _NetScan, host: str | None, depth: int) -> None:
+    for _ in range(12):
+        while argv and _ASSIGN.match(argv[0]):
+            argv = argv[1:]
+        argv = _unwrap(argv, fork=True, stop=_NET_STOP)
+        if not argv:
+            return
+        b = _prog(argv[0])
+        if b == "gate" and argv[1:2] == ["with"]:
+            scan.gate_with = True                  # gate with NAME -- CMD: CMD runs
+            if "--" not in argv:
+                return
+            argv = argv[argv.index("--") + 1:]
+            continue
+        if b in _TEXT_RUNNER:                       # sshpass, strace, ...: the program after
+            argv = _skip_runner(argv, _TEXT_RUNNER[b])
+            continue
+        if b in _TEXT_RUNNER_SKIP1:                 # flock, chroot, ...: after one operand
+            argv = _skip_runner(argv, "")[1:]
+            continue
+        if b == "watch":
+            argv = _skip_runner(argv, "n")
+            continue
+        break
+    if not argv:
+        return
+    m = _net_member(argv, scan.names)
+    if m is not None:
+        scan.hit(m, host)
+    b = _prog(argv[0])
+    if b == "find":
+        for k, w in enumerate(argv):
+            if w in _FIND_RUN and w != "-delete":
+                sub = argv[k + 1:]
+                end = next((j for j, x in enumerate(sub) if x in (";", "+")), len(sub))
+                if end:
+                    _net_argv([], sub[:end], scan, host, depth)
+    strings = _cmd_strings(st, argv, b)
+    for text, _login, _literal in strings:
+        _net_string(text, scan, host, depth + 1)
+    if b in _SHELLS and not strings and all(w.startswith("-") for w in argv[1:]):
+        scan.stdin_shell = True                    # `... | sh`: its script is the pipe's text
+    if b == "ssh":
+        rc = _remote_command("ssh", argv)
+        if rc:
+            name = next((n for n in (_resolve_host(t, scan.eff.form)
+                                     for t in _scan_ssh(argv)[0]) if n), None)
+            _net_string(rc, scan, name or host, depth + 1)
+
+
+def _net_string(text: str, scan: _NetScan, host: str | None, depth: int) -> None:
+    """A command string (a shell's -c, trap's action, a remote command):
+    parsed and judged like a command, else scanned as text. A variable in it
+    stays a known miss; its written words are still read."""
+    segs = bashparse.parse(text) if depth <= _STRING_MAX_DEPTH else None
+    if segs is None:
+        _net_text(text, scan, host, depth)
+    else:
+        _net_stages([s for seg in segs for s in seg], scan, host, depth)
+
+
+def _net_rx(names: frozenset[str]) -> re.Pattern[str]:
+    rx = _NET_RX.get(names)
+    if rx is None:
+        alt = "|".join(sorted((re.escape(n) for n in names if n not in _NET_RESERVED),
+                              key=len, reverse=True))
+        # a word (or a path's last part) never glued to a URL or a value; a
+        # program name in any letter case (_prog)
+        rx = re.compile(r"(?<![A-Za-z0-9_./:-])(?:[^\s;&|()<>`:]*/)?((?i:" + (alt + "|" if alt else "")
+                        + _NET_SHAPES + r"))(?![A-Za-z0-9_.:-])")
+        _NET_RX[names] = rx
+    return rx
+
+
+def _net_runs(text: str, i: int) -> bool:
+    """Is the word at text[i] (quote-stripped) run as a program? In command
+    position after the wrappers and runners, a shell's -c string, find
+    -exec (_text_program), after a program-naming option, or anywhere in a
+    text piped into a shell or a shell's here-string."""
+    if _TEXT_PIPE_SHELL.search(text) or _herestring_into_shell(text, i):
+        return True
+    if i and text[i - 1] not in _GLUED_STOP:
+        return False                               # glued to a word: a value or a path's part
+    words = _TEXT_SEP.split(text[:i])[-1].split()
+    if words and _TEXT_PROGRAM_OPT.match(words[-1]):   # --rsh=, ProxyCommand: a program
+        return True
+    # (`gate with NAME -- CMD`: _text_program looks through it, WS-8)
+    return _text_program(words + [_TEXT_TARGET]) == "run"
+
+
+def _text_via_busybox(words: list[str]) -> bool:
+    """Is the next word busybox's applet (`busybox wget`)? Then the busybox
+    word decides (the reserved name busybox)."""
+    argv = list(words) + [_TEXT_TARGET]
+    while argv and _ASSIGN.match(argv[0]):
+        argv = argv[1:]
+    argv = _unwrap(argv, fork=True, stop=_NET_STOP)
+    return (len(argv) >= 2 and _prog(argv[0]) == "busybox"
+            and all(w.startswith("-") for w in argv[1:-1]))
+
+
+def _net_text(command: str, scan: _NetScan, host: str | None = None, depth: int = 0) -> None:
+    """The class in text the parser can't split (as _route_text reads it):
+    every class name or structural shape the text runs as a program, an
+    `ssh HOST CMD`'s remote command, a /dev/tcp redirection, and `gate with`
+    anywhere (then every hit counts as under it)."""
+    text = _QUOTES.sub("", _drop_heredoc_data(command))
+    if "dev-tcp" in scan.names and _NET_DEV_TEXT.search(text):
+        scan.hit("dev-tcp", host)
+    if _NET_WITH.search(text):
+        scan.gate_with = True
+    for m in _net_rx(scan.names).finditer(text):
+        i = m.start()
+        if not _net_runs(text, i):
+            continue
+        words = _TEXT_SEP.split(text[i:], 1)[0].split()
+        if not words:
+            continue
+        b = _prog(words[0])
+        if b == "ssh":
+            if depth >= _STRING_MAX_DEPTH:
+                continue
+            try:
+                a = ssh_args.parse_ssh(words[1:], forwards=True)
+            except ssh_args.Refused:
+                continue
+            if a.command_text:
+                name = _resolve_host(a.dest or "", scan.eff.form)
+                _net_text(a.command_text, scan, name or host, depth + 1)
+            continue
+        if b != "busybox" and _text_via_busybox(_TEXT_SEP.split(text[:i])[-1].split()):
+            continue
+        mem = _net_member(words, scan.names)
+        if mem is not None:
+            scan.hit(mem, host)
+
+
+def _net_q(v: modes.ModeValue) -> str:
+    snap = v.snapshot()
+    if isinstance(snap, dict):
+        return "{" + v.render() + "}"
+    return {True: '"allow"', False: '"deny"'}.get(snap, f'"{snap}"')
+
+
+def _net_value(eff: consent.Effective, mode: str | None,
+               host: str | None = None) -> tuple[str, str, str, bool]:
+    """(word, key, detail, uniform) for a hit in `mode` (None: the modeless
+    rule): the stricter of [network] commands and this computer's `network`
+    policy ([hosts.localhost.policy], [policy]), plus the configured host's
+    own for its remote command. A policy's allow restricts nothing and never
+    approves a network command: only [network] commands' own allow does
+    (lead decision 19.1). `key` names the key that decided, `detail` its
+    value and where it is written."""
+    cmd = eff.network.commands
+    w, uniform = cmd.word(mode), cmd.uniform
+    fn = eff.form.network
+    key = "[network] commands"
+    ln = fn.commands_line or fn.line
+    detail = _net_q(cmd) + ((f", gateway.toml line {ln}" if ln else "") if fn.written
+                            else ", the default")
+    fw = fn.commands.word(mode) if fn.written and not fn.invalid else w
+    if modes.RANK[fw] > modes.RANK[w]:
+        detail += "; gateway.toml's wider value waits for the user's OK: gate check settings"
+    layers: list[tuple[Any, str, Any]] = []
+    fl = eff.form.hosts.get("localhost")
+    lh = eff.hosts.get("localhost")
+    if lh is not None:
+        layers.append((lh.policy_modes.get("network"), "[hosts.localhost.policy] network",
+                       fl.policy_lines.get("network") if fl else None))
+    layers.append((eff.policy_modes.get("network"), "[policy] network",
+                   eff.form.policy_lines.get("network")))
+    if host and host != "localhost" and host in eff.hosts:
+        fh = eff.form.hosts.get(host)
+        layers.append((eff.hosts[host].policy_modes.get("network"), f"[hosts.{host}.policy] network",
+                       fh.policy_lines.get("network") if fh else None))
+    for v, label, line in layers:
+        if v is None:
+            continue
+        x = v.word(mode)
+        if x != "allow" and modes.RANK[x] < modes.RANK[w]:
+            w, key, uniform = x, label, v.uniform
+            detail = _net_q(v) + (f", gateway.toml line {line}" if line else "")
+    return w, key, detail, uniform
+
+
+@dataclasses.dataclass
+class _NetVerdict:
+    """The class's answer for one command: a deny, an ask's phrase, or
+    nothing; `blocks` withholds the gateway's allow from the whole command
+    (any hit not approved in this mode), and `allow` names the members whose
+    stages the allow step may approve (an explicit allow in this mode)."""
+    deny: dict[str, Any] | None = None
+    ask: str = ""
+    blocks: bool = False
+    allow: frozenset[str] = frozenset()
+
+
+def _network(scan: _NetScan, mode: str) -> _NetVerdict:
+    """Judge the class's hits in `mode`, a job's or gateway terminal's too:
+    the mode its tool call carries (lead decision 19.14; nothing re-checks
+    the class when the job runs). deny refuses and beats any ask; ask joins
+    the asks (a job's is a refusal: _ask); cc gives no decision; allow lets
+    the allow step approve the network stages (never a job's). Under `gate
+    with` anything above ask is ask. Any hit short of allow makes the whole
+    command ineligible for the gateway's allow."""
+    out = _NetVerdict()
+    if not scan.hits:
+        return out
+    best: tuple[str, str, str, bool, str | None] | None = None
+    for _member, host in scan.hits:
+        w, key, detail, uniform = _net_value(scan.eff, mode, host)
+        if best is None or modes.RANK[w] < modes.RANK[best[0]]:
+            best = (w, key, detail, uniform, mode)
+    assert best is not None
+    w, key, detail, uniform, m = best
+    members = list(dict.fromkeys(mem for mem, _h in scan.hits))
+    shown = [_NET_SAYS.get(x, x) for x in members[:3]] + (["more"] if len(members) > 3 else [])
+    what = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+    head = what + (" are network commands" if len(shown) > 1 else " is a network command")
+    when = "" if uniform else (f" in {modes.DISPLAY[m]} mode" if m else " in some permission modes")
+    if scan.gate_with and modes.RANK[w] > modes.RANK["ask"]:
+        out.ask = f"{head} run {NET_GATE_WITH}"
+        out.blocks = True
+        return out
+    if w == "deny":
+        out.deny = _deny(NET_DENY.format(head=head, key=key, when=when, detail=detail),
+                         tool="network", target=members[0][:32])
+        return out
+    if w == "ask":
+        out.ask = f"{head}, and {key} asks{when} ({detail})"
+    out.blocks = w != "allow"
+    if w == "allow":
+        out.allow = scan.names
+    return out
+
+
+def _net_scan(stages: list | None, command: str, eff: consent.Effective) -> _NetScan:
+    scan = _NetScan(names=frozenset(n.lower() for n in eff.network.names()), eff=eff)
+    if stages is None:
+        _net_text(command, scan)
+    else:
+        _net_stages(stages, scan)
+        if scan.stdin_shell:
+            _net_text(command, scan)               # every word may be a program there
+    return scan
 
 
 # sudo's options that take a value (sudo 1.9: -C -D -g -h -p -R -r -t -T -U -u)
@@ -2994,7 +5503,7 @@ def _remote_sudo_targets(text: str) -> list[str]:
     seps = {";", "&&", "||", "|", "&"}
     out = []
     for i, w in enumerate(words):
-        if os.path.basename(w) in _SUDO_NAMES:
+        if _prog(w) in _SUDO_NAMES:
             rest = []
             for x in words[i:]:
                 if x in seps:
@@ -3035,17 +5544,14 @@ def _elevation_notice(command: str) -> str | None:
 
 
 MANAGED_TOOLS = ("Bash", "Monitor")
-MANAGED_DENY = ("gateway: managed shell unavailable: {why}. In managed mode (gateway.toml [shell] "
-                "managed = \"on\", the default) Claude's commands run only in the gateway's managed "
-                "bash, which the gateway's Claude Code mod starts, so this one was not run. Tell the "
-                "user once: turn Claude Code's mods on (or update Claude Code to 2.1.287 or later) "
-                "and start a new session; or set [shell] managed = \"warn\" (or \"off\") in "
-                "gateway.toml to run commands in their own shell, which needs their OK in the "
-                "gateway's dialog (gate check settings; the dialog needs the mod too).")
-MANAGED_WARN = ("gateway: the managed shell isn't active in this session ({why}); gateway.toml "
-                "says [shell] managed = \"warn\", so Claude's commands run in your own shell "
-                "(your login setup, PATH and environment) until it is. Turn Claude Code's mods on "
-                "(2.1.287 or later) and start a new session to use the managed shell.")
+# PLAN-0.11 §1.8: no blanket refusal without the mod. Claude's commands then
+# run in the user's own shell (the env file still puts the present stand-ins
+# first and removes Claude Code's own credential variables and the
+# stand-ins' aliases and functions), and this hook still judges them; the
+# person is told once per session.
+MANAGED_NOTICE = ("gateway: the managed shell isn't active in this session ({why}); your commands "
+                  "run in your own shell, and the gateway still judges them. Turn Claude Code's "
+                  "mods on and start a new session to use the managed shell.")
 
 
 def _prefix_why() -> str:
@@ -3054,8 +5560,8 @@ def _prefix_why() -> str:
     if prefix:
         return ("another shell prefix is set (CLAUDE_CODE_SHELL_PREFIX names "
                 f"{os.path.basename(prefix) or 'something else'}, not the gateway's gate-sh)")
-    return ("the gateway's mod didn't start it: Claude Code's mods are off or older than 2.1.287, "
-            "or this session started before managed mode was switched on")
+    return ("the gateway's mod didn't start it: Claude Code's mods are off, or this session "
+            "started before managed mode was switched on")
 
 
 def _ours(prefix: str) -> bool:
@@ -3071,34 +5577,34 @@ def _ours(prefix: str) -> bool:
     return False
 
 
-def _managed_gate(payload: dict) -> tuple[dict | None, str | None]:
-    """(a final deny, or None; a notice for the user, or None) for a Bash or
-    Monitor call that doesn't run through the gateway's gate-sh."""
+def _managed_gate(payload: dict) -> str | None:
+    """The once-per-session notice for a Bash or Monitor call that doesn't
+    run through the gateway's gate-sh while [shell] managed is "on" (the
+    hook sees Claude Code's own CLAUDE_CODE_SHELL_PREFIX), or None. Never a
+    refusal (PLAN-0.11 §1.8)."""
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return None                    # no session to tell once (Claude Code always names it)
     if _ours(os.environ.get("CLAUDE_CODE_SHELL_PREFIX", "")):
-        return None, None
+        return None
     _form, eff = _load_rights()
-    mode = eff.shell.managed
-    if mode == "off":
-        return None, None
+    if eff.shell.managed == "off":
+        return None
     why = _prefix_why()
-    if mode == "on":
-        return _deny(MANAGED_DENY.format(why=why), tool="bash", target="managed-shell"), None
-    sid = str(payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
-    mark = None
     try:
-        safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", sid or "nosession")[:80]
+        safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80]
         mark = paths.session_dir() / f"{safe_sid}.managed-warned"
         if mark.exists():
-            return None, None
+            return None
         mark.parent.mkdir(parents=True, exist_ok=True)
         mark.write_text("")
     except (OSError, paths.PathError):
         pass
     try:
-        audit.log("managed", outcome="warn", why=why[:120])
+        audit.log("managed", outcome="notice", why=why[:120])
     except Exception:  # noqa: BLE001
         pass
-    return None, MANAGED_WARN.format(why=why)
+    return MANAGED_NOTICE.format(why=why)
 
 
 def main(payload: dict) -> dict | None:
@@ -3106,6 +5612,10 @@ def main(payload: dict) -> dict | None:
     ti = payload.get("tool_input") or {}
     if not isinstance(ti, dict):
         return None
+    _JUDGED["mode"] = _mode(payload)[0]
+    _GIT_ROUTES.clear()
+    _ASK_PENDING.clear()
+    _EFF_MODE.clear()
     if payload.get("tool_name") == GW_JOB_TOOL:
         rname = _remote_name(ti.get("host"))
         if rname is UNKNOWN_HOST:
@@ -3125,11 +5635,19 @@ def main(payload: dict) -> dict | None:
             return _main_job(payload, _as_ssh(host, {"command": text}))
         return _main_job(payload, {"command": text})
     notice = None
-    if os.environ.get("GW_MANAGED_CHECK") == "1" and payload.get("tool_name") in MANAGED_TOOLS:
-        final, notice = _managed_gate(payload)
-        if final is not None:
-            return final
+    if payload.get("tool_name") in MANAGED_TOOLS:
+        d = _drop_asks()
+        if d is not None:
+            return d
+        try:
+            notice = _managed_gate(payload)
+        except Exception:  # noqa: BLE001 - a notice is never worth a failed hook
+            notice = None
     out = _main_command(payload, ti)
+    decision = ((out or {}).get("hookSpecificOutput") or {}).get("permissionDecision")
+    if decision == "ask" and _ASK_PENDING and payload.get("tool_name") in MANAGED_TOOLS:
+        # (in every mode: Claude Code shows a hook's "ask" in dontAsk too)
+        out = _record_asks() or out
     if notice:
         out = dict(out or {})
         out["systemMessage"] = notice
@@ -3148,11 +5666,52 @@ def main(payload: dict) -> dict | None:
     return out
 
 
+ASK_UNRECORDED = ("gateway: the gateway couldn't note that it asked about this command (its run "
+                  "folder can't be written), so the stand-in would refuse it after your OK; try "
+                  "again, or run gate status.")
+ASK_UNCLEARED = ("gateway: the gateway couldn't clear its note of an earlier command it asked "
+                 "about (its run folder can't be written), and nothing may use that note now; "
+                 "nothing ran. Run gate status.")
+
+
+def _drop_asks() -> dict[str, Any] | None:
+    """Before anything of this Bash or Monitor call: the records this
+    session's earlier hook calls left go (asks.drop): a prompt the user
+    declined, one Claude Code couldn't show, a stage that never ran (`false
+    && sudo x`), an account asked about but not chosen. Else a sourced file,
+    a function or eval in this call, which get no decision, could use one.
+    pre_bash.sh sends every Bash and Monitor call here while a record is
+    pending. None, or the refusal when one couldn't be removed."""
+    from . import asks
+    try:
+        if asks.drop():
+            return None
+    except Exception:  # noqa: BLE001 - fail closed: a record may be left
+        pass
+    return _deny(ASK_UNCLEARED, tool="Bash", target="record")
+
+
+def _record_asks() -> dict[str, Any] | None:
+    """The approval hook's records for the stand-in stages it is asking
+    about (asks.record: this Claude Code process, folder, tool, words,
+    entries), so each stand-in lets that very command through after the
+    user's OK (lead decision 19.14); None when written, else a deny (the
+    stand-in would refuse after the prompt)."""
+    from . import asks
+    try:
+        session = asks.session()
+        for tool, cwd, words, ents in _ASK_PENDING:
+            asks.record(tool, session, cwd, words, ents)
+    except Exception:  # noqa: BLE001 - see ASK_UNRECORDED
+        return _deny(ASK_UNRECORDED, tool=_ASK_PENDING[0][0], target="record")
+    return None
+
+
 def _main_command(payload: dict, ti: dict) -> dict | None:
     command = ti.get("command")
     if not isinstance(command, str) or not command.strip():
         return None
-    mode = payload.get("permission_mode") or ""
+    mode = _mode(payload)[0]
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     # The user's own Terminal panel (mcp__terminal__run_in_terminal) runs in
     # their login shell: no stand-ins, the real sudo and their own ssh keys.
@@ -3251,9 +5810,10 @@ def _job_cwds(payload: dict, ti: dict) -> list[str]:
 
 
 def _main_job(payload: dict, ti: dict) -> dict | None:
-    """A checkpoint job (JOB_TOOL): Bash's denies, an "ask" right denied,
-    never allow."""
-    mode = payload.get("permission_mode") or ""
+    """A checkpoint job (JOB_TOOL; also the gateway's job_start and
+    terminal_send): Bash's denies, an "ask" right denied, never allow; the
+    rights at the stricter of the payload's mode and the modeless rule."""
+    mode = _mode(payload)[0]
     cwds = list(dict.fromkeys(_job_cwds(payload, ti))) or [None]
     for command in _job_commands(ti):
         d = _decide(command, payload, mode, cwds[0], False, in_job=True,
@@ -3296,35 +5856,61 @@ def _decide(command: str, payload: dict, mode: str, cwd: str | None, in_user_ter
 def _judge(segs: list | None, command: str, payload: dict, mode: str, cwd: str | None,
            in_user_terminal: bool, in_job: bool = False,
            more_cwds: tuple[str, ...] = ()) -> dict | None:
-    """Decide on one reading of the command (bashparse's segments). in_job: a
-    checkpoint job (an "ask" right is denied, never allow)."""
+    """Decide on one reading of the command (bashparse's segments) in `mode`
+    (a mode key). in_job: a checkpoint job (an "ask" right is denied, never
+    allow; the rights also in the modeless rule)."""
+    mode = modes.normalize(mode)
     if segs is None:
-        # Too complex to judge: no deny or allow, but an "ask" right the
-        # command may use is still asked about (the stand-ins rely on it),
-        # and `gate secret` named in it is denied (review round 5).
-        if _names_gate_secret(command):
-            return _deny(DENY_GATE_SECRET, tool="gate", target=GATE_USER_SUBCMD)
-        # a credential tool the parser can't follow (by a path, or after PATH=...,
+        # Too complex to judge: no allow.
+        # a tool the parser can't follow (by a path, or after PATH=...,
         # GIT_SSH_COMMAND=..., an alias, a function, inside a shell string or
-        # eval): managed mode refuses it (the text scan)
-        _form, eff0 = _load_rights()
-        if eff0.shell.managed != "off":
-            d = _route_text(command)
+        # eval) that reaches a configured target, and a command that hides
+        # its program or host while something configured is at stake: refused
+        # in every mode (PLAN-0.11 §1.7)
+        form0, eff0 = _load_rights()
+        record_mode(payload.get("permission_mode"), eff0)
+        # network commands in the text, whatever is configured (PLAN-0.11 §3.3)
+        net0 = _network(_net_scan(None, command, eff0), mode)
+        if net0.deny is not None:
+            return net0.deny
+        more0: list[tuple[str, str]] = []
+        if _anything_configured(eff0):
+            d = _route_text(command, eff0, mode, cwd)
+            if d is None and _text_hides(command):
+                d = _hidden_rule(command, eff0)
+            if d is None and _git_hidden_text(command):
+                # git the hook can't follow (its record couldn't be written:
+                # the git stand-in would refuse after the prompt)
+                d = _git_hidden(command, eff0, mode, in_job, cwd)
+            if d is None:
+                # su, doas, pkexec, runuser, sudoedit, osascript's
+                # administrator privileges in the text (PLAN-0.11 §9.5)
+                d, more0 = _other_elevation(_text_elevator(command), eff0, mode, in_job)
             if d is not None:
                 return d
-        fb = _fallback_ask(command, *_load_rights())
-        return _ask(*fb, in_job=in_job) if fb else None
+        fbs = _fallback_asks(command, form0, eff0, mode, in_job)
+        d = _locked_sudo(fbs)
+        if d is not None:
+            return d
+        # the stand-ins it asks about pass the "ask" only with a record (the
+        # account CLIs' and `gate with`'s "ask" accounts found there too)
+        d, more_fb = _fallback_records(command, form0, eff0, mode, cwd,
+                                       in_job or in_user_terminal, fbs, in_job)
+        if d is not None:
+            return d
+        asks = list(dict.fromkeys(more0 + fbs + more_fb))
+        if asks or net0.ask:
+            return _ask(asks[0][0] if asks else "", asks[0][1] if asks else "", asks[1:],
+                        in_job=in_job, net=net0.ask)
+        return None
     stages = [st for seg in segs for st in seg]
     firsts = [k == 0 for seg in segs for k in range(len(seg))]
     if not stages:
         return None
 
-    # Deny 1: curl/wget in command position, also behind a wrapper
-    # (`command curl`, `busybox wget`, `env curl`, `timeout 5 curl`).
+    # Deny 1: az's access token as Claude's own command (behind a wrapper too)
     for st in stages:
         argv, base = _command(st, fork=True)
-        if base in ("curl", "wget"):
-            return _deny_curl(base)
         # The az stand-in gives a token only to a program that parses it; as
         # Claude's own command (Bash, Monitor) it would print it to Claude.
         if base == "az" and "get-access-token" in argv and not in_user_terminal:
@@ -3333,9 +5919,9 @@ def _judge(segs: list | None, command: str, payload: dict, mode: str, cwd: str |
                          "command; use the http tool with the azure account instead.",
                          tool="az", target="get-access-token")
 
-    # Deny 1b (review round 5): `gate secret` is the user's, in every tool;
-    # gate export/import/copy-to not in the user's Terminal panel.
-    d = _deny_gate_user(stages, command, in_user_terminal, in_job)
+    # Deny 1b: gate export/import/copy-to not in the user's Terminal panel
+    # nor as a job.
+    d = _deny_gate_dialogs(stages, in_user_terminal, in_job)
     if d is not None:
         return d
 
@@ -3347,61 +5933,150 @@ def _judge(segs: list | None, command: str, payload: dict, mode: str, cwd: str |
         return d
 
     form, eff = _load_rights()
+    record_mode(payload.get("permission_mode"), eff)
 
-    # Alternate routes around the stand-ins (managed mode; PLAN-v4 phase 7)
-    d = _alternate_route(stages, eff, command)
+    # Network commands (PLAN-0.11 §3.3): a deny here beats every ask; an ask
+    # joins the rights' asks below; any hit short of an explicit allow in
+    # this mode keeps the gateway's allow off the whole command
+    net = _network(_net_scan(stages, command, eff), mode)
+    if net.deny is not None:
+        return net.deny
+
+    # Alternate routes around the stand-ins that reach a configured target,
+    # and commands that hide their program or host whose text names one
+    # (PLAN-0.11 §1.7: every mode; what else they hide gets no record, so a
+    # stand-in refuses an "ask" there)
+    d = _alternate_route(stages, eff, command, mode,
+                         [(c[0] if c else (cwd or "")) for c in stage_cwds] or [cwd or ""])
     if d is not None:
         return d
 
-    ask: list[tuple[str, str]] = []
+    # The other elevation tools (PLAN-0.11 §9.5): no stand-in supplies their
+    # password, and pkexec and osascript open system dialogs
+    d, more = _other_elevation(_elevation_tool(stages, command), eff, mode, in_job)
+    if d is not None:
+        return d
+
+    ask: list[tuple[str, str]] = list(more)
     hidden = False                     # the words may hide an "ask" right: scan the text
-    for st in stages:
+    ctx = _stage_contexts(stages, cwd)
+    # the folder each stand-in stage's record names (_pend): where it runs,
+    # from the hook's own folder when the payload names none that exists
+    rctx = ctx if cwd and os.path.isdir(cwd) else _stage_contexts(stages, _hook_cwd())
+    for k, st in enumerate(stages):
         argv, base = _command(st)
         if not argv:
             continue
-        if base in _HIDDEN_RUNNERS or base in _LOOP_WORDS:
-            hidden = True
+        n0 = len(ask)                  # this stage's own asks follow (its record: _pend)
+        if base in _HIDDEN_RUNNERS or base in _LOOP_WORDS or _cmd_strings(st, argv, base):
+            hidden = True              # (a command string: a -c string, trap's action, an alias)
         if base in _FB_SSH_WORDS | _SUDO_NAMES and any(getattr(st, "expands", None) or []):
             hidden = True              # `ssh $H x`: the target is a variable
         if base == "gate":
             # gate check / rotate / copy-to log in to the host with Claude's
-            # key: off in the form denies; "ask" in the form or in effect asks
-            # (the helpers then honour "ask" only for this typed command or a
-            # pop-up job). A widening still waiting is not denied here: gate
-            # check is how the user approves it.
-            for name in _gate_hosts(argv, form):
-                r = _form_right(form, name, "ssh")
-                if r is False:
-                    return _deny_right(name, "ssh")
-                if r == "ask" or _eff_right(eff, name, "ssh") == "ask":
+            # key: deny in the form (in this mode) denies; "ask" in the form or
+            # in effect asks (the helpers then honour "ask" only for this typed
+            # command or a pop-up job). A widening still waiting is not denied
+            # here: gate check is how the user approves it.
+            # A job: also in the modeless rule, as for ssh (gate there isn't
+            # typed by Claude, so its login gets the strictest of the modes; a
+            # widening still waiting is left to gate itself, as above).
+            for name in _gate_hosts(argv, form, mode):
+                r = _form_word(form, name, "ssh", mode)
+                if r == "deny":
+                    return _deny_right(name, "ssh", form, mode)
+                if r == "ask" or eff.word(name, "ssh", mode) == "ask":
                     ask.append((name, "ssh"))
+                elif in_job and _right(form, eff, name, "ssh", None) in ("deny", "ask"):
+                    return _deny_job_modes(name, "ssh")
+            # `gate with NAME -- CMD` hands NAME's key to CMD: an account whose
+            # use or credential is "ask" in this mode is asked about (MF2)
+            ask += _with_asks(argv, form, eff, [mode, None] if in_job else [mode])
+            if len(ask) > n0 and not (in_job or in_user_terminal):
+                # the gate CLI passes these "ask" entries only with this record
+                # (ssh._user_present, clis._with_refused)
+                sect = "accounts" if argv[1:2] == ["with"] else "hosts"
+                d = _pend("gate", st, argv, rctx[k][0], [(sect, n) for n, _v in ask[n0:]],
+                          ask[n0:], example=" ".join(["gate", *argv[1:3]]) +
+                          (" -- ..." if sect == "accounts" else ""))
+                if d is not None:
+                    return d
             continue
         if base == "git":
+            words = " ".join(argv)
+            if any(getattr(st, "expands", None) or []) and _git_hidden_text(words):
+                # a variable for its subcommand or remote (`git $SUB`, `git push
+                # "$R"`): no record of it can be written, so the gated git would
+                # refuse an "ask" after the prompt
+                d = _git_hidden(words, eff, mode, in_job, cwd)
+                if d is not None:
+                    return d
             if any(ssh_args.has_sudo_word(v) for v in _git_remote_programs(argv)):
                 return _deny("gateway: git's --upload-pack / --receive-pack / --exec (or "
                              "remote.*.uploadpack) can't run sudo through the gateway; run the "
                              "root command as `ssh HOST sudo CMD` on its own.", tool="git")
+            here, exported, setups = ctx[k]
+            if setups and _git_may_reach(argv):
+                # after a stage that sets up a repository or remote reaching
+                # something configured: the hook can't tell what this reaches
+                entries = _git_ask_entries(eff, mode, in_job)
+                for j in setups if entries else ():
+                    if _git_setup_reaches(stages[j], ctx[j], cwd, eff):
+                        return _deny(GIT_SEQUENCE.format(
+                            entries=_entries_shown(entries), first=_git_word(_command(stages[j])[0]),
+                            command=_git_word(argv)), tool="git", target="sequence")
+            gcs = stage_cwds[k] if k < len(stage_cwds) and stage_cwds[k] else [cwd or ""]
+            d, more_git = _git_judge(argv, gcs, here, eff, mode, in_job,
+                                     {**exported, **_stage_env(st)})
+            if d is not None:
+                return d
+            ask += more_git
+            continue
+        if base in _CLI_STANDINS:
+            # an account CLI whose account's use (or credential) is "ask" in
+            # this mode: asked about, and recorded, so its stand-in uses the
+            # account after the user's OK (lead decision 19.14); only the
+            # account it will choose (GATE_ACCOUNT included)
+            here = rctx[k][0]
+            for name, verb in _cli_asks(base, argv, here or cwd, eff, mode,
+                                        {**ctx[k][1], **_stage_env(st)}):
+                ask.append((name, verb))
+            if len(ask) > n0 and not (in_job or in_user_terminal):
+                d = _pend(base, st, argv, here, [("accounts", n) for n, _v in ask[n0:]],
+                          ask[n0:])
+                if d is not None:
+                    return d
             continue
         if base in ("sudo", "ssh", "scp", "sftp", "rsync"):
-            # the policy's decisions, each action on its own (PLAN-v4 phase 7):
-            # a deny with its rule, an "ask" asked; the rights below still apply
-            for name, act, dec in _policy_hits(base, argv, form, eff):
+            # the policy's decisions in this mode, each action on its own
+            # (PLAN-v4 phase 7): a deny with its rule, an "ask" asked; the
+            # rights below still apply. A job: also in the modeless rule (what
+            # the stand-ins inside it use), so the stricter of the two counts
+            hits = _policy_hits(base, argv, form, eff, mode)
+            if in_job:
+                hits += _policy_hits(base, argv, form, eff, None)
+            for name, act, dec in hits:
                 if not _POLICY_RULE.match(dec.rule):
                     continue           # a right itself (ssh, sudo, use): judged below
-                if dec.word is False:
-                    return _deny(dec.message(), tool=base, target=name)
-                if dec.word == "ask":
+                if dec.value == "deny":
+                    return _deny(dec.message(), tool=base, target=name, mode=dec.mode_label)
+                if dec.value == "ask":
                     if base in ("scp", "sftp", "rsync") and not (in_user_terminal or in_job):
                         return _deny_transfer_ask(base, name, act)
                     ask.append((name, act))
         if base == "sudo":
-            r = _right(form, eff, "localhost", "sudo")
-            if r is False:
-                return _deny_right("localhost", "sudo")
+            r = _right(form, eff, "localhost", "sudo", mode)
+            if r == "deny":
+                return _deny_right("localhost", "sudo", form, mode)
             if r == WAIT:
-                return _deny_wait("localhost", "sudo", form, eff)
+                return _deny_wait("localhost", "sudo", form, eff, mode)
             if r == "ask":
+                d = _locked_sudo([("localhost", "sudo")])
+                if d is not None:
+                    return d
                 ask.append(("localhost", "sudo"))
+            elif in_job and r is not None and _job_short(form, eff, "localhost", "sudo"):
+                return _deny_job_modes("localhost", "sudo")
         elif base in ("ssh", "scp", "sftp", "rsync"):
             targets, _ = _scan_family(base, argv)
             if base == "sftp" and _scan_transfer(base, argv).subsystem:
@@ -3413,45 +6088,67 @@ def _judge(segs: list | None, command: str, payload: dict, mode: str, cwd: str |
                 name = _resolve_host(t, form)
                 if name is None:
                     continue
-                r = _right(form, eff, name, "ssh")
-                if r is False:
-                    return _deny_right(name, "ssh")
+                r = _right(form, eff, name, "ssh", mode)
+                if r == "deny":
+                    return _deny_right(name, "ssh", form, mode)
                 if r == WAIT:
-                    return _deny_wait(name, "ssh", form, eff)
+                    return _deny_wait(name, "ssh", form, eff, mode)
                 if r == "ask":
                     if base != "ssh" and not (in_user_terminal or in_job):
                         return _deny_transfer_ask(base, name, "ssh")
                     ask.append((name, "ssh"))
+                elif in_job and _job_short(form, eff, name, "ssh"):
+                    return _deny_job_modes(name, "ssh")
                 if sudo_word:          # remote sudo: the host's sudo right decides too
-                    rs = _right(form, eff, name, "sudo")
-                    if rs is False and sudo_cmd:
-                        return _deny_right(name, "sudo")
+                    rs = _right(form, eff, name, "sudo", mode)
+                    if rs == "deny" and sudo_cmd:
+                        return _deny_right(name, "sudo", form, mode)
                     if rs == WAIT and sudo_cmd:
-                        return _deny_wait(name, "sudo", form, eff)
+                        return _deny_wait(name, "sudo", form, eff, mode)
                     if rs == "ask":
                         if base != "ssh" and not (in_user_terminal or in_job):
                             return _deny_transfer_ask(base, name, "sudo")
                         ask.append((name, "sudo"))
-    if ask:
-        return _ask(ask[0][0], ask[0][1], ask[1:], in_job=in_job)
+                    elif in_job and sudo_cmd and _job_short(form, eff, name, "sudo"):
+                        return _deny_job_modes(name, "sudo")
+        if len(ask) > n0 and base in ("ssh", "sudo") and not (in_job or in_user_terminal):
+            # the stand-in passes these "ask" entries only with this record
+            d = _pend(base, st, argv, rctx[k][0], [("hosts", n) for n, _v in ask[n0:]], ask[n0:])
+            if d is not None:
+                return d
     if hidden:
         # a shell, eval or exec behind a wrapper (`env bash -c 'ssh h x'`), a
-        # loop, or a target in a variable
-        fb = _fallback_ask(command, form, eff)
-        if fb:
-            return _ask(*fb, in_job=in_job)
+        # loop, or a target in a variable, that names an "ask" target, beside
+        # the stages asked about above or alone: asked about too, with the
+        # records of what can be read there (should-fix 3)
+        fbs = _fallback_asks(command, form, eff, mode, in_job)
+        d = _locked_sudo(fbs)
+        if d is not None:
+            return d
+        d, more_fb = _fallback_records(command, form, eff, mode, cwd,
+                                       in_job or in_user_terminal, fbs, in_job)
+        if d is not None:
+            return d
+        ask = list(dict.fromkeys(ask + fbs + more_fb))
+    if ask or net.ask:
+        return _ask(ask[0][0] if ask else "", ask[0][1] if ask else "", ask[1:], in_job=in_job,
+                    net=net.ask)
 
     if in_job:
         return None    # never allow a job: Claude Code's own permission check decides
-    if mode in ("auto", "bypassPermissions") and cwd_known and not in_user_terminal:
+    # the allow step (SPEC 8 step 5), per mode: only for a mode the payload
+    # names (empty, missing or unknown is default, and never allows)
+    if _mode(payload)[1] and cwd_known and not in_user_terminal and not net.blocks:
         try:
             roots = _read_roots(cwd)
         except Exception:  # noqa: BLE001 - no roots: no file read is vouched for
             roots = None
         if len(stage_cwds) == len(stages) and all(
-                _stage_allowed(st, form, eff, c, f, roots)
+                _stage_allowed(st, form, eff, c, f, roots, mode, net=net.allow)
                 for st, c, f in zip(stages, stage_cwds, firsts)):
             if all(_argv_meta(st)[0][0] in BENIGN for st in stages):
                 return _out("allow", READ_ALLOW)
+            if net.allow:
+                return _out("allow", NET_ALLOW)
             return _out("allow", "gateway: allowed (host/account rights in gateway.toml).")
     return None

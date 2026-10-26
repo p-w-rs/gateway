@@ -24,6 +24,8 @@ from gateway import audit, bashparse, consent, hooks_bash, vault
 JOB = "mcp__plugin_check_jobs__job_start"
 ASK, DENY, NONE = "ask", "deny", None
 JOB_ASK = "a job can't use the \"ask\" right"
+# a network command's "ask" in a job (PLAN-0.11 §3.3: nobody can be asked)
+JOB_NET = "a job or gateway terminal can't be asked about this: "
 
 
 @contextlib.contextmanager
@@ -79,7 +81,8 @@ def _forms(cmd):
 # (command, decision for a job in every mode). Bash's deny rows stay deny;
 # Bash's "ask" rows become deny; Bash's allow rows get no decision.
 JOB_TABLE = [
-    # curl/wget, private folder, transcripts, git credential, redaction
+    # network commands (Bash asks; nobody can be asked in a job), private folder,
+    # transcripts, git credential, redaction
     ("curl http://example.com", DENY),
     ("wget http://example.com/file", DENY),
     ("env curl http://x", DENY),
@@ -91,9 +94,7 @@ JOB_TABLE = [
     ("git credential fill", DENY),
     ("GIT_TRACE_REDACT=0 git push", DENY),
     ("az account get-access-token", DENY),
-    # the user's gate commands
-    ("gate secret box", DENY),
-    ("bash -c 'gate secret box'", DENY),
+    # gate commands that ask the user in the gateway's dialog
     ("gate export /tmp/x.age", DENY),
     ("gate import f.age", DENY),
     ("gate copy-to example", DENY),
@@ -157,8 +158,9 @@ def test_every_bash_row_is_a_deny_or_no_decision_for_a_job():
                 got = _decision(out)
                 if got != want:
                     failures.append(f"{mode:8} {cmd!r}: got {got} want {want}")
-                elif auto == ASK and not terminal and JOB_ASK not in out["hookSpecificOutput"][
-                        "permissionDecisionReason"]:
+                elif auto == ASK and not terminal and not any(
+                        w in out["hookSpecificOutput"]["permissionDecisionReason"]
+                        for w in (JOB_ASK, JOB_NET)):
                     failures.append(f"{mode:8} {cmd!r}: reason {out}")
         assert not failures, "\n".join(failures)
 
@@ -340,7 +342,7 @@ def test_prefilter_sends_jobs_with_trigger_words_to_python():
     with tempfile.TemporaryDirectory(dir=Path(H.tmp_base())) as td:
         pre, marker = P._rig(Path(td) / "rig")
         for cmd in ("ssh askhost uptime", "sudo make install", "curl http://x",
-                    "gate secret box", "rsync -a x h:/y", "cat ~/.config/gateway/private/key.txt"):
+                    "gate export x", "rsync -a x h:/y", "cat ~/.config/gateway/private/key.txt"):
             for ti in _forms(cmd):
                 marker.unlink(missing_ok=True)
                 r, _ = _run_job(pre, ti)

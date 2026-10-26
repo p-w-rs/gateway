@@ -12,6 +12,7 @@ from pathlib import Path
 
 import harness  # noqa: F401
 import harness_ssh as H
+import harness_posture as HP
 from gateway import vault
 
 FORM = '''[accounts.ghe-work]
@@ -114,10 +115,13 @@ def test_ssh_git_refusals() -> None:
     with H.ssh_env() as s:
         form = FORM.replace("default = true\n", "")
         t, fps = _setup(s, form)
-        # no owner match and no default
+        # an owner no account covers (no owner match, no default, two accounts):
+        # the user's own ssh and agent (PLAN-0.11 §1.4 step 9)
+        d = HP.user_tools(s.env, "ssh")
+        s.set(user_tools=str(d))
         r = s.run("ssh", "git@ghe.test", "git-upload-pack 'other/x.git'")
-        assert r.returncode == 2 and "no account is chosen for ghe.test/other" in r.stderr, r
-        assert "ghe-work and ghe-me exist" in r.stderr and "GATE_ACCOUNT=NAME" in r.stderr, r
+        assert r.returncode == 0 and r.stdout == "fake ssh ran\n", r
+        assert HP.runs(d, "ssh")[-1]["argv"] == ["git@ghe.test", "git-upload-pack 'other/x.git'"]
         # only git commands, only as git@
         r = s.run("ssh", "git@ghe.test", "id")
         assert r.returncode == 2 and "only git commands go to ghe.test over ssh" in r.stderr

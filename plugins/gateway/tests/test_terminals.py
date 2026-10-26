@@ -215,7 +215,9 @@ def test_a_terminal_runs_the_gateway_bash_in_the_managed_environment_never_the_u
         a = Agent(de, fc)
         lc = canary("lc")
         tok = canary("ghp")
-        v = a.open(env={"LC_GWTEST": lc, "GITHUB_TOKEN": tok, "LANG": "C.UTF-8"})
+        cc = canary("cc")
+        v = a.open(env={"LC_GWTEST": lc, "GITHUB_TOKEN": tok, "LANG": "C.UTF-8",
+                        "CLAUDE_CODE_OAUTH_TOKEN": cc, "BASH_ENV": str(marker)})
         tid = v["id"]
         assert T.ID_RE.fullmatch(tid) and tid.startswith("t_")
         assert v["state"] == "open" and v["owner"] == "agent" and v["kind"] == "terminal"
@@ -223,12 +225,16 @@ def test_a_terminal_runs_the_gateway_bash_in_the_managed_environment_never_the_u
         assert isinstance(v["seq"], int) and v["cols"] == 100 and v["rows"] == 24
         # what the pane's processes and the tmux server have on their command lines
         ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
-        assert lc not in ps and tok not in ps
+        assert lc not in ps and tok not in ps and cc not in ps
         out = de.root / "env.txt"
         a.run(tid, f"env > '{out}'; echo BASH=$BASH_VERSION; echo done-env", "done-env")
         env = dict(ln.split("=", 1) for ln in out.read_text().splitlines() if "=" in ln)
         assert env.get("LC_GWTEST") == lc, "a platform variable from the caller didn't arrive"
-        assert "GITHUB_TOKEN" not in env, "a credential-looking variable reached the pane"
+        # the user's own variables reach the pane, minus the managed shell's
+        # removals (invariant 18, PLAN-0.11 §11): Claude Code's credentials,
+        # the shell startup variables
+        assert env.get("GITHUB_TOKEN") == tok, "the user's own token is theirs"
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env and "BASH_ENV" not in env, env.keys()
         assert "FROM_USER_RC" not in env and not marker.exists(), "the user's rc ran"
         assert "TMUX" not in env and "TMUX_PANE" not in env
         assert env.get("GW_TERMINAL") == tid and env.get("PATH", "").startswith(str(paths.bin_dir()))
@@ -237,7 +243,8 @@ def test_a_terminal_runs_the_gateway_bash_in_the_managed_environment_never_the_u
         assert any(ln.startswith("BASH=5.") for ln in a.read(tid)["lines"])
         # the start file is gone once read, and nothing in the run dir holds the values
         assert not list((de.run / "terms").glob("*.rc"))
-        assert lc.encode() not in _gated_files(de) and tok.encode() not in _gated_files(de)
+        assert lc.encode() not in _gated_files(de) and tok.encode() not in _gated_files(de) \
+            and cc.encode() not in _gated_files(de)
         # the user's tmux config was never read: the gateway's own is
         assert _tmux(de, "show", "-gv", "@gw_user_conf").stdout.strip() == ""
         assert _tmux(de, "show", "-gv", "status").stdout.strip() == "off"
@@ -721,6 +728,107 @@ def test_contract_job_routes_events_snapshot_and_their_plane():
         assert st == 403
 
 
+def test_a_contract_job_gets_the_consumers_environment_minus_the_managed_removals():
+    """CONTRACT-v1 feature job_env (PLAN-0.11 §19.14): POST /v1/jobs takes
+    `env` (names to string values); the job gets those variables minus the
+    managed shell's removals (Claude Code's credentials, the shell startup
+    variables, GW_*), with the stand-ins first on its PATH, then the
+    consumer's PATH (as a gateway job_start gets Claude Code's). What a
+    session's environment holds that a job can't take (an exported
+    function, a long value, a name that isn't a shell name, a NUL, more
+    than ENV_MAX variables) is skipped, never a refusal; only an env that
+    isn't an object of strings, or one whose kept part is over 256 KiB, is
+    refused whole before anything starts. Without `env` a job gets the
+    plain managed environment, as before."""
+    from gateway import managed
+    with D.daemon_env() as de:
+        fc = de.claude()
+        a = Agent(de, fc)
+        st, cap = a.de.probe(fc, a.probe / "run.py", ["x"], "/v1/capabilities", method="GET")
+        assert "job_env" in cap["features"], cap
+        tok, cc = canary("ghp"), canary("cc")
+        mine = str(de.root / "consumer-bin")
+        out = de.root / "job-env.txt"
+        env = {"MY_PROJECT_VAR": "from-checkpoint", "GITHUB_TOKEN": tok, "PATH": f"{mine}:/usr/bin:/bin",
+               "CLAUDE_CODE_OAUTH_TOKEN": cc, "BASH_ENV": "/x/rc", "GW_PLANTED": "1",
+               "LANG": "C.UTF-8"}
+        assert managed.dropped("CLAUDE_CODE_OAUTH_TOKEN") and managed.dropped("BASH_ENV")
+        body = {"command": f"env > '{out}'; echo job-env-done", "host": "localhost",
+                "cwd": str(de.root), "session": "s-test", "idempotency_key": "ck-env-1", "env": env}
+        st, r = a.call("/v1/jobs", body, mode="x")
+        assert st == 200 and r["job"].startswith("j_"), (st, r)
+        assert de.wait_for(lambda: out.exists() and "LANG=" in out.read_text(), 15)
+        got = dict(ln.split("=", 1) for ln in out.read_text().splitlines() if "=" in ln)
+        assert got.get("MY_PROJECT_VAR") == "from-checkpoint" and got.get("GITHUB_TOKEN") == tok
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in got and "BASH_ENV" not in got and \
+            "GW_PLANTED" not in got, sorted(got)
+        p = got.get("PATH", "").split(":")
+        assert p[0] == str(paths.bin_dir()) and p[1] == mine, p
+        assert tok.encode() not in _gated_files(de) and cc.encode() not in _gated_files(de)
+        # without env: the plain managed environment (no consumer variable)
+        out2 = de.root / "job-env-2.txt"
+        st, r = a.call("/v1/jobs", {**{k: v for k, v in body.items() if k != "env"},
+                                    "command": f"env > '{out2}'", "idempotency_key": "ck-env-2"},
+                       mode="x")
+        assert st == 200, r
+        assert de.wait_for(lambda: out2.exists() and "PATH=" in out2.read_text(), 15)
+        assert "MY_PROJECT_VAR" not in out2.read_text()
+        # a session's odd variables are skipped, the job starts with the rest
+        out3 = de.root / "job-env-3.txt"
+        odd: dict[str, str] = {"KEEP_ME": "yes", "PATH": "/usr/bin:/bin",
+                               "BASH_FUNC_module%%": "() {  eval x\n}",
+                               "DIRENV_DIFF": "e" * (T.ENV_VALUE_MAX + 1), "X" * 70: "1",
+                               "1BAD": "x", "A-B": "x", "NUL_VALUE": "a\x00b", "LONE": "\udc80x"}
+        odd.update({f"V{i}": "v" for i in range(T.ENV_MAX + 50)})
+        st, r = a.call("/v1/jobs", {**body, "command": f"env > '{out3}'", "idempotency_key": "ck-env-3",
+                                    "env": odd}, mode="x")
+        assert st == 200 and r["job"].startswith("j_"), (st, r)
+        assert de.wait_for(lambda: out3.exists() and "LANG=" in out3.read_text(), 15)
+        got = dict(ln.split("=", 1) for ln in out3.read_text().splitlines() if "=" in ln)
+        assert got.get("KEEP_ME") == "yes" and got.get("V0") == "v", sorted(got)[:20]
+        kept = [f"V{i}" for i in range(T.ENV_MAX + 50) if f"V{i}" in got]
+        assert len(kept) == T.ENV_MAX - 1, len(kept)        # ENV_MAX kept, KEEP_ME among them
+        for name in ("DIRENV_DIFF", "X" * 70, "1BAD", "A-B", "NUL_VALUE", "LONE"):
+            assert name not in got, name
+        assert not any(k.startswith("BASH_FUNC") for k in got), sorted(got)
+        # refused whole, before anything starts: not an object of strings (the
+        # size cap: test_a_contract_jobs_env_is_capped_by_what_the_job_keeps)
+        bad = [[], "A=1", {"OK": 1}, {"OK": None}, {"OK": ["yyyy"]}]
+        before = len(a.ok("/agent/job/list", {})["jobs"])
+        for i, e in enumerate(bad):
+            st, r = a.call("/v1/jobs", {**body, "idempotency_key": f"ck-bad-{i}", "env": e}, mode="x")
+            assert st == 400 and r.get("error") == "bad_env", (i, st, r)
+            assert "yyyy" not in json.dumps(r)
+        assert len(a.ok("/agent/job/list", {})["jobs"]) == before, "nothing started"
+
+
+def test_a_contract_jobs_env_is_capped_by_what_the_job_keeps():
+    """job_env's one size limit: what the job would keep (terminals.env_kept)
+    is at most 256 KiB in UTF-8 bytes, else the request is refused whole
+    (400 bad_env); what is skipped anyway (values over ENV_VALUE_MAX, odd
+    names, the managed shell's removals) doesn't count. (In process: a body
+    this large can't travel in the probe's environment on Linux.)"""
+    from gateway.daemon import server
+    with H.gateway_env():
+        def refused(env: Any) -> bool:
+            try:
+                server._job_env(env)
+            except server.Reply as e:
+                assert e.status == 400 and e.body["error"] == "bad_env", e.body
+                return True
+            return False
+        assert server._job_env(None) is None
+        big = "y" * 8000
+        assert refused({f"V{i}": big for i in range(40)})                     # 320 KB kept
+        assert not refused({f"V{i}": big for i in range(30)})                 # 240 KB kept
+        assert refused({f"V{i}": "é" * 4000 for i in range(40)}), "bytes, not characters"
+        skipped = {f"B{i}": "b" * (T.ENV_VALUE_MAX + 1) for i in range(40)}  # all over the max
+        skipped.update({f"BASH_FUNC_f{i}%%": big for i in range(40)})
+        skipped["CLAUDE_CODE_OAUTH_TOKEN"] = big
+        assert not refused({**skipped, "KEEP": "1"})
+        assert refused([]) and refused({"A": 1}) and refused("A=1")
+
+
 def test_terminal_routes_are_the_mcp_servers_and_the_panes_alone():
     with D.daemon_env() as de:
         fc = de.claude()
@@ -812,7 +920,7 @@ def test_the_sudo_stand_in_hands_a_gateway_terminal_to_the_real_sudo_on_its_tty(
     tid = T.ulid("t")
     try:
         sudo._real_sudo = lambda: "/usr/bin/sudo"
-        sudo._rights_now = lambda fresh=False: ({}, None, False)
+        sudo._rights_now = lambda fresh=False: ({}, None, False, sudo.GATED)
         sudo._exec_real = lambda real, argv: calls.append(("exec", real, list(argv))) or 0
         sudo.probe_nopasswd = lambda *a, **k: calls.append(("probe",)) or False
         old_direct = sudo.ancestry.is_direct
@@ -831,7 +939,7 @@ def test_the_sudo_stand_in_hands_a_gateway_terminal_to_the_real_sudo_on_its_tty(
             assert ("probe",) in calls                                # not a terminal: the usual path
             calls.clear()
             os.environ["GW_TERMINAL"] = tid
-            sudo._rights_now = lambda fresh=False: ({}, sudo.OFF, False)
+            sudo._rights_now = lambda fresh=False: ({}, sudo.OFF, False, sudo.GATED)
             assert sudo.main(["whoami"]) == 1 and not calls          # sudo off: refused there too
     finally:
         os.environ.pop("GW_TERMINAL", None)
@@ -1027,7 +1135,7 @@ def test_the_bash_hook_sees_the_gw_tools_that_type_or_run():
     names = pre[0]["matcher"].split("|")
     assert "mcp__plugin_gate_gw__job_start" in names and "mcp__plugin_gate_gw__terminal_send" in names
     post = [m for m in hooks["hooks"]["PostToolUse"] if "post.sh" in json.dumps(m)]
-    assert post and "mcp__plugin_gate_gw__.*" in post[0]["matcher"]      # their output is masked too
+    assert post and post[0]["matcher"] == ".*"    # every tool's output is masked (PLAN-0.11 §9.1)
 
 
 def test_a_removed_run_dir_takes_the_unreachable_tmux_server_with_gated():

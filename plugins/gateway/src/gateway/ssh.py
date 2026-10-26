@@ -1,22 +1,42 @@
-"""The ssh family stand-ins: ssh, scp, sftp (and rsync via RSYNC_RSH, git via
-GIT_SSH_COMMAND) (SPEC 9.2, 9.3), plus the ssh side of `gate check` (SPEC 15).
+"""The ssh family stand-ins: ssh, scp, sftp (and the gated git's ssh, its
+core.sshCommand; rsync through PATH) (SPEC 9.2, 9.3; PLAN-0.11 §1.4, §6.3),
+plus the ssh side of `gate check` (SPEC 15). The stand-ins exist only while
+something configured is reachable over ssh (envfile.standins_for).
 
 Stand-in flow (`main("ssh", argv)`):
 
+0. Classify (PLAN-0.11 §1.4): a lenient parse (ssh_args.parse_lenient)
+   finds the destination without refusing anything. A direct hit on the
+   destination word (a configured host's name, gw-NAME, address or `also`
+   host, from the configured set: the form, the approval and the configured
+   list) takes the gated path below; so does an account's ssh endpoint
+   (git@github.com, git@hf.co, a GHES host) whose owner an account covers.
+   Otherwise the user's own ssh (`ssh -G` with the full argv, 1.5 s), every
+   ProxyJump hop (through `ssh -G` too), the ProxyCommand's words and the
+   resolved addresses (same port) are checked: a configured target found
+   only there is refused with a hint ("use `ssh homelab`"), never routed.
+   No hit: the user's own ssh runs with the full argv and the environment
+   unchanged (envfile.pass_through; the user's agent and keys). scp and
+   sftp classify each remote operand the same way: all configured (the
+   gated path), none (the user's own), or a mix (refused: copy in two
+   steps). Rights are read in the session's mode the hook recorded for a
+   command Claude typed (modes.current_for), else the modeless rule. A vault
+   that can't be read (locked) still classifies: only a configured target is
+   refused.
 1. Parse argv like OpenSSH (ssh_args); refused options exit 2 with a reason.
-2. Map the destination to (a) a form host (by name, then gw-NAME, address,
-   also or user@address), (b) an account ssh endpoint (git@github.com,
-   git@hf.co, a GHES host), or (c) unknown: refused (with "did you mean")
-   unless the user approved `others = "mine"`, which execs the system ssh
-   unchanged, except for a name the user's ssh config sends to a form
-   host's address (refused: use the form name so its rights apply).
+2. Map the destination to (a) a configured host (by name, then gw-NAME,
+   address, also or user@address; a host the form no longer names gates
+   with its approved entry until the user's OK), or (b) an account ssh
+   endpoint.
 3. No command and no -N: refused at once (interactive ssh can't work).
 4. Effective rights (consent.compute, after consent's ratchet): ssh false
    refuses; "ask" (ssh, or sudo for a remote command with a sudo word)
    refuses unless Claude's own command shell started this ssh with nothing in
    between (ancestry.typed_by_claude: no git, rsync, scp, sftp, wrapper,
-   script or `sh -c`; Claude Code can only ask about a command Claude typed);
-   a non-direct caller gets nothing unless the entry has `scripts = true`
+   script or `sh -c`; Claude Code can only ask about a command Claude typed)
+   and the approval hook's record of this very command covers the host
+   (asks.standin, taken once: a sourced script's `ssh box` has none); a
+   non-direct caller gets nothing unless the entry has `scripts = true`
    (ancestry.is_direct).
 5. Address choice and the per-call config (ssh_conf), host-key pinning
    (a changed key on the last candidate opens popup.hostkey), the private
@@ -55,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import accounts, ancestry, audit, consent, paths, testing, vault
+from . import accounts, ancestry, audit, consent, envfile, paths, testing, vault
 from . import form as formmod
 from . import ssh_args, ssh_conf, ssh_sudo
 from .ssh_conf import Conn, Link, SshError
@@ -77,19 +97,53 @@ class State:
     form: formmod.Form
     data: dict[str, Any]
     eff: consent.Effective
+    # PLAN-0.11: the session's mode the hook recorded for a command Claude
+    # typed (None: the modeless rule), and why the vault can't be read now
+    # (its own refusal text: locked, or broken), for a configured target
+    mode: str | None = None
+    unreadable: str | None = None
 
 
 def _load() -> State:
+    """The form, the vault and the effective rights in the session's mode
+    (modes.current_for: a command Claude typed; else the modeless rule). A
+    vault that can't be read still classifies (the configured list): only a
+    configured target is refused then (State.unreadable), an unconfigured
+    one passes through."""
+    from . import modes
+    unreadable = None
+    locked = False
     try:
-        data = vault.load()
+        data: dict[str, Any] | None = vault.load()
+    except vault.VaultLocked as e:
+        data, unreadable, locked = None, str(e), True
     except vault.VaultError as e:
-        raise SshError(f"gateway: the vault can't be read ({e}); run gate status") from None
+        data, unreadable = None, f"gateway: the vault can't be read ({e}); run gate status"
     form = consent.load_form(data)
-    if consent.needs_sync(data, form) and not paths.v2_store_path().exists():
+    if data is not None and consent.needs_sync(data, form):
         with contextlib.suppress(Exception):
             consent.ratchet(form)
             data = vault.load()
-    return State(form, data, consent.compute(form, data))
+    try:
+        mode = modes.current_for("standin")
+    except Exception:  # noqa: BLE001 - the modeless rule
+        mode = None
+    if mode is None:
+        # the ssh of the gateway's gated git for a command Claude typed (no
+        # hook script between): the mode the git stand-in read
+        # (githelper.gated_parent)
+        from . import githelper
+        g = githelper.gated_parent()
+        mode = g.mode if g.strict() else None
+    _CALL["mode"] = modes.audit_word(mode)      # for its audit lines (lead decision 19.8)
+    eff = consent.compute(form, data, mode, locked=locked)
+    return State(form, data if data is not None else vault.empty(), eff, mode, unreadable)
+
+
+def _need_vault(st: State) -> None:
+    """A configured target's gated path needs the vault's approval and keys."""
+    if st.unreadable:
+        raise SshError(st.unreadable)
 
 
 def _err(msg: str) -> None:
@@ -104,8 +158,13 @@ def _refuse(tool: str, target: str | None, e: SshError | str, code: int = 2) -> 
         msg, fix = e, None
     if not printed:
         _err(msg)
-    audit.refusal(tool, target, msg, fix)
+    audit.refusal(tool, target, msg, fix, mode=_audit_mode())
     return code
+
+
+def _audit_mode() -> str:
+    from . import modes
+    return modes.standin_audit_mode(_CALL)
 
 
 def _direct() -> tuple[bool, str]:
@@ -121,15 +180,54 @@ def _direct() -> tuple[bool, str]:
 
 
 def _typed() -> tuple[bool, str]:
-    """(typed by Claude, culprit) for an "ask" right: started by Claude's own
-    command shell (or a fork of it) with nothing in between, so the approval
-    hook saw this very command (ancestry.typed_by_claude). Fails closed."""
+    """(typed by Claude, culprit): started by Claude's own command shell (or
+    a fork of it) with nothing in between (ancestry.typed_by_claude), for
+    the gateway's own helpers on an "ask" host (_user_present). A stand-in's
+    "ask" also needs the approval hook's record: _asked. Fails closed."""
+    try:
+        ok, culprit = ancestry.typed_by_claude()
+    except Exception:  # noqa: BLE001 - fail closed (NotImplementedError too)
+        return False, "an unknown program"
+    c = os.path.basename(str(culprit or ""))
+    return bool(ok), c if _SAFE_CULPRIT.fullmatch(c) else "a script"
+
+
+# The command this stand-in call serves (main sets it): an "ask" passes only
+# with the approval hook's record of this very command (asks.standin; lead
+# decision 19.14)
+_CALL: dict[str, Any] = {}
+_UNASKED = "unasked:"           # _asked's culprit for a typed command with no record
+
+
+def _asked(name: str, via: tuple[str, str] | None = None) -> tuple[bool, str]:
+    """(may pass, culprit) for an "ask" on `name`: a command Claude typed
+    (ancestry.typed_by_claude) that the approval hook asked about, its record
+    of this very command covering the entry (`via`, else the host: the
+    record is taken once, asks.standin). via (("hosts", NAME) or
+    ("accounts", NAME)): that entry's ssh right, its git over ssh and git's
+    read or write (never a remote sudo or a command) also pass for the ssh
+    the gateway's own gated git starts for a command Claude typed, with no
+    hook script between, when the approval hook asked about that entry for
+    it (githelper.gated_parent: PLAN-0.11 §6.5, the push the user approved
+    runs). A typed command with no record: (False, "unasked:none" or
+    "unasked:expired"), which _ask_refusal turns into "run `ssh NAME ...` as
+    its own command". Fails closed."""
+    from . import asks
     try:
         ok, culprit = ancestry.typed_by_claude()
     except Exception:  # noqa: BLE001 - fail closed, NotImplementedError too
         return False, "an unknown program"
+    if ok:
+        got = asks.standin(str(_CALL.get("tool") or "ssh"), list(_CALL.get("argv") or []),
+                           via or ("hosts", name))
+        return (True, "") if got == "ok" else (False, _UNASKED + got)
+    if via is not None:
+        from . import githelper
+        g = githelper.gated_parent()
+        if g.strict() and via in g.asked:
+            return True, ""
     c = os.path.basename(str(culprit or ""))
-    return bool(ok), c if _SAFE_CULPRIT.fullmatch(c) else "a script"
+    return False, c if _SAFE_CULPRIT.fullmatch(c) else "a script"
 
 
 # Programs that start ssh by themselves: Claude Code can't ask about the ssh
@@ -139,9 +237,15 @@ _SSH_STARTERS = ("git", "git-lfs", "rsync", "scp", "sftp", "gh")
 
 def _ask_refusal(name: str, what: str, culprit: str) -> SshError:
     """The refusal for an "ask" right reached by anything but a command Claude
-    typed (SPEC 9: Claude Code can only prompt for that). Inside a checkpoint
-    job: the approval hook's job wording (consent.job_ask_message); inside a
-    gateway terminal or job: the pane's (consent.pane_ask_message)."""
+    typed that the approval hook asked about (SPEC 9: Claude Code can only
+    prompt for that). A typed command with no record (_asked's "unasked:"):
+    run it as its own command (asks.refusal). Inside a checkpoint job: the
+    approval hook's job wording (consent.job_ask_message); inside a gateway
+    terminal or job: the pane's (consent.pane_ask_message)."""
+    if culprit.startswith(_UNASKED):
+        from . import asks
+        return SshError(asks.refusal(culprit[len(_UNASKED):], [consent.ask_phrase(name, what)],
+                                     f"ssh {name} ..."))
     if culprit == ancestry.CHECKPOINT:
         return SshError(consent.job_ask_message([consent.ask_phrase(name, what)]))
     if culprit == ancestry.TERMINAL:
@@ -172,13 +276,14 @@ def off_message(name: str, what: str, form_right: Any = False) -> str:
 
 
 def _gate_rights(name: str, right: Any, scripts: bool, what: str = "ssh",
-                 who: tuple[bool, str] | None = None, form_right: Any = False) -> None:
+                 who: tuple[bool, str] | None = None, form_right: Any = False,
+                 via: tuple[str, str] | None = None) -> None:
     direct, culprit = who if who is not None else _direct()
     if right is False:
         raise SshError(off_message(name, what, form_right))
     if right == "ask":
-        typed, by = _typed()
-        if not typed:
+        asked, by = _asked(name, via=via)
+        if not asked:
             raise _ask_refusal(name, what, by)
     if not (direct or scripts):
         raise SshError(f"gateway: {what} started by {culprit} got no key (only Claude's own "
@@ -377,18 +482,23 @@ def _hostkey_changed(name: str, addr: formmod.Address, pins: list[str], seen: li
     raise _popup_failed(name, "host key", outcome)
 
 
-def _user_present() -> bool:
-    """For the gateway's own helpers on an "ask" host: the user is at hand,
-    either answering a dialog job (the detached helper) or approving the
-    command Claude typed, which the approval
-    hook asks about (gate check / rotate / copy-to on an "ask" host)."""
+def _user_present(name: str) -> bool:
+    """For the gateway's own helpers on "ask" host `name`: the user is at
+    hand, either answering a dialog job (the detached helper) or having
+    approved the command Claude typed (gate check / rotate / copy-to), which
+    the approval hook asked about: a command Claude typed with the hook's
+    record of it (asks.current: the gate CLI's own words, gate.main), taken
+    once. A sourced file's `gate rotate box` has no record."""
     try:
         from . import popup
         if popup.mode() == "direct":
             return True
     except Exception:  # noqa: BLE001
         pass
-    return _typed()[0]
+    if not _typed()[0]:
+        return False
+    from . import asks
+    return asks.current(("hosts", name)) == "ok"
 
 
 def _helper_right(name: str, eh: Any) -> None:
@@ -399,7 +509,7 @@ def _helper_right(name: str, eh: Any) -> None:
     if eh.ssh is False:
         fh = getattr(eh, "host", None)
         raise SshError(off_message(name, "ssh", getattr(fh, "ssh", False)))
-    if eh.ssh == "ask" and not _user_present():
+    if eh.ssh == "ask" and not _user_present(name):
         raise SshError(f'gateway: ssh on {name} is set to "ask"; run the gate command as its own '
                        f"command so Claude Code can ask the user (gate check {name}), or ask the "
                        f"user to set ssh = true for {name}")
@@ -415,7 +525,8 @@ def _build_link(name: str, st: State, cands: list[formmod.Address] | None = None
     asks through its own dialog and raises; PLAN-v4 phase 6); it must raise
     or return the new pins."""
     eh = st.eff.hosts.get(name)
-    fh = st.form.hosts.get(name)
+    # (a host the form no longer names: its approved entry, until the OK)
+    fh = st.form.hosts.get(name) or (eh.host if eh is not None and eh.removed else None)
     if eh is None or fh is None or fh.is_local:
         raise SshError(f"gateway: {name} isn't a host in gateway.toml")
     if eh.new:
@@ -544,6 +655,10 @@ def _verify_cmdline(conn: Conn, kept: list[str], command: list[str] | None = Non
 
 def main(tool: str, argv: list[str]) -> int:
     """Stand-in entry for tool in ssh|scp|sftp (SPEC 9.2). Returns the exit code."""
+    from . import asks
+    asks.reset()
+    _CALL.clear()
+    _CALL.update(tool=tool, argv=list(argv))
     try:
         if tool == "ssh":
             return _ssh(list(argv))
@@ -566,6 +681,34 @@ def main(tool: str, argv: list[str]) -> int:
 
 
 def _copy(tool: str, argv: list[str]) -> int:
+    """scp / sftp (PLAN-0.11 §1.4 step 8): each remote operand classified as
+    ssh's destination is. Any configured: the gated path for all of them
+    (refused options, then the gateway's scp/sftp with `-S` the ssh stand-in,
+    which gates each connection); a configured remote beside an unconfigured
+    one: refused ("copy in two steps"); a hit found only through the user's
+    ssh config, a jump host, a ProxyCommand or an address: refused with a
+    hint; none: the user's own scp/sftp (pass_through)."""
+    st = _load()
+    lp = ssh_args.parse_lenient(argv, tool)
+    remotes = _copy_remotes(tool, lp)
+    hits: list[tuple[str, Reach]] = []
+    for word, port in remotes:
+        r = _reach_of(word, port, st, extra=_copy_opts(lp))
+        hits.append((word, r))
+    gated = [(w, r) for w, r in hits if r.kind != "none"]
+    if not gated:
+        return envfile.pass_through(tool, argv, _shown_target(remotes),
+                                    entries=_ssh_entries(st))
+    indirect = [(w, r) for w, r in gated if r.how]
+    if indirect:
+        w, r = indirect[0]
+        return _refuse(tool, r.name, _hint(w, r, tool))
+    if len(gated) != len(hits):
+        names = ", ".join(dict.fromkeys(r.name or "?" for _w, r in gated))
+        return _refuse(tool, gated[0][1].name,
+                       f"gateway: this {tool} reaches {names}, which goes through the gateway, and "
+                       "another machine that doesn't; copy in two steps (one through the "
+                       "gateway's host, one with your own tools)")
     try:
         ssh_args.check_copy(tool, argv)
     except ssh_args.Refused as e:
@@ -579,22 +722,123 @@ def _copy(tool: str, argv: list[str]) -> int:
     return 127  # pragma: no cover
 
 
-def _system_ssh() -> str:
-    t = testing.get("system_ssh")
-    if t:
-        return str(t)
-    if os.access("/usr/bin/ssh", os.X_OK):
-        return "/usr/bin/ssh"
-    return ssh_conf.ssh_bin()
+def _copy_remotes(tool: str, lp: ssh_args.Lenient) -> list[tuple[str, int | None]]:
+    """The remote operands of a scp / sftp command line, as (destination
+    word, port): scp's [user@]host:path, scp://[user@]host[:port]/path;
+    sftp's one destination ([user@]host[:path], sftp://...)."""
+    out: list[tuple[str, int | None]] = []
+    try:
+        port = ssh_args.parse_port(lp.port) if lp.port else None
+    except ssh_args.Refused:
+        port = None
+    ops = lp.command if tool == "scp" else lp.command[:1]
+    for x in ops:
+        u = re.match(r"(?i)(?:scp|sftp)://([^/]+)(?:/.*)?\Z", x)
+        if u:
+            hp = u.group(1)
+            user, _, hp = hp.rpartition("@")
+            m = re.fullmatch(r"\[([^\]]+)\](?::([0-9]{1,5}))?|([^:]+)(?::([0-9]{1,5}))?", hp)
+            if m:
+                host = m.group(1) or m.group(3) or ""
+                p = m.group(2) or m.group(4)
+                out.append(((user + "@" if user else "") + host, int(p) if p else port))
+            continue
+        if tool == "sftp":
+            word = x.split(":", 1)[0] if not x.startswith("[") else x[1:].split("]", 1)[0]
+            out.append((word, port))
+            continue
+        if _scp_remote_path(x) is None:
+            continue
+        if x.startswith("[") or "@[" in x:
+            user, _, rest = x.partition("@[") if "@[" in x else ("", "", x[1:])
+            host = rest.split("]", 1)[0]
+            out.append(((user + "@" if user else "") + host, port))
+        else:
+            out.append((x.split(":", 1)[0], port))
+    return out
 
 
-def _user_ssh_cmd() -> list[str]:
-    """The system ssh with the user's own config (tests: -F ssh_user_config)."""
-    cmd = [_system_ssh()]
-    ucfg = testing.get("ssh_user_config")
-    if ucfg:
-        cmd += ["-F", str(ucfg)]
-    return cmd
+def _copy_opts(lp: ssh_args.Lenient) -> list[str]:
+    """The options of a scp / sftp line that change where ssh goes (-F, -J,
+    -o), for the user's `ssh -G`."""
+    out: list[str] = []
+    for c, v in lp.opts:
+        if c in ("F", "J", "o") and v is not None:
+            out += [f"-{c}", v]
+    return out
+
+
+def _shown_target(remotes: list[tuple[str, int | None]]) -> str | None:
+    for w, _p in remotes:
+        return w.rsplit("@", 1)[-1]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Classifying a target against the configured set (PLAN-0.11 §1.4): a direct
+# hit on the destination word takes the gated path; a hit found only through
+# the user's own ssh config (`ssh -G`), a jump host, a ProxyCommand or a
+# resolved address is refused with a hint (never routed: the hook judged the
+# command by its words); no hit passes through to the user's own ssh.
+# ---------------------------------------------------------------------------
+
+G_TIMEOUT = 1.5           # the user's `ssh -G`, and each address lookup
+HOP_DEPTH = 4             # ProxyJump hops followed through `ssh -G`
+
+
+@dataclass
+class Reach:
+    kind: str                  # "host" | "endpoint" | "none"
+    name: str | None = None    # the configured host, or the account (endpoint)
+    how: str = ""              # "" for a direct hit; else how it was found (the hint)
+
+
+def _owner_reach(st: State, host: str, command: str) -> Reach | None:
+    """An account's ssh endpoint (git@github.com, hf.co, a GHES host): the
+    account that covers the owner named in the remote command (a covered
+    owner, the default, the only account of its kind there, or a command
+    that names no owner: PLAN-0.11 §1.4 step 9), else none (Reach "none": an
+    owner no account covers passes through with the user's own agent); None
+    when `host` is no account's ssh endpoint."""
+    c = st.eff.configured
+    h = host.lower().strip("[]")
+    if not any(h in r.ssh_hosts for r in c.reaches()):
+        return None
+    from . import gitroute
+    parsed = accounts.owner_from_git_command(command)
+    owner = parsed[1] if parsed else None
+    where = gitroute.Where(scheme="ssh", host=h, path=f"{owner}/x" if owner else "")
+    names = [n for sect, n in c.git_targets().hits(where) if sect == "accounts"]
+    return Reach("endpoint", names[0]) if names else Reach("none", h)
+
+
+def _direct_reach(word: str, st: State, command: str = "") -> Reach | None:
+    """A direct hit on a destination word ([user@]host): a configured host's
+    name, gw-NAME, address or `also` host, or an account's ssh endpoint."""
+    host = word.rsplit("@", 1)[-1].strip("[]").lower()
+    n = st.eff.configured.host_named(host)
+    if n is not None:
+        return Reach("host", n)
+    return _owner_reach(st, host, command)
+
+
+def _user_ssh_g(args: list[str]) -> dict[str, list[str]] | None:
+    """What the user's own ssh makes of these arguments (`ssh -G`, 1.5 s):
+    hostname, user, port, proxyjump, proxycommand; None when there is no
+    user ssh or it doesn't answer. It runs the user's own config (its `Match
+    exec` too): the same argv is about to be exec'd with the same
+    environment, and this process holds no secret (PLAN-0.11 §1.4 step 2)."""
+    real = envfile.user_tool("ssh")
+    if real is None:
+        return None
+    try:
+        r = subprocess.run([real, "-G", *args], capture_output=True, text=True,
+                           timeout=G_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return ssh_conf.parse_g(r.stdout)
 
 
 def _ips(name: str) -> frozenset[str]:
@@ -605,39 +849,138 @@ def _ips(name: str) -> frozenset[str]:
         return frozenset()
 
 
-def _form_host_behind(argv: list[str], form: formmod.Form) -> str | None:
-    """others = "mine": where the system ssh would really go (`ssh -G` with
-    the user's config: aliases, HostName). The form host at that address and
-    port (by name, or by IP address), if any: it must be reached by its form
-    name so its rights apply. None when -G can't tell (the system ssh then
-    fails the same way)."""
-    try:
-        r = subprocess.run([*_user_ssh_cmd(), "-G", *argv], capture_output=True, text=True,
-                           timeout=15, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if r.returncode != 0:
-        return None
-    g = ssh_conf.parse_g(r.stdout)
-    h = (g.get("hostname") or [""])[0].strip().lower()
-    try:
-        port = int((g.get("port") or ["22"])[0])
-    except ValueError:
-        return None
-    if not h:
-        return None
-    addrs = [(n, a) for n, x in form.hosts.items() if not x.is_local
-             for a in x.addresses() if a.port == port]
-    for n, a in addrs:
-        if a.host.lower() == h:
-            return n
-    names = list(dict.fromkeys([h, *(a.host.lower() for _n, a in addrs)]))
-    ips = dict(zip(names, ssh_conf.parallel(_ips, names, 1.5)))
-    mine = ips.get(h) or frozenset()
-    for n, a in addrs:
-        if mine & (ips.get(a.host.lower()) or frozenset()):
-            return n
+_PC_WORD = re.compile(r"[A-Za-z0-9._@\[\]:-]+")
+
+
+def _words_hit(text: str, st: State) -> Reach | None:
+    """A configured host (or account endpoint) named among a ProxyCommand's
+    words."""
+    for w in _PC_WORD.findall(text or ""):
+        w = w.rsplit("@", 1)[-1]
+        for cand in (w, w.split(":", 1)[0] if w.count(":") == 1 else w):
+            n = st.eff.configured.host_named(cand.strip("[]"))
+            if n is not None:
+                return Reach("host", n)
+            h = cand.strip("[]").lower()
+            if any(h in r.ssh_hosts for r in st.eff.configured.reaches()):
+                acct = next(r.name for r in st.eff.configured.reaches() if h in r.ssh_hosts)
+                return Reach("endpoint", acct)
     return None
+
+
+def _hop_host(hop: str) -> tuple[str, int | None]:
+    h = hop
+    if h.lower().startswith("ssh://"):
+        h = h[6:].rstrip("/")
+    h = h.rsplit("@", 1)[-1]
+    if h.startswith("["):
+        host, _, rest = h[1:].partition("]")
+        p = rest[1:] if rest.startswith(":") else ""
+    else:
+        host, _, p = h.partition(":")
+    return host.lower(), (int(p) if p.isdigit() else None)
+
+
+def _indirect(word: str, port: int | None, st: State, args: list[str],
+              command: str = "") -> Reach | None:
+    """A configured target reached only through the user's ssh config, a
+    jump host, a ProxyCommand or an address (PLAN-0.11 §1.4 step 3): the
+    `ssh -G` hostname, every ProxyJump hop (followed through `ssh -G`), the
+    ProxyCommand's words, and the resolved IP addresses (the same port)."""
+    g = _user_ssh_g(args)
+    hostname = ((g or {}).get("hostname") or [""])[0].strip().lower()
+    try:
+        gport = int(((g or {}).get("port") or [""])[0])
+    except ValueError:
+        gport = None
+    if hostname and hostname != word.rsplit("@", 1)[-1].strip("[]").lower():
+        n = st.eff.configured.host_named(hostname)
+        if n is not None:
+            return Reach("host", n, f"your ssh config sends it to {hostname}")
+        o = _owner_reach(st, hostname, command)
+        if o is not None and o.kind == "endpoint":
+            o.how = f"your ssh config sends it to {hostname}"
+            return o
+    # ProxyJump hops: the argv's and the config's, each followed through -G
+    lp = ssh_args.parse_lenient(args)
+    hops = list(lp.jumps())
+    for v in (g or {}).get("proxyjump") or []:
+        hops += [h.strip() for h in v.split(",") if h.strip() and h.strip().lower() != "none"]
+    seen: set[str] = set()
+    depth = 0
+    while hops and depth <= HOP_DEPTH * 4:
+        depth += 1
+        hop = hops.pop(0)
+        hh, _hp = _hop_host(hop)
+        if not hh or hh in seen:
+            continue
+        seen.add(hh)
+        n = st.eff.configured.host_named(hh)
+        if n is not None:
+            return Reach("host", n, f"it goes through {hh}")
+        if len(seen) <= HOP_DEPTH:
+            hg = _user_ssh_g([hop])
+            if hg is not None:
+                real = (hg.get("hostname") or [""])[0].strip().lower()
+                n = st.eff.configured.host_named(real) if real else None
+                if n is not None:
+                    return Reach("host", n, f"it goes through {hh}, which your ssh config sends "
+                                            f"to {real}")
+                for v in hg.get("proxyjump") or []:
+                    hops += [h.strip() for h in v.split(",")
+                             if h.strip() and h.strip().lower() != "none"]
+                for v in hg.get("proxycommand") or []:
+                    r = _words_hit(v, st) if v.lower() != "none" else None
+                    if r is not None:
+                        r.how = f"it goes through {hh}, whose ProxyCommand names {r.name}"
+                        return r
+    # ProxyCommand: the argv's and the config's
+    for v in lp.o_values("proxycommand") + list((g or {}).get("proxycommand") or []):
+        if v and v.lower() != "none":
+            r = _words_hit(v, st)
+            if r is not None:
+                r.how = f"its ProxyCommand names {r.name}"
+                return r
+    # a resolved address (the same port) of a configured host
+    target = hostname or word.rsplit("@", 1)[-1].strip("[]").lower()
+    p = gport or port or 22
+    addrs = [(n, a) for n, al in st.eff.configured.hosts.items() for a in al if a.port == p]
+    if target and addrs:
+        names = list(dict.fromkeys([target, *(a.host.lower() for _n, a in addrs)]))
+        ips = dict(zip(names, ssh_conf.parallel(_ips, names, G_TIMEOUT)))
+        mine = ips.get(target) or frozenset()
+        for n, a in addrs:
+            if mine & (ips.get(a.host.lower()) or frozenset()):
+                return Reach("host", n, f"{target} is {n}'s address")
+    return None
+
+
+def _reach_of(word: str, port: int | None, st: State, extra: list[str] | None = None,
+              command: str = "", args: list[str] | None = None) -> Reach:
+    """Where a destination word goes (PLAN-0.11 §1.4): a direct hit, else an
+    indirect one (Reach.how set), else Reach("none")."""
+    r = _direct_reach(word, st, command)
+    if r is not None:
+        return r
+    a = args if args is not None else [*(extra or []), *(["-p", str(port)] if port else []), word]
+    r = _indirect(word, port, st, a, command)
+    return r if r is not None else Reach("none")
+
+
+def _hint(word: str, r: Reach, tool: str = "ssh") -> str:
+    shown = formmod.safe(word.rsplit("@", 1)[-1]) or "that name"
+    if r.kind == "endpoint":
+        return (f"gateway: {shown} reaches an account's git server ({r.how}), which goes through "
+                f"the gateway ({r.name}); use its own name (git@HOST) so its account applies.")
+    return (f"gateway: {shown} reaches {r.name}, which goes through the gateway ({r.how}); use "
+            f"`{tool} {r.name}` so its rights apply.")
+
+
+def _ssh_entries(st: State) -> list[str]:
+    """What the gateway handles ssh for (the 127 message): configured hosts
+    and accounts with an ssh endpoint."""
+    c = st.eff.configured
+    return [*c.hosts, *(r.name for r in c.reaches() if r.ssh_hosts)]
 
 
 # ---------------------------------------------------------------------------
@@ -718,14 +1061,19 @@ def _policy_gate(name: str, a: ssh_args.SshArgs, st: State) -> None:
     server here."""
     for act, path in ssh_args.ssh_actions(a, _scp_parent_actions):
         # a path is decided in its workspace and in every one it may reach
-        d = ssh_args.decide_path(st.eff, act, name, path)
+        d = ssh_args.decide_path(st.eff, act, name, path, st.mode)
         if d.word is True:
             continue
         what = ssh_args.FORWARD_WHAT.get(act[8:]) if act.startswith("forward_") else None
         if d.word == "ask":
-            typed, _by = _typed()
-            if typed:
+            # a command Claude typed with the hook's record, or git's own read
+            # or write (git-upload-pack / git-receive-pack) under the gated
+            # git the hook asked about (PLAN-0.11 §6.5)
+            asked, by = _asked(name, via=("hosts", name) if act in ("read", "write") else None)
+            if asked:
                 continue
+            if by.startswith(_UNASKED):
+                raise _ask_refusal(name, act, by)
         raise SshError(d.message(what))
     if "x11" in a.forwards and not os.environ.get("DISPLAY"):
         raise SshError(f"gateway: X11 forwarding to {name} is allowed, but there is no X server "
@@ -735,44 +1083,59 @@ def _policy_gate(name: str, a: ssh_args.SshArgs, st: State) -> None:
 
 
 def _ssh(argv: list[str]) -> int:
+    """PLAN-0.11 §1.4: a lenient parse finds the destination without
+    refusing anything; a direct hit on a configured host takes the gated
+    path (the full parse with its refusals, rights, policy and pins), an
+    account endpoint whose owner an account covers takes the account's; a
+    hit found only indirectly is refused with a hint; anything else runs the
+    user's own ssh (pass_through), refused options included (they are the
+    user's business there)."""
+    lp = ssh_args.parse_lenient(argv)
+    if lp.dest is None:
+        st0 = _load()
+        return envfile.pass_through("ssh", argv, None, entries=_ssh_entries(st0))
+    try:
+        ldest = ssh_args.parse_destination(lp.dest)
+        lport = ssh_args.parse_port(lp.port) if lp.port else ldest.port
+    except ssh_args.Refused:
+        ldest, lport = None, None
+    st = _load()
+    word = ((lp.login + "@") if lp.login else "") + (ldest.host if ldest else lp.dest)
+    r = _reach_of(word, lport, st, command=lp.command_text, args=argv)
+    if r.kind == "none":
+        return envfile.pass_through("ssh", argv, ldest.host if ldest else None,
+                                    entries=_ssh_entries(st))
+    if r.how:
+        return _refuse("ssh", r.name, _hint(lp.dest, r))
+    # the gated path: today's full parse and refusals
     try:
         a = ssh_args.parse_ssh(argv, forwards=True)
         port = ssh_args.parse_port(a.port)
     except ssh_args.Refused as e:
-        return _refuse("ssh", None, e.message)
-    if a.has("V") or any(c == "Q" for c, _ in a.opts):
-        real = ssh_conf.ssh_bin()
-        q = [v for c, v in a.opts if c == "Q"]
-        os.execv(real, [real, "-Q", q[0]] if q else [real, "-V"])
+        return _refuse("ssh", r.name, e.message)
     if a.dest is None:
-        return _refuse("ssh", None, "gateway: ssh needs a host: ssh NAME COMMAND")
+        return _refuse("ssh", r.name, "gateway: ssh needs a host: ssh NAME COMMAND")
     try:
         dest = ssh_args.parse_destination(a.dest)
     except ssh_args.Refused as e:
-        return _refuse("ssh", None, e.message)
+        return _refuse("ssh", r.name, e.message)
     if port is None:
         port = dest.port
-    st = _load()
-    t = _classify(dest, port, st.form)
+    try:
+        _need_vault(st)
+    except SshError as e:
+        return _refuse("ssh", r.name, e)
+    if r.kind == "endpoint":
+        t = Target("endpoint", by="endpoint")
+    else:
+        t = _classify_configured(r.name or "", dest, port, st)
     if a.forwards and t.kind != "host":
         k = a.forwards[0]
         return _refuse("ssh", formmod.safe(dest.host),
                        f"gateway: {ssh_args.FORWARD_WHAT[k]} is only for a host in gateway.toml whose "
                        f"policy turns it on ([hosts.NAME.policy] forward_{k} = \"allow\"); run "
                        "the command without it")
-    if t.kind == "unknown":
-        if st.eff.others == "mine":
-            behind = _form_host_behind(argv, st.form)
-            if behind is not None:
-                shown = formmod.safe(dest.host) or "that name"
-                return _refuse("ssh", behind, f"gateway: {shown} is {behind} in gateway.toml (same "
-                                              f"address); run `ssh {behind} CMD` so its rights apply")
-            audit.log("others_mine", tool="ssh", target=formmod.safe(dest.host))
-            real = _system_ssh()
-            os.execv(real, [real, *argv])
-        return _refuse("ssh", formmod.safe(dest.host), _unknown_message(dest, a.command_text,
-                                                                        st.form))
-    if t.kind in ("local", "disabled", "error"):
+    if t.kind in ("local", "disabled", "error", "refused"):
         return _refuse("ssh", formmod.safe(dest.host), t.error or "gateway: refused")
     if not a.command and not a.has("N"):
         return _refuse("ssh", formmod.safe(dest.host),
@@ -782,20 +1145,64 @@ def _ssh(argv: list[str]) -> int:
     return _host(a, dest, port, st, t)
 
 
+def _classify_configured(name: str, dest: ssh_args.Destination, port: int | None,
+                         st: State) -> Target:
+    """The gated path's target for a configured host `name` the destination
+    names directly: refused outright when the configured set holds it but it
+    can't be used (a mistake in it, only the configured list names it,
+    gateway.toml gone, its approval unreadable), else the host by name or by
+    the address it named (an address two configured hosts share is an
+    error). A host the form no longer names keeps gating with its approved
+    entry until the user's OK (PLAN-0.11 §1.1)."""
+    eff = st.eff
+    if st.form.is_disabled(name, "hosts") and name not in st.form.hosts:
+        return Target("disabled", error=f"gateway: {name} is off because of a mistake in "
+                                        "gateway.toml; gate status shows the line to fix")
+    why = eff.refused.get(name)
+    if why is not None:
+        return Target("refused", error=f"gateway: {name} is refused: {why}")
+    eh = eff.hosts.get(name)
+    if eh is None or eh.host is None:
+        why = eff.refusal(name) or f"it waits for the user's OK (gate check {name})"
+        return Target("refused", error=f"gateway: {name} isn't usable now: {why}")
+    h = dest.host
+    if h.startswith("gw-") and h[3:] == name:
+        h = name
+    if h == name:
+        return Target("host", name=name, by="name")
+    hits: dict[str, list[formmod.Address]] = {}
+    for n, x in eff.hosts.items():
+        if x.is_local or x.host is None:
+            continue
+        for a in [*x.host.addresses(), *x.held_addresses]:
+            if a.host == h and (port is None or a.port == port):
+                hits.setdefault(n, []).append(a)
+    if len(hits) > 1:
+        names = " and ".join(sorted(hits))
+        return Target("error", error=f"gateway: {names} both use that address; run ssh with the "
+                                     "host's name instead")
+    if hits:
+        (n, addrs), = hits.items()
+        return Target("host", name=n, by="address", matches=addrs)
+    return Target("host", name=name, by="name")
+
+
 def _host(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None, st: State,
           t: Target) -> int:
     name = t.name or ""
-    fh = st.form.hosts[name]
     eh = st.eff.hosts.get(name)
+    # a host the form no longer names gates with its approved entry until the
+    # user's OK (PLAN-0.11 §1.1): consent rebuilt it from the approval
+    fh = st.form.hosts.get(name) or (eh.host if eh is not None else None)
     try:
-        if eh is None or eh.new:
+        if eh is None or eh.new or fh is None:
             raise SshError(f"gateway: {name} waits for the user's OK; run gate check {name} while "
                            "the user is here")
         if eh.ssh is False and fh.ssh is not False and not eh.addresses:
             raise SshError(f"gateway: {name}'s address waits for the user's OK; run gate check "
                            f"{name} while the user is here")
         who = _direct()
-        _gate_rights(name, eh.ssh, eh.scripts, who=who, form_right=fh.ssh)
+        _gate_rights(name, eh.ssh, eh.scripts, who=who, form_right=fh.ssh, via=("hosts", name))
         _check_users(name, fh, [a.login, dest.user])
         cands = list(eh.addresses)
         if t.by == "address":
@@ -814,8 +1221,8 @@ def _host(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None, st:
         if eh.sudo is False and ssh_args.sudo_in_command_position(cmd):
             raise SshError(off_message(name, "sudo", fh.sudo))
         if want_sudo and eh.sudo == "ask":
-            typed, by = _typed()
-            if not typed:
+            asked, by = _asked(name)
+            if not asked:
                 raise _ask_refusal(name, "sudo", by)
         # scripts = false: only `sudo` in command position in Claude's own command
         # gets the password (the askpass is a shell function, not exported), so
@@ -825,8 +1232,12 @@ def _host(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None, st:
         _policy_gate(name, a, st)
         if use_sudo:
             from . import policy
-            d = policy.decide(st.eff, "elevation", host=name)
-            if d.word is False or (d.word == "ask" and not _typed()[0]):
+            d = policy.decide(st.eff, "elevation", host=name, mode=st.mode)
+            if d.word == "ask":
+                asked, by = _asked(name)
+                if not asked and by.startswith(_UNASKED):
+                    raise _ask_refusal(name, "elevation", by)
+            if d.word is False or (d.word == "ask" and not asked):
                 raise SshError(d.message())
         link = _build_link(name, st, cands, checked=True)   # _gate_rights above
         overrides = None
@@ -849,7 +1260,7 @@ def _host(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None, st:
             reuse = conn.master_alive()
             audit.use("ssh", name, None, ["ssh", name, *a.command], address=link.addr.render(),
                       via=link.jump.name if link.jump else None, reuse=reuse,
-                      remote_sudo=use_sudo, why=link.why)
+                      remote_sudo=use_sudo, why=link.why, mode=_audit_mode())
             if use_sudo:
                 return _run_sudo(conn, a, kept, name, link.addr.effective_user(), st,
                                  bool(eh.scripts), _sudo_names(cmd))
@@ -953,7 +1364,8 @@ def _ask_secret(name: str, what: str, prompt: str, verify: Any = None, store: An
     joined another process's pop-up gets `load()` on OK (popup.py); with no
     value even then, `joined` (or a retry line) is the message. `check` is
     what gated rechecks before it hands the value over (host_check);
-    `remember=True` offers "Remember it" (ticked) where storing is optional."""
+    `remember` offers "Remember it" where storing is optional, its value the
+    box's first state (the sudo dialog's: unticked, ssh_sudo.REMEMBER_DEFAULT)."""
     kw: dict[str, Any] = {"verify": verify, "store": store, "detail": detail, "lazy": lazy,
                           "check": check}
     if load is not None:
@@ -979,8 +1391,8 @@ def host_check(name: str, *rights: str) -> dict[str, Any]:
 
 def _sudo_note(name: str, user: str) -> str:
     """The sudo pop-up's honest caveat (docs/dev/modules/ssh.md, residual risk)."""
-    return (f"While sudo uses it, commands Claude runs on {name} could read it. Untick Remember "
-            "it to use it for this command only.")
+    return (f"While sudo uses it, commands Claude runs on {name} could read it. "
+            + ssh_sudo.REMEMBER_NOTE)
 
 
 def _sudo_store(name: str, user: str) -> Any:
@@ -1023,7 +1435,7 @@ def _sudo_password(name: str, user: str, st: State, conn: Conn) -> tuple[str, bo
                      joined=(f"gateway: the sudo password for {name} was entered in another "
                              "command's gateway dialog and can't be read back here (it isn't kept "
                              "when Remember it is unticked); run the command again"),
-                     check=host_check(name, "ssh", "sudo"), remember=True)
+                     check=host_check(name, "ssh", "sudo"), remember=ssh_sudo.REMEMBER_DEFAULT)
     if ssh_sudo.too_short(pw):          # verify refuses these; a joined/loaded value too
         raise SshError(ssh_sudo.short_message(name, user), 2)
     return pw, True, None
@@ -1048,8 +1460,8 @@ def _rights_after_dialog(name: str) -> None:
     if eh.sudo is False:
         raise SshError(off_message(name, "sudo", fh.sudo), 1)
     if eh.sudo == "ask":
-        typed, by = _typed()
-        if not typed:
+        asked, by = _asked(name)          # the record this call took (asks.standin)
+        if not asked:
             raise _ask_refusal(name, "sudo", by)
 
 
@@ -1088,7 +1500,7 @@ def _rejected(name: str, user: str, conn: Conn) -> str:
     ssh_sudo.forget_verified(name, user)
     msg = _reentry_popup(name, user, conn.target)
     _err(msg)
-    audit.refusal("ssh", name, msg)
+    audit.refusal("ssh", name, msg, mode=_audit_mode())
     return msg
 
 
@@ -1226,8 +1638,14 @@ def _endpoint(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None,
                            "only git-lfs may run it (git lfs pull / git lfs push do)")
         sel_host = _sel_host(accts[0])
         # accounts.select refuses when the owner's account isn't usable yet
-        # (it never hands those repos to the default or the only other one)
-        sel = accounts.select(kinds, sel_host, owner, st.form, effective=st.eff, vault=st.data)
+        # (it never hands those repos to the default or the only other one);
+        # an account's "ask" (its use or credential) passes for the gated
+        # git's push the approval hook asked about that account for
+        from . import githelper
+        g = githelper.gated_parent()
+        asked = {n for s, n in g.asked if s == "accounts"} if g.strict() else set()
+        sel = accounts.select(kinds, sel_host, owner, st.form, effective=st.eff, vault=st.data,
+                              mode=st.mode, asked=asked)
         if sel.error:
             raise SshError(sel.error)
         if sel.account is None:
@@ -1235,11 +1653,15 @@ def _endpoint(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None,
                            + " (git over ssh needs an account's key)")
         acct = sel.account
         ea = st.eff.accounts.get(acct.name)
-        _gate_rights(acct.name, bool(ea and ea.use), bool(ea and ea.scripts), what="git over ssh")
+        use = st.eff.word(acct.name, "use", st.mode)
+        right = "ask" if use == "ask" else bool(ea and ea.use)
+        _gate_rights(acct.name, right, bool(ea and ea.scripts), what="git over ssh",
+                     via=("accounts", acct.name))
         from . import policy
         for act in ("credential",) + (("write",) if service.startswith("git-receive-pack") else ()):
-            d = policy.decide(st.eff, act, account=acct.name)
-            if d.word is False or (d.word == "ask" and not _typed()[0]):
+            d = policy.decide(st.eff, act, account=acct.name, mode=st.mode)
+            if d.word is False or (d.word == "ask" and not _asked(acct.name,
+                                                                 via=("accounts", acct.name))[0]):
                 raise SshError(d.message("a git push" if act == "write" else None))
         if not consent.bound_ok(st.data, acct.name, sel_host):
             raise SshError(f"gateway: {acct.name}'s credential isn't bound to {sel_host}; run gate "
@@ -1269,7 +1691,7 @@ def _endpoint(a: ssh_args.SshArgs, dest: ssh_args.Destination, port: int | None,
             kept = a.kept_options()
             _verify_cmdline(conn, kept, a.command)
             audit.use("ssh", f"{user}@{host}", acct.name, [service, owner or ""],
-                      address=addr.render())
+                      address=addr.render(), mode=_audit_mode())
             return _run_plain(conn, a, kept, acct.name)
         except SshError as e:
             return _refuse("ssh", formmod.safe(host), e)
@@ -1525,10 +1947,10 @@ def _recorded(name: str) -> str:
 
 
 def _user_agent_sock() -> str | None:
-    """The user's own ssh agent for "use my own SSH login once". Claude's Bash
-    (where gate check and its pop-up helper start) has SSH_AUTH_SOCK unset
-    (others = "refuse"), so (round 3) it comes from the session record (Claude
-    Code's environment), else the caller's environment, else macOS's
+    """The user's own ssh agent for "use my own SSH login once". A command in
+    Claude's Bash (where gate check and its pop-up helper start) may have
+    changed or unset its SSH_AUTH_SOCK, so (round 3) it comes from the session
+    record (Claude Code's environment) first, else the caller's environment, else macOS's
     launchd, else the usual sockets under $XDG_RUNTIME_DIR on Linux; each
     only when it is a socket owned by the user."""
     for cand in (_recorded("SSH_AUTH_SOCK"), os.environ.get("SSH_AUTH_SOCK", "")):
@@ -1563,6 +1985,26 @@ def _user_agent_env() -> dict[str, str]:
     if sock:
         env["SSH_AUTH_SOCK"] = sock
     return env
+
+
+def _system_ssh() -> str:
+    """The system's ssh for "use my own SSH login once" (gate check's key
+    install; CLAUDE.md invariant 13), by path."""
+    t = testing.get("system_ssh")
+    if t:
+        return str(t)
+    if os.access("/usr/bin/ssh", os.X_OK):
+        return "/usr/bin/ssh"
+    return ssh_conf.ssh_bin()
+
+
+def _user_ssh_cmd() -> list[str]:
+    """The system ssh with the user's own config (tests: -F ssh_user_config)."""
+    cmd = [_system_ssh()]
+    ucfg = testing.get("ssh_user_config")
+    if ucfg:
+        cmd += ["-F", str(ucfg)]
+    return cmd
 
 
 def _install_my_login(name: str, st: State, link: Link, cmd: str) -> None:
@@ -1715,7 +2157,7 @@ def _audit_gate(link: Link, command: str, **extra: Any) -> None:
     """One audit `use` line for a credential use by the gate process itself
     (gate check helpers, copy-to): host, address, via, command summary."""
     audit.use("gate", link.name, None, ["ssh", link.name, command], address=link.addr.render(),
-              via=link.jump.name if link.jump else None, why=link.why, **extra)
+              via=link.jump.name if link.jump else None, why=link.why, mode=_audit_mode(), **extra)
 
 
 def test_login(name: str) -> tuple[bool, str]:

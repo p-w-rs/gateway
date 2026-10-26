@@ -9,8 +9,9 @@ Modules: safety (guards, hermetic env), fakeapi (fake API server + client),
 driver (PTY session), install (snapshots, git server, `claude plugin`),
 gwe2e (the gateway's e2e route and the session guard), scan (canaries),
 observe (observer plugin helpers), gitserve (git server process), proxy (the
-record-only telemetry proxy, mitmproxy through `pixi exec`). Python 3.12, stdlib + pyte. The same folder is kept identical in
-the gateway and checkpoint repositories (tests/tui/).
+record-only telemetry proxy, mitmproxy through `pixi exec`). The newest
+Python (`pixi exec --spec python`), stdlib + pyte. The same folder is kept
+identical in the gateway and checkpoint repositories (tests/tui/).
 """
 from . import safety  # noqa: F401
 

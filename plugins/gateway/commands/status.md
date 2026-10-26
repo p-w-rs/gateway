@@ -19,9 +19,10 @@ Only when it applies (otherwise say nothing about it):
 - the output says the gateway is still setting up, or that `gate` wasn't
   found: the gateway builds its tools in the background during the first
   session (about a minute) and works once a new session starts;
-- it says pixi isn't installed: point to https://pixi.sh; it says setup
-  failed: name the log file it shows (setup is retried at the next session
-  start);
+- it says pixi isn't installed: point to https://pixi.sh; pixi is too old:
+  `pixi self-update` (or the package manager for a Homebrew or MacPorts
+  pixi), then a new session; setup failed: name the log file
+  it shows (setup is retried at the next session start);
 - it lists a gateway dialog waiting (`/gate-dialog` shows it), a change
   waiting for their OK or problems in gateway.toml: point that out once.
 

@@ -2,7 +2,19 @@
 
 Reading:
 - a lenient pre-pass turns bare `sudo = yes|no|on|off|ask|true|false` words
-  (keys ssh, sudo, scripts, use, default, packages) into TOML values;
+  (keys ssh, sudo, scripts, use, default, packages) into TOML values, and
+  bare cc / allow / deny into strings (those keys, the policy restrictions
+  and [network] commands);
+- rights (ssh, sudo, an account's use), the policy restrictions read, exec,
+  write, network, elevation and credential, and [network] commands take a
+  word or a per-mode inline table (PLAN-0.11 §2, modes.py): the value per
+  mode is kept in new attributes (`Host.modes`, `Account.modes`, the
+  `policy_modes` beside every `policy`, `Form.network.commands`), and the
+  attributes every older reader uses (`Host.ssh`, `Host.sudo`,
+  `Account.use`, `policy`) hold the modeless resolution in today's
+  vocabulary (True / "ask" / False; cc and allow are True; an account's use
+  is True only for cc), so a reader that knows nothing of modes gets the
+  strict value;
 - tomllib parses it; a syntax error keeps the last good form (the caller passes
   it from the vault) and reports the line;
 - every entry is validated on its own: a bad entry is disabled and reported
@@ -28,7 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import paths
+from . import modes, paths
+from .modes import ModeValue
 
 # ---------------------------------------------------------------------------
 # Grammar
@@ -39,6 +52,13 @@ RESERVED = frozenset({"localhost", "local", "this", "all", "gateway", "gate", "s
 KINDS = ("github", "huggingface", "azure", "ml-catalog", "pijul", "registry", "api-key")
 RIGHT_WORDS = {"true": True, "yes": True, "on": True, "false": False, "no": False,
                "off": False, "ask": "ask"}
+# The form a new install starts with (SessionStart writes it when there is
+# neither a form nor anything stored): these three comment lines, no entry.
+STARTER = (
+    "# The machines and accounts Claude may use. Edit freely, or ask Claude.\n"
+    "# Secrets never go here; the gateway asks for them in its dialog in Claude Code.\n"
+    "#   true = yes (in Auto and Bypass without asking)   \"ask\" = ask me each time   false = no\n"
+)
 
 USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")
 LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
@@ -134,16 +154,15 @@ def git_server_note(host: str) -> str | None:
     if kind:
         return (f"{h} is a git server, not a machine: add a {kind} account (kind = \"{kind}\") "
                 "instead of a host")
-    return (f"{h} is a git server, not a machine, and the gateway has no account kind for it: use "
-            "https for a public repository, or ask the user about others = \"mine\" in [settings]")
+    return (f"{h} is a git server, not a machine, and the gateway has no account kind for it: "
+            "leave it out of gateway.toml (the user's own ssh and git reach it)")
 LOCALHOST_KEYS = ("sudo", "scripts", "note", "policy", "workspaces")
-# sudo on this computer when the form doesn't say (no [hosts.localhost], or one
-# without sudo): "ask", Claude Code asks each time, on a new install. An
-# install whose vault an older gateway made (vault.older_install) keeps that
-# gateway's default, true (apply_install_defaults). A remote host's ssh and
-# sudo default to true.
+# This computer's sudo when the form doesn't say (no [hosts.localhost], or one
+# without sudo) is not configured (PLAN-0.11 §1.5: the user's own sudo runs,
+# `Host.sudo_configured` False, no `modes["sudo"]`). The legacy attribute
+# `Host.sudo` then holds "ask", the strict value for a reader that doesn't
+# know the marker. A remote host's ssh and sudo default to true.
 LOCALHOST_SUDO = "ask"
-LOCALHOST_SUDO_OLDER = True
 # a host's `runtime` (PLAN-v4 phase 6): where the gateway stages its managed
 # remote runtime on that host (daemon/remote.py base_ok says the same)
 RUNTIME_RE = re.compile(r"(?:~/|/)[A-Za-z0-9._/@+-]{0,200}")
@@ -152,18 +171,49 @@ COMMON_KEYS = ("kind", "login", "owners", "default", "name", "email", "env", "sc
 KIND_KEYS: dict[str, tuple[str, ...]] = {
     "github": ("host", "packages"),
     "huggingface": (),
-    "azure": ("tenant", "client_id", "databricks", "storage", "registries", "sites"),
-    "ml-catalog": ("host",),
+    "azure": ("tenant", "client_id", "databricks", "storage", "registries", "sites", "sign_in",
+              "scope"),
+    "ml-catalog": ("host", "tenant"),
     "pijul": ("host", "remote_pijul"),
     "registry": ("host",),
     "api-key": ("sites", "auth"),
 }
+# The browser sign-in (PLAN-0.11 §7): azure's `sign_in` ("browser", or
+# "service-principal", the default, kept as "") and `scope` (the authorization
+# request's scope only: space-separated tokens, offline_access added), and
+# ml-catalog's optional `tenant` (default "organizations"; its authority and
+# scope are fixed, its client id comes from the bound catalog).
+SIGN_IN_WORDS = ("browser", "service-principal")
+SCOPE_TOKEN_RE = re.compile(r"[A-Za-z0-9._:/~-]{1,200}")
+SCOPE_MAX_TOKENS = 8
+CATALOG_TENANT = "organizations"
 IDENTITY_KINDS = ("github", "huggingface", "pijul")   # name / email for commits
 ENV_KINDS = ("github", "huggingface", "azure", "api-key")
-SETTINGS_KEYS = ("others",)
 VAULT_KEYS = ("lock_after",)
 SHELL_KEYS = ("managed", "import_path", "import_env")
-TOP_KEYS = ("settings", "vault", "shell", "policy", "hosts", "accounts")
+# [network] (PLAN-0.11 §3.2): network commands are one class the approval
+# hook judges (curl, wget, nmap, ... and the structural members below by
+# their reserved names). `commands` is a word or a per-mode table (deny,
+# ask, cc, allow; "ask" in every mode when absent); `extra` adds names to the
+# class, `drop` takes names (or reserved names) out. A name entering the
+# class is a narrowing, one leaving it and a raised `commands` are widenings
+# (consent entry "settings"). A mistake keeps the approved [network].
+NETWORK_KEYS = ("commands", "extra", "drop")
+NETWORK_DEFAULT = "ask"
+NETWORK_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
+NETWORK_LIST_MAX = 32
+NETWORK_BUILTIN = (
+    "curl", "wget", "wget2", "aria2c", "xh", "http", "https", "lynx", "w3m", "links", "links2",
+    "nmap", "nping", "masscan", "zmap", "rustscan", "hping3", "ssh-keyscan",
+    "nc", "ncat", "netcat", "socat", "telnet", "ftp", "tftp", "lftp", "smbclient", "certutil",
+    "tcpdump", "tshark", "nikto", "sqlmap", "hydra", "gobuster", "ffuf", "nuclei", "arp-scan",
+    "iperf3")
+NETWORK_RESERVED = ("openssl-tls", "http-server", "dev-tcp", "rsync-daemon", "busybox")
+TOP_KEYS = ("vault", "shell", "policy", "network", "hosts", "accounts")
+# [settings] (its one key, `others`) is gone (PLAN-0.11 §0.2): anything not in
+# gateway.toml is the user's own. A written one is a warning, never read.
+SETTINGS_GONE = ("[settings] was removed in gateway 0.11 (anything not in gateway.toml uses the "
+                 "user's own ssh, git, gh and sudo now); delete the table")
 # Policy (PLAN-v4 phase 7, docs/dev/modules/policy.md): allow / ask / deny per
 # action, layered on the rights above (ssh, sudo, an account's use) and never
 # above them. Restrictions (the first list) default to what the right gives
@@ -174,9 +224,12 @@ TOP_KEYS = ("settings", "vault", "shell", "policy", "hosts", "accounts")
 # them on; [policy] can only keep them off. A read grant never implies any
 # other action. Raising or removing a restriction, and turning a grant on,
 # are widenings (the user's OK in the gateway dialog, `gate check NAME`).
+# PLAN-0.11 §2.2: the restrictions in POLICY_MODED take a word or a per-mode
+# table ("cc" too); env_import, provision and the grants take one word.
 POLICY_WORDS = {"allow": True, "ask": "ask", "deny": False}
 POLICY_RESTRICT = ("read", "exec", "write", "network", "elevation", "credential", "env_import",
                    "provision")
+POLICY_MODED = ("read", "exec", "write", "network", "elevation", "credential")
 POLICY_GRANT = ("forward_agent", "forward_x11", "forward_remote", "forward_stdio")
 HOST_POLICY_KEYS = ("read", "exec", "write", "network", "elevation", "credential", "env_import",
                     "provision") + POLICY_GRANT
@@ -191,15 +244,13 @@ WORKSPACES_MAX = 32
 # PATH, and names whose values come from that host's own login environment.
 HOST_SHELL_KEYS = ("import_path", "import_env")
 # [shell] (PLAN-v4 phase 4, docs/dev/modules/managed.md): how Claude's Bash runs.
-# managed = "on" (the default: the gateway's managed bash, a curated
-# environment, never the login shell), "warn" (managed while Claude Code's
-# mods run; without them, the user's own shell with a notice each session) or
-# "off" (Claude Code's own shell, as before v4). import_path adds host
-# folders to the managed PATH (after the stand-ins and runtime tools, before
-# the system folders); import_env passes named variables from Claude Code's
-# environment. Lowering `managed` and adding an import are widenings (the
-# user's OK in the gateway dialog, `gate check settings`).
-SHELL_MODES = {"on": "on", "warn": "warn", "off": "off"}
+# managed = "on" (the default: the gateway's managed bash) or "off" (Claude
+# Code's own shell). "warn" is gone (PLAN-0.11 §1.6): written, it is a
+# mistake and counts as "on". import_path adds host folders to the managed
+# PATH; import_env passes named variables from Claude Code's environment.
+# Lowering `managed` and adding an import are widenings (the user's OK in the
+# gateway dialog, `gate check settings`).
+SHELL_MODES = {"on": "on", "off": "off"}
 IMPORT_PATH_MAX = 32
 IMPORT_ENV_MAX = 32
 IMPORT_ENV_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -243,7 +294,11 @@ NOTE_MAX = 200
 
 LENIENT_RE = re.compile(
     r"^(\s*(?:ssh|sudo|scripts|use|default|packages)\s*=\s*)"
-    r"((?i:yes|no|on|off|ask|true|false))(\s*(?:#.*)?)$")
+    r"((?i:yes|no|on|off|ask|true|false|cc|allow|deny))(\s*(?:#.*)?)$")
+# bare cc / allow / deny / ask for the per-mode policy keys and [network] commands
+LENIENT_POLICY_RE = re.compile(
+    r"^(\s*(?:read|exec|write|network|elevation|credential|commands)\s*=\s*)"
+    r"((?i:ask|cc|allow|deny))(\s*(?:#.*)?)$")
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +360,17 @@ class Workspace:
     policy: dict[str, Any] = field(default_factory=dict)
     line: int | None = None
     lines: dict[str, int] = field(default_factory=dict)
+    policy_modes: dict[str, ModeValue] = field(default_factory=dict)   # per mode (PLAN-0.11 §2)
+
+    def policy_mode(self, key: str) -> ModeValue | None:
+        return _policy_mode(self.policy, self.policy_modes, key)
 
     def snapshot(self) -> dict[str, Any]:
         d: dict[str, Any] = {"root": self.root}
         if self.local:
             d["local"] = self.local
         if self.policy:
-            d["policy"] = dict(self.policy)
+            d["policy"] = policy_snapshot(self.policy, self.policy_modes)
         return d
 
 
@@ -332,15 +391,12 @@ class Host:
     address: Address | None = None   # None only for localhost
     also: list[Address] = field(default_factory=list)
     via: str | None = None
-    ssh: Any = True                  # True | "ask" | False
+    ssh: Any = True                  # True | "ask" | False (the modeless resolution)
     sudo: Any = True
     scripts: bool = False
     note: str = ""
     runtime: str = ""                # the managed remote runtime's folder (PLAN-v4 phase 6; "" default)
     explicit: bool = True            # False: the implicit [hosts.localhost]
-    # localhost only: the form doesn't say sudo (no table, or no key). Its
-    # value then depends on the install (apply_install_defaults).
-    sudo_default: bool = False
     # PLAN-v4 phase 7: [hosts.NAME.policy] (key -> True | "ask" | False; None
     # when the host has no policy table), its lines, the workspaces, and a
     # remote host's [hosts.NAME.shell] imports
@@ -348,10 +404,32 @@ class Host:
     policy_lines: dict[str, int] = field(default_factory=dict)
     workspaces: dict[str, "Workspace"] = field(default_factory=dict)
     shell: "HostShell" = field(default_factory=HostShell)
+    # PLAN-0.11 §2: ssh and sudo per mode (a remote host has both; localhost
+    # only a configured sudo), the policy keys per mode, and whether this
+    # computer's sudo is configured (a `sudo` key in [hosts.localhost];
+    # always True for a remote host)
+    modes: dict[str, ModeValue] = field(default_factory=dict)
+    policy_modes: dict[str, ModeValue] = field(default_factory=dict)
+    sudo_configured: bool = True
 
     @property
     def is_local(self) -> bool:
         return self.name == "localhost"
+
+    def mode_value(self, key: str) -> ModeValue | None:
+        """ssh or sudo per mode; None for this computer's sudo when it isn't
+        configured (and for localhost's ssh). An entry built without its
+        per-mode values (a test, an older caller) reads its legacy word as
+        written bare."""
+        if key not in ("ssh", "sudo"):
+            raise KeyError(key)
+        if self.is_local and (key == "ssh" or not self.sudo_configured):
+            return None
+        mv = self.modes.get(key)
+        return mv if mv is not None else modes.bare(getattr(self, key), "right")
+
+    def policy_mode(self, key: str) -> ModeValue | None:
+        return _policy_mode(self.policy, self.policy_modes, key)
 
     def addresses(self) -> list[Address]:
         """Candidates in order: address (with its `when`), then also."""
@@ -377,8 +455,10 @@ class Account:
     note: str = ""
     host: str = ""                   # github, ml-catalog, pijul, registry
     packages: bool = False           # github
-    tenant: str = ""                 # azure
+    tenant: str = ""                 # azure; ml-catalog (optional: "" means "organizations")
     client_id: str = ""              # azure
+    sign_in: str = ""                # azure: "browser", or "" (a service principal)
+    scope: str = ""                  # azure: the browser sign-in's request scope ("" = ARM)
     databricks: list[str] = field(default_factory=list)
     storage: list[str] = field(default_factory=list)
     registries: list[str] = field(default_factory=list)
@@ -387,6 +467,20 @@ class Account:
     auth: str = ""                   # api-key placement
     policy: dict[str, Any] | None = None             # [accounts.NAME.policy] (PLAN-v4 phase 7)
     policy_lines: dict[str, int] = field(default_factory=dict)
+    # PLAN-0.11 §2: use per mode (`use` above is True only where the
+    # modeless word is cc: an "ask" or a per-mode table reads as False to an
+    # older reader) and the policy keys per mode
+    modes: dict[str, ModeValue] = field(default_factory=dict)
+    policy_modes: dict[str, ModeValue] = field(default_factory=dict)
+
+    def mode_value(self, key: str = "use") -> ModeValue:
+        if key != "use":
+            raise KeyError(key)
+        mv = self.modes.get("use")
+        return mv if mv is not None else modes.bare(bool(self.use), "right")
+
+    def policy_mode(self, key: str) -> ModeValue | None:
+        return _policy_mode(self.policy, self.policy_modes, key)
 
     def destinations(self) -> list[str]:
         from . import accounts
@@ -402,20 +496,29 @@ class Account:
 
 
 @dataclass
-class Settings:
-    others: str = "refuse"
-    others_invalid: bool = False   # a bad value: refuse for now, but don't ratchet the approval
-
-
-@dataclass
 class VaultSettings:
     lock_after: int = LOCK_AFTER_DEFAULT
 
 
 @dataclass
+class NetworkSettings:
+    """[network] (PLAN-0.11 §3.2). `invalid`: a mistake somewhere in the
+    table; the approved [network] then applies whole and nothing ratchets."""
+    commands: ModeValue = field(default_factory=lambda: modes.bare(NETWORK_DEFAULT, "network"))
+    extra: list[str] = field(default_factory=list)
+    drop: list[str] = field(default_factory=list)
+    invalid: bool = False
+    written: bool = False                # the form has a [network] table
+    line: int | None = None              # [network]
+    commands_line: int | None = None
+    extra_line: int | None = None
+    drop_line: int | None = None
+
+
+@dataclass
 class ShellSettings:
     managed: str = "on"
-    managed_invalid: bool = False   # a bad value: the approved mode stays, nothing ratchets
+    managed_invalid: bool = False   # a bad value: "on" applies, nothing ratchets
     import_path: list[str] = field(default_factory=list)
     import_env: list[str] = field(default_factory=list)
     line: int | None = None              # [shell]
@@ -431,12 +534,13 @@ class Form:
     used_text: str = ""            # what was parsed (the last good form after a syntax error)
     mtime_ns: int = 0
     sha256: str = ""               # of used_text
-    settings: Settings = field(default_factory=Settings)
     vault: VaultSettings = field(default_factory=VaultSettings)
     shell: ShellSettings = field(default_factory=ShellSettings)
+    network: NetworkSettings = field(default_factory=NetworkSettings)
     policy: dict[str, Any] = field(default_factory=dict)          # [policy] (PLAN-v4 phase 7)
     policy_lines: dict[str, int] = field(default_factory=dict)
     policy_line: int | None = None
+    policy_modes: dict[str, ModeValue] = field(default_factory=dict)   # [policy] per mode
     hosts: dict[str, Host] = field(default_factory=dict)
     accounts: dict[str, Account] = field(default_factory=dict)
     disabled: dict[str, str] = field(default_factory=dict)   # safe name -> first error
@@ -447,6 +551,12 @@ class Form:
     # disabled accounts whose kind could be read: {name: kind} (a stand-in
     # names the entry that is off instead of saying there is none)
     disabled_kinds: dict[str, str] = field(default_factory=dict)
+    # disabled hosts' addresses that still parse (PLAN-0.11 §1.1: a malformed
+    # entry stays configured, and what it names keeps classifying)
+    disabled_addresses: dict[str, list[Address]] = field(default_factory=dict)
+    # disabled accounts whose kind could be read, with the destination keys
+    # that still parse (_lenient_account): their own destinations classify
+    disabled_accounts: dict[str, Account] = field(default_factory=dict)
     unnamed_off: int = 0           # entries whose name can't even be shown (unsafe text)
     problems: list[Problem] = field(default_factory=list)
     syntax_error: Problem | None = None
@@ -466,6 +576,10 @@ class Form:
 
     def entry(self, name: str) -> Host | Account | None:
         return self.hosts.get(name) or self.accounts.get(name)
+
+    def policy_mode(self, key: str) -> ModeValue | None:
+        """[policy]'s key per mode (None: not written)."""
+        return _policy_mode(self.policy, self.policy_modes, key)
 
     def host(self, name: str) -> Host | None:
         return self.hosts.get(name)
@@ -506,6 +620,30 @@ class Form:
 # ---------------------------------------------------------------------------
 
 
+def _policy_mode(policy: dict[str, Any] | None, per_mode: dict[str, ModeValue],
+                 key: str) -> ModeValue | None:
+    """A policy key per mode: the parsed value, else the legacy word read as
+    a bare policy word (an entry built without per-mode values), else None
+    (not written)."""
+    mv = per_mode.get(key)
+    if mv is not None:
+        return mv
+    if policy and key in policy:
+        return modes.bare(policy[key], "policy")
+    return None
+
+
+def policy_snapshot(policy: dict[str, Any] | None,
+                    per_mode: dict[str, ModeValue]) -> dict[str, Any]:
+    """A policy table as the approved snapshot keeps it: each key's bare word
+    in today's vocabulary, or its six-mode map (ModeValue.snapshot)."""
+    out: dict[str, Any] = {}
+    for k, v in (policy or {}).items():
+        mv = per_mode.get(k)
+        out[k] = mv.snapshot() if mv is not None else v
+    return out
+
+
 def safe(s: Any) -> str | None:
     """s if it may be echoed in a message, else None."""
     return s if isinstance(s, str) and SAFE_ECHO.fullmatch(s) else None
@@ -520,19 +658,24 @@ def unsafe_text(s: str) -> bool:
 
 
 def strip_unsafe(s: str, repl: str = " ") -> str:
-    """s with every unsafe character replaced (for migrated notes)."""
+    """s with every unsafe character replaced (for text shown in messages)."""
     return "".join(repl if _unsafe_char(c) else c for c in s)
 
 
 def normalize_lenient(text: str) -> str:
-    """The pre-pass: bare yes/no/on/off/ask/true/false for the right keys."""
+    """The pre-pass: bare yes/no/on/off/ask/true/false for the right keys,
+    and bare cc / allow / deny (as strings) for those and the per-mode
+    policy keys."""
     out = []
     for line in text.split("\n"):
-        m = LENIENT_RE.match(line)
+        m = LENIENT_RE.match(line) or LENIENT_POLICY_RE.match(line)
         if m:
             word = m.group(2).lower()
-            val = RIGHT_WORDS[word]
-            rep = '"ask"' if val == "ask" else ("true" if val else "false")
+            if word in RIGHT_WORDS:
+                val = RIGHT_WORDS[word]
+                rep = '"ask"' if val == "ask" else ("true" if val else "false")
+            else:
+                rep = f'"{word}"'
             line = m.group(1) + rep + m.group(3)
         out.append(line)
     return "\n".join(out)
@@ -631,6 +774,13 @@ def _right(v: Any) -> Any:
     if isinstance(v, str) and v.strip().lower() in RIGHT_WORDS:
         return RIGHT_WORDS[v.strip().lower()]
     return None
+
+
+def moded(v: Any, kind: str) -> ModeValue:
+    """A right, policy restriction or [network] commands value: a word or a
+    per-mode table (modes.parse). ValueError (modes.ModeError) with a safe
+    message otherwise."""
+    return modes.parse(v, kind)
 
 
 def _suggest(key: str, known: Iterable[str]) -> str:
@@ -755,12 +905,27 @@ def policy_text(r: Any) -> str:
     return "allow" if r is True else ("ask" if r == "ask" else "deny")
 
 
+def policy_value(k: str, v: Any) -> tuple[Any, ModeValue | None]:
+    """(legacy word, per-mode value or None) for one policy key: a key in
+    POLICY_MODED takes a word or a per-mode table (its legacy word is the
+    modeless resolution), the others one word ("allow", "ask", "deny").
+    ValueError with a safe message."""
+    if k in POLICY_MODED:
+        mv = moded(v, "policy")
+        return mv.legacy(), mv
+    w = policy_word(v)
+    if w is _BAD:
+        raise ValueError(f"{k} must be \"allow\", \"ask\" or \"deny\" (one word)")
+    return w, None
+
+
 def _policy_keys(ctx: _Ctx, raw: Any, sect: tuple[str, ...], allowed: tuple[str, ...],
                  errs: list[tuple[str, str | None]], where: str,
-                 lines: dict[str, int]) -> dict[str, Any]:
-    """A policy table's keys: each one of `allowed` with allow / ask / deny.
-    An unknown key or a bad value is an error (the entry goes off: a
-    misspelt restriction must never quietly not apply)."""
+                 lines: dict[str, int], per_mode: dict[str, ModeValue]) -> dict[str, Any]:
+    """A policy table's keys: each one of `allowed` with allow / ask / deny
+    (the POLICY_MODED ones also "cc" or a per-mode table, kept in
+    `per_mode`). An unknown key or a bad value is an error (the entry goes
+    off: a misspelt restriction must never quietly not apply)."""
     if not isinstance(raw, dict):
         errs.append((f"{where} must be a table like [{'.'.join(sect)}]", sect[-1]))
         return {}
@@ -774,11 +939,14 @@ def _policy_keys(ctx: _Ctx, raw: Any, sect: tuple[str, ...], allowed: tuple[str,
                 errs.append((f"{where}: {_suggest(k, allowed) if safe(k) else 'an unknown key'}",
                              sect[-1]))
             continue
-        w = policy_word(v)
-        if w is _BAD:
-            errs.append((f"{where}: {k} must be \"allow\", \"ask\" or \"deny\"", sect[-1]))
+        try:
+            w, mv = policy_value(k, v)
+        except ValueError as e:
+            errs.append((f"{where}: {k} {e}" if k in POLICY_MODED else f"{where}: {e}", sect[-1]))
             continue
         out[k] = w
+        if mv is not None:
+            per_mode[k] = mv
         n = ctx.line(*sect, k)
         if n:
             lines[k] = n
@@ -858,13 +1026,15 @@ def _workspaces(ctx: _Ctx, host: str, raw: Any, errs: list[tuple[str, str | None
                 w.note = n.strip()
         for k in WORKSPACE_POLICY_KEYS:
             if k in wt:
-                r = policy_word(wt[k])
-                if r is _BAD:
-                    errs.append((f"workspaces.{wn}.{k} must be \"allow\", \"ask\" or \"deny\"",
-                                 "workspaces"))
+                try:
+                    r, mv = policy_value(k, wt[k])
+                except ValueError as e:
+                    errs.append((f"workspaces.{wn}.{k} {e}", "workspaces"))
                     bad = True
                 else:
                     w.policy[k] = r
+                    if mv is not None:
+                        w.policy_modes[k] = mv
                     n = ctx.line(*sect, k)
                     if n:
                         w.lines[k] = n
@@ -929,7 +1099,8 @@ def _host_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Host:
     local = name == "localhost"
     h = Host(name=name, line=ctx.line(*sect))
     if local:
-        h.sudo, h.sudo_default = LOCALHOST_SUDO, "sudo" not in raw
+        h.sudo = LOCALHOST_SUDO
+        h.sudo_configured = "sudo" in raw
     allowed = LOCALHOST_KEYS if local else HOST_KEYS
     for k in raw:
         if k in allowed:
@@ -947,12 +1118,20 @@ def _host_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Host:
             ctx.add("warning", _suggest(k, known), ctx.line(*sect, k) if safe(k) else h.line,
                     name)
     for key in ("ssh", "sudo"):
-        if key in raw and key in allowed:
-            r = _right(raw[key])
-            if r is None:
-                errs.append((f"{key} must be true, \"ask\" or false", key))
-            else:
-                setattr(h, key, r)
+        if key not in allowed:
+            continue
+        if key in raw:
+            try:
+                mv = moded(raw[key], "right")
+            except ValueError as e:
+                errs.append((f"{key} {e}", key))
+                continue
+        elif local:
+            continue                   # this computer's sudo isn't configured
+        else:
+            mv = modes.bare(True, "right")
+        h.modes[key] = mv
+        setattr(h, key, mv.legacy())
     if local:
         h.ssh = False
     if "scripts" in raw:
@@ -970,7 +1149,7 @@ def _host_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Host:
     if "policy" in raw:
         h.policy = _policy_keys(ctx, raw["policy"], sect + ("policy",),
                                 LOCALHOST_POLICY_KEYS if local else HOST_POLICY_KEYS, errs,
-                                "policy", h.policy_lines)
+                                "policy", h.policy_lines, h.policy_modes)
     if "workspaces" in raw:
         h.workspaces = _workspaces(ctx, name, raw["workspaces"], errs, local)
     if "shell" in raw and not local:
@@ -1065,6 +1244,19 @@ def _host_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Host:
     return h
 
 
+def _tenant(t: Any) -> str | None:
+    """A tenant ID (GUID, as written) or a domain (lowercased); None if
+    neither."""
+    if not isinstance(t, str):
+        return None
+    s = t.strip()
+    if GUID_RE.fullmatch(s):
+        return s
+    if "." in s and DNS_RE.fullmatch(s.lower()):
+        return s.lower()
+    return None
+
+
 def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
     errs: list[tuple[str, str | None]] = []
     sect = ("accounts", name)
@@ -1114,13 +1306,21 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
                     raise ValueError(f"owners: {_q(o)} is not an owner or org name")
     except ValueError as e:
         errs.append((str(e), "owners"))
-    for key in ("default", "scripts", "use"):
+    for key in ("default", "scripts"):
         if key in raw:
             b = _bool(raw[key])
             if b is None:
                 errs.append((f"{key} must be true or false", key))
             else:
                 setattr(a, key, b)
+    # use: a right per mode (PLAN-0.11 §2.2); the legacy bool is True only
+    # where the modeless word is cc, so "ask" or a table reads as False to a
+    # reader that doesn't know modes
+    try:
+        a.modes["use"] = moded(raw["use"], "right") if "use" in raw else modes.bare(True, "right")
+        a.use = a.modes["use"].modeless() == "cc"
+    except ValueError as e:
+        errs.append((f"use {e}", "use"))
     if "name" in raw or "email" in raw:
         a.commit_name = get_str("name", None, 100, "must be at most 100 characters")
         a.email = get_str("email", EMAIL_RE, 254, "is not an email address")
@@ -1145,7 +1345,7 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
             a.note = n.strip()
     if "policy" in raw:
         a.policy = _policy_keys(ctx, raw["policy"], sect + ("policy",), ACCOUNT_POLICY_KEYS, errs,
-                                "policy", a.policy_lines)
+                                "policy", a.policy_lines, a.policy_modes)
 
     # kind-specific
     if kind in ("github", "ml-catalog", "pijul", "registry"):
@@ -1162,6 +1362,14 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
                          "host = \"catalog.example.com\"", None))
         else:
             a.host = DEFAULT_HOSTS[kind]
+    if kind == "ml-catalog" and "tenant" in raw:
+        t = raw["tenant"]
+        if not isinstance(t, str) or not (GUID_RE.fullmatch(t.strip()) or t.strip() == CATALOG_TENANT
+                                          or ("." in t and DNS_RE.fullmatch(t.strip().lower()))):
+            errs.append(("tenant must be a tenant ID (GUID), a domain or \"organizations\"",
+                         "tenant"))
+        else:
+            a.tenant = t.strip() if GUID_RE.fullmatch(t.strip()) else t.strip().lower()
     if kind == "github":
         a.packages = a.host == "github.com"
         if "packages" in raw:
@@ -1174,11 +1382,10 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
         t = raw.get("tenant")
         if t is None:
             errs.append(("tenant is required, like tenant = \"contoso.onmicrosoft.com\"", None))
-        elif not isinstance(t, str) or not (GUID_RE.fullmatch(t.strip()) or (
-                "." in t and DNS_RE.fullmatch(t.strip().lower()))):
+        elif (tv := _tenant(t)) is None:
             errs.append(("tenant must be a tenant ID (GUID) or a domain", "tenant"))
         else:
-            a.tenant = t.strip().lower() if not GUID_RE.fullmatch(t.strip()) else t.strip()
+            a.tenant = tv
         if "client_id" in raw:
             c = raw["client_id"]
             if not isinstance(c, str) or not GUID_RE.fullmatch(c.strip()):
@@ -1187,6 +1394,31 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
                 a.client_id = c.strip()
         else:
             a.client_id = AZURE_CLI_CLIENT_ID
+        if "sign_in" in raw:
+            s = raw["sign_in"]
+            if s not in SIGN_IN_WORDS:
+                errs.append(("sign_in must be \"browser\" or \"service-principal\"", "sign_in"))
+            elif s == "browser":
+                if "client_id" not in raw:
+                    errs.append(("sign_in = \"browser\" needs client_id: a public client "
+                                 "application registered for the redirect http://127.0.0.1",
+                                 "sign_in"))
+                a.sign_in = "browser"
+        if "scope" in raw:
+            sc = raw["scope"]
+            toks = sc.split() if isinstance(sc, str) else []
+            if not toks or len(toks) > SCOPE_MAX_TOKENS or not all(
+                    SCOPE_TOKEN_RE.fullmatch(t) for t in toks):
+                errs.append(("scope must be up to 8 scopes separated by spaces, like "
+                             "scope = \"https://management.azure.com/.default\"", "scope"))
+            else:
+                a.scope = " ".join(dict.fromkeys(t for t in toks if t != "offline_access"))
+                if not a.scope:
+                    errs.append(("scope must name more than offline_access (the gateway adds it)",
+                                 "scope"))
+                elif a.sign_in != "browser":
+                    ctx.add("warning", "scope is used only with sign_in = \"browser\" (ignored)",
+                            ctx.line(*sect, "scope"), name)
         for key in ("databricks", "registries", "sites"):
             if key in raw:
                 try:
@@ -1236,7 +1468,7 @@ def _account_entry(ctx: _Ctx, name: str, raw: dict[str, Any]) -> Account:
             except ValueError as e:
                 errs.append((str(e), "sites"))
             if not a.sites and "sites" in raw and not errs:
-                if a.use:
+                if a.mode_value().any_above("deny"):
                     errs.append(("sites is empty; list where the key may go (or set use = "
                                  "false)", "sites"))
                 else:
@@ -1327,15 +1559,82 @@ def _chain_ok(form: Form, ctx: _Ctx) -> None:
                     why = "via can't be localhost"
                     break
                 if j.ssh is False:
-                    why = f"via {cur}: that host has ssh = false, so it can't be a jump host"
+                    why = (f"via {cur}: that host has ssh = false, so it can't be a jump host"
+                           if not j.mode_value("ssh").is_table else
+                           f"via {cur}: that host's ssh is false in a mode a command may run in, "
+                           "so it can't be a jump host")
                     break
                 seen.append(cur)
                 cur = j.via
             if why:
                 ctx.add("error", why, ctx.line("hosts", name, "via") or h.line, name)
                 form.disabled[name] = why
+                form.disabled_addresses[name] = h.addresses()
                 del form.hosts[name]
                 changed = True
+
+
+def _lenient_addresses(raw: Any) -> list[Address]:
+    """The addresses a disabled host's table still spells (`address` and
+    `also` entries that parse on their own): a malformed entry stays
+    configured (PLAN-0.11 §1.1), so what it names keeps classifying."""
+    out: list[Address] = []
+    if not isinstance(raw, dict):
+        return out
+    also = raw.get("also")
+    items = [raw.get("address")] + (also if isinstance(also, list) else [also])
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("at")
+        try:
+            out.append(parse_address(item))
+        except ValueError:
+            continue
+    return out
+
+
+def _lenient_account(name: str, raw: dict[str, Any]) -> Account:
+    """What a disabled account's table still spells of where it sends: its
+    kind's `host`, `packages`, `sites`, `databricks`, `storage` and
+    `registries`, each value that parses on its own (a list keeps its good
+    items). A malformed entry stays configured (PLAN-0.11 §1.1), so its own
+    destinations keep classifying. A `host` that doesn't parse falls back to
+    the kind's default where there is one (github.com, nest.pijul.com), and
+    a `packages` that doesn't parse counts as on: more stays gated, never
+    less. `raw["kind"]` is one of KINDS."""
+    kind = raw["kind"]
+    a = Account(name=name, kind=kind)
+    if kind in ("github", "ml-catalog", "pijul", "registry"):
+        a.host = DEFAULT_HOSTS.get(kind, "")
+        if "host" in raw:
+            try:
+                a.host = parse_hostport(raw["host"])
+            except ValueError:
+                pass
+    if kind == "github":
+        a.packages = a.host == "github.com" if "packages" not in raw else \
+            _bool(raw["packages"]) is not False
+
+    def names(key: str, dot: bool = False) -> list[str]:
+        v = raw.get(key)
+        out = []
+        for x in v if isinstance(v, list) else []:
+            if not isinstance(x, str):
+                continue
+            x = x.lower()
+            bare = x[1:] if dot and x.startswith(".") else x
+            if valid_hostname(bare) and not (x.startswith(".") and too_broad_site(bare)):
+                out.append(x)
+        return out
+
+    if kind == "azure":
+        a.databricks, a.registries, a.sites = names("databricks"), names("registries"), names("sites")
+        st = raw.get("storage")
+        a.storage = [x for x in st if isinstance(x, str) and STORAGE_RE.fullmatch(x)] \
+            if isinstance(st, list) else []
+    elif kind == "api-key":
+        a.sites = names("sites", dot=True)
+    return a
 
 
 def _endpoint_hosts(form: Form, ctx: _Ctx) -> None:
@@ -1374,23 +1673,10 @@ def _primary(a: Account) -> str:
 def validate(doc: dict[str, Any], form: Form, idx: dict[tuple[str, ...], int]) -> None:
     ctx = _Ctx(form, idx)
     for k in doc:
-        if k not in TOP_KEYS:
+        if k == "settings":
+            ctx.add("warning", SETTINGS_GONE, ctx.line("settings"))
+        elif k not in TOP_KEYS:
             ctx.add("warning", _suggest(k, TOP_KEYS), ctx.line(k) if safe(k) else None)
-    st = doc.get("settings", {})
-    if not isinstance(st, dict):
-        ctx.add("error", "settings must be a table: [settings]", ctx.line("settings"))
-    else:
-        for k, v in st.items():
-            if k == "others":
-                if v in ("refuse", "mine"):
-                    form.settings.others = v
-                else:
-                    form.settings.others_invalid = True
-                    ctx.add("error", "others must be \"refuse\" or \"mine\" (\"refuse\" until "
-                            "it's fixed)", ctx.line("settings", "others"))
-            else:
-                ctx.add("warning", f"settings: {_suggest(k, SETTINGS_KEYS)}",
-                        ctx.line("settings", k) if safe(k) else ctx.line("settings"))
     vt = doc.get("vault", {})
     if not isinstance(vt, dict):
         ctx.add("error", "vault must be a table: [vault]", ctx.line("vault"))
@@ -1409,6 +1695,8 @@ def validate(doc: dict[str, Any], form: Form, idx: dict[tuple[str, ...], int]) -
                         ctx.line("vault", k) if safe(k) else ctx.line("vault"))
     _shell_table(ctx, doc.get("shell", {}), form)
     _policy_global(ctx, doc.get("policy", {}), form)
+    if "network" in doc:
+        _network_table(ctx, doc["network"], form)
     hosts = _table_entries(ctx, doc, "hosts")
     accts = _table_entries(ctx, doc, "accounts")
     # One namespace: a name used twice keeps the earlier definition.
@@ -1425,6 +1713,7 @@ def validate(doc: dict[str, Any], form: Form, idx: dict[tuple[str, ...], int]) -
             form.hosts[name] = _host_entry(ctx, name, raw)
         except _EntryErrors as e:
             form.disabled[name] = str(e)
+            form.disabled_addresses[name] = _lenient_addresses(raw)
     for name, (raw, _line) in accts.items():
         try:
             form.accounts[name] = _account_entry(ctx, name, raw)
@@ -1432,11 +1721,14 @@ def validate(doc: dict[str, Any], form: Form, idx: dict[tuple[str, ...], int]) -
             form.disabled[name] = str(e)
             if raw.get("kind") in KINDS:
                 form.disabled_kinds[name] = raw["kind"]
+                form.disabled_accounts[name] = _lenient_account(name, raw)
     _chain_ok(form, ctx)
     _endpoint_hosts(form, ctx)
     if "localhost" not in form.hosts and "localhost" not in form.disabled:
+        # the implicit [hosts.localhost] (PLAN-0.11 §1.5): kept for every
+        # reader that looks this computer up; its sudo isn't configured
         form.hosts["localhost"] = Host(name="localhost", sudo=LOCALHOST_SUDO, ssh=False,
-                                       explicit=False, sudo_default=True)
+                                       explicit=False, sudo_configured=False)
     # default: at most one per kind+host
     groups: dict[tuple[str, str], list[Account]] = {}
     for a in form.accounts.values():
@@ -1481,7 +1773,7 @@ def import_env_entry(v: Any) -> tuple[str | None, str | None]:
     name = v.strip()
     if SHELL_PASSED.fullmatch(name):
         return None, f"{name} always reaches the managed shell (it needn't be imported)"
-    if CREDENTIAL_NAME.fullmatch(name) or name.upper() in _ENV_UNSET_NAMES:
+    if CREDENTIAL_NAME.fullmatch(name) or _credential_variable(name):
         return None, (f"{name} looks like a credential; credentials come from an account "
                       "(accounts.NAME with env = ...), never an import")
     if IMPORT_ENV_DENY.fullmatch(name):
@@ -1490,14 +1782,13 @@ def import_env_entry(v: Any) -> tuple[str | None, str | None]:
     return name, None
 
 
-# The user's credential variables (envfile.ENV_UNSET), never importable.
-_ENV_UNSET_NAMES = frozenset({
-    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS",
-    "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
-    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN",
-    "AZURE_STORAGE_KEY", "AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_CONNECTION_STRING",
-    "AZURE_CLIENT_SECRET", "ARM_CLIENT_SECRET", "ARM_ACCESS_KEY",
-    "DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DOCKER_AUTH_CONFIG", "REGISTRY_AUTH_FILE"})
+def _credential_variable(name: str) -> bool:
+    """One of the user's credential variables (envfile.ENV_UNSET) or a name
+    the output masker hides (envfile.MASK_ENV_NAMES, the one list): never
+    importable, since an imported value isn't in Claude Code's environment,
+    where the masker looks (PLAN-0.11 §1.6)."""
+    from .envfile import ENV_UNSET, MASK_ENV_NAMES
+    return name.upper() in ENV_UNSET or name.upper() in MASK_ENV_NAMES
 
 
 def _shell_table(ctx: _Ctx, sh: Any, form: Form) -> None:
@@ -1515,8 +1806,11 @@ def _shell_table(ctx: _Ctx, sh: Any, form: Form) -> None:
                 SHELL_MODES.get(v.strip().lower()) if isinstance(v, str) else None)
             if m is None:
                 out.managed_invalid = True
-                ctx.add("error", 'managed must be "on", "warn" or "off" (the approved mode '
-                        "stays until it's fixed)", ctx.line("shell", "managed"))
+                out.managed = "on"
+                was_warn = isinstance(v, str) and v.strip().lower() == "warn"
+                ctx.add("error", ('managed = "warn" is gone: managed is "on" or "off"' if was_warn
+                                  else 'managed must be "on" or "off"')
+                        + " (\"on\" until it's fixed)", ctx.line("shell", "managed"))
             else:
                 out.managed = m
         elif k in ("import_path", "import_env"):
@@ -1563,18 +1857,82 @@ def _policy_global(ctx: _Ctx, pt: Any, form: Form) -> None:
             ctx.add("error", f"policy: {_suggest(k, GLOBAL_POLICY_KEYS) if safe(k) else 'an unknown key'}",
                     line)
             continue
-        w = policy_word(v)
-        if w is _BAD:
-            ctx.add("error", f"policy: {k} must be \"allow\", \"ask\" or \"deny\" (\"deny\" "
-                    "until it's fixed)", line)
-            w = False
-        elif k in POLICY_GRANT and w is True:
+        try:
+            w, mv = policy_value(k, v)
+        except ValueError as e:
+            ctx.add("error", f"policy: {k} {e} (\"deny\" until it's fixed)" if k in POLICY_MODED
+                    else f"policy: {e} (\"deny\" until it's fixed)", line)
+            w, mv = False, (modes.uniform("deny", "policy") if k in POLICY_MODED else None)
+        if k in POLICY_GRANT and w is True:
             ctx.add("error", f"policy: {k} is turned on per host ([hosts.NAME.policy] {k} = "
                     "\"allow\"); [policy] can only keep it off (\"deny\" until it's fixed)", line)
             w = False
         form.policy[k] = w
+        if mv is not None:
+            form.policy_modes[k] = mv
         if line:
             form.policy_lines[k] = line
+
+
+def network_name(v: Any) -> str | None:
+    """A [network] extra/drop entry: a plain program name or a reserved name
+    (NETWORK_RESERVED), else None."""
+    if isinstance(v, str) and NETWORK_NAME_RE.fullmatch(v.strip()) and v.strip() not in (".", ".."):
+        return v.strip()
+    return None
+
+
+def _network_table(ctx: _Ctx, nt: Any, form: Form) -> None:
+    """[network] (PLAN-0.11 §3.2): commands (a word or a per-mode table),
+    extra and drop (lists of names). Any mistake marks the table invalid:
+    the approved [network] then applies whole ("ask" and the built-in
+    names if none was approved) and nothing ratchets."""
+    out = form.network
+    out.written = True
+    out.line = ctx.line("network")
+    if not isinstance(nt, dict):
+        out.invalid = True
+        ctx.add("error", "network must be a table: [network] (the approved one applies until "
+                "it's fixed)", out.line)
+        return
+    for k, v in nt.items():
+        line = ctx.line("network", k) if safe(k) else out.line
+        if k == "commands":
+            out.commands_line = line
+            try:
+                out.commands = moded(v, "network")
+            except ValueError as e:
+                out.invalid = True
+                ctx.add("error", f"network: commands {e} (the approved value applies until "
+                        "it's fixed)", line)
+        elif k in ("extra", "drop"):
+            setattr(out, f"{k}_line", line)
+            if not isinstance(v, list):
+                out.invalid = True
+                ctx.add("error", f"network: {k} must be a list, like {k} = [\"dig\"] (the "
+                        "approved [network] applies until it's fixed)", line)
+                continue
+            got: list[str] = []
+            for item in v:
+                n = network_name(item)
+                if n is None:
+                    out.invalid = True
+                    ctx.add("error", f"network: {k} entries are program names (letters, digits, "
+                            ". _ -; at most 32) or reserved names (" + ", ".join(NETWORK_RESERVED)
+                            + "); the approved [network] applies until it's fixed", line)
+                elif n not in got:
+                    got.append(n)
+            if len(got) > NETWORK_LIST_MAX:
+                out.invalid = True
+                ctx.add("error", f"network: {k} takes at most {NETWORK_LIST_MAX} names (the "
+                        "approved [network] applies until it's fixed)", line)
+                got = got[:NETWORK_LIST_MAX]
+            setattr(out, k, got)
+        else:
+            out.invalid = True
+            ctx.add("error", f"network: {_suggest(k, NETWORK_KEYS) if safe(k) else 'an unknown key'}"
+                    .replace(" (ignored)", "") + " (the approved [network] applies until it's "
+                    "fixed)", line)
 
 
 _RIGHTS_LINE = re.compile(r"^\s*(ssh|sudo|scripts|use|default|packages)\s*=")
@@ -1589,8 +1947,9 @@ def _syntax_problem(e: tomllib.TOMLDecodeError, text: str = "") -> Problem:
     if "Invalid value" in base or "invalid value" in base.lower():
         lines = text.splitlines()
         km = _RIGHTS_LINE.match(lines[line - 1]) if line and 0 < line <= len(lines) else None
-        if km and km.group(1) in ("ssh", "sudo"):
-            hint = f' ({km.group(1)} takes true, "ask" or false)'
+        if km and km.group(1) in ("ssh", "sudo", "use"):
+            hint = (f' ({km.group(1)} takes true, "ask" or false; also "cc" or a table like '
+                    '{ default = "ask", auto = true })')
         elif km:
             hint = f" ({km.group(1)} takes true or false)"
         else:
@@ -1651,31 +2010,21 @@ def _not_utf8(p: Path, raw: bytes, err: UnicodeDecodeError, last_good: str | Non
     return f
 
 
-def apply_install_defaults(form: Form, older_install: bool) -> None:
-    """Set the defaults that depend on the install (review round 3): sudo on
-    this computer where the form doesn't say (Host.sudo_default) is "ask" on a
-    new install and true on one whose vault an older gateway made (its
-    default then, so that install keeps its rights). consent.compute calls
-    this with the vault before it reads the form's rights, so every reader
-    after it (the approval hook's form right, snapshots, approvals) sees the
-    same value; each call sets it again (a cached form follows the vault)."""
-    h = form.hosts.get("localhost")
-    if h is not None and h.sudo_default:
-        h.sudo = LOCALHOST_SUDO_OLDER if older_install else LOCALHOST_SUDO
-
-
 _CACHE: dict[str, tuple[int, int, str | None, Form]] = {}
 
 
 def load(path: Path | None = None, last_good: str | None = None, use_cache: bool = True) -> Form:
     """The form at `path` (default ~/.config/gateway/gateway.toml), cached by
-    mtime. A missing file is an empty form (localhost implicit)."""
+    mtime. A missing file is the last good form when there is one
+    (PLAN-0.11 §1.1: `exists` False, `from_last_good` True; nothing ratchets
+    from it), else an empty form (localhost implicit)."""
     p = Path(path) if path else paths.form_path()
     try:
         st = p.stat()
     except FileNotFoundError:
-        f = parse_text("", p)
+        f = parse_text(last_good or "", p)
         f.exists = False
+        f.from_last_good = bool(last_good) and f.syntax_error is None
         return f
     key = str(p)
     hit = _CACHE.get(key)
@@ -1709,7 +2058,10 @@ class FormWriteError(Exception):
 
 
 def toml_value(v: Any) -> str:
-    """A TOML value for the writer (strings, bools, ints, lists, inline tables)."""
+    """A TOML value for the writer (strings, bools, ints, lists, inline tables,
+    a per-mode value as written)."""
+    if isinstance(v, ModeValue):
+        return toml_value(v.toml())
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, int):
@@ -1806,7 +2158,7 @@ def append_table(table: str, items: dict[str, Any] | list[tuple[str, Any]],
             raise FormWriteError(f"{table}: its parent isn't a table")
     if parts[-1] in cur:
         raise FormWriteError(f"[{table}] already exists")
-    cur[parts[-1]] = {k: v for k, v in pairs}
+    cur[parts[-1]] = {k: (v.toml() if isinstance(v, ModeValue) else v) for k, v in pairs}
     lines = []
     if old and not old.endswith("\n"):
         lines.append("")
@@ -1897,7 +2249,7 @@ def set_key(table: str, key: str, value: Any, path: Path | None = None) -> None:
         cur = cur[part]
     if not isinstance(cur, dict):
         raise FormWriteError(f"{table} isn't a table")
-    cur[key] = value
+    cur[key] = value.toml() if isinstance(value, ModeValue) else value
     if not re.fullmatch(_BARE, key):
         raise FormWriteError("keys must be plain words")
     lines = old.split("\n")

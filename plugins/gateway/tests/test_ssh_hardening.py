@@ -17,6 +17,7 @@ import time
 
 import harness  # noqa: F401
 import harness_ssh as H
+import harness_posture as HP
 from gateway import form as formmod
 from gateway import ssh, ssh_args, ssh_conf
 
@@ -208,28 +209,26 @@ def test_ssh_hard_wildcard_forwards_refused() -> None:
         assert r.returncode == 0 and r.stdout == "fwd\n", r
 
 
-def test_ssh_hard_others_mine_alias_of_form_host() -> None:
+def test_ssh_hard_an_alias_of_a_configured_host_is_refused_with_a_hint() -> None:
+    """PLAN-0.11 §1.4: a name the user's ssh config sends to a configured
+    host's address (by HostName, or by resolving to it on the same port) is
+    refused with a hint, never routed; another one is the user's own ssh."""
     with H.ssh_env() as s:
         t = s.sshd("target")
-        s.write_form(f'[settings]\nothers = "mine"\n\n[hosts.box]\naddress = "{t.addr()}"\n'
-                     "ssh = false\n")
+        s.write_form(f'[hosts.box]\naddress = "{t.addr()}"\nssh = false\n')
         s.approve()
-        ucfg = s.root / "user_ssh_config"
-        ucfg.write_text(f"Host myalias\n  HostName 127.0.0.1\n  Port {t.port}\n\n"
-                        f"Host byname\n  HostName localhost\n  Port {t.port}\n\n"
-                        "Host other\n  HostName 192.0.2.10\n")
-        fake = s.root / "system-ssh"
-        fake.write_text("#!/bin/sh\ncase \" $* \" in *\" -G \"*) exec "
-                        f"{H.sq(H.ENV_BIN / 'ssh')} \"$@\";; esac\necho \"SYSTEM-SSH $*\"\n")
-        os.chmod(fake, 0o755)
-        s.set(system_ssh=str(fake), ssh_user_config=str(ucfg))
+        d = HP.user_tools(s.env, "ssh", ssh_g={
+            "myalias": {"hostname": "127.0.0.1", "port": str(t.port)},
+            "byname": {"hostname": "localhost", "port": str(t.port)},
+            "other": {"hostname": "192.0.2.10"}})
+        s.set(user_tools=str(d))
         for alias in ("myalias", "byname"):
             r = s.run("ssh", alias, "uptime")
-            assert r.returncode == 2 and "SYSTEM-SSH" not in r.stdout, (alias, r)
-            assert (f"gateway: {alias} is box in gateway.toml (same address); run `ssh box CMD` so "
-                    "its rights apply") in r.stderr, r.stderr
+            assert r.returncode == 2 and "fake ssh ran" not in r.stdout, (alias, r)
+            assert f"gateway: {alias} reaches box, which goes through the gateway" in r.stderr, r
+            assert "use `ssh box` so its rights apply" in r.stderr, r.stderr
         r = s.run("ssh", "other", "uptime")
-        assert r.returncode == 0 and r.stdout.startswith("SYSTEM-SSH "), r
+        assert r.returncode == 0 and r.stdout == "fake ssh ran\n", r
         assert t.accepted() == 0 and t.commands() == []
 
 

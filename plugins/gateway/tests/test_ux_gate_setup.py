@@ -1,7 +1,6 @@
 """gate_setup: gate check end to end against mocks of ssh/sudo/logins/entra,
 idempotency, cancel handling, approve-exactly-shown, accounts (token paste
-with login check, browser sign-in, Entra), forget/rotate, and gate secret
-(TTY-only; refuses with CLAUDECODE=1 or without /dev/tty; terminal flow)."""
+with login check, browser sign-in, Entra), forget/rotate."""
 from __future__ import annotations
 
 import contextlib
@@ -198,7 +197,8 @@ def test_check_localhost_sudo_with_verification():
         assert rc == 0 and out.startswith("gateway: localhost ready: sudo ✓"), (out, err)
         d = env.dialog.calls()
         assert len(d) == 3 and d[0]["kind"] == "choice" and "Try again (2 of 3)" in d[2]["message"]
-        assert "Remember it box keeps it" in d[0]["message"] and "sudoers" not in d[0]["message"]
+        assert "Remember it box, which starts unticked" in d[0]["message"] and \
+            "sudoers" not in d[0]["message"]
         assert vault.load()["localhost"]["sudo"][paths.local_user()]["password"] == "mac-pw-correct"
     with U.ux_env() as env:
         U.setup(env, "[hosts.localhost]\nsudo = true\n")
@@ -207,31 +207,31 @@ def test_check_localhost_sudo_with_verification():
         assert rc == 0 and env.dialog.calls() == [], "NOPASSWD: nothing asked"
 
 
-def test_check_localhost_on_a_new_install_asks_nothing_to_approve_and_keeps_ask():
-    """A new install's starter (sudo = "ask"): gate check localhost has
-    nothing to approve (no consent dialog), sets up the password choice as
-    for any sudo right, and reports sudo as "ask"; the form is untouched."""
-    from gateway import hooks_session, migrate, sudo
-    with U.ux_env(U.answers(("ok", gate_setup.SUDO_ASK))) as env:
+def test_check_localhost_on_a_new_install_has_nothing_to_set_up():
+    """The starter configures nothing (PLAN-0.11 §1.5): this computer's sudo
+    is the user's own, so gate check localhost asks nothing (no dialog), says
+    so and how to have the gateway ask for the password; the form is
+    untouched."""
+    from gateway import hooks_session, sudo
+    with U.ux_env(U.answers()) as env:
         hooks_session.session_main({"session_id": "new", "source": "startup"})
-        assert paths.form_path().read_text() == migrate.STARTER
+        assert paths.form_path().read_text() == formmod.STARTER
         with U.patch(sudo, "probe_nopasswd", lambda user=None: False):
             rc, out, err = _run(gate_setup.check, "localhost")
-        assert rc == 0 and out.startswith("gateway: localhost ready: sudo ask"), (out, err)
-        d = env.dialog.calls()
-        assert len(d) == 1 and d[0]["kind"] == "choice", d
-        assert not any("Approve" in c.get("title", "") or "->" in c["message"] for c in d), d
-        assert paths.form_path().read_text() == migrate.STARTER
+        assert rc == 0 and out.startswith("gateway: localhost: sudo here is your own"), (out, err)
+        assert "gate host set localhost sudo ask" in out
+        assert env.dialog.calls() == []
+        assert paths.form_path().read_text() == formmod.STARTER
         eff = consent.compute(env.form(), vault.load() if vault.exists() else None)
-        assert eff.hosts["localhost"].sudo == "ask" and not eff.pending
+        assert "sudo" not in eff.hosts["localhost"].modes and not eff.pending
 
 
 def test_check_localhost_approves_an_old_starters_sudo_true_without_a_vault():
-    """An install from before the "ask" default with no vault (nothing ever
-    stored): its form's sudo = true waits for the OK; one gate check
-    localhost (the consent dialog) makes it true, with no form change."""
-    from gateway import migrate, sudo
-    old = migrate.HEADER + "\n[hosts.localhost]\nsudo = true\n"
+    """A form whose sudo = true here with no vault (nothing ever stored):
+    it waits for the OK; one gate check localhost (the consent dialog) makes
+    it true, with no form change."""
+    from gateway import sudo
+    old = formmod.STARTER + "\n[hosts.localhost]\nsudo = true\n"
     with U.ux_env(U.answers(("ok",))) as env:
         env.write_form(old)
         assert not vault.exists()
@@ -241,7 +241,9 @@ def test_check_localhost_approves_an_old_starters_sudo_true_without_a_vault():
             rc, out, err = _run(gate_setup.check, "localhost")
         assert rc == 0 and out.startswith("gateway: localhost ready: sudo ✓"), (out, err)
         d = env.dialog.calls()
-        assert len(d) == 1 and 'sudo "ask" -> true' in d[0]["message"], d
+        assert len(d) == 1 and ("sudo on this computer: in Auto and Bypass permissions modes the "
+                                "gateway now approves without asking you; elsewhere Claude Code "
+                                "decides (was: asks you in every mode)") in d[0]["message"], d
         eff = consent.compute(env.form(), vault.load())
         assert eff.hosts["localhost"].sudo is True and not eff.pending
         assert paths.form_path().read_text() == old
@@ -280,41 +282,40 @@ def test_github_token_paste_with_login_check():
         assert "good-token" not in out + err
 
 
-def test_browser_and_device_code_signins_are_unavailable_and_say_what_works():
-    """Brief section 11: no authorization web page, browser or device code.
-    Every entry point says so and names what works instead; nothing is asked."""
+def test_no_device_code_and_a_service_principal_without_its_client_says_what_works():
+    """No device code anywhere; the browser sign-in runs only in gated
+    (daemon/oauth.py: test_accounts_entra). An azure account that signs in
+    with a service principal (the default) but names no client of its own is
+    told what to add before any dialog; a refresh token an older gateway
+    stored doesn't keep it working (PLAN-0.11 §7)."""
     from gateway import logins
     assert not hasattr(logins, "github_login") and not hasattr(gate_setup, "github_login")
     assert not hasattr(gate_setup, "open_browser") and not hasattr(gate_setup, "entra_login")
     from gateway import entra
     assert not hasattr(entra, "login_browser") and not hasattr(entra, "login_device")
-    for form, kind, instead in (
-            ('[accounts.az]\nkind = "azure"\ntenant = "example.com"\n', "azure", "service principal"),
-            ('[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n', "ml-catalog",
-             "keeps working")):
-        with U.ux_env(U.answers(("ok",))) as env:
-            U.setup(env, form, approve=False)
-            name = "az" if kind == "azure" else "cat"
-            rc, out, err = _run(gate_setup.check, name)
-            assert rc == 1 and "browser or a device code isn't available" in err, err
-            assert instead in err and "existing sign-in keeps working" in err, err
-            assert env.dialog.calls() == [], "nothing is asked (not even the consent)"
-            rc, out, err = _run(gate_setup.login, name)
-            assert rc == 1 and "isn't available" in err, err
-    # an existing refresh token keeps working: no sign-in asked
+    form = '[accounts.az]\nkind = "azure"\ntenant = "example.com"\n'
+    with U.ux_env(U.answers(("ok",))) as env:
+        U.setup(env, form, approve=False)
+        for fn in (gate_setup.check, gate_setup.login):
+            rc, out, err = _run(fn, "az")
+            assert rc == 1 and "own client_id" in err and "not the Azure CLI's" in err, err
+            assert 'sign_in = "browser"' in err, err
+        assert env.dialog.calls() == [], "nothing is asked (not even the consent)"
+    # an older gateway's refresh token: not a credential any more
     with U.ux_env() as env:
-        U.setup(env, '[accounts.az]\nkind = "azure"\ntenant = "example.com"\n')
+        U.setup(env, form)
         with vault.edit() as d:
             vault.account_record(d, "az", "azure")["entra"] = {
                 "refresh_token": "rt-existing-123456", "client_id": formmod.AZURE_CLI_CLIENT_ID,
                 "tenant_id": "tid-1", "refreshed": "x"}
         rc, out, err = _run(gate_setup.check, "az")
-        assert rc == 0 and env.dialog.calls() == [], (out, err)
-    popup_text = popup.signin_unavailable("github", "gh")
-    assert "personal access token" in popup_text and "gate check gh" in popup_text
-    # the azure guidance names only what the form takes (tenant, client_id), and that form is valid
-    az_text = popup.signin_unavailable("azure", "az")
-    assert "tenant" in az_text and "client_id" in az_text and "auth =" not in az_text, az_text
+        assert rc == 1 and "own client_id" in err and env.dialog.calls() == [], (out, err)
+    # where it can't run, the fixed text names why and what works
+    assert popup.signin_unavailable() == (
+        "gateway: browser sign-in isn't available here (no display). Sign in from a session "
+        "with a display, or use a service principal (azure).")
+    assert "(this is claude -p, nothing else)" in popup.signin_unavailable(
+        "this is claude -p, nothing else.")
     with U.ux_env():
         f = formmod.parse_text('[accounts.az]\nkind = "azure"\ntenant = "contoso.com"\n'
                                'client_id = "11111111-2222-3333-4444-555555555555"\n')
@@ -365,7 +366,7 @@ def test_names_disabled_entries_and_all():
         from gateway import sudo
         with U.patch(sudo, "probe_nopasswd", lambda user=None: True):
             rc, out, err = _run(gate_setup.check, "all")
-        assert rc == 0 and "ok ready" in out and "localhost ready" in out, (out, err)
+        assert rc == 0 and "ok ready" in out and "localhost: sudo here is your own" in out, (out, err)
         rc, out, err = _run(gate_setup.login, "ok")
         assert rc == 2 and "isn't an account" in err
 
@@ -453,8 +454,7 @@ def test_forget_keeps_no_copy_and_names_older_ones_rotate_keeps_one_when_it_chan
         assert d == "~/.config/gateway/private/backups", d
         assert f"Older copies of the vault in {d} (" in out and snaps[0].name in out \
             and imp.name in out and "store-v2-20260101.age" in out and "may still hold it" in out, out
-        assert f"the user deletes them in their own terminal: cd {d} && rm -r *.vault.age import-* " \
-            "store-v2-*.age" in out, out
+        assert "gate forget --backups deletes them" in out and "own terminal" not in out, out
         # rotate's copies: the newest 5
         for i in range(6):
             time.sleep(0.01)
@@ -464,6 +464,99 @@ def test_forget_keeps_no_copy_and_names_older_ones_rotate_keeps_one_when_it_chan
         left = sorted(bk.glob("rotate-*.vault.age"))
         assert len(left) == vault.SNAPSHOT_KEEP == 5 and snaps[0] not in left, left
         assert imp.is_dir() and (bk / "store-v2-20260101.age").exists(), "others' copies stay"
+
+
+def test_forget_backups_lists_exactly_the_older_copies_and_deletes_them_only_after_the_ok():
+    """PLAN-0.11 §19.14: `gate forget --backups` lists the older vault copies
+    (rotate's, an import's backup folder, a start-over's folder, the 0.6
+    store) by name in the gateway's dialog and deletes exactly those, only
+    after the person's Delete; Cancel deletes nothing; anything else in
+    private/backups (another file, a link) is never listed or touched. The
+    notes of forget, rotate and an import point at it, never at a terminal."""
+    from gateway import transfer
+    with U.ux_env(U.answers(("cancelled",), ("ok",))) as env:
+        U.setup(env, HOSTFORM)
+        bk = paths.backups_dir()
+        bk.mkdir(parents=True, exist_ok=True)
+        copies = ["import-20260101-000000-abcdef", "rotate-20260102-000000-abcdef.vault.age",
+                  "startover-20260103-000000-abcdef", "store-v2-20260101.age"]
+        (bk / copies[0]).mkdir()
+        (bk / copies[0] / "vault.age").write_bytes(b"an import's backup")
+        (bk / copies[0] / "gateway.toml").write_text("# the form before\n")
+        (bk / copies[1]).write_bytes(b"rotate's copy")
+        (bk / copies[2]).mkdir()
+        (bk / copies[2] / "key.wrapped").write_bytes(b"a lost passphrase's key")
+        (bk / copies[3]).write_bytes(b"the 0.6 store")
+        (bk / "notes.txt").write_text("not a vault copy\n")
+        (env.root / "elsewhere.vault.age").write_bytes(b"outside")
+        os.symlink(env.root / "elsewhere.vault.age", bk / "link.vault.age")
+        rc, out, err = _run(gate_setup.forget_backups)
+        assert rc == 1 and "kept the older vault copies; nothing was deleted" in out, (out, err)
+        assert all((bk / n).exists() for n in copies), "Cancel deletes nothing"
+        call = env.dialog.calls()[-1]
+        assert call["kind"] == "confirm" and "delete older vault copies" in call["title"], call
+        assert call["default"] == "Cancel", "Enter keeps them: Delete is never the default"
+        listed = [ln.strip() for ln in call["message"].splitlines() if ln.startswith("  ")]
+        assert listed == ["rotate-20260102-000000-abcdef.vault.age",
+                          "import-20260101-000000-abcdef/ (a folder)",
+                          "startover-20260103-000000-abcdef/ (a folder)",
+                          "store-v2-20260101.age"], listed
+        assert "notes.txt" not in call["message"] and "link.vault.age" not in call["message"]
+        rc, out, err = _run(gate_setup.forget_backups)
+        assert rc == 0 and "deleted 4 older copies of the vault" in out, (out, err)
+        assert not any((bk / n).exists() for n in copies), out
+        assert (bk / "notes.txt").exists() and (bk / "link.vault.age").is_symlink()
+        assert (env.root / "elsewhere.vault.age").exists(), "a link's target is never touched"
+        rc, out, _ = _run(gate_setup.forget_backups)
+        assert rc == 0 and "no older copies of the vault" in out and len(env.dialog.calls()) == 2
+        # only names still older copies when the person says Delete
+        (bk / copies[1]).write_bytes(b"rotate's copy")
+        assert vault.delete_older_copies([copies[1], "notes.txt", "link.vault.age", "../x"]) == \
+            [copies[1]]
+        assert (bk / "notes.txt").exists() and (bk / "link.vault.age").is_symlink()
+        # the notes point at it
+        (bk / copies[3]).write_bytes(b"the 0.6 store")
+        assert "gate forget --backups deletes them" in gate_setup._older_copies_note()
+        assert "own terminal" not in gate_setup._older_copies_note()
+        assert "gate forget --backups" in gate_setup.BACKUPS_HINT
+        assert "gate passphrase --start-over" in transfer.VAULT_UNREADABLE
+
+
+def test_after_a_start_over_the_last_export_can_be_imported():
+    """PLAN-0.11 §19.14, the README's "import your last export": a vault
+    whose passphrase is lost can't be read, so an import says what to do
+    (unlock it, or start over); once vault.move_aside has moved its files
+    into private/backups/startover-* (nothing deleted), the import's load
+    reads an empty vault and goes on."""
+    from gateway import transfer
+    with U.ux_env() as env:
+        U.setup(env, HOSTFORM)
+        priv = paths.private_dir()
+        # a wrapped key whose passphrase nobody knows: key.txt gone
+        paths.wrapped_key_path().write_bytes(b"age-encryption.org/v1 a wrapped key\n")
+        paths.recipient_path().write_text("age1" + "q" * 58 + "\n")
+        paths.key_path().unlink()
+        try:
+            transfer._load()
+            raise AssertionError("an unreadable vault was read")
+        except transfer.TransferError as e:
+            assert str(e) == transfer.VAULT_UNREADABLE and "gate passphrase --start-over" in str(e)
+        before = {n: (priv / n).read_bytes() for n in vault.START_OVER_FILES if (priv / n).exists()}
+        # a link in a vault file's place is never moved (nor what it points at)
+        assert "cache.age" not in before
+        (env.root / "outside-cache").write_bytes(b"not the gateway's")
+        os.symlink(env.root / "outside-cache", priv / "cache.age")
+        with vault.locked():
+            dest = vault.move_aside("startover")
+        assert dest.parent == paths.backups_dir() and dest.name.startswith("startover-")
+        assert {n: (dest / n).read_bytes() for n in before} == before, "moved, not deleted"
+        assert (priv / "cache.age").is_symlink() and not (dest / "cache.age").exists()
+        assert (env.root / "outside-cache").read_bytes() == b"not the gateway's"
+        (priv / "cache.age").unlink()
+        assert vault.key_mode() == "none" and not paths.vault_path().exists()
+        form, _eff, data = transfer._load()
+        assert data == vault.empty() or not data.get("hosts"), "an empty vault: the import goes on"
+        assert dest.name in [n for _g, ns in vault.older_copies() for n in ns]
 
 
 def test_vault_writes_are_durable_temp_file_fsync_rename_fsync_folder():
@@ -521,22 +614,16 @@ def test_vault_writes_are_durable_temp_file_fsync_rename_fsync_folder():
                 assert not list(target.parent.glob(f".{target.name}.*.tmp")), "no temp file left"
 
 
-# ---------------------------------------------------------------------------
-# gate secret (removed)
-# ---------------------------------------------------------------------------
-
-
-def test_gate_secret_is_removed_and_says_where_credentials_are_entered():
+def test_gate_secret_is_gone():
+    """The removed `gate secret` has no stub left: gate says it doesn't know
+    the command, and nothing is asked."""
     with U.ux_env(session=None) as env:
         U.setup(env, HOSTFORM)
-        for name in ("box", "../box", "nosuch"):
-            rc, out, err = _run(gate_setup.secret_removed, name)
-            assert rc == 2 and "gate secret was removed" in err and "dialog inside Claude Code" in err
-            assert "../box" not in err
-        assert env.dialog.calls() == [] and popup.pending() == []
         from gateway import gate
         rc, out, err = _run(gate.main, ["secret", "box"])
-        assert rc == 2 and "gate check box" in err
+        assert rc == 2 and "unknown or incomplete command" in err, err
+        assert env.dialog.calls() == [] and popup.pending() == []
+        assert not hasattr(gate_setup, "secret_removed")
 
 
 class _Pty:
@@ -621,6 +708,57 @@ def test_token_checks_ignore_proxy_and_ca_settings_from_the_environment():
             assert sapi.rec.requests == [], "nothing was sent over the untrusted connection"
 
 
+def test_gate_checks_consent_longer_than_one_dialog_comes_in_parts_and_approves_only_after_the_last():
+    """PLAN-0.11 §19.11 (WS-8) through the real flow: gate check settings
+    with more widening lines than one dialog holds (30 environment and 12
+    PATH imports) shows them in parts; a Decline on the first or the last
+    part approves nothing (all of it still waits); Approve on the last part
+    approves all of it, every line shown whole on one of the parts."""
+    from gateway import consent
+    names = [f"TOOL_HOME_{i:02d}" for i in range(30)]
+    dirs = [f"/opt/tool-{i:02d}/bin" for i in range(12)]
+    form = ("[shell]\nimport_env = [" + ", ".join(f'"{n}"' for n in names) + "]\n"
+            "import_path = [" + ", ".join(f'"{d}"' for d in dirs) + "]\n")
+    with U.ux_env() as env:
+        U.setup(env, form, approve=False)
+        pend = consent.compute(env.form(), vault.load()).pending_for("settings")
+        assert len(pend) == 42, len(pend)
+        pages = popup.consent_pages("settings", pend)
+        assert pages is not None and len(pages) >= 2, pages and len(pages)
+    n = len(pages)
+    # exactly CONSENT_PARTS parts open (here n), one more doesn't (below)
+    for answers, rc_want, approved in (([("cancelled",)], 1, False),
+                                       ([("ok",)] * (n - 1) + [("cancelled",)], 1, False),
+                                       ([("ok",)] * n, 0, True)):
+        with U.ux_env(U.answers(*answers)) as env, U.patch(popup, "CONSENT_PARTS", n):
+            U.setup(env, form, approve=False)
+            rc, out, err = _run(gate_setup.check, "settings")
+            calls = env.dialog.calls()
+            assert rc == rc_want and len(calls) == len(answers), (rc, out, err, len(calls))
+            assert all(c["kind"] == "confirm" for c in calls)
+            left = consent.compute(env.form(), vault.load()).pending_for("settings")
+            assert (left == []) is approved, len(left)
+            if approved:
+                shown = " ".join(" ".join(c["message"].split()) for c in calls)
+                for c in pend:
+                    assert " ".join(c.what.split()) in shown, c.what
+                assert env.form().shell.import_env == names
+            else:
+                assert len(left) == 42 and "cancelled the consent dialog for settings" in err, err
+    # one part more than CONSENT_PARTS (here n - 1): no dialog, nothing
+    # approved, and gate check says why and what to do (WS-8 review
+    # should-fixes 1 and 6: nothing was asked, so no "OK wasn't used")
+    with U.ux_env(U.answers(*[("ok",)] * n)) as env, U.patch(popup, "CONSENT_PARTS", n - 1):
+        U.setup(env, form, approve=False)
+        rc, out, err = _run(gate_setup.check, "settings")
+        assert rc != 0 and env.dialog.calls() == [], (rc, out, err)
+        assert len(consent.compute(env.form(), vault.load()).pending_for("settings")) == 42
+        assert (f"nothing was approved for settings: its changes need more than {n - 1} gateway dialogs, "
+                "so none was opened; make fewer changes to the gateway settings in gateway.toml "
+                "at a time, then run gate check settings") in err, err
+        assert "wasn't used" not in err and "after 3 tries" not in err, err
+
+
 def test_an_entry_named_settings_is_refused():
     form = '[hosts.settings]\naddress = "octo@settings.example.com"\nsudo = false\n'
     with U.ux_env(session=None) as env, ssh_mocks(env):
@@ -630,7 +768,7 @@ def test_an_entry_named_settings_is_refused():
         from gateway import sudo
         with U.patch(sudo, "probe_nopasswd", lambda user=None: True):
             rc, out, err = _run(gate_setup.check, "all")
-        assert rc == 2 and "reserved" in err and "localhost ready" in out, (out, err)
+        assert rc == 2 and "reserved" in err and "localhost: sudo here is your own" in out, (out, err)
         assert env.dialog.calls() == [], "no dialog for the clashing entry"
         from gateway import hooks_post
         assert "settings is reserved" in hooks_post.form_report(env.form(), None)

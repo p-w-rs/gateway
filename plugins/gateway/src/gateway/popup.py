@@ -2,14 +2,20 @@
 
 Every question is a native dialog inside Claude Code: a pane the gate mod
 draws, with a private Client field for secrets (dialog.py, daemon/dialogs.py,
-hooks/mod/). No OS dialog, browser, web page or terminal prompt is ever used
-(the `gate secret` terminal path, its one-time codes and the browser and
-device-code sign-ins are gone; DECISIONS "PLAN-v4 phase 3").
+hooks/mod/). No OS dialog, web page or terminal prompt is ever used (the
+`gate secret` terminal path, its one-time codes and the device-code sign-in
+are gone; DECISIONS "PLAN-v4 phase 3"). The one browser exception is the
+authorization code + PKCE sign-in (PLAN-0.11 §7), which gated runs after the
+person pressed Open in its own confirm dialog (daemon/oauth.py);
+signin_unavailable() is its fixed text where it can't run.
 
 Kinds: consent(entry, changes), secret(entry, what, prompt, verify),
 choice(entry, question, options), hostkey(entry, old, new), text, checklist,
 confirm, info, plus run(entry, what, job) for a multi-step job (gate check,
-export) whose dialogs all belong to one request.
+export) whose dialogs all belong to one request. offer_passphrase() is the
+vault passphrase offer's one entry point (PLAN-0.11 §8): after a secret is
+stored, gated offers to protect the vault with a passphrase (its own dialog,
+daemon/offer.py), never forced.
 
 Broker (one dialog per (entry, what) across all processes)
 ---------------------------------------------------------
@@ -88,6 +94,7 @@ import select
 import signal
 import sys
 import time
+import unicodedata
 import urllib.request   # imported before any fork: on macOS its _scproxy import aborts in a forked child
 import warnings
 from pathlib import Path
@@ -115,6 +122,7 @@ RESULT_KEEP = 600         # seconds a .result file is kept for joiners
 UNTAKEN_KEEP = 1800       # seconds a public job's line nobody took is kept for the retry
 REPLAYED = ("ok", "failed", "cancelled")   # the outcomes a retry is given instead of a new dialog
 LINE_MAX = 4000
+CONFIRM_LINE = 300        # popup.confirm keeps this much of each line (transfer fits its lines to it)
 TITLE = "Gateway"
 NEVER_SEES = "Claude never sees what you type here."
 WHERE = ("in Claude Code, in a terminal or the desktop app (not claude -p, VS Code, mobile or "
@@ -245,19 +253,183 @@ def secret_prompt(what: str, entry: str, *, target: str | None = None,
     return "\n".join(lines)
 
 
+# A consent dialog's change line is never cut (WS-3 review: a cut line hid
+# the approval it asked for): it is wrapped at word boundaries into lines
+# that fit gated's and the pane's 400-character line (daemon/dialogs.py
+# MAX_LINE, mod/dialog.ts), continuation lines indented.
+CONSENT_WRAP = 300
+
+
+def wrap_line(text: str, width: int = CONSENT_WRAP, first: str = "  - ",
+              rest: str = "    ") -> list[str]:
+    """One generated line (unsafe characters removed, nothing dropped) as
+    lines of at most `width` characters, words kept whole where they fit."""
+    lines: list[str] = []
+    cur, fresh = first, True
+    for w in clean_line(text, limit=len(str(text)) + 1).split(" "):
+        if not fresh and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur, fresh = rest, True
+        while len(cur) + len(w) > width:           # longer than a whole line: split it
+            room = width - len(cur)
+            lines.append(cur + w[:room])
+            w, cur = w[room:], rest
+        cur += ("" if fresh else " ") + w
+        fresh = False
+    lines.append(cur)
+    return lines
+
+
 def consent_text(entry: str, changes: Sequence[Any], extra_lines: Sequence[str] = ()) -> str:
     _name(entry)
-    who = "the gateway settings" if entry == "settings" else entry
-    out = [f"Claude asks for more rights for {who}:", ""]
+    out = [f"Claude asks for more rights for {_consent_who(entry)}:", ""]
     for c in changes:
         line = c.what if hasattr(c, "what") else str(c)
-        out.append("  - " + clean_line(line))
+        out += wrap_line(line)
     extras = [clean_line(x, 300) for x in extra_lines if x]
     if extras:
         out.append("")
         out += extras
-    out += ["", "Approve? Decline keeps what you approved before (nothing changes)."]
+    out += ["", CONSENT_QUESTION]
     return "\n".join(out)
+
+
+def _consent_who(entry: str) -> str:
+    return "the gateway settings" if entry == "settings" else entry
+
+
+CONSENT_QUESTION = "Approve? Decline keeps what you approved before (nothing changes)."
+# What one gateway dialog shows: gated keeps the first 40 lines of a dialog
+# (daemon/dialogs.py MAX_LINES) and the pane draws 40 (mod/dialog.ts); a test
+# keeps the three alike. A longer consent dialog comes in parts, at most
+# CONSENT_PARTS (PLAN-0.11 §19.11, as the import confirm): nothing is
+# approved before the last part's Approve, and a Decline on any part
+# changes nothing; more parts are refused without a dialog.
+DIALOG_LINES = 40
+CONSENT_PARTS = 10
+CONSENT_TOO_LONG = ("its changes need more than {n} gateway dialogs, so none was opened; make fewer "
+                    "changes to {who} in gateway.toml at a time, then run gate check {entry}")
+# A dialog in parts is sized by the rows its lines take in the pane, not by
+# its lines: docked beside a normal terminal (~170 columns) the pane is about
+# 75 columns wide, so 40 lines of 100 characters took ~80 rows and the pane
+# opened scrolled past the part's heading. PANE_COLUMNS is a little narrower
+# than that (its border and padding); a part's rows, its heading and question
+# included, stay within DIALOG_LINES.
+PANE_COLUMNS = 72
+
+
+def cells(text: str) -> int:
+    """The columns `text` takes in a terminal: a character of East Asian
+    width W or F (Chinese, Japanese and Korean characters, most emoji)
+    takes two, any other one."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pane_rows(line: str, width: int = PANE_COLUMNS) -> int:
+    """The rows one line takes in the dialog pane at `width` columns, wrapped
+    as the pane wraps it (Claude Code's text wrap: wrap-ansi's hard wrap
+    without trimming): at spaces, which are kept (after a row a word filled
+    exactly, the space starts the next row), a word wider than a row broken
+    (on the next row when that breaks it less), widths in columns (cells);
+    an empty line is one row."""
+    rows, used = 1, 0
+    for k, word in enumerate(unicodedata.normalize("NFC", line).split(" ")):
+        w = cells(word)
+        if k:
+            if used >= width:
+                rows, used = rows + 1, 0
+            used += 1                                   # the space
+        if w > width:
+            if (w - 1) // width < 1 + (w - (width - used) - 1) // width:
+                rows, used = rows + 1, 0
+            for i, ch in enumerate(word):
+                c = cells(ch)
+                if used + c > width:
+                    rows, used = rows + 1, 0
+                used += c
+                if used == width and i < len(word) - 1:
+                    rows, used = rows + 1, 0
+            continue
+        if used + w > width and used > 0 and w > 0:
+            rows, used = rows + 1, 0
+        used += w
+    return rows
+
+
+def dialog_parts(groups: Sequence[Sequence[str]], head: Callable[[int, int], list[str]],
+                 tail: Callable[[int, int], list[str]], max_parts: int,
+                 rows: int = DIALOG_LINES, width: int = PANE_COLUMNS) -> list[list[str]] | None:
+    """Lines too long for one dialog as parts that each fit `rows` rows of
+    the pane (pane_rows): part i of n is head(i, n), its lines, tail(i, n).
+    A group (a line and its continuation lines) stays on one part where it
+    fits, else goes on in the next; nothing is cut, and a part never starts
+    with a blank line. None when it takes more than max_parts parts. The
+    consent dialog (consent_pages) and the import confirm
+    (transfer.confirm_pages) both come in these parts."""
+    def tall(lines: Sequence[str]) -> int:
+        return sum(pane_rows(ln, width) for ln in lines)
+    # room for the lines: what the longest heading and question leave (n and
+    # i at max_parts), so the actual ones fit whatever n turns out to be
+    room = rows - tall(head(max_parts, max_parts)) - tall(tail(max_parts, max_parts))
+    if room < 1:
+        raise ValueError("a dialog part has no room for its lines")
+    parts: list[list[str]] = []
+    cur: list[str] = []
+    used = 0
+
+    def close() -> None:
+        while cur and not cur[-1].strip():
+            cur.pop()
+        if cur:
+            parts.append(cur[:])
+        cur.clear()
+    for g in groups:
+        if cur and used + tall(g) > room:
+            close()
+            used = 0
+        for ln in g:
+            r = pane_rows(ln, width)
+            if cur and used + r > room:
+                close()
+                used = 0
+            if cur or ln.strip():
+                cur.append(ln)
+                used += r
+    close()
+    n = len(parts)
+    if n > max_parts:
+        return None
+    return [head(i, n) + body + tail(i, n) for i, body in enumerate(parts, 1)]
+
+
+def consent_pages(entry: str, changes: Sequence[Any],
+                  extra_lines: Sequence[str] = ()) -> list[str] | None:
+    """The consent dialog's text: one dialog when it fits DIALOG_LINES rows
+    of the pane, else parts (dialog_parts: "part i of n" in the heading and
+    again in the question beside the buttons), each change line whole
+    (wrapped, never cut, and kept on one part where it fits), each part
+    ending with its question. None when it would take more than
+    CONSENT_PARTS parts."""
+    text = consent_text(entry, changes, extra_lines)
+    if sum(pane_rows(ln) for ln in text.split("\n")) <= DIALOG_LINES:
+        return [text]
+    groups = [wrap_line(c.what if hasattr(c, "what") else str(c)) for c in changes]
+    extras = [clean_line(x, 300) for x in extra_lines if x]
+    if extras:
+        groups.append([""] + extras)
+    who = _consent_who(entry)
+
+    def head(i: int, n: int) -> list[str]:
+        return [f"Claude asks for more rights for {who} (part {i} of {n}):", ""]
+
+    def tail(i: int, n: int) -> list[str]:
+        return ["", f"Part {i} of {n}. " + (
+            f"Approve all of this (parts 1 to {n})? Decline keeps what you approved before "
+            "(nothing changes)." if i == n else
+            f"Go on to part {i + 1} of {n}? Nothing is approved before the last part; Decline "
+            "changes nothing.")]
+    parts = dialog_parts(groups, head, tail, CONSENT_PARTS)
+    return None if parts is None else ["\n".join(p) for p in parts]
 
 
 _FP_NOTES = ("(your ~/.ssh/known_hosts has it)", "(not in your ~/.ssh/known_hosts)")
@@ -321,6 +493,9 @@ def message(outcome: str, entry: str, what: str, reason: str = "") -> str:
         return (f"gateway: the task is paused (checkpoint), so {p} wasn't asked for or used; "
                 "it can be given after the user resumes the task")
     if outcome == Outcome.FAILED:
+        if reason and what == "consent":
+            # (also when no dialog opened: more changes than CONSENT_PARTS show)
+            return f"gateway: nothing was approved for {entry}: {reason.removeprefix('gateway: ')}"
         if reason:
             return f"gateway: {p} wasn't used: {reason.removeprefix('gateway: ')}; nothing was saved"
         return f"gateway: {p} didn't work after {MAX_TRIES} tries; nothing was saved"
@@ -713,6 +888,7 @@ def _helper_main(w: int, key: str, rid: str, job: Job, entry: str, what: str, ki
         outcome, value = Outcome.FAILED, None
         _audit("popup_error", entry=entry, what=what, error=type(e).__name__)
     finally:
+        _offer_if_due()            # a secret stored by the job: the vault passphrase offer
         dialog.release_lease()
     payload = base64.b64encode(value.encode()).decode() if isinstance(value, str) else "-"
     result: dict[str, Any] = {"id": rid, "outcome": outcome, "at": _iso()}
@@ -1008,18 +1184,35 @@ def run(entry: str, what: str, job: Job, *, kind: str = "setup", lazy: bool = Fa
 def consent(entry: str, changes: Sequence[Any], *, extra_lines: Sequence[str] = (),
             on_ok: Callable[[], Any] | None = None, lazy: bool = False) -> str:
     """One consent dialog listing each widening line; Approve / Decline,
-    Decline the default. on_ok runs where the dialog runs (the helper), right
-    after the user's OK (e.g. consent.approve with exactly these changes).
-    Returns an Outcome."""
-    text = consent_text(entry, changes, extra_lines)
-    lines = [clean_line(c) for c in changes] + [clean_line(x) for x in extra_lines]
+    Decline the default. Longer than one dialog: in parts (consent_pages),
+    Next / Decline on each but the last; nothing is approved before the last
+    part's Approve, and a Decline on any part changes nothing. on_ok runs
+    where the dialog runs (the helper), right after the user's OK (e.g.
+    consent.approve with exactly these changes). Returns an Outcome: failed,
+    with no dialog, when it would take more than CONSENT_PARTS parts."""
+    global _LAST_REASON
+    _LAST_REASON = ""
+    pages = consent_pages(entry, changes, extra_lines)
+    if pages is None:
+        _LAST_REASON = CONSENT_TOO_LONG.format(n=CONSENT_PARTS, who=_consent_who(entry), entry=entry)
+        _audit("popup", entry=entry, what="consent", outcome=Outcome.FAILED, parts="too many")
+        return Outcome.FAILED
+    # the digest names the whole of every line (never a cut one: two change
+    # sets alike in their first 200 characters are different requests)
+    lines = [clean_line(c, limit=1 << 20) for c in changes] + [clean_line(x) for x in extra_lines]
 
     def job() -> tuple[str, Any]:
-        oc = _confirm(f"{TITLE}: allow changes for {entry}?", text, "Approve", default_cancel=True,
-                      entry=entry, what="consent", cancel_label="Decline")
-        if oc == Outcome.OK and on_ok is not None:
+        n = len(pages)
+        for i, page in enumerate(pages, 1):
+            last = i == n
+            oc = _confirm(f"{TITLE}: allow changes for {entry}?" + (f" (part {i} of {n})" if n > 1 else ""),
+                          page, "Approve" if last else "Next", default_cancel=True,
+                          entry=entry, what="consent", cancel_label="Decline")
+            if oc != Outcome.OK:
+                return oc, None
+        if on_ok is not None:
             on_ok()
-        return oc, None
+        return Outcome.OK, None
     return run(entry, "consent", job, kind="consent", lazy=lazy, digest=_digest(lines))[0]
 
 
@@ -1027,7 +1220,7 @@ def confirm(entry: str, lines: Sequence[str], *, title: str, ok_label: str = "Al
             what: str = "confirmation") -> str:
     """A yes/no dialog of generated lines (import summary); default button Cancel."""
     _name(entry)
-    body = "\n".join(clean_line(x, 300) for x in lines)
+    body = "\n".join(clean_line(x, CONFIRM_LINE) for x in lines)
     t = clean_line(title, 80)
 
     def job() -> tuple[str, Any]:
@@ -1046,7 +1239,7 @@ def secret(entry: str, what: str, prompt: str, verify: Callable[[str], tuple[boo
     never stores a failing value; store(value) runs in the helper once the
     value is good and, when `remember` offers the "Remember it" choice (True
     or False: the box's first state; None, the default: no box, stored),
-    only if the person kept it ticked. `check` names the form entry the
+    only if the box is ticked when the person submits. `check` names the form entry the
     daemon rechecks before handing the value over ({"section", "entry",
     "right" (one or a list) or "kind"}); every dialog for a host's or an
     account's secret passes one. Returns (Outcome, value or None). A joined
@@ -1096,6 +1289,7 @@ def secret(entry: str, what: str, prompt: str, verify: Callable[[str], tuple[boo
                 keep = r.remember if r.remember is not None else (remember is not False)
                 if store is not None and keep:
                     store(v)
+                    offer_passphrase()   # (in the helper: offered once its job has ended)
                 d.close(Outcome.OK, "supplied")
                 return Outcome.OK, v
             v = None
@@ -1193,27 +1387,75 @@ def reenter(entry: str, what: str, prompt: str, verify: Callable[[str], tuple[bo
 
 
 # ---------------------------------------------------------------------------
-# Sign-ins that need a browser: unavailable (brief section 11)
+# The vault passphrase offer (PLAN-0.11 §8)
 # ---------------------------------------------------------------------------
 
-SIGNIN_UNAVAILABLE = (
-    "gateway: signing in through a browser or a device code isn't available: the gateway "
-    "shows no web page, browser or code to type elsewhere (only its own dialogs inside "
-    "Claude Code). {instead} An existing sign-in keeps working (its refresh token is used as "
-    "before).")
-SIGNIN_INSTEAD = {
-    "github": "Use a personal access token instead: create one on GitHub (Settings > Developer "
-              "settings > Personal access tokens) and paste it into the gateway's dialog "
-              "(gate check NAME).",
-    "azure": "Use a service principal instead: set tenant and client_id (the service "
-             "principal's application id, not the Azure CLI's) for the account in gateway.toml "
-             "and paste its client secret into the gateway's dialog (gate check NAME).",
-    "ml-catalog": "A catalog account signs in through Entra in a browser, which isn't "
-                  "available; one signed in before keeps working until its refresh token "
-                  "expires.",
-}
+_OFFER_DUE = False      # inside the helper: a secret was stored; offered when its job ends
 
 
-def signin_unavailable(kind: str, name: str = "NAME") -> str:
-    instead = SIGNIN_INSTEAD.get(kind, "Use a token or API key instead (gate check NAME).")
-    return SIGNIN_UNAVAILABLE.format(instead=instead.replace("NAME", name))
+def offer_passphrase() -> str:
+    """The one entry point of the vault passphrase offer: call it right after
+    a secret was stored, outside the vault's lock (vault.edit() closed:
+    setting a passphrase takes that lock). In popup's detached helper the
+    offer waits until the helper's job has ended (its own dialogs first, every
+    vault write done) and then goes to gated with the helper's dialog lease;
+    in a gateway program below the session it goes to gated now. gated
+    decides (daemon/offer.py): the offer due ("pending"), the key without a
+    passphrase, not offered in this session yet, a session that can draw
+    it. Never waits for the person's answer and never raises. Returns what
+    happened: "offered", "deferred", or why not."""
+    global _OFFER_DUE
+    if dialog.backend()[0] != "native":
+        return "unavailable"        # a test's fake dialog, or none: never offered
+    if _MODE != "broker":
+        _OFFER_DUE = True
+        return "deferred"
+    return _offer_now(None)
+
+
+def _offer_now(lease: str | None) -> str:
+    try:
+        from .daemon import client
+        if lease:
+            r = client.call("POST", "/lease/vault/offer", {"lease": lease}, timeout=10)
+        else:
+            r = client.call("POST", "/agent/vault/offer", {}, timeout=10)
+    except Exception:  # noqa: BLE001 - nothing offered; a later store may
+        return "unreachable"
+    return "offered" if r.get("offered") is True else str(r.get("reason") or "not offered")
+
+
+def _offer_if_due() -> None:
+    """The helper's job ended: the offer its stores made due, with its lease."""
+    global _OFFER_DUE
+    if not _OFFER_DUE:
+        return
+    _OFFER_DUE = False
+    try:
+        lease = dialog.lease()
+        if lease:
+            _offer_now(lease)
+    except Exception:  # noqa: BLE001 - never breaks the helper
+        pass
+
+
+# ---------------------------------------------------------------------------
+# The browser sign-in where it can't run (PLAN-0.11 §7.2)
+# ---------------------------------------------------------------------------
+
+# The fixed text where no browser sign-in can run: no display (headless, an
+# ssh session without a forward), or a surface that can't draw the gateway's
+# confirm dialog (claude -p, the Agent SDK, mods off, mobile, VS Code), whose
+# reason is the gateway daemon's own fixed clause.
+SIGNIN_UNAVAILABLE = ("gateway: browser sign-in isn't available here ({why}). Sign in from a "
+                      "session with a display, or use a service principal (azure).")
+
+
+def signin_unavailable(why: str = "") -> str:
+    why = clean_line(why, 300).removeprefix("gateway: ").rstrip(".") if why else ""
+    return SIGNIN_UNAVAILABLE.format(why=why or "no display")
+
+
+def deadline() -> float | None:
+    """The overall wait cap a command set (set_deadline), or None."""
+    return _DEADLINE

@@ -17,7 +17,7 @@ starts and removes it when it stops:
 { "contract": "gateway.v1", "versions": [1], "gateway_version": "0.9.0",
   "socket": "/tmp/gw-501/gated.sock", "pid": 12345, "started": 1792450000.0, "epoch": 7,
   "machine_id": "m_...", "features": ["hosts", "events", "pause", "jobs", "terminals",
-  "remote", "workspaces", "accounts", "pause_id"] }
+  "remote", "workspaces", "accounts", "pause_id", "job_env"] }
 ```
 
 A consumer treats a missing file, a dead `pid`, an unknown `contract`, or a `versions` list
@@ -29,7 +29,7 @@ whose ancestry reaches a Claude Code session; UI-plane calls are refused on this
 `features` says what this daemon serves; a consumer uses a feature only when it is listed
 (a field of a feature the daemon doesn't list is ignored by that daemon). Added within v1:
 `remote` (gateway 0.8: terminals and jobs on remote hosts in the gateway's managed remote
-runtime), `workspaces`, `accounts` and `pause_id` (gateway 0.9).
+runtime), `workspaces`, `accounts` and `pause_id` (gateway 0.9), `job_env` (gateway 0.11).
 
 ## Messages
 
@@ -63,7 +63,7 @@ as the person wrote it (for example `[hosts.build.policy] exec = "deny" (gateway
 | `GET /v1/capabilities` | `{contract, gateway_version, features, limits}` |
 | `GET /v1/snapshot` | `{seq, hosts[], workspaces[], accounts[], terminals[], jobs[]}`: sanitized state at `seq` |
 | `GET /v1/events?since=<seq>&wait=<s>` | `{events[], next}`; long-poll up to `wait` (≤ 25 s). Events carry `seq` (strictly increasing per daemon epoch), `epoch`, `ts`, `kind`, ids. A consumer that sees a new `epoch` re-reads the snapshot. |
-| `POST /v1/jobs` | start a job: `{argv \| command, host, workspace?, cwd?, session, agent?, task_ref?, idempotency_key, on_pause?}` → `{job, op, state}`. The same `idempotency_key` within 24 h returns the original job instead of starting another. |
+| `POST /v1/jobs` | start a job: `{argv \| command, host, workspace?, cwd?, session, agent?, task_ref?, idempotency_key, on_pause?, env?}` → `{job, op, state}`. The same `idempotency_key` within 24 h returns the original job instead of starting another. |
 | `GET /v1/jobs/<job>` | `{job, state, exit?, signal?, started, ended?, host, cwd, command (scrubbed), owner, on_pause}` |
 | `GET /v1/jobs/<job>/tail?bytes=<n>` | last ≤ 64 KiB of scrubbed output, `{text, truncated, offset}` |
 | `POST /v1/jobs/<job>/signal` | `{signal: "INT"\|"TERM"\|"KILL"\|"STOP"\|"CONT"}` → `{state}` |
@@ -120,6 +120,18 @@ from the task). The outcome reports what actually happened.
   that is still alive is refused (403 `session`). A session that has ended (no live Claude
   Code process registered under it) may be named only together with `task_ref`, and then
   only that task's jobs are touched (a task picked up in a later session).
+- `env` (feature `job_env`): the job's environment, an object of variable names to string
+  values (a session's whole environment will do). A job on this machine gets the first 400
+  variables whose name is a shell name (letters, digits and `_`, not starting with a digit, at
+  most 64 characters) and whose value is at most 8192 characters of UTF-8 without NUL, minus
+  the ones Gateway's managed shell removes (Claude Code's own credentials, the shell's startup
+  variables, Gateway's own) and the ones Gateway or its terminal sets itself (`HOME`, `USER`,
+  `LOGNAME`, `SHELL`, `TERM`, `PWD`, `OLDPWD`, `SHLVL`, `COLUMNS`, `LINES`, `TMUX`,
+  `TMUX_PANE`, `CLAUDE_PID`); anything else is skipped. `PATH` is Gateway's stand-ins, then
+  the `PATH` given. Only an `env` that isn't an object of strings, or whose kept variables
+  come to more than 256 KiB (UTF-8 bytes), is refused whole (400 `bad_env`), and then
+  nothing starts. Without `env` the job gets Gateway's plain managed environment. A job on a
+  remote host keeps that host's managed environment (`env` is ignored there).
 - `pause_id` (feature `pause_id`): an opaque id of at most 64 characters
   (`[A-Za-z0-9._:-]`). A pause or resume repeated with the same `session` and `pause_id`
   within 24 h returns the first answer with `replayed: true` and applies nothing again (no
@@ -137,7 +149,10 @@ from the task). The outcome reports what actually happened.
 `vault.unlocked`, `vault.locked` (gateway 0.7), and since gateway 0.9 `rights.changed`
 (`entry`, `change`: `widened` after the person's OK, `narrowed`, `removed`),
 `account.state` (`account`, `state`) and `policy.denied` (`host`, `account`, `workspace`,
-`action`, `entry`: what was refused and under which entry, never the command).
+`action`, `entry`: what was refused and under which entry, never the command), and since
+gateway 0.11 `vault.unwrapped` (the passphrase removed: the vault key is kept without one)
+and `vault.started_over` (a locked vault whose passphrase was lost moved aside: there is no
+vault until the next store).
 
 ## Compatibility
 

@@ -393,9 +393,20 @@ def test_a_deleted_form_is_described_as_it_is():
         fp.unlink()
         msg = hooks_filechanged.main({"file_path": str(fp)})["systemMessage"]
         assert "nothing is turned off" not in msg
-        assert "only this computer's defaults apply" in msg and "restores the last good" in msg, msg
+        # PLAN-0.11 §1.1: a missing form is its last good version meanwhile
+        assert "uses the last good version" in msg and "next session restores it" in msg, msg
         eff = consent.compute(consent.load_form(), vault.load())
-        assert "homelab" not in eff.hosts, "what the message says is what happens"
+        assert eff.hosts["homelab"].ssh is True and not eff.hosts["homelab"].removed, \
+            "what the message says is what happens"
+        # with no copy to fall back on, the entries it named are refused, never passed through
+        from gateway import form as formmod
+        with vault.edit() as d:
+            d["form_last_good"] = None
+        formmod.clear_cache()
+        msg = hooks_filechanged.main({"file_path": str(fp)})["systemMessage"]
+        assert "the hosts and accounts it named are refused" in msg, msg
+        eff = consent.compute(consent.load_form(), vault.load())
+        assert "homelab" not in eff.hosts and eff.refused["homelab"] == consent.FORM_GONE
         import io
         import contextlib
         buf = io.StringIO()
@@ -1151,23 +1162,31 @@ _JOB = {"id": "leak-20261019-120504", "name": "leak", "state": "exited", "exit_c
         "gateway_env": True}
 
 
+# Tools whose output must reach the output hooks (PLAN-0.11 §9.1, 27e): the
+# built-in readers and fetchers, AskUserQuestion's answers, the desktop app's
+# Browser pane, Claude in Chrome, the Terminal panel, checkpoint's job tools,
+# the gateway's own and any other MCP server.
+EVERY_TOOL = ("Bash", "BashOutput", "Monitor", "Read", "Grep", "Glob", "WebFetch", "WebSearch",
+              "AskUserQuestion", "TaskOutput", "Task", "Agent", "NotebookEdit",
+              "mcp__Claude_Browser__get_page_text", "mcp__Claude_Browser__read_page",
+              "mcp__claude-in-chrome__get_page_text", "mcp__terminal__read_terminal",
+              "mcp__terminal__run_in_terminal", "mcp__plugin_gate_gw__terminal_read",
+              "mcp__some_other_server__fetch", *JOB_RESULT_TOOLS)
+
+
 def test_hooks_json_sends_checkpoint_job_results_to_the_output_hooks():
     """Integration review: a job ran `cat notes.txt` (the planted API key and
     the remote sudo password) and job_tail returned both raw to Claude, the
     stream-json and the transcript: PostToolUse's matcher didn't name the job
-    tools. Both output events name them now, by their exact names (anchored:
-    nothing else matches, and nothing changes when checkpoint isn't loaded).
-    Claude Code: a matcher with characters beyond letters, digits, _ and | is
-    a regular expression, searched in the tool name."""
+    tools. PLAN-0.11 §9.1: both output events take every tool (".*"; Claude
+    Code: a matcher with characters beyond letters, digits, _ and | is a
+    regular expression, searched in the tool name); post.sh skips only the
+    tools whose response is fixed text (SKIP_TOOLS)."""
     for ev in ("PostToolUse", "PostToolUseFailure"):
         m = _post_sh_matcher(ev)
         assert not re.fullmatch(r"[A-Za-z0-9_|]+", m), m
-        for tool in JOB_RESULT_TOOLS:
+        for tool in EVERY_TOOL:
             assert re.search(m, tool), (ev, tool, m)
-        for tool in ("mcp__plugin_check_jobs__job_tail_all", "xmcp__plugin_check_jobs__job_tail",
-                     "mcp__plugin_check_jobs__job_", "mcp__plugin_check_jobs__job_stopx",
-                     "mcp__plugin_other_jobs__job_tail"):
-            assert not re.search(m, tool), (ev, tool, m)
 
 
 def test_post_sh_masks_stored_values_in_checkpoint_job_results():
@@ -1248,3 +1267,304 @@ def test_post_sh_warns_when_a_failed_job_stop_returns_a_stored_value():
         leaks = [a for a in audit.read(50) if a.get("event") == "leak"]
         assert leaks and leaks[-1]["tool"] == "mcp__plugin_check_jobs__job_stop", leaks
         assert "PlantedApiKey" not in json.dumps(leaks) and "Pl4nted" not in json.dumps(leaks)
+
+
+# ---------------------------------------------------------------------------
+# PLAN-0.11 §9.1, §1.6, §9.2 (WS-6): every tool's output, the user's
+# credential variables, and AskUserQuestion asking for a secret
+# ---------------------------------------------------------------------------
+
+
+def _sh_list(name: str) -> list[str]:
+    """post.sh's lists, written out where they are used (zsh splits no
+    variable): the skip list's case pattern, the variables' for loop."""
+    text = (U.SH_SCRIPTS / "post.sh").read_text()
+    if name == "SKIP_TOOLS":
+        m = re.search(r"# SKIP_TOOLS \(hooks_post\.SKIP_TOOLS\)\n\s*([A-Za-z|]+)\) exit 0 ;;", text)
+        assert m, name
+        return m.group(1).split("|")
+    m = re.search(r"\n\s*for n in ((?:[A-Z_ ]+\\\n)*[A-Z_ ]+); do\n", text)
+    assert m, name
+    return m.group(1).replace("\\\n", " ").split()
+
+
+def test_post_sh_lists_are_pythons():
+    from gateway import envfile
+    assert _sh_list("SKIP_TOOLS") == list(hooks_post.SKIP_TOOLS)
+    assert _sh_list("MASK_ENV_NAMES") == list(envfile.MASK_ENV_NAMES)
+    assert not set(hooks_post.SKIP_TOOLS) & {"TaskOutput", "Task", "Agent", "WebFetch", "Read",
+                                             "AskUserQuestion", "BashOutput", "Monitor"}
+
+
+def test_one_list_of_credential_variables_is_masked_and_never_imported():
+    """WS-8: envfile.MASK_ENV_NAMES is the one list (WS-6's hooks_post kept a
+    shorter one of its own, so post.sh started Python for fewer of the names
+    WS-1's posture leaves in Claude's shell). Every listed name is masked,
+    the ones no credential-like ending catches too; a name holding a socket,
+    a program or a path never is; none can be imported into the managed
+    shell ([shell] import_env), whose imported values aren't in Claude
+    Code's environment, where the masker looks. The managed shell keeps
+    every listed name but Claude Code's own (masked all the same)."""
+    from gateway import envfile, managed
+    from gateway import form as formmod
+    names = envfile.MASK_ENV_NAMES
+    assert not hasattr(hooks_post, "MASK_ENV_NAMES"), "one list: envfile's"
+    assert len(set(names)) == len(names) and not set(names) & set(envfile.NOT_SECRET_NAMES)
+    assert set(envfile.ENV_UNSET) - set(envfile.NOT_SECRET_NAMES) <= set(names)
+    assert set(envfile.CLAUDE_CRED_NAMES) - set(envfile.NOT_SECRET_NAMES) <= set(names)
+    env = {n: f"Listed-{n.lower()}-v9v9v9" for n in names}
+    env.update({n: f"/tmp/gw-{n.lower()}/agent.sock" for n in envfile.NOT_SECRET_NAMES})
+    got = dict(hooks_post.env_secrets(env))
+    assert set(got) == set(names), sorted(set(got) ^ set(names))
+    for n in names + ("AZURE_DEVOPS_EXT_PAT", "docker_auth_config"):
+        value, why = formmod.import_env_entry(n)
+        assert value is None and "looks like a credential" in str(why), (n, why)
+    assert formmod.import_env_entry("CONDA_PREFIX") == ("CONDA_PREFIX", None)
+    claudes = {n for n in names if managed.dropped(n)}
+    assert claudes == set(envfile.CLAUDE_CRED_NAMES) & set(names), sorted(claudes)
+
+
+def test_post_sh_skips_only_the_tools_whose_response_is_fixed_text():
+    """Every tool reaches post.sh now; with a vault every response goes to
+    Python but a skipped tool's (a todo list, plan mode), whose response is
+    Claude's own input. TaskOutput and Task carry output: they go. A payload
+    whose tool can't be told for sure goes too."""
+    import subprocess
+    with H.gateway_env() as env:
+        root, fake, log = _post_rig(env)
+        e = {"PATH": "/usr/bin:/bin", "HOME": str(fake)}
+
+        def went(payload) -> bool:
+            if log.exists():
+                log.unlink()
+            data = payload if isinstance(payload, str) else json.dumps(payload)
+            r = subprocess.run(["/bin/sh", str(root / "hooks" / "post.sh")], input=data,
+                               capture_output=True, text=True, env=e, timeout=30)
+            assert r.returncode == 0, r.stderr
+            return log.exists()
+        for tool in hooks_post.SKIP_TOOLS:
+            p = {"session_id": "s", "hook_event_name": "PostToolUse", "tool_name": tool,
+                 "tool_input": {"todos": []}, "tool_response": {"todos": ["x"]}}
+            assert not went(p), tool
+            assert not went(json.dumps(p, separators=(",", ":"))), tool
+            assert went(dict(p, tool_response={"x": {"tool_name": "Bash"}})), \
+                f"{tool}: named twice, not trusted"
+        for tool in EVERY_TOOL:
+            assert went({"session_id": "s", "tool_name": tool, "tool_response": {"text": "x"}}), tool
+        assert went('{"session_id":"s","tool_name":"TodoWriteX","tool_response":{}}')
+        assert went('{"session_id":"s","tool_name":"Todo\\"Write","tool_response":{}}')
+
+
+def test_post_sh_sends_a_credential_variables_value_to_python_without_a_vault():
+    """Claude's shell keeps the user's environment (PLAN-0.11 §1.6): `env`
+    would show GH_TOKEN. Without a vault post.sh compares the listed
+    variables' values (8+ characters) with builtins; a hit starts Python."""
+    import subprocess
+    with H.gateway_env() as env:
+        d = env.root / "rig"
+        fake = d / "pwhome"
+        (fake / ".config" / "gateway").mkdir(parents=True)
+        root = _hooks_copy(d, fake, names=("post.sh",))
+        log = d / "launched"
+        (root / "hooks" / "launch.sh").write_text(f"#!/bin/sh\ncat >> {str(log)!r}\n")
+        val = "PlainUserToken" + "q7" * 8
+        shells = [s for s in ("/bin/sh", "/bin/dash", "/bin/bash", "/bin/zsh", shutil.which("dash"))
+                  if s and os.path.exists(s)]
+        for sh in dict.fromkeys(shells):
+            def went(text: str, tool: str = "Bash", **env_kw: str) -> bool:
+                if log.exists():
+                    log.unlink()
+                p = {"session_id": "s", "tool_name": tool, "tool_response": {"stdout": text}}
+                r = subprocess.run([sh, str(root / "hooks" / "post.sh")], input=json.dumps(p),
+                                   capture_output=True, text=True, timeout=30,
+                                   env={"PATH": "/usr/bin:/bin", "HOME": str(fake), **env_kw})
+                assert r.returncode == 0 and not r.stderr, (sh, r.stderr)
+                return log.exists()
+            assert not went(f"GH_TOKEN={val}"), (sh, "no such variable here")
+            assert went(f"GH_TOKEN={val}", GH_TOKEN=val), sh
+            assert went(f"x {val} y", ANTHROPIC_API_KEY=val), sh
+            assert went(f"x {val} y", ANTHROPIC_AUTH_TOKEN=val), (sh, "the list's last name")
+            # names only WS-1's list had (WS-8: one list), one no ending catches
+            assert went(f"x {val} y", CI_JOB_TOKEN=val), sh
+            assert went(f"x {val} y", AZURE_DEVOPS_EXT_PAT=val), sh
+            slash = "/Ab1+cdEf" + "Gh2/Ij3+" * 4
+            assert went(f"k={slash}", AWS_SECRET_ACCESS_KEY=slash), (sh, "a value starting with /")
+            assert not went("nothing", GH_TOKEN=val), sh
+            assert not went("short1 here", GH_TOKEN="short1"), (sh, "under 8 characters never counts")
+            assert not went(f"{val}", SOME_OTHER_NAME=val), (sh, "only the listed names in sh")
+            assert not went(f"GH_TOKEN={val}", "TodoWrite", GH_TOKEN=val), (sh, "a skipped tool")
+
+
+def test_post_masks_the_users_credential_variables_and_names_them_on_a_failure():
+    gh = "PlainUserToken" + "q7" * 8
+    svc = "svc-" + "Z9y8" * 5
+    # a base64 secret starts with "/" about one time in 64: still masked (WS-6 review)
+    aws = "/Ab1+cdEf" + "Gh2/Ij3+" * 4
+    key = "/Zz9" + "Yy8x" * 5
+    with H.gateway_env() as env:
+        U.setup(env, "")
+        with U.env_vars(GH_TOKEN=gh, MY_SERVICE_TOKEN=svc, GIT_AUTHOR_NAME="Octo Catalina Person",
+                        SSH_AUTH_SOCK="/tmp/agent.sock.12345678", SHORT_TOKEN="abc",
+                        AWS_SECRET_ACCESS_KEY=aws, MY_STORE_API_KEY=key):
+            out = hooks_post.main({"tool_name": "Bash", "tool_input": {"command": "env"},
+                                   "tool_response": {"stdout": f"GH_TOKEN={gh}\nMY_SERVICE_TOKEN={svc}\n"
+                                                               "GIT_AUTHOR_NAME=Octo Catalina Person\n"
+                                                               "SSH_AUTH_SOCK=/tmp/agent.sock.12345678\n"
+                                                               "SHORT_TOKEN=abc\n"}})
+            new = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            assert gh not in new and svc not in new and "GH_TOKEN=***" in new, new
+            assert "Octo Catalina Person" in new and "/tmp/agent.sock.12345678" in new, \
+                "a name, a socket path: not secrets"
+            assert "SHORT_TOKEN=abc" in new
+            for name, val in (("AWS_SECRET_ACCESS_KEY", aws), ("MY_STORE_API_KEY", key)):
+                out = hooks_post.main({"tool_name": "Bash",
+                                       "tool_response": {"stdout": f"{name}={val}\n"}})
+                assert out is not None, (name, "a value starting with / is masked too")
+                new = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+                assert val not in new and f"{name}=***" in new, (name, new)
+            # a failed call: Claude Code shows it unmasked; the variable is named, never its value
+            out = hooks_post.main({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                                   "session_id": "s", "error": f"Exit code 1\n{gh}"})
+            dump = json.dumps(out)
+            assert gh not in dump and "GH_TOKEN" in out["systemMessage"], dump
+            assert "never repeat, store or use it" in out["hookSpecificOutput"]["additionalContext"]
+        assert hooks_post.main({"tool_name": "Bash", "tool_response": {"stdout": f"x {gh}"}}) is None, \
+            "not in the environment: nothing to mask"
+
+
+def test_every_tools_output_is_masked_through_post_sh():
+    """WebFetch, a recorded Browser-pane payload (the pane is desktop-only:
+    an MCP content list), the Terminal panel and run_in_terminal's own
+    result, AskUserQuestion's answers: masked through the real hook."""
+    key = "PlantedApiKeyNoPrefix7Q9Z2X4V6B8N0M"
+    pw = "correct horse battery staple"
+    with U.ux_env() as env:
+        _ready_vault_env(env, key, pw)
+        cases = [
+            ("WebFetch", {"bytes": 120, "code": 200, "codeText": "OK", "durationMs": 40,
+                          "result": f"The page says: key={key}", "url": "https://example.com/"}),
+            ("mcp__Claude_Browser__get_page_text", [{"type": "text", "text": f"Settings\nAPI key {key}"}]),
+            ("mcp__claude-in-chrome__get_page_text", [{"type": "text", "text": f"sudo: {pw}"}]),
+            ("mcp__terminal__read_terminal", [{"type": "text", "text": f"$ cat .env\nKEY={key}"}]),
+            ("mcp__terminal__run_in_terminal", [{"type": "text", "text": f"started; {pw}"}]),
+            ("AskUserQuestion", {"questions": [{"question": "Which file?"}],
+                                 "answers": {"Which file?": f"the one with {key}"}}),
+            ("TaskOutput", {"task_id": "b1", "output": f"done {pw}"}),
+        ]
+        for tool, resp in cases:
+            r = U.run_sh(env, "post.sh", {"tool_name": tool, "session_id": "s", "tool_input": {},
+                                          "tool_response": resp})
+            assert r.returncode == 0 and r.stdout, (tool, r.stderr)
+            assert key not in r.stdout and pw not in r.stdout, (tool, r.stdout)
+            new = json.loads(r.stdout)["hookSpecificOutput"]["updatedToolOutput"]
+            assert type(new) is type(resp) and "***" in json.dumps(new), (tool, new)
+
+
+TOOL_GUARD = H.PLUGIN / "hooks" / "tool_guard.sh"
+
+
+def _ask_guard(env, questions: list, extra: dict | None = None, compact: bool = False) -> str:
+    import subprocess
+    # the paths around tool_input ask for secrets: only tool_input is read
+    p = {"session_id": "s", "transcript_path": "/x/.claude/projects/-p-your-token-secret-svc/a.jsonl",
+         "cwd": "/p/paste-your-password-manager", "permission_mode": "default",
+         "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {"questions": questions},
+         "tool_use_id": "toolu_1", **(extra or {})}
+    text = json.dumps(p, separators=(",", ":")) if compact else json.dumps(p)
+    r = subprocess.run(["sh", str(TOOL_GUARD), "--test"], input=text, capture_output=True, text=True,
+                       timeout=15, env={"PATH": "/usr/bin:/bin", "GATEWAY_TEST_ROOT": str(env.root)})
+    assert r.returncode == 0 and not r.stderr, r.stderr
+    return r.stdout.strip()
+
+
+def _q(question: str, header: str = "Choice", options: tuple = ("Yes", "No")) -> dict:
+    return {"question": question, "header": header, "multiSelect": False,
+            "options": [{"label": o, "description": f"{o}."} for o in options]}
+
+
+def test_ask_user_question_asking_for_a_secret_is_denied():
+    """PLAN-0.11 §9.2: AskUserQuestion's answer goes to the model and the
+    transcript. A question, header or option asking for a secret is denied
+    with the fixed reason; ordinary questions pass, and only tool_input is
+    read (the paths around it may say anything)."""
+    with H.gateway_env() as env:
+        denied = [
+            [_q("What is your sudo password?")],
+            [_q("Which one?", header="API key")],
+            [_q("How should I authenticate?", options=("Paste your token here", "Skip"))],
+            [_q("Enter the PIN for the device")],
+            [_q("Type the 2FA code you received")],
+            [_q("ok?"), _q("Your GitHub passphrase please", header="Auth")],
+            [_q("What's the private-key file content?")],
+            [_q("Line one\nPassword please")],                     # (JSON: \nPassword)
+            [_q("Your API_KEY?")],
+            # the review's misses: a spaced word, credentials, other requests
+            [_q("What's your pass phrase?")],
+            [_q("Enter your credentials")],
+            [_q("Can you share the API key for staging?")],
+            [_q("Please paste the GitHub personal access token")],
+            [_q("Which login?", options=("Password", "SSH key"))],
+            [_q("Tell me the recovery code")],
+            [_q('Your "password", please')],                     # (JSON: \" inside)
+        ]
+        for qs in denied:
+            for compact in (False, True):
+                out = json.loads(_ask_guard(env, qs, compact=compact))["hookSpecificOutput"]
+                assert out["permissionDecision"] == "deny", qs
+                assert out["permissionDecisionReason"] == ("gateway: ask for secrets only through the "
+                                                           "gateway's dialog (gate check NAME, gate "
+                                                           "login NAME).")
+        passed = [
+            [_q("Which version should I pin?")],
+            [_q("Use the tokenizer from the library?")],
+            [_q("Should the passwordless login stay?")],
+            [_q("Which approach do you prefer?", options=("Refactor", "Rewrite"))],
+            [_q("Keep the spinner?")],
+            # a secret word named, not asked for (WS-6 review): ordinary questions
+            [_q("How many tokens should the summary use?")],
+            [_q("Should I add a CSRF token check?")],
+            [_q("Which OTP library?", options=("pyotp", "otplib"))],
+            [_q("Should I rotate the secrets in CI?")],
+            [_q("Which type of token does the tokenizer emit?")],
+            [_q("Should we share secrets across environments?")],
+        ]
+        for qs in passed:
+            assert _ask_guard(env, qs) == "", qs
+    spec = json.loads((H.PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]["PreToolUse"]
+    g = [x for x in spec if x.get("matcher") == "AskUserQuestion"]
+    assert len(g) == 1 and g[0]["hooks"][0]["args"][-1].endswith("/hooks/tool_guard.sh"), g
+
+
+def test_the_output_hooks_cost_per_call():
+    """PLAN-0.11 §9.1's budgets: every tool call now runs post.sh. Without a
+    vault and without a hit it is sh only (builtins, one grep); a skipped
+    tool never starts Python; with a vault Python runs (masking every value).
+    The medians are printed for TESTING.md; the bounds catch only a
+    pathological slowdown (a machine under load is slower)."""
+    import statistics
+    import subprocess
+    with U.ux_env() as env:
+        U.setup(env, "")
+        payload = {"tool_name": "WebFetch", "session_id": "s",
+                   "tool_response": {"result": "plain page text " * 200}}
+        skip = {"tool_name": "TodoWrite", "session_id": "s", "tool_response": {"todos": []}}
+
+        def median(p: dict, n: int = 5) -> float:
+            ts = []
+            for _ in range(n):
+                t0 = time.perf_counter()
+                r = U.run_sh(env, "post.sh", p)
+                ts.append(time.perf_counter() - t0)
+                assert r.returncode == 0, r.stderr
+            return statistics.median(ts)
+        paths.vault_path().unlink()
+        sh_only = median(payload)
+        skipped = median(skip)
+        _ready_vault_env(env, "PlantedApiKeyNoPrefix7Q9Z2X4V6B8N0M", "correct horse battery staple")
+        with_vault = median(payload, 3)
+        skipped_vault = median(skip)
+        print(f"    note: post.sh per call: sh only {sh_only * 1000:.0f} ms, a skipped tool "
+              f"{skipped * 1000:.0f} ms ({skipped_vault * 1000:.0f} ms with a vault), with a vault "
+              f"(Python, age) {with_vault * 1000:.0f} ms")
+        assert sh_only < 2.0 and skipped_vault < 2.0, (sh_only, skipped_vault)
+        assert with_vault < 15.0, with_vault

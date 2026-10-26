@@ -1,7 +1,11 @@
-"""Packaging (PLAN-v4 phase 1; brief section 2): locked installs and the
-tested pixi range, the build lock's liveness (a killed build is stale at
-once), the cold window's Bash guard (launch.sh's degraded hook-bash, byte for
-byte), no bytecode in the plugin folder, and `launch.sh status`."""
+"""Packaging (PLAN-v4 phase 1; brief section 2; PLAN-0.11 section 5): locked
+installs, the latest-only pins (every dependency "*", requires-pixi the tested
+pixi, pixi-unpack equal to pixi-pack, pijul one exact release, the suite on
+the lock's Python, the locked age's prompts), the build lock's liveness (a
+killed build is stale at once), the cold window's Bash guard (launch.sh's
+degraded hook-bash, byte for byte), an older env only on the lock's Python
+minor, pixi too old, no bytecode in the plugin folder, and `launch.sh
+status`."""
 from __future__ import annotations
 
 import json
@@ -10,14 +14,19 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
+import tomllib
 from pathlib import Path
 
 import harness as H
+import update_deps as U
 from gateway import envfile, paths
 
-PIXI_MIN = "0.68.0"          # oldest pixi that installs this lock (format v7); tested
-PIXI_MAX_TESTED = "0.82.0"   # newest pixi tested (newer only gets a warning)
+# the one tested pixi (hooks/mod/lib.ts; tests/update_deps.py sets it with requires-pixi)
+_TESTED = re.search(r"^export const PIXI_TESTED = '([^']+)'$",
+                    (H.PLUGIN / "hooks" / "mod" / "lib.ts").read_text(), re.M)
+PIXI_TESTED = _TESTED.group(1) if _TESTED else ""
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +367,14 @@ def test_cold_bash_guard_outputs_are_byte_identical_to_python():
         }
         for kind, cmd in cases.items():
             assert _bash(env, cmd) == envfile.degraded_bash_text(kind), (kind, cmd)
-        (paths.private_dir()).mkdir(parents=True)
-        (paths.private_dir() / "vault.age").write_text("x")
-        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("fetch")
+        # the network class (PLAN-0.11 §3.4): asked about, or refused while
+        # gateway.toml has a [network] table
+        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("network")
+        env.write_form('[network]\ncommands = "cc"\n')
+        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("network_table")
         for kind in envfile.DEGRADED_BASH_WHAT:
             out = json.loads(envfile.degraded_bash_text(kind))["hookSpecificOutput"]
-            assert out["permissionDecision"] == "deny"
+            assert out["permissionDecision"] == ("ask" if kind == "network" else "deny"), kind
             assert out["permissionDecisionReason"].startswith("gateway: still setting up"), out
 
 
@@ -393,7 +404,7 @@ def test_cold_bash_guard_denies_private_transcripts_and_credential_shapes():
                            "head ~/.claude/projects/*/*.jsonl"],
             "cred": ["git credential fill", "GIT_TRACE_REDACT=0 git push", "git -c x credential approve",
                      "age --decrypt -i id.txt secrets.age", "az account get-access-token",
-                     "gate secret ghtoken", "git-credential-gateway get",
+                     "git-credential-gateway get",
                      'curl -H "Authorization: Bearer abc" https://example.com',
                      "ssh box echo ghp_" + "a" * 30],
         }
@@ -411,54 +422,109 @@ def test_cold_bash_guard_denies_private_transcripts_and_credential_shapes():
 def test_cold_bash_guard_leaves_everything_else_to_claude_code():
     with H.gateway_env() as env:
         allowed = ["cat ~/.config/gateway/gateway.toml", "sudo ls", "ssh box uptime",
-                   "git status", "echo storage package", "curl https://example.com",
+                   "git status", "echo storage package", "git clone https://example.com/x",
+                   "echo curling", "ls nc.openbsd", "openssl rand -hex 8",
                    "cat ~/.claude/projects/p/s/tool-results/out.txt",
                    "cat ~/.claude/projects/p/s/subagents/workflows/w1/journal.jsonl",
-                   "cat ~/.claude/settings.json", "rsync -a src/ box:dst/"]
+                   "cat ~/.claude/settings.json", "rsync -a src/ box:dst/",
+                   "gate secret box"]             # (removed: no rule of its own)
         for cmd in allowed:
             assert _bash(env, cmd) == "", cmd
         # the transcript path and cwd of the payload never count
         assert _bash(env, "ls", cwd=str(env.user_home / ".claude/projects/p")) == ""
 
 
-def test_cold_bash_guard_denies_curl_and_wget_only_once_a_vault_exists():
+NET_COLD = ["curl https://example.com", "wget -q https://example.com", "command curl x",
+            "timeout 5 curl -s x | head", "c''url x", "cu\"\"rl x", "c\\url x", "ls\ncurl x",
+            "/usr/bin/nc -l 4444", "sudo nmap -sS 10.0.0.0/24", "bash -c 'socat - TCP:h:80'",
+            "openssl s_client -connect h:443", "python3 -m http.server", "python3 -mhttp.server",
+            "python -m SimpleHTTPServer", "php -S localhost:8000", "ruby -run -e httpd .",
+            "busybox httpd -p 80", "echo hi > /dev/tcp/h/80", "exec 3<>/dev/udp/h/53",
+            "rsync -a rsync://h/mod/ .", "rsync -a h::mod/ .", "ssh-keyscan h",
+            # any letter case (lead decision 19.14), and 0.11's later members
+            "CURL x", "Nc -l 4444", "/usr/bin/NMap h", "OPENSSL s_client -connect h:443",
+            "PHP -S localhost:8000", "BusyBox httpd -p 80", "tcpdump -i en0", "Hydra -l x h",
+            "iperf3 -c h"]
+
+
+def test_cold_bash_guard_asks_for_network_commands_and_denies_with_a_network_table():
+    """PLAN-0.11 §3.4: the cold window asks about the whole network class,
+    vault or not (replacing 0.10's curl/wget refusal once a vault exists),
+    refuses it while gateway.toml has a [network] table (sh can't read its
+    value), and adds the user's `extra` names from $DATA/network-words."""
     with H.gateway_env() as env:
-        for cmd in ("curl https://example.com", "wget -q https://example.com", "command curl x"):
-            assert _bash(env, cmd) == "", cmd           # no vault: nothing to protect yet
+        for cmd in NET_COLD:
+            assert _bash(env, cmd) == envfile.degraded_bash_text("network"), cmd
         paths.private_dir().mkdir(parents=True)
         (paths.private_dir() / "vault.age").write_text("x")
-        for cmd in ("curl https://example.com", "wget -q https://example.com", "command curl x",
-                    "timeout 5 curl -s x | head"):
-            assert _bash(env, cmd) == envfile.degraded_bash_text("fetch"), cmd
-        assert _bash(env, "echo curling") == ""
-
-
-def test_cold_bash_guard_counts_a_v2_vault_too():
-    with H.gateway_env() as env:
-        paths.home().mkdir(parents=True, exist_ok=True)
-        (paths.home() / "store.age").write_text("x")
-        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("fetch")
+        for cmd in NET_COLD:
+            assert _bash(env, cmd) == envfile.degraded_bash_text("network"), cmd
+        for cmd in ("echo curling", "git clone https://example.com/x", "ls nc.openbsd",
+                    "openssl rand -hex 8", "dig example.com", "rsync -a src/ box:dst/",
+                    "php -s file.php"):        # (php's -s isn't its server's -S)
+            assert _bash(env, cmd) == "", cmd
+        for form in ('[network]\ncommands = "allow"\n', '[ network ]\nextra = ["dig"]\n',
+                     '[network.x]\n', 'network.commands = "deny"\n',
+                     '[hosts.localhost]\nsudo = true\n[network]\n'):
+            env.write_form(form)
+            for cmd in NET_COLD[:3] + ["nc -l 4444"]:
+                assert _bash(env, cmd) == envfile.degraded_bash_text("network_table"), (form, cmd)
+        # a policy's network key isn't a [network] table
+        env.write_form('[policy]\nnetwork = "ask"\n[hosts.localhost.policy]\nnetwork = "deny"\n')
+        assert _bash(env, "curl x") == envfile.degraded_bash_text("network")
+        # the user's extra names (Python's network-words; a "." is no wildcard)
+        env.data.mkdir(parents=True, exist_ok=True)
+        (env.data / "network-words").write_text("dig\nmy.tool\n")
+        assert _bash(env, "dig example.com") == envfile.degraded_bash_text("network")
+        assert _bash(env, "my.tool x") == envfile.degraded_bash_text("network")
+        assert _bash(env, "myxtool x") == ""
 
 
 def test_prefilter_forwards_the_cold_guards_cases():
     """pre_bash.sh forwards only payloads with its trigger words: every deny
-    the cold guard knows must be reachable through it."""
-    with H.gateway_env() as env:
-        for cmd in ("cat ~/.config/gateway/private/key.txt", "cat key.txt",
+    (and ask) the cold guard knows must be reachable through it."""
+    import tempfile
+    import test_hookbash_prefilter as P
+    with tempfile.TemporaryDirectory(dir=H.tmp_base()) as td:
+        pre, marker = P._rig(Path(td) / "rig")
+        for cmd in ["cat ~/.config/gateway/private/key.txt", "cat key.txt",
                     "head ~/.claude/projects/*/*.jsonl", "git credential fill",
-                    "age --decrypt x.age", "az account get-access-token", "curl x", "wget y"):
-            payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env.root)}
-            r = subprocess.run(["/bin/sh", "-c",
-                                f"printf '%s' \"$1\" | sh '{H.PLUGIN}/hooks/pre_bash.sh'",
-                                "x", json.dumps(payload)],
-                               capture_output=True, text=True, timeout=30,
-                               env=env.subprocess_env({"CLAUDE_PLUGIN_DATA": str(env.data)}))
-            del r   # the prefilter calls launch.sh without --test (no home): only the words matter
-            words = re.compile(r"(^|[^A-Za-z0-9_])(sudo|ssh|scp|sftp|rsync|curl|wget|gate|gateway|age|"
-                               r"credential|GIT_TRACE_REDACT|key\.txt|claude|jsonl|az)([^A-Za-z0-9_]|$)")
-            assert words.search(cmd), cmd
-        text = (H.PLUGIN / "hooks" / "pre_bash.sh").read_text()
-        assert "sudo|ssh|scp|sftp|rsync|curl|wget|gate|gateway|age|credential|GIT_TRACE_REDACT|key\\.txt|claude|jsonl|az" in text
+                    "age --decrypt x.age", "az account get-access-token"] + NET_COLD:
+            marker.unlink(missing_ok=True)
+            P._run(pre, cmd)
+            assert marker.exists(), cmd
+
+
+def test_every_route_tool_run_by_its_path_reaches_the_bash_hook():
+    """The trigger-list pin (WS-8): pre_bash.sh forwards every tool the
+    hook's route checks know (hooks_bash.ROUTE_TOOLS) run by its path, where
+    it skips its stand-in, so a route tool can't be added without its
+    trigger (git with a word that contacts a remote, PLAN-0.11 §6.6); a tool
+    with no stand-in that the hook refuses by its name too (slogin, su,
+    sudoedit, huggingface-cli, ...) by its plain name as well; every tool by its name where the command
+    changes how names are found (env -i, env -, command -p, PATH=: the
+    system's tool, WS-8 review must-fix 1); an account CLI's plain name is
+    its stand-in's and never starts Python."""
+    import tempfile
+    import test_hookbash_prefilter as P
+    from gateway import hooks_bash
+    with tempfile.TemporaryDirectory(dir=H.tmp_base()) as td:
+        pre, marker = P._rig(Path(td) / "rig")
+
+        def fires(cmd: str) -> bool:
+            marker.unlink(missing_ok=True)
+            P._run(pre, cmd)
+            return marker.exists()
+        for t in sorted(hooks_bash.ROUTE_TOOLS):
+            args = "push origin main" if t == "git" else "x"
+            cmd = f"/usr/local/bin/{t} {args}"
+            assert fires(cmd), cmd
+            for pre_words in ("env -i", "env -", "env -u PATH", "command -p", "PATH=/usr/bin"):
+                assert fires(f"{pre_words} {t} {args}"), f"{pre_words} {t}"
+            if t not in envfile.STANDIN_NAMES:
+                assert fires(f"{t} x"), f"{t} has no stand-in: its plain name reaches the hook too"
+        for t in ("gh", "hf", "databricks", "crane", "pijul", "dvc"):
+            assert t in envfile.STANDIN_NAMES and not fires(f"{t} x"), t
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +562,7 @@ def test_no_pycache_in_the_plugin_folder_at_run_time():
         assert not left, f"bytecode written into the plugin folder: {left}"
         assert list(paths.pycache_dir().rglob("*.pyc")), "the cache goes to the data folder instead"
         # the stand-ins and the launcher start Python the same way
-        assert "-X 'pycache_prefix=" in (paths.bin_dir() / "ssh").read_text()
+        assert "-X 'pycache_prefix=" in (paths.bin_dir() / "gate").read_text()
         assert "-X 'pycache_prefix=" in paths.launcher_path().read_text()
 
 
@@ -539,26 +605,24 @@ def test_status_reports_each_state_and_never_reads_the_vault():
         assert _status(env, fake=fake)["managed"] is True
 
 
-def test_status_reports_an_unmigrated_v2_vault_apart_from_a_v3_one():
-    """A 0.6 user in the cold window has store.age and no private/vault.age.
-    The cold Bash guard counts it as "a vault exists" (it denies curl), so
-    status must not report vault=false with nothing else: vault stays the v3
-    vault, and vault_v2 flags the store the doctor then names."""
+def test_status_and_the_cold_guard_know_only_this_gateways_vault():
+    """launch.sh status reports the vault (private/vault.age) and nothing of a
+    gateway 0.6 one (no vault_v2 field). The cold Bash guard's network rule
+    doesn't depend on a vault (PLAN-0.11 §3.4): it asks either way."""
     with H.gateway_env() as env:
         fake = _slow_pixi(env.root / "fakebin")
         st = _status(env, fake=fake)
-        assert st["vault"] is False and st["vault_v2"] is False, st
+        assert st["vault"] is False and "vault_v2" not in st, st
         paths.home().mkdir(parents=True, exist_ok=True)
-        (paths.v2_store_path()).write_text("x")          # a 0.6 vault, unmigrated
+        (paths.v2_store_path()).write_text("x")          # a 0.6 vault
         st = _status(env, fake=fake)
-        assert st["vault"] is False and st["vault_v2"] is True, st
-        # the same store the cold Bash guard treats as a vault
-        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("fetch")
-        # once migrated (private/vault.age), vault is the v3 one
+        assert st["vault"] is False and "vault_v2" not in st, st
+        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("network")
         paths.private_dir().mkdir(parents=True, exist_ok=True)
         (paths.vault_path()).write_text("x")
         st = _status(env, fake=fake)
-        assert st["vault"] is True and st["vault_v2"] is True, st
+        assert st["vault"] is True and "vault_v2" not in st, st
+        assert _bash(env, "curl https://example.com") == envfile.degraded_bash_text("network")
 
 
 def test_status_names_pixi_missing_and_its_version_on_request():
@@ -577,28 +641,489 @@ def test_status_names_pixi_missing_and_its_version_on_request():
 
 
 # ---------------------------------------------------------------------------
-# Locked resolution and the tested pixi range
+# pixi too old (PLAN-0.11 section 5): pixi's "requires pixi" refusal
+# ---------------------------------------------------------------------------
+
+REFUSAL = ("Error:   × this project requires pixi '>=0.83.0', but you have pixi 0.81.0\n"
+           "  help: install a version of pixi that satisfies '>=0.83.0' with `pixi self-\n"
+           "        update --version <version>`\n")
+
+
+def _refusing_pixi(d: Path, log: str = REFUSAL, version: str = "pixi 0.81.0\n") -> Path:
+    """A pixi whose install fails with LOG on stderr and whose --version
+    prints VERSION."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "log").write_text(log)
+    (d / "version").write_text(version)
+    p = d / "pixi"
+    p.write_text(f"#!/bin/sh\ncase $1 in\n  --version) cat '{d}/version' ;;\n"
+                 f"  install) cat '{d}/log' >&2; exit 1 ;;\nesac\nexit 1\n")
+    os.chmod(p, 0o755)
+    return p
+
+
+def _ensure(env, fake: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["/bin/sh", str(H.PLUGIN / "hooks" / "launch.sh"), "ensure-env"],
+                          capture_output=True, text=True, env=_launch_env(env, fake),
+                          cwd=str(env.root), timeout=60)
+
+
+def test_pixi_too_old_is_recognized_and_every_not_ready_text_says_pixi_self_update():
+    """An older pixi refuses the manifest (requires-pixi is the newest pixi):
+    the build fails at once with "requires pixi". launch.sh records the found
+    and needed versions, status reports them, and the session message,
+    Claude's context, the stand-ins and the launcher (byte-identical to
+    Python's) say to update pixi instead of "setup failed, see the log"."""
+    with H.gateway_env() as env:
+        fake = _refusing_pixi(env.root / "oldpixi")
+        assert _ensure(env, fake).returncode != 0
+        marker = paths.env_dir() / envfile.PIXI_TOO_OLD_FILE
+        assert marker.read_text() == "found=0.81.0\nneeded=>=0.83.0\n"
+        st = _status(env, "pixi", fake=fake)
+        assert st["state"] == "failed" and st["pixi_too_old"] is True, st
+        assert st["pixi_found"] == "0.81.0" and st["pixi_needed"] == ">=0.83.0", st
+        words = "pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0)"
+        e = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
+        out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"}, extra_env=e).stdout)
+        assert words in out["systemMessage"] and "pixi self-update" in out["systemMessage"], out
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert words in ctx and "pixi self-update" in ctx and "setup failed" not in ctx, ctx
+        stub = H.run_stub(env, "gate", "status")         # nothing configured: the helpers only
+        assert stub.returncode == 75 and words in stub.stderr and "pixi self-update" in stub.stderr, stub.stderr
+        lt = paths.launcher_path().read_text()
+        assert lt == envfile.launcher_text("pixiold"), lt
+        assert words in lt and "pixi self-update" in lt and "tell the user" not in lt
+        sub = json.loads(H.run_launch(env, "hook-subagent", extra_env=e).stdout)
+        assert words in sub["hookSpecificOutput"]["additionalContext"]
+        # any other failure isn't pixi's age: the next attempt clears the record
+        other = _refusing_pixi(env.root / "netpixi", "error: network unreachable\n")
+        assert _ensure(env, other).returncode != 0
+        assert not marker.exists()
+        st = _status(env, fake=other)
+        assert st["state"] == "failed" and st["pixi_too_old"] is False and st["pixi_found"] == "", st
+        out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"},
+                                      extra_env={"PATH": f"{other.parent}:/usr/bin:/bin"}).stdout)
+        assert "setting up failed" in out["systemMessage"] and "too old" not in out["systemMessage"], out
+        assert paths.launcher_path().read_text() == envfile.launcher_text("failed")
+
+
+def test_pixi_too_old_needs_a_failed_build():
+    """A record beside a build that runs says nothing: only a failed build is
+    pixi's refusal (status and the not-ready texts alike)."""
+    with H.gateway_env() as env:
+        fake = _slow_pixi(env.root / "fakebin")
+        envd = paths.env_dir()
+        envd.mkdir(parents=True)
+        (envd / envfile.PIXI_TOO_OLD_FILE).write_text("found=0.81.0\nneeded=>=0.83.0\n")
+        (envd / "install.log").write_text(REFUSAL)
+        e = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
+        assert _status(env, fake=fake)["pixi_too_old"] is True
+        _lockd().mkdir()                                   # a build runs (a fresh lock, no owner yet)
+        try:
+            st = _status(env, fake=fake)
+            assert st["state"] == "building" and st["pixi_too_old"] is False, st
+            out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"}, extra_env=e).stdout)
+            msg = out["systemMessage"]
+            assert "too old" not in msg and "first-time setup is running" in msg, msg
+            assert "too old" not in out["hookSpecificOutput"]["additionalContext"]
+        finally:
+            _lockd().rmdir()
+
+
+def _too_old_texts(env, fake: Path, words: str) -> None:
+    """Every not-ready text names WORDS, the session's JSON stays valid, and
+    the launcher is Python's launcher_text("pixiold") byte for byte."""
+    e = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
+    assert envfile.pixi_too_old_words() == words
+    out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"}, extra_env=e).stdout)
+    assert words in out["systemMessage"] and "pixi self-update" in out["systemMessage"], out
+    assert words in out["hookSpecificOutput"]["additionalContext"], out
+    sub = json.loads(H.run_launch(env, "hook-subagent", extra_env=e).stdout)
+    assert words in sub["hookSpecificOutput"]["additionalContext"], sub
+    stub = H.run_stub(env, "gate", "status")             # nothing configured: the helpers only
+    assert stub.returncode == 75 and words in stub.stderr, stub.stderr
+    lt = paths.launcher_path().read_text()
+    assert lt == envfile.launcher_text("pixiold"), lt
+    assert words in lt
+
+
+# (refusal log, `pixi --version`'s output, the record launch.sh writes, the words)
+TOO_OLD_CASES = {
+    "quotes, backslashes and $(...) in the refusal": (
+        "Error:   × this project requires pixi '>=0.83.0\"\\$(x)', but you have pixi 0.81.0\"\\$(y)\n",
+        "pixi 0.81.0\n", "found=0.81.0y\nneeded=>=0.83.0x\n",
+        "pixi 0.81.0y is too old (the gateway needs pixi >=0.83.0x)"),
+    "no 'you have pixi': pixi --version names it": (
+        "Error:   × this project requires pixi '>=0.83.0'\n",
+        "pixi 0.81.0\n", "found=0.81.0\nneeded=>=0.83.0\n",
+        "pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0)"),
+    "pixi --version with quotes, backslashes and $(...)": (
+        "Error:   × this project requires pixi '>=0.83.0'\n",
+        "pixi 0.81.0\"\\$(z) (abc)\n", "found=0.81.0z\nneeded=>=0.83.0\n",
+        "pixi 0.81.0z is too old (the gateway needs pixi >=0.83.0)"),
+    "no version anywhere": (
+        "Error:   × this project requires pixi '>=0.83.0'\n",
+        "", "found=\nneeded=>=0.83.0\n",
+        "this pixi is too old (the gateway needs pixi >=0.83.0)"),
+    "the refusal broken by a newline": (
+        "Error:   × this project requires pixi '>=0.83.0\n\"$(x)', but you have pixi 0.82.0\n",
+        "pixi 0.81.0\n", "found=0.81.0\nneeded=\n",
+        "pixi 0.81.0 is too old"),
+}
+
+
+def test_pixi_too_old_keeps_only_version_characters_and_every_text_matches_python():
+    """launch.sh takes the found and needed versions from pixi's refusal (or
+    `pixi --version`) and keeps only version characters, so nothing in a log
+    reaches the session's JSON or the sh texts; in each case the launcher is
+    Python's, byte for byte, with the same words ("this pixi is too old" when
+    no version is known)."""
+    with H.gateway_env() as env:
+        marker = paths.env_dir() / envfile.PIXI_TOO_OLD_FILE
+        for i, (name, (log, version, record, words)) in enumerate(TOO_OLD_CASES.items()):
+            fake = _refusing_pixi(env.root / f"pixi{i}", log, version)
+            assert _ensure(env, fake).returncode != 0, name
+            assert marker.read_text() == record, (name, marker.read_text())
+            st = _status(env, fake=fake)
+            vals = dict(line.split("=", 1) for line in record.splitlines())
+            assert st["pixi_too_old"] is True, (name, st)
+            assert (st["pixi_found"], st["pixi_needed"]) == (vals["found"], vals["needed"]), (name, st)
+            _too_old_texts(env, fake, words)
+
+
+def test_a_pixi_too_old_record_never_breaks_the_session_json():
+    """Should a record ever hold a quote or a backslash (launch.sh's own never
+    does), SessionStart's and SubagentStart's JSON stay valid and carry it
+    as written; the launcher stays Python's."""
+    with H.gateway_env() as env:
+        fake = _refusing_pixi(env.root / "oldpixi")
+        envd = paths.env_dir()
+        envd.mkdir(parents=True)
+        (envd / "install.log").write_text(REFUSAL)
+        (envd / envfile.PIXI_TOO_OLD_FILE).write_text('found=0.81"\\x\nneeded=>=0.83"\\\n')
+        _too_old_texts(env, fake, 'pixi 0.81"\\x is too old (the gateway needs pixi >=0.83"\\)')
+
+
+def test_gate_status_says_pixi_too_old_while_the_env_cant_be_built():
+    """With an older env on the lock's Python minor, the hooks and `gate`
+    run on it while pixi refuses the new manifest, so the stand-ins work and
+    no not-ready text appears; with mods off `gate status` is where the user
+    learns why the update waits. Only for a failed build: not while one runs,
+    not for another failure, not once the env is ready."""
+    import contextlib
+    import io
+    from gateway import gate
+
+    def status_text() -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            assert gate.main(["status"]) == 0
+        return out.getvalue()
+
+    line = ("Environment: can't be set up: pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0); "
+            "update pixi (pixi self-update, or your package manager for a Homebrew or MacPorts "
+            "pixi), then start a new session")
+    # the mod's doctor gives the same advice (pixi self-update refuses a
+    # Homebrew or MacPorts pixi)
+    lib = (H.PLUGIN / "hooks" / "mod" / "lib.ts").read_text()
+    assert f"export const PIXI_UPDATE = '{envfile.PIXI_UPDATE}'" in lib
+    with H.gateway_env() as env:
+        fake = _refusing_pixi(env.root / "oldpixi")
+        envd = paths.env_dir()
+        envd.mkdir(parents=True)
+        log, record = envd / "install.log", envd / envfile.PIXI_TOO_OLD_FILE
+
+        def check(state: str, want: bool) -> None:
+            text = status_text()
+            assert (line in text.splitlines()) is want and (want or "too old" not in text), (state, text)
+            assert _status(env, fake=fake)["pixi_too_old"] is want, f"launch.sh status says the same ({state})"
+
+        log.write_text("error: network unreachable\n")
+        check("another failure", False)
+        log.write_text(REFUSAL)
+        record.write_text("found=0.81.0\nneeded=>=0.83.0\n")
+        check("pixi refused the manifest", True)
+        log.unlink()
+        check("a record without a build's log", False)
+        log.write_text(REFUSAL)
+        _lockd().mkdir()                                   # a build runs
+        try:
+            check("a build runs", False)
+        finally:
+            _lockd().rmdir()
+        b = paths.env_bin()
+        b.mkdir(parents=True)
+        os.symlink(H.PY, b / "python3")
+        (envd / ".ready").write_text("")
+        check("the env is ready", False)
+
+
+# ---------------------------------------------------------------------------
+# An older env only on the lock's Python minor (PLAN-0.11 section 5)
 # ---------------------------------------------------------------------------
 
 
-def test_requires_pixi_is_the_tested_lower_bound_with_no_upper_bound():
+def _older_env(name: str, minor: str, age: float = 0) -> Path:
+    """A finished env (a link to this Python) whose bin has python3 and
+    python{minor}; its .ready is AGE seconds old."""
+    old = paths.envs_dir() / name
+    b = old / ".pixi" / "envs" / "default" / "bin"
+    b.mkdir(parents=True)
+    os.symlink(H.PY, b / "python3")
+    os.symlink(H.PY, b / f"python{minor}")
+    (old / ".ready").write_text("")
+    t = time.time() - age
+    os.utime(old / ".ready", (t, t))
+    return old
+
+
+def _lock_root(env, edit) -> Path:
+    """A plugin root whose pixi.lock is edit(the real one)."""
+    root = env.root / "plugin-lock"
+    (root / "hooks").mkdir(parents=True)
+    shutil.copy2(H.PLUGIN / "hooks" / "launch.sh", root / "hooks" / "launch.sh")
+    (root / "pixi.lock").write_text(edit((H.PLUGIN / "pixi.lock").read_text()))
+    for name in ("pixi.toml", "run.py", "src"):
+        os.symlink(H.PLUGIN / name, root / name)
+    return root.resolve()
+
+
+def _sh_lock_minor(lock_text: str, d: Path) -> str:
+    """launch.sh's own lock_py_minor, run alone on LOCK_TEXT."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "pixi.lock").write_text(lock_text)
+    text = (H.PLUGIN / "hooks" / "launch.sh").read_text()
+    fn = re.search(r"^lock_py_minor\(\) \{\n.*?^\}\n", text, re.M | re.S)
+    assert fn, "launch.sh defines lock_py_minor"
+    r = subprocess.run(["/bin/sh", "-c", fn.group(0) + 'ROOT="$1"; lock_py_minor', "x", str(d)],
+                       capture_output=True, text=True, timeout=10)
+    return r.stdout.strip()
+
+
+def test_the_locks_python_minor_is_read_alike_in_sh_and_python():
+    real = (H.PLUGIN / "pixi.lock").read_text()
+    minor = envfile.lock_python_minor(real)
+    assert re.fullmatch(r"3\.\d+", minor), minor
+    py = f"/python-{minor}."
+    assert py in real
+    other = "3.99"
+    first = real.index(py, real.index("\n  default:\n"))
+    cases = {
+        "real": (real, minor),
+        "two minors on two platforms": (real[:first] + real[first:].replace(py, f"/python-{other}.", 1), ""),
+        "no python": (real.replace(py, "/pythonx-"), ""),
+        "another environment's python only": (real.replace("\n  default:\n", "\n  zzdefault:\n"), ""),
+        "no lock": ("", ""),
+    }
+    with H.gateway_env() as env:
+        for i, (name, (text, want)) in enumerate(cases.items()):
+            assert envfile.lock_python_minor(text) == want, name
+            assert _sh_lock_minor(text, env.root / f"l{i}") == want, name
+
+
+def test_an_older_env_on_another_python_minor_is_never_used():
+    """While an update's env builds, the hooks, the MCP server and the stubs
+    run on an older finished env only when its Python is the lock's minor
+    (new code never runs on the previous Python): a newer env on another minor
+    is skipped, and with only such an env the cold paths answer (launch.sh's
+    degraded hook-bash), as on a first install."""
+    with H.gateway_env() as env:
+        minor = envfile.lock_python_minor()
+        other = "3.11" if minor != "3.11" else "3.10"
+        stale = _older_env("0123456789ab", other, age=0)
+        fake = _slow_pixi(env.root / "fakebin")              # pixi is there; nothing built
+        assert _status(env, fake=fake)["older"] == ""
+        cmd = f"cat {env.user_home}/.config/gateway/private/key.txt"
+        assert _bash(env, cmd) == envfile.degraded_bash_text("private")
+        assert not (stale / ".used").exists(), "the other minor's env ran nothing"
+        good = _older_env("ba9876543210", minor, age=600)     # older than stale's, but on the minor
+        assert _status(env, fake=fake)["older"] == str(good)
+        out = _bash(env, cmd)
+        assert out != envfile.degraded_bash_text("private") and '"deny"' in out, out
+        assert (good / ".used").exists() and not (stale / ".used").exists()
+        # a lock whose Python minor can't be told: no older env at all
+        root = _lock_root(env, lambda t: t.replace(f"/python-{minor}.", "/pythonx-"))
+        r = H.run_launch(env, "status", plugin_root=root,
+                         extra_env={"PATH": f"{fake.parent}:/usr/bin:/bin"})
+        assert json.loads(r.stdout)["older"] == "", r.stdout
+
+
+def test_stubs_fall_back_to_an_older_env_only_on_the_locks_minor():
+    """envfile.older_env_python, which the stubs Python writes from an older
+    env use, says the same: never a Python of another minor."""
+    with H.gateway_env() as env:
+        minor = envfile.lock_python_minor()
+        old = _older_env("0123456789ab", minor)
+        py = old / ".pixi" / "envs" / "default" / "bin" / "python3"
+        saved = sys.executable
+        try:
+            sys.executable = str(py)
+            assert envfile.older_env_python() == py
+            assert str(py) in envfile.stub_text("ssh", ("shim", "ssh"))
+            env.o.plugin_root = _lock_root(env, lambda t: t.replace(f"/python-{minor}.", "/python-3.99."))
+            try:
+                assert envfile.lock_python_minor() == "3.99"
+                assert envfile.older_env_python() is None
+                assert str(py) not in envfile.stub_text("ssh", ("shim", "ssh"))
+            finally:
+                env.o.plugin_root = None
+        finally:
+            sys.executable = saved
+
+
+# ---------------------------------------------------------------------------
+# Locked resolution and the latest-only pins (PLAN-0.11 section 5)
+# ---------------------------------------------------------------------------
+
+
+def test_requires_pixi_is_the_tested_pixi_with_no_upper_bound():
     toml = (H.PLUGIN / "pixi.toml").read_text()
     m = re.search(r'^requires-pixi = "([^"]+)"', toml, re.M)
-    assert m and m.group(1) == f">={PIXI_MIN}", m and m.group(1)
-    assert "<" not in m.group(1), "an upper bound would break users when pixi updates"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", PIXI_TESTED), PIXI_TESTED
+    assert m and m.group(1) == f">={PIXI_TESTED}", (m and m.group(1), PIXI_TESTED)
+    assert "<" not in m.group(1) and "," not in m.group(1), "an upper bound would break users when pixi updates"
     lib = (H.PLUGIN / "hooks" / "mod" / "lib.ts").read_text()
-    assert f"PIXI_TESTED_MIN = '{PIXI_MIN}'" in lib and f"PIXI_TESTED_MAX = '{PIXI_MAX_TESTED}'" in lib
+    assert re.search(r"^export const CLAUDE_TESTED = '\d+\.\d+\.\d+'$", lib, re.M), "one tested Claude Code"
+    assert "PIXI_TESTED_MIN" not in lib and "PIXI_TESTED_MAX" not in lib, "one tested pixi, no range"
     assert (H.PLUGIN / "pixi.lock").read_text().startswith("version: 7\n")
 
 
-def test_the_docs_state_the_tested_pixi_range():
+def test_every_dependency_is_latest():
+    """Every dependency, in every feature and in the runtime, is "*" (the
+    relock takes conda-forge's newest), except pixi-unpack, which is exactly
+    pixi-pack's version."""
+    main = tomllib.loads((H.PLUGIN / "pixi.toml").read_text())
+    rt = tomllib.loads((H.PLUGIN / "runtime" / "pixi.toml").read_text())
+    tables = {"dependencies": main["dependencies"], "runtime dependencies": rt["dependencies"]}
+    for name, feat in main.get("feature", {}).items():
+        if "dependencies" in feat:
+            tables[f"feature {name}"] = feat["dependencies"]
+        for tname, target in feat.get("target", {}).items():
+            tables[f"feature {name} target {tname}"] = target.get("dependencies", {})
+    for fname, feat in rt.get("feature", {}).items():
+        deps = dict(feat.get("dependencies", {}))
+        if fname == "unpacker":
+            assert re.fullmatch(r"==\d+\.\d+\.\d+", deps.pop("pixi-unpack", "")), feat
+        tables[f"runtime feature {fname}"] = deps
+    assert {"python", "age", "pynacl", "bash", "tmux", "pixi-pack", "zstd"} <= set(main["dependencies"])
+    pinned = {f"{t}: {k} = {v!r}" for t, deps in tables.items() for k, v in deps.items() if v != "*"}
+    assert not pinned, sorted(pinned)
+
+
+def test_pixi_unpack_is_pixi_packs_version_on_every_platform():
+    """They ship from one repository: the target's pixi-unpack must unpack
+    what the local pixi-pack packed (update-deps writes the pin)."""
+    main = U.lock_packages((H.PLUGIN / "pixi.lock").read_text())
+    rt = U.lock_packages((H.PLUGIN / "runtime" / "pixi.lock").read_text())
+    platforms = {"linux-64", "linux-aarch64", "osx-arm64", "osx-64"}
+    assert set(main["default"]) == platforms and set(rt["unpacker"]) == platforms
+    pack = U.lock_version(main, "default", "pixi-pack")
+    assert U.lock_version(rt, "unpacker", "pixi-unpack") == pack, (pack, rt["unpacker"])
+    pin = tomllib.loads((H.PLUGIN / "runtime" / "pixi.toml").read_text())["feature"]["unpacker"]["dependencies"]
+    assert pin["pixi-unpack"] == f"=={pack}"
+
+
+def test_pijul_is_one_exact_release():
+    """The pijul task installs one exact version (pijul's newest release,
+    pre-releases included: update-deps bumps it), never a range cargo would
+    resolve by itself."""
+    toml = (H.PLUGIN / "pixi.toml").read_text()
+    v = U.pijul_version(toml)
+    assert re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?", v), v
+    assert toml.count("cargo install pijul --version ") == 1
+    assert 'update-deps = "python tests/update_deps.py"' in toml
+
+
+def test_the_suite_runs_on_the_locks_python():
+    """The lock names one Python minor (the newest conda-forge had at the
+    relock), and the suite runs on it: what passes here is what the env runs."""
+    minor = envfile.lock_python_minor()
+    assert re.fullmatch(r"3\.\d+", minor), minor
+    assert f"{sys.version_info[0]}.{sys.version_info[1]}" == minor, (sys.version, minor)
+
+
+def test_the_locked_age_prompts_match_agepass():
+    """age reads a passphrase only from a terminal; agepass answers its
+    prompts by a regex (agepass.PROMPT_RE). Run the locked age under a pty,
+    unanswered, and check each prompt it shows against that regex: a reworded
+    prompt fails here at the relock instead of hanging export, import and the
+    vault key's wrap until AGE_TIMEOUT."""
+    import pty
+    import select
+    from gateway import agepass
+    age = Path(sys.executable).parent / "age"
+    assert age.is_file(), f"the locked age is missing beside {sys.executable}"
+
+    def prompts(args: list[str], answers: list[bytes]) -> list[bytes]:
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execv(str(age), [str(age), *args])
+            finally:
+                os._exit(127)
+        seen, out, mark = [], b"", 0
+        deadline = time.time() + 20
+        try:
+            while time.time() < deadline:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if r:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                    continue
+                tail = out[mark:]
+                if tail.strip() and len(seen) < len(answers):      # quiet: age waits for input
+                    seen.append(tail)
+                    os.write(fd, answers[len(seen) - 1] + b"\r")
+                    mark = len(out)
+                elif len(seen) == len(answers) and os.waitpid(pid, os.WNOHANG)[0]:
+                    pid = 0
+                    break
+        finally:
+            os.close(fd)
+            if pid:
+                with __import__("contextlib").suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+        return seen
+
+    with H.gateway_env() as env:
+        d = env.root / "age"
+        d.mkdir()
+        (d / "in").write_bytes(b"canary\n")
+        enc = prompts(["-p", "-o", str(d / "out.age"), str(d / "in")], [b"pass phrase 1", b"pass phrase 1"])
+        assert len(enc) == 2, enc
+        dec = prompts(["-d", "-o", str(d / "back"), str(d / "out.age")], [b"pass phrase 1"])
+        assert len(dec) == 1, dec
+        for p in enc + dec:
+            assert agepass.PROMPT_RE.search(p), f"age's prompt {p!r} doesn't match agepass.PROMPT_RE"
+        assert (d / "back").read_bytes() == b"canary\n", "the answers typed at those prompts were taken"
+
+
+def test_the_docs_state_the_tested_pixi():
+    """Each doc update-deps edits (U.DOCS) quotes requires-pixi once, as the
+    tested pixi: update-deps moves them with it at every relock. The README
+    and CLAUDE.md quote no other pixi version (one update-deps doesn't move
+    goes stale at the next relock)."""
     readme = H.REPO / "README.md"
     if not readme.exists():                    # a scratch copy of the plugin alone (mutations)
         print("    note: no repo docs next to this plugin folder; skipped")
         return
+    for rel in U.DOCS:
+        assert U.doc_pixi((H.REPO / rel).read_text()) == [PIXI_TESTED], rel
     docs = readme.read_text() + (H.REPO / "docs" / "CAPABILITIES.md").read_text()
-    assert f"{PIXI_MIN} or newer" in docs and PIXI_MAX_TESTED in docs
-    assert "requires-pixi" in docs and "no upper bound" in docs
+    assert "no upper bound" in docs
+    assert "0.68.0" not in docs, "the old floor"
+    # the README and CLAUDE.md quote no other pixi version (CLAUDE.md's
+    # `pixi exec --spec pixi==0.83.0` went stale at the relock: WS-9)
+    for rel in ("README.md", "CLAUDE.md"):
+        rest = U.DOC_RE.sub("", (H.REPO / rel).read_text())
+        stale = re.findall(r"pixi\W{0,3}(?:>=|==)?\d+\.\d+(?:\.\d+)?|>=\s*\d+\.\d+(?:\.\d+)?", rest)
+        assert not stale, f"{rel} quotes a pixi version outside requires-pixi's line: {stale}"
 
 
 def test_shipped_installs_use_locked_never_frozen():
@@ -609,23 +1134,28 @@ def test_shipped_installs_use_locked_never_frozen():
 
 
 def test_the_lock_matches_the_manifest_offline():
-    pixi = shutil.which("pixi")
+    """Both locks (the env's and the remote runtime's) match their manifests
+    as committed, checked by the pixi running the suite (PIXI_EXE; the
+    manifest's requires-pixi refuses an older one) without a solve."""
+    pixi = os.environ.get("PIXI_EXE") or shutil.which("pixi")
     if pixi is None:
         print("    note: pixi not found; lock/manifest check skipped")
         return
     d = Path(H.tmp_base()) / f"gw-lockcheck-{os.getpid()}"
     shutil.rmtree(d, ignore_errors=True)
-    d.mkdir(parents=True)
     try:
-        for n in ("pixi.toml", "pixi.lock"):
-            shutil.copy2(H.PLUGIN / n, d / n)
-        dead = "http://127.0.0.1:9"                     # offline: a solve would fail
-        r = subprocess.run([pixi, "lock", "--check", "--dry-run", "--manifest-path", str(d / "pixi.toml")],
-                           capture_output=True, text=True, timeout=120,
-                           env=dict(os.environ, HTTP_PROXY=dead, HTTPS_PROXY=dead, ALL_PROXY=dead,
-                                    PIXI_CACHE_DIR=str(d / "cache")))
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert (d / "pixi.lock").read_bytes() == (H.PLUGIN / "pixi.lock").read_bytes()
+        for sub in ("", "runtime"):
+            w = d / (sub or "main")
+            w.mkdir(parents=True)
+            for n in ("pixi.toml", "pixi.lock"):
+                shutil.copy2(H.PLUGIN / sub / n, w / n)
+            dead = "http://127.0.0.1:9"                     # offline: a solve would fail
+            r = subprocess.run([pixi, "lock", "--check", "--dry-run", "--manifest-path", str(w / "pixi.toml")],
+                               capture_output=True, text=True, timeout=120,
+                               env=dict(os.environ, HTTP_PROXY=dead, HTTPS_PROXY=dead, ALL_PROXY=dead,
+                                        PIXI_CACHE_DIR=str(d / "cache")))
+            assert r.returncode == 0, (sub, r.stdout + r.stderr)
+            assert (w / "pixi.lock").read_bytes() == (H.PLUGIN / sub / "pixi.lock").read_bytes(), sub
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

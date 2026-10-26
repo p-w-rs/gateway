@@ -2,9 +2,10 @@
 import { describe, expect, test } from 'claude-code/testing'
 import {
   CAPABILITIES,
-  PIXI_TESTED_MAX,
-  PIXI_TESTED_MIN,
+  CLAUDE_TESTED,
+  PIXI_TESTED,
   capabilityLines,
+  claudeVerdict,
   clean,
   compareVersions,
   daemonLine,
@@ -19,7 +20,9 @@ import {
   parseManagedState,
   parsePixiVersion,
   parseStatus,
+  pixiTooOldText,
   pixiVerdict,
+  registerStopping,
   secretLine,
   sessionColumns,
   setupReady,
@@ -30,8 +33,9 @@ import {
 
 const base: EnvStatus = {
   state: 'missing', root: '/r', data: '/d', env: '/d/envs/abc', lock: 'abc', warm: false, managed: true, older: '',
-  build_running: false, install_log: false, pixi: '/u/.pixi/bin/pixi', pixi_version: '', home: '/u/.config/gateway',
-  form: false, vault: false, vault_v2: false,
+  build_running: false, install_log: false, pixi: '/u/.pixi/bin/pixi', pixi_version: '',
+  pixi_too_old: false, pixi_found: '', pixi_needed: '', home: '/u/.config/gateway',
+  form: false, vault: false,
 }
 
 describe('launch.sh status', () => {
@@ -42,11 +46,17 @@ describe('launch.sh status', () => {
     expect(parseStatus('{not json')).toBeUndefined()
     expect(parseStatus(JSON.stringify({ ...base, state: 'exploded' }))).toBeUndefined()
   })
-  test("reads whether the managed shell's settings are written (absent: an older launch.sh, counted as written)", () => {
+  test("reads whether the managed shell's settings are written (only an explicit true counts)", () => {
     expect(parseStatus(JSON.stringify({ ...base, state: 'ready', managed: false }))!.managed).toBe(false)
     expect(parseStatus(JSON.stringify({ ...base, state: 'ready', managed: true }))!.managed).toBe(true)
-    const { managed: _m, ...old } = base
-    expect(parseStatus(JSON.stringify({ ...old, state: 'ready' }))!.managed).toBe(true)
+    const { managed: _m, ...absent } = base
+    expect(parseStatus(JSON.stringify({ ...absent, state: 'ready' }))!.managed).toBe(false)
+    expect(parseStatus(JSON.stringify({ ...base, state: 'ready', managed: 'yes' }))!.managed).toBe(false)
+  })
+  test('has no field for a gateway 0.6 vault', () => {
+    const st = parseStatus(JSON.stringify({ ...base, vault_v2: true }))!
+    expect(st).toEqual(base)
+    expect('vault_v2' in st).toBe(false)
   })
   test('provisions only when nothing is building and the env is missing or failed', () => {
     expect(shouldProvision({ ...base, state: 'missing' })).toBe(true)
@@ -101,23 +111,53 @@ describe('data folder', () => {
   })
 })
 
-describe('pixi range', () => {
-  test('tested inside, warns when newer, refuses older', () => {
+describe('tested versions (latest only)', () => {
+  test('one tested pixi and Claude Code: older warns with the update, newer is an info line', () => {
     expect(compareVersions('0.81.0', '0.82.0')).toBe(-1)
     expect(compareVersions('0.82', '0.82.0')).toBe(0)
     expect(compareVersions('1.0.0', '0.99.9')).toBe(1)
     expect(parsePixiVersion('pixi 0.81.0')).toBe('0.81.0')
     expect(parsePixiVersion('weird')).toBeUndefined()
-    expect(pixiVerdict(PIXI_TESTED_MIN).kind).toBe('tested')
-    expect(pixiVerdict(PIXI_TESTED_MAX).kind).toBe('tested')
-    expect(pixiVerdict('0.81.0').text).toContain('inside the tested range')
-    const newer = pixiVerdict('0.90.0')
-    expect(newer.kind).toBe('newer')
-    expect(newer.text).toContain('a warning only')
-    const older = pixiVerdict('0.67.0')
+    expect(pixiVerdict(PIXI_TESTED)).toEqual({ kind: 'tested', text: `${PIXI_TESTED}, the tested version` })
+    const older = pixiVerdict('0.81.0')
     expect(older.kind).toBe('older')
-    expect(older.text).toContain('pixi self-update')
+    expect(older.text).toBe(`0.81.0, older than the tested ${PIXI_TESTED}: warning: update pixi (pixi self-update, or your package manager for a Homebrew or MacPorts pixi): only the latest is supported`)
+    const newer = pixiVerdict('9.0.0')
+    expect(newer.kind).toBe('newer')
+    expect(newer.text).toContain('info')
+    expect(newer.text).not.toContain('warning')
     expect(pixiVerdict(undefined).kind).toBe('unknown')
+    expect(claudeVerdict(CLAUDE_TESTED).kind).toBe('tested')
+    const cc = claudeVerdict('2.1.200')
+    expect(cc.kind).toBe('older')
+    expect(cc.text).toContain('warning: update Claude Code (claude update): only the latest is supported')
+    expect(claudeVerdict('9.0.0').kind).toBe('newer')
+    expect(claudeVerdict(undefined).kind).toBe('unknown')
+  })
+  test('a doctor report names the tested pair and judges this Claude Code', () => {
+    const text = doctorText({ pluginVersion: '0.11.0', claude: { version: '2.1.200' }, surfaces: [],
+                              located: locate('/r', 'gate', '/u/.claude'), status: undefined })
+    const lines = text.split('\n')
+    expect(lines).toContain(`Tested with pixi ${PIXI_TESTED} and Claude Code ${CLAUDE_TESTED} (only the latest is supported)`)
+    expect(lines).toContain(`Claude Code: 2.1.200, older than the tested ${CLAUDE_TESTED}: warning: update Claude Code (claude update): only the latest is supported`)
+    expect(text).not.toContain('mods need')
+    const none = doctorText({ pluginVersion: '0.11.0', claude: undefined, surfaces: [],
+                              located: locate('/r', 'gate', '/u/.claude'), status: undefined })
+    expect(none.split('\n')).toContain(`Claude Code: version unknown (tested with ${CLAUDE_TESTED})`)
+  })
+  test('pixi too old: launch.sh status names it, the doctor says pixi self-update or the package manager', () => {
+    const line = JSON.stringify({ ...base, state: 'failed', pixi_too_old: true, pixi_found: '0.81.0', pixi_needed: '>=0.83.0' })
+    const st = parseStatus(line)!
+    expect(st.pixi_too_old).toBe(true)
+    expect(st.pixi_found).toBe('0.81.0')
+    expect(st.pixi_needed).toBe('>=0.83.0')
+    expect(pixiTooOldText(st)).toBe('pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0); update pixi (pixi self-update, or your package manager for a Homebrew or MacPorts pixi), then start a new session')
+    expect(statusLine(st, 0)).toBe('pixi is too old: update it; /gate-doctor says how')
+    expect(statusLine({ ...st, pixi_too_old: false }, 0)).toBe('setup failed; /gate-doctor says why')
+    const text = doctorText({ pluginVersion: '0.11.0', claude: { version: CLAUDE_TESTED }, surfaces: [],
+                              located: locate('/r', 'gate', '/u/.claude'), status: { ...st, pixi_version: 'pixi 0.81.0' } })
+    expect(text).toContain("Environment: can't be set up: pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0); update pixi (pixi self-update, or your package manager for a Homebrew or MacPorts pixi)")
+    expect(text).toContain(`0.81.0, older than the tested ${PIXI_TESTED}: warning: update pixi (pixi self-update, or your package manager`)
   })
 })
 
@@ -162,6 +202,14 @@ describe('gateway daemon', () => {
     expect(parseDaemon('{nope')).toBeUndefined()
     expect(parseDaemon(JSON.stringify({ ok: false, running: false }))!.running).toBe(false)
     expect(parseDaemon(JSON.stringify({ ...health, epoch: 'four', parent_pid: '1' }))!.epoch).toBe(0)
+  })
+  test('a registration refused because gated is stopping is told apart from every other answer', () => {
+    expect(registerStopping(503, '{"ok": false, "error": "stopping", "message": "gateway: ..."}')).toBe(true)
+    expect(registerStopping(200, '{"ok": true, "error": "stopping"}')).toBe(false)
+    expect(registerStopping(503, '{"ok": false, "error": "draining"}')).toBe(false)
+    expect(registerStopping(403, '{"ok": false, "error": "stopping"}')).toBe(false)
+    expect(registerStopping(503, 'not json')).toBe(false)
+    expect(registerStopping(503, '"stopping"')).toBe(false)
   })
   test('says what the doctor shows', () => {
     expect(formatUptime(59.9)).toBe('59 s')
@@ -249,9 +297,10 @@ test('parseManagedState: only a known mode counts; lists keep their well-formed 
   expect(parseManagedState(undefined)).toBe(undefined)
   expect(parseManagedState('')).toBe(undefined)
   expect(parseManagedState('{"mode":"maybe"}')).toBe(undefined)
+  expect(parseManagedState('{"mode":"warn"}')).toBe(undefined)       // gone (PLAN-0.11 §1.6)
   expect(parseManagedState('not json')).toBe(undefined)
-  const s = parseManagedState(JSON.stringify({ mode: 'warn', path: [{ dir: '/a', origin: 'x' }, { nodir: 1 }, 'str'], env: [{ name: 'A' }], pending: ['p', 3], vault_readable: false }))!
-  expect(s.mode).toBe('warn')
+  const s = parseManagedState(JSON.stringify({ mode: 'on', path: [{ dir: '/a', origin: 'x' }, { nodir: 1 }, 'str'], env: [{ name: 'A' }], pending: ['p', 3], vault_readable: false }))!
+  expect(s.mode).toBe('on')
   expect(s.path).toEqual([{ dir: '/a', origin: 'x' }])
   expect(s.env).toEqual([{ name: 'A', origin: '' }])
   expect(s.pending).toEqual(['p'])
@@ -273,7 +322,7 @@ test('secretLine: says before any dialog whether a secret can be typed here (GW-
   expect(main).toContain("main screen, so a secret can't be typed into the gateway dialog's field")
   expect(main).toContain('(/gate-dialog, then Tab and Enter)')
   expect(main).toContain('Paste leaves the value on your clipboard: clear it yourself')
-  expect(main).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(main).toContain('/tui fullscreen')
   expect(main).not.toContain('tmux')
   expect(secretLine(['terminal'], false, true)).toContain('main screen (inside tmux)')
   expect(secretLine(['terminal'], true, true)).toContain('the fullscreen view')
@@ -293,7 +342,7 @@ test('secretLine: on Linux without a display neither typing nor Paste works on t
   expect(main).toContain('neither typing nor Paste can work in this terminal')
   expect(main).toContain('main screen (inside tmux)')
   expect(main).toContain('no DISPLAY or WAYLAND_DISPLAY')
-  expect(main).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(main).toContain('/tui fullscreen')
   expect(main).toContain("from a Claude Code session in this machine's desktop")
   expect(main).not.toContain('press Paste')
   const full = secretLine(['terminal'], true, false, true)!

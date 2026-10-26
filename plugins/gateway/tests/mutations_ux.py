@@ -16,24 +16,12 @@ import mutation_check  # noqa: E402
 
 S = "src/gateway/"
 
-# hooks.json: the output hooks' matcher (the same for PostToolUse and
-# PostToolUseFailure), without and with checkpoint's job tools.
-_POST_TOOLS = ("Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal"
-               "|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts"
-               "|mcp__ccd_session_mgmt__list_events")
-_JOB_TOOLS = ("|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status"
-              "|mcp__plugin_check_jobs__job_stop")
-
-
-def _post_matcher(event: str, tools: str) -> str:
-    return f'"{event}": [\n      {{\n        "matcher": "^({tools})$"'
-
 # (name, file, old, new, test selector "module::substring")
 MUTATIONS = [
     # --- pop-ups -------------------------------------------------------------
     ("the consent dialog defaults to Approve", S + "popup.py",
-     'oc = _confirm(f"{TITLE}: allow changes for {entry}?", text, "Approve", default_cancel=True,',
-     'oc = _confirm(f"{TITLE}: allow changes for {entry}?", text, "Approve", default_cancel=False,',
+     'page, "Approve" if last else "Next", default_cancel=True,',
+     'page, "Approve" if last else "Next", default_cancel=False,',
      "test_ux_popup::test_default_buttons"),
     ("the host-key dialog defaults to Trust", S + "popup.py",
      '        oc = _confirm(f"{TITLE}: new host key for {entry}", t, "Trust new key",\n'
@@ -91,7 +79,7 @@ MUTATIONS = [
      "        if False:\n",
      "test_web_http::test_cross_host_redirect_drops"),
     ("credentials go to unapproved or unbound hosts", S + "web.py",
-     "    if not ea.may_send_to(host) or not consent.bound_ok(data, name, host):\n",
+     "    if not acctmod.covers(ea.destinations, host) or not consent.bound_ok(data, name, host):\n",
      "    if False:\n",
      "test_web_http::test_binding_and_consent_checks"),
     ("response bodies are not scrubbed", S + "web.py",
@@ -136,7 +124,7 @@ MUTATIONS = [
      "test_ux_mcp::test_mcp_perm_decisions"),
     # --- PostToolUse / UserPromptSubmit ------------------------------------------
     ("PostToolUse doesn't scrub", S + "hooks_post.py",
-     "        new = scrub_text(obj)\n        return new, new != obj\n",
+     "        new = scrub_text(obj, env)\n        return new, new != obj\n",
      "        new = obj\n        return new, new != obj\n",
      "test_ux_hooks::test_post_scrubs_tool_output"),
     ("paste guard lets a token through", S + "hooks_prompt.py",
@@ -355,6 +343,37 @@ MUTATIONS = [
      "    _out(f\"gateway: forgot {', '.join(gone)} for {real}\" + _older_copies_note())\n",
      "    _out(f\"gateway: forgot {', '.join(gone)} for {real}\")\n",
      "test_ux_gate_setup::test_forget_keeps_no_copy_and_names_older_ones"),
+    # --- gate forget --backups: the older copies, listed, deleted after the OK (§19.14) ---
+    ("gate forget --backups deletes the copies without the person's OK", S + "gate_setup.py",
+     "        if oc != popup.Outcome.OK:\n            return oc, None\n"
+     "        gone = vault.delete_older_copies(batch)\n",
+     "        gone = vault.delete_older_copies(batch)\n",
+     "test_ux_gate_setup::test_forget_backups_lists_exactly_the_older_copies"),
+    ("gate forget --backups lists fewer copies than it deletes", S + "gate_setup.py",
+     "              for n in batch]\n",
+     "              for n in batch[:1]]\n",
+     "test_ux_gate_setup::test_forget_backups_lists_exactly_the_older_copies"),
+    ("deleting the older copies deletes a name that isn't one (any file in backups)", S + "vault.py",
+     '        if n not in now or "/" in n or n in (".", ".."):\n',
+     '        if "/" in n or n in (".", ".."):\n',
+     "test_ux_gate_setup::test_forget_backups_lists_exactly_the_older_copies"),
+    ("a start-over's folder isn't counted as an older copy of the vault", S + "vault.py",
+     '                    ("startover-*", lambda f: f.is_dir() and f.name.startswith("startover-")),\n',
+     "",
+     "test_ux_gate_setup::test_forget_backups_lists_exactly_the_older_copies"),
+    ("gate forget --backups: Delete is the default button (Enter deletes)", S + "gate_setup.py",
+     "            default_cancel=True, entry=\"gateway\", what=BACKUPS_WHAT)\n",
+     "            default_cancel=False, entry=\"gateway\", what=BACKUPS_WHAT)\n",
+     "test_ux_gate_setup::test_forget_backups_lists_exactly_the_older_copies"),
+    ("a start-over moves a link in a vault file's place", S + "vault.py",
+     "        if src.is_file() and not src.is_symlink():\n",
+     "        if src.exists():\n",
+     "test_ux_gate_setup::test_after_a_start_over_the_last_export_can_be_imported"),
+    ("gate forget still sends the person to their own terminal", S + "gate_setup.py",
+     '            f"start-over or the 0.6 conversion) may still hold it; {BACKUPS_HINT}")\n',
+     '            "start-over or the 0.6 conversion) may still hold it; the user deletes them in '
+     'their own terminal")\n',
+     "test_ux_gate_setup::test_forget_keeps_no_copy_and_names_older_ones"),
     ("gate rotate keeps no copy of the vault first", S + "gate_setup.py",
      "        line = ssh.rotate(real, before_change=lambda: kept.append(_snapshot()))\n",
      "        line = ssh.rotate(real, before_change=lambda: None)\n",
@@ -433,8 +452,8 @@ MUTATIONS = [
      "    if False and testing.active() is not None and not testing.get(\"e2e\") \\\n",
      "test_ux_dialog::test_backend_choice"),
     ("sudo stand-in stores nothing from a late pop-up answer", S + "sudo.py",
-     "        outcome, value = popup.secret(\"localhost\", \"sudo password\", prompt, verify=verify_local,\n                                      store=store, load=load, remember=True, check=SUDO_CHECK)\n",
-     "        outcome, value = popup.secret(\"localhost\", \"sudo password\", prompt, verify=verify_local,\n                                      remember=True, check=SUDO_CHECK)\n",
+     "        outcome, value = popup.secret(\"localhost\", \"sudo password\", prompt, verify=verify_local,\n                                      store=store, load=load, remember=REMEMBER_DEFAULT,\n",
+     "        outcome, value = popup.secret(\"localhost\", \"sudo password\", prompt, verify=verify_local,\n                                      remember=REMEMBER_DEFAULT,\n",
      "test_sudo_standin::test_missing_password_pop_up_stores_it"),
     # --- review round 3 ---------------------------------------------------
     ("no PostToolUseFailure hook (a failed call's output unmasked, no warning)",
@@ -642,19 +661,8 @@ MUTATIONS = [
      "  case $UHOME in /nonexistent|'') return 1 ;; esac\n",
      "",
      "test_ux_hooks::test_file_guard_fast_path_in_production_mode_leaves_run_dirs_and_test_roots_to_python"),
-    # --- checkpoint's job tools through the output hooks (integration review) -
-    ("output hook: checkpoint's job_tail/job_status/job_stop results go unmasked", "hooks/hooks.json",
-     _post_matcher("PostToolUse", _POST_TOOLS + _JOB_TOOLS),
-     _post_matcher("PostToolUse", _POST_TOOLS),
-     "test_ux_hooks::test_hooks_json_sends_checkpoint_job_results_to_the_output_hooks"),
-    ("output hook: job_tail (a job's log) alone left out", "hooks/hooks.json",
-     _post_matcher("PostToolUse", _POST_TOOLS + _JOB_TOOLS),
-     _post_matcher("PostToolUse", _POST_TOOLS + _JOB_TOOLS.replace("|mcp__plugin_check_jobs__job_tail", "")),
-     "test_ux_hooks::test_hooks_json_sends_checkpoint_job_results_to_the_output_hooks"),
-    ("failure hook: a failed job_stop's log lines go unremarked", "hooks/hooks.json",
-     _post_matcher("PostToolUseFailure", _POST_TOOLS + _JOB_TOOLS),
-     _post_matcher("PostToolUseFailure", _POST_TOOLS),
-     "test_ux_hooks::test_hooks_json_sends_checkpoint_job_results_to_the_output_hooks"),
+    # (checkpoint's job tools through the output hooks: since PLAN-0.11 §9.1
+    # the output hooks take every tool; their mutations are in mutations_offer.py)
 ]
 
 

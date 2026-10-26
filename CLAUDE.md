@@ -16,6 +16,10 @@ under [docs/dev/](docs/dev/):
 - [PLAN-v4.md](docs/dev/PLAN-v4.md): the v4 upgrade, authoritative where it
   differs from SPEC-v3; its platform evidence is
   [FEASIBILITY-v4.md](docs/dev/FEASIBILITY-v4.md).
+- [PLAN-0.11.md](docs/dev/PLAN-0.11.md): 0.11.0 (ungated unless configured,
+  per-mode values, the network class, the git stand-in, browser sign-in),
+  authoritative where it differs from the documents above; its section 19
+  holds the lead's decisions, which win over its other sections.
 - [TESTING.md](docs/dev/TESTING.md): how every kind of test runs;
   [TEST-LOG.md](docs/dev/TEST-LOG.md): past runs and per-phase status.
 
@@ -31,13 +35,16 @@ setting.
 A Claude Code plugin, `gate` (`plugins/gateway/`), in the marketplace
 `gateway` (`.claude-plugin/marketplace.json`). Users install it with
 `/plugin marketplace add p-w-rs/gateway` and `/plugin install gate@gateway`.
-It gives Claude the user's machines ("hosts") and accounts as ordinary
-commands (`sudo`, `ssh`, `git`, `gh`, ...) through stand-ins on Claude's
-PATH, keeps every secret in an age vault Claude can't read, and lets the user
-(or Claude, when asked) edit what Claude may do in one form,
-`~/.config/gateway/gateway.toml`. Users need only Claude Code and pixi, on
-macOS or Linux, desktop or headless; keep it that way. Nothing goes into
-settings.json.
+It gives Claude the machines ("hosts") and accounts the user configures in
+one form, `~/.config/gateway/gateway.toml`, as ordinary commands (`sudo`,
+`ssh`, `git`, `gh`, ...) through stand-ins on Claude's PATH, keeps every
+secret in an age vault Claude can't read, and lets the user (or Claude, when
+asked) set what Claude may do, per Claude Code permission mode. Everything
+the form doesn't configure is the user's own: a stand-in exists only for a
+tool that can reach something configured, and passes anything else to the
+user's own tool untouched (PLAN-0.11 §1). Users need only Claude Code and
+pixi, on macOS or Linux, desktop or headless; keep it that way. Nothing goes
+into settings.json.
 
 The parts (each landed in a PLAN-v4 phase; [TEST-LOG.md](docs/dev/TEST-LOG.md)
 has what each one added):
@@ -50,12 +57,22 @@ has what each one added):
   for checkpoint, and the broker that holds a passphrase-wrapped vault key.
 - **Native dialogs**: every question is a pane inside Claude Code, drawn by
   the mod from requests gated holds; a secret is typed into a `Client` field
-  and reaches gated sealed with NaCl's box. No OS dialogs, terminal prompts,
-  browsers or device codes.
+  and reaches gated sealed with NaCl's box. No OS dialogs, terminal prompts
+  or device codes; the system browser only for a browser sign-in (azure,
+  ml-catalog), after the user presses Open (gated's `daemon/oauth.py`).
 - **The managed shell** (`hooks/gate-sh`, docs/dev/modules/managed.md):
   `CLAUDE_CODE_SHELL_PREFIX` runs every command Claude Code starts through
-  its shell in the gateway env's bash, with the gateway rc and a curated
-  environment.
+  its shell in the gateway env's bash, with the user's environment minus
+  Claude Code's credentials and the shell's startup variables, the
+  stand-ins first and unshadowable.
+- **Per-mode values and the network class** (PLAN-0.11 §2, §3;
+  `modes.py`, docs/dev/modules/network.md): rights and restrictions resolve
+  per Claude Code permission mode; network commands are one configurable
+  class the approval hook judges.
+- **The git stand-in** (PLAN-0.11 §6; `gitroute.py`, `githelper.py`):
+  inside a repository with a configured remote every git command runs the
+  env's git with its own config and an allowlisted environment; elsewhere
+  the user's git, untouched.
 - **Terminals and jobs** (docs/dev/modules/terminals.md): persistent PTYs in
   gated's own tmux, one writer at a time, password prompts through the
   dialog, watched and taken over in `/gate-terminal`.
@@ -74,16 +91,18 @@ has what each one added):
 CHANGELOG.md, SECURITY.md           what each release changed; how to report a vulnerability
 docs/
   CONFIG.md                         every gateway.toml setting (the user's reference)
-  CAPABILITIES.md                   features x surfaces x minimum versions; what works without mods
+  CAPABILITIES.md                   features x surfaces; what works without mods
   CONTRACT-v1.md                    gateway <-> checkpoint contract (identical copy in checkpoint's docs/;
                                     gated serves discovery, capabilities, snapshot, events)
   dev/                              developer documentation and design history (README.md lists it)
     ARCHITECTURE.md                 how v3 fits together
     SPEC-v3.md                      the contract
     MODULES-v3.md, modules/*.md     module APIs and wiring, kept current with the code
-                                    (modules/daemon.md: gated, the planes, the broker)
+                                    (modules/daemon.md: gated, the planes, the broker;
+                                    modules/network.md: the network class)
     DECISIONS.md                    why: platform facts, critiques, design choices, rejected ideas
     PLAN-v4.md, FEASIBILITY-v4.md   the v4 upgrade plan (phases, requirements matrix) and its probe evidence
+    PLAN-0.11.md                    the 0.11.0 plan (section 19: the lead's decisions)
     TESTING.md, TEST-LOG.md         how the tests run; past runs and per-phase status notes
     phaseB-requests/                how the build groups' requests were settled (RESOLUTION.md)
     history/                        the approved v3 plan (REDESIGN-v3.md)
@@ -94,10 +113,12 @@ plugins/gateway/
   hooks/hooks.json                  every hook, exec form (table in docs/dev/MODULES-v3.md, "Wiring"; the
                                     async SessionStart `hook-daemon` starts gated and registers the
                                     session), and "modules": ["./mod/register.tsx"]
-  hooks/gate-sh                     the managed shell's prefix (POSIX sh; PLAN-v4 phase 4): hook strings
-                                    pass through as /bin/sh -c; Bash-tool scripts run in the env's bash
-                                    with the gateway rc (never the snapshot) and a curated env (the rest
-                                    removed by name, `env -u`: no value on any command line)
+  hooks/gate-sh                     the managed shell's prefix (POSIX sh; PLAN-v4 phase 4, PLAN-0.11 §1.6):
+                                    hook strings pass through as /bin/sh -c; Bash-tool scripts run in the
+                                    env's bash with the gateway rc and the inherited env minus Claude Code's
+                                    credentials, the startup variables and GW_* (removed by name, `env -u`:
+                                    no value on any command line); not ready: without its settings, in the
+                                    shell that made the snapshot (never /bin/sh), a notice
   hooks/launch.sh                   finds pixi, builds (`pixi install --locked`, a build lock with a live
                                     owner) and warms the env, runs run.py (-X pycache_prefix=$DATA/pycache);
                                     degraded output while it builds (env file, stubs, file guard, the cold
@@ -107,49 +128,55 @@ plugins/gateway/
                                     CLAUDE_CODE_SHELL), status line, provisioning via $.process.spawn, gated
                                     start + UI-plane registration ($.http.fetch over the socket),
                                     /gate-doctor, the dialog pane and loop, the guard, /gate-dialog|unlock|lock
-  hooks/mod/dialog.ts               the dialog's pure logic (views, texts, the sealed-post parser)
+  hooks/mod/dialog.ts               the dialog's pure logic (views, texts, the sealed-post parser; the
+                                    browser sign-in confirm and the passphrase offer templates)
   hooks/mod/field.tsx, seal.ts      the private field (a Client module) and its sealing (NaCl box)
   hooks/mod/terminal.ts, term.tsx   the terminal pane's pure logic and its screen (a Client module: styled runs,
                                     keys batched with sequence numbers, the click is the takeover, Ctrl-] prefix)
   hooks/mod/manage.ts               the /gate-hosts and /gate-accounts panes' pure logic (gated's /ui/manage, the
-                                    edit line -> one fixed `gate host|workspace|policy` argv; PLAN-v4 phase 7)
+                                    edit line of either pane -> one fixed `gate host|account|workspace|policy|
+                                    network` argv, MODE=WORD tokens included; per-mode values drawn in words)
   hooks/mod/vendor/                 TweetNaCl 1.0.3 (nacl-fast.js, one-line ES-module change; VENDOR.md)
   hooks/mod/*.test.ts               its tests, run by `claude plugin test .`
   hooks/pre_bash.sh                 PreToolUse prefilter -> hook-bash: Bash, Monitor, run_in_terminal,
                                     checkpoint's job_start, the gateway's own job_start and terminal_send
-  hooks/mcp_perm.sh                 PreToolUse decisions for the gw tools (sh + awk, no Python)
-  hooks/post.sh, hooks/prompt.sh    PostToolUse/PostToolUseFailure and UserPromptSubmit prefilters
+                                    (trigger words in any letter case, $DATA/network-words; a plain account
+                                    CLI while its stand-in exists and $DATA/ask-clis names it; every Bash
+                                    and Monitor call while a record is pending, $DATA/asks; while
+                                    $DATA/mode-epoch exists, the rest to hook-mode)
+  hooks/mcp_perm.sh                 PreToolUse decisions for the gw tools (sh + awk, no Python); http and
+                                    download go to hook-mcp (hooks_mcp.py)
+  hooks/tool_guard.sh               PreToolUse: the browser-automation tools while a sign-in runs, and an
+                                    AskUserQuestion that asks for a secret (sh)
+  hooks/post.sh, hooks/prompt.sh    PostToolUse/PostToolUseFailure (every tool but a skip list; the user's
+                                    credential variables checked with builtins) and UserPromptSubmit prefilters
   hooks/e2e.sh                      the e2e marker rules for the sh hooks
   commands/status.md, help.md       /gate:status, /gate:help (/gate-doctor is the mod's)
   skills/gateway/SKILL.md           gate:gateway (user-invocable: false): how Claude edits the form, gate check, accounts
-  pixi.toml, pixi.lock              Python 3.12, PyNaCl, age, gh, git-lfs, openssh, git, bash 5 (the managed
-                                    shell), tmux 3 (gated's terminal supervisor), pixi-pack and zstd (the remote
-                                    runtime's packs); features hf, databricks, dvc, registry, pijul
-  runtime/pixi.toml, pixi.lock      the managed remote runtime (PLAN-v4 phase 6): bash 5 + tmux 3 for linux-64,
+  pixi.toml, pixi.lock              every dependency "*" (latest only, `pixi run update-deps`): Python, PyNaCl,
+                                    age, gh, git-lfs, openssh, git, bash (the managed shell), tmux (gated's
+                                    terminal supervisor), pixi-pack and zstd (the remote runtime's packs);
+                                    features hf, databricks, dvc, registry, pijul
+  runtime/pixi.toml, pixi.lock      the managed remote runtime (PLAN-v4 phase 6): bash + tmux for linux-64,
                                     linux-aarch64, osx-arm64, osx-64 (no Python), feature `unpacker` (the target's
                                     pixi-unpack); never installed here, packed by gated (docs/dev/modules/remote.md)
-  run.py                            the one entry point: hook-*, mcp, shim TOOL, askpass, git-credential, gate,
-                                    gated serve|start|status|stop, managed-sync
+  run.py                            the one entry point: hook-* (hook-mcp, hook-mode included), mcp, shim TOOL
+                                    (git too), askpass, git-credential, gate, gated serve|start|status|stop,
+                                    managed-sync
   src/gateway/                      the code (stdlib, plus PyNaCl in gated; below); daemon/ is gated
   tests/                            run_tests.py, harness*.py (harness_daemon: a real gated in a test
-                                    root, FakeClaude), fakes/ (fake_claude.py: a python named `claude`),
-                                    fixtures/, test_*.py, mutation files (mutations_daemon.py,
-                                    mutations_dialogs.py), e2e/ (headless claude -p suite;
-                                    tests/e2e.py forwards to it), tui/ (the interactive TUI harness,
-                                    identical in checkpoint; proxy.py: the record-only telemetry proxy),
-                                    acceptance_dialogs.py (the native dialogs, live, through tui/),
-                                    test_managed.py, mutations_managed.py, acceptance_managed.py (managed
-                                    execution; the last live through tui/, with a baseline session),
-                                    test_terminals.py, mutations_terminals.py, acceptance_terminals.py
-                                    (terminals and jobs; the last live through tui/),
-                                    test_remote.py, harness_remote.py, mutations_remote.py, acceptance_remote.py
-                                    (the remote runtime; the last live against the Linux VM and a local sshd),
-                                    test_policy.py, test_workspaces.py, test_accounts_states.py,
-                                    test_portability.py, mutations_policy.py (PLAN-v4 phase 7),
-                                    acceptance_install.py, acceptance_canaries.py, acceptance_native_ui.py
-                                    (PLAN-v4 phase 8, brief 14.1, 14.9/14.13, 14.10/14.12: both plugins
-                                    installed, live through tui/),
-                                    release_check.py (is the git index the tested tree? read-only)
+                                    root, FakeClaude; harness_posture: the user_tools knob's recording
+                                    fakes; harness_oauth: a fake OAuth server and the browser knob),
+                                    fakes/ (fake_claude.py: a python named `claude`; fake_user_tool.py),
+                                    test_*.py, mutation_check.py and mutations_*.py (one file per area;
+                                    PLAN-0.11's: posture, modes, network, git, sso, offer, relock,
+                                    integration, final, asks),
+                                    e2e/ (headless claude -p suite; tests/e2e.py forwards to it), tui/
+                                    (the interactive TUI harness, identical in checkpoint; proxy.py: the
+                                    record-only telemetry proxy), acceptance_*.py (live through tui/:
+                                    dialogs, managed, terminals, install, canaries, native_ui; remote
+                                    against the Linux VM and a local sshd), update_deps.py (the per-release
+                                    relock), release_check.py (is the git index the tested tree? read-only)
   logs/, quarantine/                old v0.5 data some checkouts keep (git-ignored); never move or delete
                                     them (a local folder marketplace would copy them, so installs come
                                     from git only)
@@ -164,12 +191,12 @@ plugins/gateway/
 
 | area | modules |
 |---|---|
-| core | `paths` (every location), `testing` (the test override API), `form` (parse/validate/write the form, its policy/workspace/shell tables), `accounts` (destinations, account choice), `vault` (age vault v3, cache, events), `vault_v2` (reads 0.6 vaults), `consent` (approved vs effective rights and policy, ratchet), `policy` (allow/ask/deny decisions with their rule, PLAN-v4 phase 7), `migrate` (0.6 to v3), `audit`, `envfile` (env file, stubs, git include, launcher), `warm` (loads a new env once), `managed` (the managed shell's conf, rc, state and runtime links for gate-sh; `gate status`'s section; the host inspection behind `host_inspect`), `runtime_pack` (the remote runtime's artifacts: platforms, pixi-pack builds into plugin data, the target's pixi-unpack out of its conda packages, the sha256 manifest) |
-| hooks | `hooks_session` (SessionStart/SubagentStart, Claude's context), `hooks_bash` + `bashparse` (approval hook), `hooks_files` (file guard), `hooks_post` (scrub output, form checks, no-screen notices), `hooks_prompt` (paste guard), `hooks_filechanged` |
-| sudo / ssh | `sudo` (local stand-in, askpass, the passwordless probe; never a sudoers rule), `ancestry` (direct vs scripts), `ssh`, `ssh_args`, `ssh_conf`, `ssh_sudo` (remote sudo) |
-| accounts | `githelper` (credential helper, include file), `clis` (gh, hf, databricks, crane, pijul, az, `gate with`), `asiml`, `entra` (also a certificate's client assertion), `logins`, `scrub`, `adapters` (account states from each service's API, PLAN-v4 phase 7) |
-| user | `gate` (CLI, status, lock), `gate_setup` (check, login, forget, rotate; account setup by PAT, API key, service principal secret or certificate), `manage` (`gate host`, `workspace`, `policy`, `accounts`, through the form writer), `popup` + `dialog` (the only way to ask the user: a lease from gated, then the native dialog through gated; a fake under tests), `transfer` (export, import, copy-to; format 3: per-item, digest, staged import), `agepass` (age's passphrase recipient under a private pty: export/import and the vault key's wrap), `web` + `mcp_server` (http, download) |
-| daemon | `daemon/`: `peers` (kernel peer credentials, gateway entry points), `planes` (sessions, plane checks), `events` (event log), `broker` (wrapped key, lock, scoped views, merges), `server` (HTTP routes), `lifecycle` (start, detach, single instance, contract.json, idle exit, version skew, the vault's dialogs), `dialogs` (dialog requests: the queue, per-attempt X25519 keys, sealed intake opened with PyNaCl, the recheck, leases, persistence, pause; gated's own terminal-prompt dialogs), `clipboard` (Paste: the OS clipboard by absolute path, or the test override's program), `terminals` (the tmux supervisor: terminals and jobs, ownership, password prompts, survival, pause policies; remote panes and their pollers), `remote` (remote hosts: the verified connection, machine identity, the host-change gates, staging the runtime, the runtime's tmux over ssh), `screen` (capture-pane escapes to plain lines and styled runs, PTY streams, key and signal names), `client` (what the other processes call) |
+| core | `paths` (every location), `testing` (the test override API), `form` (parse/validate/write the form, its policy/workspace/shell/network tables, per-mode values in their own attributes), `modes` (permission modes, the four words and their order, `ModeValue`, the modeless rule, the recorded mode and its epoch marker), `accounts` (destinations, account choice, `entra_fits`), `vault` (age vault v3, cache, events, the passphrase offer's state, the older copies and their delete, a start-over's move; refuses a vault beside a 0.6 one), `consent` (approved vs effective rights and policy mode by mode, the configured set and `private/configured.json`, removal as a widening, ratchet, `network-words` and `ask-clis`), `asks` (the approval hook's record that Claude Code asked about a stand-in's exact command: record, take, standin, drop at the session's next call, the gate CLI's own command), `policy` (allow/ask/deny/cc decisions with their rule, per mode), `audit`, `envfile` (env file, which stand-ins exist, `user_tool` and the pass-through, stubs, launcher, the cold-window texts), `warm` (loads a new env once), `managed` (the managed shell's conf, rc and its unshadowing tail, state for gate-sh, the removal lists; `gate status`'s section; the host inspection behind `host_inspect`), `gitroute` (the git resolver the git stand-in and the hook share: repository, effective URLs, configured or not), `runtime_pack` (the remote runtime's artifacts: platforms, pixi-pack builds into plugin data, the target's pixi-unpack out of its conda packages, the sha256 manifest) |
+| hooks | `hooks_session` (SessionStart/SubagentStart, Claude's context, the first 0.11 session's notice), `hooks_bash` + `bashparse` (approval hook: rights per mode, the records of what it asks about, the configured-only route checks, the hidden-command rule, the network class, git's up-front judging; program names without letter case), `hooks_mcp` (the http and download decision), `hooks_files` (file guard), `hooks_post` (mask every tool's output, form checks), `hooks_prompt` (paste guard), `hooks_filechanged` |
+| sudo / ssh | `sudo` (local stand-in: gated, restriction-only, or pass-through; askpass, the passwordless probe, the system sudo's allowlisted environment; never a sudoers rule), `ancestry` (direct vs scripts, typed by Claude), `ssh` (configured, a hint, or pass-through: `ssh -G`, hops, IPs), `ssh_args`, `ssh_conf`, `ssh_sudo` (remote sudo) |
+| accounts | `githelper` (the git stand-in: pass-through or the gated git with its environment, global config and include; the credential helper), `clis` (gh, hf, databricks, crane, pijul, az: each tool's destination, pass-through, the account it chooses, an "ask" account with the hook's record; `gate with` and its account's use and credential policy), `asiml` (also dvc's pass-through), `entra` (also a certificate's client assertion, the browser sign-in's client side), `logins`, `scrub`, `adapters` (account states from each service's API, PLAN-v4 phase 7) |
+| user | `gate` (CLI, status, lock, passphrase), `gate_setup` (check, login, forget and forget --backups, rotate; account setup by PAT, API key, service principal secret or certificate, or a browser sign-in), `manage` (`gate host`, `account set`, `workspace`, `policy`, `network`, `accounts`, through the form writer, MODE=WORD tables), `popup` + `dialog` (the only way to ask the user: a lease from gated, then the native dialog through gated; `offer_passphrase`; a fake under tests), `transfer` (export, import, copy-to; format 3: per-item, digest, staged import, the confirm in parts), `agepass` (age's passphrase recipient under a private pty: export/import and the vault key's wrap), `web` + `mcp_server` (http, download) |
+| daemon | `daemon/`: `peers` (kernel peer credentials, gateway entry points), `planes` (sessions, plane checks, recorded modes), `events` (event log), `broker` (wrapped key, lock, change and removal of the passphrase, start-over, scoped views, merges), `server` (HTTP routes), `lifecycle` (start, detach, single instance, contract.json, idle exit, version skew, the vault's dialogs and menu, CONTRACT-v1's rights words), `dialogs` (dialog requests: the queue, per-attempt X25519 keys, sealed intake opened with PyNaCl, the recheck, leases, persistence, pause; gated's own terminal-prompt dialogs), `oauth` (the browser sign-in: lease, confirm, the 127.0.0.1 listener, PKCE, the browser by absolute path, the token exchange), `offer` (the vault passphrase offer), `clipboard` (Paste: the OS clipboard by absolute path, or the test override's program), `terminals` (the tmux supervisor: terminals and jobs, ownership, password prompts, survival, pause policies; remote panes and their pollers), `remote` (remote hosts: the verified connection, machine identity, the host-change gates, staging the runtime, the runtime's tmux over ssh), `screen` (capture-pane escapes to plain lines and styled runs, PTY streams, key and signal names), `client` (what the other processes call) |
 
 ## Invariants: don't break these
 
@@ -182,37 +209,84 @@ plugins/gateway/
    exception text. The daemon's events are built only from an allowlist of
    keys and safe values (`events.clean`), and its log never records a request
    body. Values under 8 characters are never masked by literal (that
-   would reveal them) and must not reach an output path.
+   would reveal them) and must not reach an output path. Under the posture
+   the user's own environment (their agent and token variables) reaches
+   Claude's shell: it is the user's, not the vault's. Claude Code's own
+   credential variables never do (gate-sh and the env file remove them). The
+   output masker covers every tool's response but a fixed skip list
+   (`hooks_post.SKIP_TOOLS`, mirrored in post.sh) and also masks the values
+   (8 characters or more) of credential-named variables in Claude Code's
+   environment (one list of names, compared with post.sh by a test). A
+   question asking the user for a secret (AskUserQuestion) is denied
+   (`hooks/tool_guard.sh`).
 2. **Credentials go only to bound destinations.** Check `consent.bound_ok`
    (or `EffectiveAccount.may_send_to`) before sending. Host secrets are tied
    to the pinned host keys. Credentialed HTTP goes through `entra.urlopen` or
    `web`'s opener: no automatic redirects with credentials, no proxies, the
-   Python build's own CA bundle.
+   Python build's own CA bundle. The gated git runs with an allowlisted
+   environment (no proxy, CA, askpass, trace or config-injection variables;
+   `githelper.gated_env`), the gateway's settings at command-line scope
+   (first the user's own `user.name`/`user.email` as the user's git reads
+   them in that repository, the one the command works on (`git -C`,
+   `--git-dir`), `githelper.user_identity`, so the account's
+   identity in the include wins: values only in the child's environment,
+   never on a command line) and a read-only global config of its own (with
+   `user.useConfigOnly`: git never guesses an identity). The configured
+   sudo hands the system sudo an allowlisted environment (`sudo.sudo_env`:
+   `clis.ENV_ALLOW`, TERM, `sudo -e`'s editor variables and the askpass's
+   variables), so `sudo -E` keeps
+   only that. The credential helper refuses a URL
+   with an `http.proxy`, `sslCAInfo`, `sslCAPath`, `sslBackend` or
+   `sslVerify` override, or a remote with its own proxy.
 3. **Widening needs the user's OK in the gateway's dialog.** Use effective rights
    (`consent.compute`), never the raw form. Narrowing applies at once and is
    persisted (`consent.ratchet` from every process that loads the form).
    `consent.approve` runs only after the user said yes, with the changes the
-   dialog showed. No model-settable "approved" parameter, ever. What counts
-   as approved when nothing is recorded is `consent.baseline(older)`, and
-   the install decides it (0.10.0): a vault made by this release carries
-   `"baseline": 2` (`vault.BASELINE_KEY`), and on such a new install this
-   computer's sudo, where the form doesn't say it, is `"ask"`
-   (`form.LOCALHOST_SUDO`); a vault without the mark is an older install
-   (`vault.older_install`), which keeps the old default `true`
-   (`LOCALHOST_SUDO_OLDER`). `form.apply_install_defaults`, called inside
-   `consent.compute`, applies it, so the hook, snapshots and `approve()` see
-   the same value. No vault counts as new; a locked or unreadable vault gets
-   the new defaults (the refusals then add `consent.LOCKED_SUDO_NOTE`); the
-   broker's merge keeps the mark exactly as the vault has it (no writer adds
-   or drops it); an export leaves it out; a 0.6 conversion has none. Remote
-   hosts still default to `true`.
+   dialog showed. No model-settable "approved" parameter, ever. Nothing
+   recorded means nothing approved (`consent.baseline()`: no entry, this
+   computer's sudo not configured), and under the posture a target the
+   configured set doesn't name is the user's own. The configured set is the
+   form (disabled entries included), the approved snapshot and
+   `private/configured.json` (rewritten whole by approve and ratchet).
+   Taking a configured target out of the gateway is a widening, and the
+   approved entry keeps gating until the user's OK: deleting or renaming its
+   table, dropping an address, `also`, `via`, owner, host or destination,
+   listing the first `owners` of an account that listed none (the only
+   account of its kind covers every owner only while it lists none:
+   `accounts.owner_covered`, the approval's `any_owner`), adding or
+   changing `when`, deleting localhost's `sudo` key, or an import
+   replace that does so. Values compare mode by mode (deny < ask < cc <
+   allow < unconfigured; `modes.RANK` raises on an unknown word); the
+   effective value is the per-mode minimum of the form and the approved
+   value, and a policy table's explicit allow ranks above a plain one.
+   Writing localhost's `sudo` where none is approved applies at once up to
+   `"ask"`; above it waits. A missing or unparseable form falls back to the
+   last good form, else the configured list, whose entries are refused. With
+   a locked vault the configured list still classifies and configured entries
+   are refused (`LOCKED_ENTRY`); so is this computer's configured sudo, up
+   front, by the Bash hook wherever it would ask and by the sudo stand-in,
+   with the vault's own message (how to unlock: `/gate-unlock`; PLAN-0.11
+   §19.16). A disabled entry is configured and refused. A snapshot from
+   before 0.11 counts localhost as implicit (not configured). Remote hosts' `ssh` and `sudo` default to
+   `true`.
 4. **The gateway asks only through its native dialog** (PLAN-v4 phase 3):
    `popup.py` -> `dialog.py` -> gated's dialog requests -> the mod's pane.
    No OS dialog (osascript, zenity, kdialog), no terminal prompt, no
-   browser or device-code sign-in, never MCP elicitation, and no other way
-   on a surface without the private field (mobile, VS Code, `-p`, the SDK,
-   mods off): there the request is reported as unavailable (what is needed,
-   where it can be given). Fixed templates; names only after validation
+   device-code sign-in, never MCP elicitation, and no other way on a surface
+   without the private field (mobile, VS Code, `-p`, the SDK, mods off):
+   there the request is reported as unavailable (what is needed, where it
+   can be given). The one browser exception is the authorization code flow
+   with PKCE for azure (`sign_in = "browser"`) and ml-catalog accounts
+   (`daemon/oauth.py`): gated opens the system browser by absolute path only
+   after the user clicks Open in its confirm dialog, the callback lands on a
+   127.0.0.1 listener, and the tokens go straight into the vault; never the
+   desktop Browser pane, and the browser-automation tools are denied while a
+   sign-in runs (`hooks/tool_guard.sh`, `<run>/signin-active`). A consent or
+   import confirm longer than one pane comes in parts ("Part i of n", at most
+   10; each fits 40 rows of a 72-column pane, a wide character two columns,
+   `popup.dialog_parts`, and its question beside the buttons names the
+   part); nothing applies until the last part is accepted, and a cancel on
+   any part changes nothing. Fixed templates; names only after validation
    (`form.safe`); text Claude wrote (notes) is never shown in a dialog or
    put into Claude's context. A secret is typed only into the `Client`
    field and leaves it sealed (TweetNaCl box to the attempt's X25519 key,
@@ -233,19 +307,37 @@ plugins/gateway/
    a reload) clears the field and gated's buffers. Paste reads the
    clipboard in gated by absolute path (under any test override only the
    override's program).
-5. **`allow` only for SPEC 8 shapes, only in auto/bypass mode.** The Bash
+5. **`allow` only for SPEC 8 shapes, and only where the effective per-mode
+   word is `allow`.** A bare `true` right is `allow` in auto and
+   bypassPermissions and `cc` (no decision) in manual, plan, acceptEdits and
+   dontAsk; only an explicit per-mode `allow` approves elsewhere, never in
+   plan. The mode is the payload's `permission_mode` (`modes.from_payload`:
+   empty, missing or unknown reads as default and never allows). The Bash
    hook denies and asks in every mode; it allows only when every segment is
    an allowed shape, run by its bare name (never `./ssh` or `/tmp/x/cat`),
-   on an effective `true` right. Never `allow` for `gate with`, account
-   CLIs, `mcp__terminal__run_in_terminal`, checkpoint's
+   on an effective `allow` with every policy decision for it `allow` too;
+   the benign commands and `gate`'s subcommands, which have no right of
+   their own, only in auto and bypass (`BARE_ALLOW_MODES`). A network-class
+   hit (invariant 22) makes the whole command ineligible for allow unless
+   `[network] commands` itself is allow in that mode (lead decision 19.1).
+   An unconfigured ssh host, account or local sudo gets no decision (the
+   user's own tool runs). Never `allow` for `gate with`, account CLIs, git,
+   `mcp__terminal__run_in_terminal`, checkpoint's
    `mcp__plugin_check_jobs__job_start` or the gateway's own `job_start` and
-   `terminal_send` (a job gets Bash's denies, an
-   `"ask"` right there is denied, never `allow` or `ask`). Deny/ask use the stricter of
-   the form and the effective right (an approved `"ask"` edited to `true`
-   stays `"ask"` until the user's OK; a right waiting for the OK is denied
-   with "run gate check NAME"), allow the effective right. Never answer
-   `ask` except for an `"ask"` right (an `ask` always becomes a human
-   prompt). Monitor and `run_in_background` commands are judged like any
+   `terminal_send` (a job is judged at the stricter of its payload's mode
+   and the modeless rule, the network class at its payload's mode alone,
+   gets Bash's denies, an `"ask"` there is denied, never `allow` or `ask`).
+   Deny/ask use the stricter of the form and the
+   effective value (an approved `"ask"` edited to `true` stays `"ask"` until
+   the user's OK; a value waiting for the OK is denied with "run gate check
+   NAME"), allow the effective value. Never answer `ask` except for an
+   `"ask"` value in the current mode (a right, an account's use, a policy
+   restriction, the network class, or text the parser can't follow that
+   names an "ask" target: see 6; an `ask` always becomes a human prompt).
+   Program names are compared without letter case (macOS's file systems
+   ignore it: `CURL`, `/usr/bin/SSH`), in the hook, pre_bash.sh and the cold
+   guard; the allow step approves only the plain lower-case name. Monitor and
+   `run_in_background` commands are judged like any
    Bash command (no `gate scrub` rule; see 14). Never `allow`
    `sudo visudo|vipw|vigr` (they edit sudoers and the user database with no
    path argument), nor `gate forget` (not in `GATE_SUBCMDS`). The plain
@@ -260,8 +352,11 @@ plugins/gateway/
    at such a file); the same rule under sudo (`_reads_plain`). `~-`, `~N`
    and `~` with no known home are denied (`DENY_TILDE`). mcp_perm.sh allows
    only host_inspect, the terminal and job reads, a local `terminal_open`,
-   `terminal_resize` and `host_runtime`'s status; `http` and `download` get no
-   decision in any mode (Claude Code's mode decides).
+   `terminal_resize` and `host_runtime`'s status; `http` and `download` go
+   to Python (`hooks_mcp`), which answers deny or ask from the effective
+   `network` policy for the payload's mode, allow only where the user wrote
+   an explicit per-mode allow in this computer's `network` policy (never for
+   a call with an account), otherwise no decision.
 6. **Credentials go to direct callers only** (`ancestry.is_direct`, by
    executable path) unless the entry has `scripts = true`; an ancestry error
    counts as not direct. **An `"ask"` right goes only to a command Claude
@@ -269,11 +364,44 @@ plugins/gateway/
    it, nothing in between, never checkpoint's job runner, never a gateway
    terminal's or job's shell (its `CLAUDE_PID=$$` names a shell, never Claude
    Code), whatever `scripts` says), because Claude Code can only prompt for
-   that command (so on a new install sudo here from a gateway terminal, a
-   job, make or a script is refused until the form says `sudo = true` and
-   the user approves it: `gate check localhost`); the approval
-   hook denies scp/sftp/rsync on an `"ask"` right and asks about commands
-   that hide their verbs.
+   that command; the approval hook denies scp/sftp/rsync on an `"ask"` right.
+   A stand-in resolves a per-mode value with the session mode the hook
+   recorded in gated (`modes.current_for`, under the current epoch: lead
+   decision 3) for a command Claude typed, and with the modeless rule for
+   everything else (the strictest word over every mode but plan, allow
+   capped at cc): jobs, terminals, scripts, gated, and any caller gated has
+   no record for. There an "ask" is a refusal. **An "ask" is proved by a
+   record** (lead decision 19.14, `asks.py`): the Bash hook writes one for
+   each stand-in stage it answers "ask" for (ssh, sudo, the account CLIs,
+   git, and `gate`: `gate with NAME --` for the account, `gate
+   check|rotate|copy-to` for the host; Bash and Monitor only, in every
+   mode: Claude Code shows a hook's ask in dontAsk too), with that Claude
+   Code, the real folder, the tool and its exact
+   words (quotes gone, `$HOME` and a leading `~/` the home) and the
+   entries it asked about, and denies a stage whose words or folder it
+   can't spell out (a variable, a glob, `~user`, a `cd` it can't follow);
+   a stand-in passes an "ask" only for a command Claude typed with a
+   matching record, used once, within 15 minutes and before the session's
+   next Bash or Monitor call, else "run `ssh box ...` as its own command".
+   That next call's hook first drops every record the session's earlier
+   calls left (`asks.drop`: a prompt declined or never shown, a stage that
+   never ran), and pre_bash.sh sends every Bash and Monitor call to the hook
+   while one is pending (`$DATA/asks` links to them). So a sourced file,
+   eval, a function or anything else the hook can't read gets no record and
+   its stand-in refuses: the hook never asks about a hidden command for an
+   "ask" entry (`source .venv/bin/activate && pytest` gets no decision),
+   refuses one whose text names a configured target, and for text the
+   parser can't follow, or a hidden stage beside an asked one, that names
+   an "ask" target asks (naming each) with records for the ssh, sudo,
+   account-CLI and `gate with` commands it can read there (a here-document,
+   `&`, a subshell, eval's or a shell's written-out string, trap's action),
+   else denies. An "ask" reaches the gated git (and the ssh stand-in or
+   credential helper below it) only with the hook's record, and never
+   through a git hook script. An account's use = "ask" works for its CLI as
+   for git (`clis._select`); the hook asks about the account the stand-in
+   will choose (`clis.chosen`, GATE_ACCOUNT included). `gate with` hands a
+   key over only while the account's use and credential policy allow it
+   (`clis._with_refused`).
 7. **Production entry points never honour test overrides.** Locations come
    only from `paths.py`; stand-ins, askpass, the git helper and `gate` never
    read `GATEWAY_*` or take the data folder from `CLAUDE_PLUGIN_DATA`;
@@ -282,7 +410,13 @@ plugins/gateway/
    only; `gated` too, with `GATEWAY_TEST_RUN` for a short run dir), and the
    e2e marker in a scratch copy under a temp folder (decided by the code's
    own location, never a variable). The daemon takes its data folder from its
-   python, never from `CLAUDE_PLUGIN_DATA`.
+   python, never from `CLAUDE_PLUGIN_DATA`. Exception: a stand-in's
+   pass-through finds the user's own tool on PATH (`envfile.user_tool`),
+   skipping every folder with a `.gateway-standins` marker and this plugin's
+   own envs, and only for an unconfigured target, with a recursion guard
+   (`GW_PASSTHRU`). A configured target always uses `paths.tool()`. gated
+   opens the system browser by absolute path (`/usr/bin/open`, or xdg-open
+   from fixed folders), never `$BROWSER` or a PATH lookup.
 8. **Tests never touch the real home.** Everything goes through
    `gateway.testing.override(...)` and the harness; the harness guard aborts
    the run on any real location.
@@ -292,11 +426,17 @@ plugins/gateway/
    pass, and sends everything else to Python), the paste guard and the
    task-notification check (prompt.sh blocks if Python can't answer). The other hooks fail open (no decision), so
    Claude Code's own permissions still apply. A cold start never switches a
-   guard off: while no env can run Python, launch.sh's degraded paths deny
-   in sh (the file guard, and the Bash hook's `degraded_bash`: private folder
-   and `~/.config/gateway` other than gateway.toml, transcripts, credential
-   shapes, curl/wget once a vault exists), byte-identical to
-   `envfile.degraded_bash_text`.
+   guard off: while no env can run Python, launch.sh's degraded paths decide
+   in sh (the file guard, and the Bash hook's `degraded_bash`: deny the
+   private folder and `~/.config/gateway` other than gateway.toml,
+   transcripts, credential shapes; the network class asks, or denies when
+   gateway.toml has a `[network]` table), byte-identical to
+   `envfile.degraded_bash_text`. The cold stand-ins exist whenever
+   gateway.toml may configure something (or `private/configured.json`
+   exists) and say "still setting up" (sudo's execs `/usr/bin/sudo`, which
+   gets nothing from the gateway; git's runs the user's git only while
+   nothing may be configured), so no credential flows before Python can
+   classify the target.
 10. **The form is never re-serialized**: append a table or replace one
     `key = value` line, re-parse, roll back if anything else changed.
 11. **Vault read-modify-write only inside `vault.locked()` / `vault.edit()`.**
@@ -308,17 +448,36 @@ plugins/gateway/
     rotate` keeps an encrypted copy just before its first vault write
     (`vault.snapshot`, `private/backups/rotate-*.vault.age`, newest 5);
     `gate forget` keeps none and names the older copies it can't reach
-    (`vault.older_copies`), with the command to delete them.
+    (`vault.older_copies`: rotate's, an import's backup, a start-over's
+    folder, the 0.6 store); `gate forget --backups` lists them in the
+    gateway's dialog and deletes exactly those after the user's OK
+    (`vault.delete_older_copies`, each still an older copy then). The
+    passphrase is changed or removed (unlocked) and a vault whose
+    passphrase is lost started over (locked: its files renamed into
+    `private/backups/startover-*`, `vault.move_aside`, nothing deleted)
+    only in gated's own dialogs (`Broker.change_passphrase`,
+    `remove_passphrase`, `start_over`; `/gate-unlock`, `gate passphrase`).
 12. **Every credential use and every refusal is audited** (`audit.use`,
-    `audit.refusal`; `gate why` reads the last refusal). Messages start with
+    `audit.refusal`, both with the mode they used or `modeless`: lead
+    decision 8; `gate why` reads the last refusal). A pass-through writes one
+    `passthrough` line (the tool and a validated host or owner name, never
+    argv; for git only commands that touch a remote). Messages start with
     `gateway:` and say what to do next.
-13. **Stdlib only** in `src/` (Python 3.12). **POSIX sh** in `hooks/` (no
-    bashisms; the desktop app gives hooks a minimal PATH), except
+13. **Stdlib only** in `src/` (the lock's Python, the newest conda-forge has;
+    an older env with another Python minor is never used for new code:
+    launch.sh's `older_env`, `envfile.older_env_python`). **POSIX sh** in
+    `hooks/` (no bashisms; the desktop app gives hooks a minimal PATH), except
     `hooks/mod/` (the mod, TypeScript, run by Claude Code itself). External
-    binaries: the pixi env's age, OpenSSH, gh, git-lfs (and git as a
-    fallback), the system's sudo, git and sshd (and its ssh, by path, only for
-    `others = "mine"`, "use my own login once" and a draining gated whose env
-    lost its own: `ssh_conf.allow_system_ssh`). One exception since PLAN-v4
+    binaries: the pixi env's age, OpenSSH, gh, git-lfs and git (the gated
+    git is always the env's); for pass-through only, the user's own tools
+    found on PATH (invariant 7's exception), and the user's git for the
+    gated git's identity read (`githelper.user_identity`: `git config
+    --get-regexp` in the repository the command works on, only for a
+    command that may commit, with a recursion guard); the system's
+    sudo for a
+    configured local sudo; the system's sshd in tests; the system's ssh only
+    for "use my own login once" and a draining gated whose env lost its own
+    (`ssh_conf.allow_system_ssh`). One exception since PLAN-v4
     phase 3: PyNaCl (libsodium), imported only by gated's `daemon/dialogs.py`
     to open the dialog's sealed boxes (`_nacl()` adds the env's
     site-packages for that import, since gated runs with `-I -S`); the mod
@@ -332,10 +491,10 @@ plugins/gateway/
     `runtime/pixi.toml`'s lock (bash, tmux) and the target's pixi-unpack; on
     the host only POSIX tools are used (`sh -c`, cat, mv, mkdir, chmod, df, ps,
     stty, kill, uname).
-14. **Claude's commands run in the managed shell, never the login shell**
-    (PLAN-v4 phase 4, docs/dev/modules/managed.md; replaces "don't change how
-    Claude's ordinary commands behave"). In managed mode (`[shell] managed =
-    "on"`, the default, or "warn") the mod sets `CLAUDE_CODE_SHELL_PREFIX` to
+14. **Claude's commands run in the gateway's bash 5 with the user's own
+    environment, and with the stand-ins unshadowable** (PLAN-v4 phase 4,
+    PLAN-0.11 §1.6, docs/dev/modules/managed.md). In managed mode (`[shell]
+    managed = "on"`, the default) the mod sets `CLAUDE_CODE_SHELL_PREFIX` to
     `hooks/gate-sh` before anything else at session start. gate-sh runs a
     classic hook string exactly as Claude Code does without it (`exec /bin/sh
     -c "$1"`, builtins only and no variable assigned before it, SHLVL given
@@ -344,46 +503,72 @@ plugins/gateway/
     `source` first); a Bash-tool script runs with only the snapshot's
     `source` replaced by the gateway rc, the rest byte for byte (other
     plugins' env files, the eval'd command, the cwd tracker, the exit
-    status), under the env's bash with only the platform variables, Claude
-    Code's own, `GW_MANAGED_DIR` (a Claude Code started from a command stays
-    managed) and approved imports, never a credential-looking name (the
-    lists are mirrored in `managed.py` and compared by a test; they cover
-    Claude Code's own credential variables, `PASSPHRASE`, `CRED`,
-    `CLIENT_KEY` and `CLIENT_CERT` included). Every other variable is removed
-    by name (`env -u NAME`): no value ever reaches a command line, which
-    every local user can read. A script that has a tool script's shape but
-    doesn't parse (126) or a managed shell that isn't ready (75) is refused,
-    never run in the user's shell; a newer gateway.toml makes gate-sh renew
-    its settings before the command (a narrowing applies at once). Without the prefix the
-    classic Bash hook decides every Bash and Monitor call (pre_bash.sh sends
-    them all to Python): "on" denies "managed shell unavailable", "warn" runs
-    with a notice once per session. Lowering `managed` and adding an import
+    status), under the env's bash with the inherited environment minus, by
+    name (`env -u NAME`, never a value on a command line, which every local
+    user can read): Claude Code's own credential variables; `BASH_ENV`,
+    `ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `PROMPT_COMMAND`,
+    `CDPATH`, `IFS`, `GLOBIGNORE`, `BASH_XTRACEFD`; and `GW_*` except
+    `GW_MANAGED_DIR` (a Claude Code started from a command stays managed).
+    The lists are mirrored in `managed.py` and compared by a test; gate-sh
+    exits 126 when it can't list the environment. PATH is the present
+    stand-ins, then the snapshot's PATH, then other plugins' bins, then the
+    approved `import_path`. The gateway rc sources a bash snapshot (a zsh
+    snapshot gives only its PATH), then, in POSIX mode, clears the snapshot's
+    traps and removes every alias and function named after a present
+    stand-in or a builtin the tail relies on, and runs `hash -r`; it fails
+    closed (the command never runs) where it can't (`managed.rc_tail`). No
+    vault secret ever enters the environment. A managed shell that isn't
+    ready runs the script without its settings in the shell that made the
+    snapshot (zsh or bash, from the snapshot's name), found the way Claude
+    Code finds its shell (`CLAUDE_CODE_SHELL`, `SHELL`, then PATH and its
+    usual places in its order; absolute, no `=`; never `/bin/sh`; none:
+    refused, 126), with a one-line notice naming that shell and why
+    (PLAN-0.11 §19.15); a
+    script with a tool script's shape that doesn't parse (126) is refused. A
+    newer gateway.toml makes gate-sh renew its settings before the command
+    (a narrowing applies at once). Turning `managed` off and adding an import
     are widenings; the mod only reads a cache (`state.json`) that can take
     the prefix away, never keep it off where the vault says "on" (it takes
     the managed bash for `CLAUDE_CODE_SHELL` from `launch.sh status`, never
     from `state.json`, and the data folder's gate-sh copy only while its text
-    is the plugin's gate-sh). Still kept
-    from the rollback: no EXIT trap, no hook requires a command shape for
-    output's sake (no mandatory `| gate scrub`); output Claude Code passes to
-    no rewriting hook is a documented known limit (PostToolUseFailure warns,
-    the prompt hook holds back a task notification quoting a stored value or
-    a token shape, `gate scrub` is optional). Host inspection (`host_inspect`)
-    reads files and lists folders only, never runs or sources anything, and
-    returns folder names, version words and variable names, never values.
-    In managed mode the approval hook also denies the routes around the
-    stand-ins it can see (a credential tool by its path, `command -p`, `env
-    -i`, PATH or ssh settings changed in the command) and what it can't follow
-    (a shell's `-c` string that may run a tool by its path or is a variable,
-    eval, a function, find -exec, a variable as the program); every such
-    refusal names `[shell] managed = "off"` as the way out, which is a
-    widening (docs/dev/modules/managed.md, "Alternate routes").
+    is the plugin's gate-sh). Still kept from the rollback: no EXIT trap, no
+    hook requires a command shape for output's sake (no mandatory `| gate
+    scrub`); output Claude Code passes to no rewriting hook is a documented
+    known limit (PostToolUseFailure warns, the prompt hook holds back a task
+    notification quoting a stored value or a token shape, Monitor's lines
+    reach no hook, `gate scrub` is optional). Host inspection
+    (`host_inspect`) reads files and lists folders only, never runs or
+    sources anything, and returns folder names, version words and variable
+    names, never values. The approval hook denies a route around a stand-in
+    only when it reaches a configured target, in every mode (managed off and
+    mods off included): a tool by its path (git, rsync and the elevation
+    tools included; an account CLI by path while an account of its kind
+    exists, and huggingface-cli, hf's older name with no stand-in, by any
+    name while a huggingface account exists: "use `hf ...`"), a login shell or PATH-resetting wrapper (`bash -l`, `su -`,
+    `sudo -i`, `env -i`, `command -p`), a PATH or transport change
+    (`PATH=`, `GIT_SSH_COMMAND`, `RSYNC_RSH`, `rsync -e`, `-c
+    core.sshCommand=`, `-o ProxyCommand=`, `-o HostName=`), a ProxyJump to a
+    configured host, a guarded `git config` write in a configured
+    repository; `gate with NAME --` is unwrapped first; a program name in
+    any letter case (`/usr/bin/SSH`, `ENV -i`). It refuses commands that hide
+    their program or host when the text names a configured target (what else
+    they run gets no record of an ask: invariant 6; the known misses:
+    managed.md). While
+    this computer's sudo is configured, su, doas, pkexec, runuser, sudoedit
+    (by its bare name: no stand-in supplies its password) and osascript's
+    administrator privileges are denied ("use sudo"). Refusals
+    name the stand-in route ("use `ssh homelab`"), never `managed = "off"`
+    (docs/dev/modules/managed.md, "Alternate routes").
 15. **Guards live in the classic hooks, never only in the mod** (PLAN-v4):
     Anthropic can switch mods off and older Claude Code has none, so the mod
-    adds conveniences (status line, provisioning, `/gate-doctor`) and reads
-    no secret location; every security behaviour holds through hooks.json.
-    Managed execution follows this: the mod starts the managed shell, and
-    without it the classic Bash hook refuses (or, with an approved "warn",
-    notices) instead.
+    adds conveniences (status line, provisioning, `/gate-doctor`, the managed
+    shell) and reads no secret location; every security behaviour holds
+    through hooks.json. Without the mod the env file still prepends the
+    present stand-ins and, when `CLAUDECODE` is set, unsets Claude Code's own
+    credential variables and the stand-in names' aliases and functions; the
+    classic Bash hook still enforces every right, policy, per-mode value, the
+    network class and the configured-only route check, and gives a notice
+    once per session. There is no blanket refusal.
 16. **Nothing is written into the plugin folder at run time** (versioned,
     maybe read-only content): Python runs with `-X pycache_prefix=$DATA/pycache`
     (launch.sh, the stubs, the launcher and the daemon: `envfile.py_flags`,
@@ -391,7 +576,9 @@ plugins/gateway/
     `~/.config/gateway` and the run dir.
 17. **With a wrapped vault key only gated decrypts** (PLAN-v4 phase 2):
     `vault.brokered()` sends every read and write to the daemon, with no local
-    fallback; never write a key.txt beside key.wrapped; the identity reaches
+    fallback; never write a key.txt beside key.wrapped (but
+    `remove_passphrase`, after the user's OK: key.txt written whole, then
+    key.wrapped removed); the identity reaches
     age only on an inherited pipe. Every daemon request meets the uid check,
     then its route's plane check, before anything else; a vault route also
     needs a gateway entry point (by executable and argv: this plugin's run.py,
@@ -420,6 +607,18 @@ plugins/gateway/
     a `run.py mcp` entry point below a session) and the mod's (UI plane); a
     process inside a gateway terminal counts as the pane's owner session only
     while that session lives (`Registry.pane_session`).
+    `/agent/session/mode` (the Python hooks record the payload's mode with
+    the epoch of `$DATA/mode-epoch`; a stand-in Claude typed and the MCP
+    server read it back only under the same epoch),
+    `/agent/signin/start|wait` (a lease like the dialog's: a gateway entry
+    point below a session with a drawing surface, one sign-in per user, the
+    wait proved by the lease token in a POST body) and the passphrase offer
+    routes (`/agent/vault/offer`, `/lease/vault/offer`) follow the same plane
+    rules. The browser sign-in's 127.0.0.1 listener is the one TCP endpoint
+    gated opens: it has no peer uid, so `state` and the PKCE verifier bind
+    the callback (only `GET /cb`, headers capped, a deadline per connection,
+    at most 16 at once). A recorded mode is a guardrail too: a process
+    running as the user could post a false one.
 18. **Terminals: one writer, nothing on a command line, passwords only
     through the dialog** (PLAN-v4 phase 5, docs/dev/modules/terminals.md). The
     owner is the agent or the user; a takeover fails every queued agent write
@@ -466,10 +665,13 @@ plugins/gateway/
     persisted and re-armed after a restart. The approval hook's per-call
     judging of `terminal_send` is a guardrail (split-bypassable), not the
     boundary: the stand-ins and the encrypted vault are. The user's tmux
-    server and `~/.tmux.conf` are never used.
+    server and `~/.tmux.conf` are never used. A pane's environment keeps the
+    user's variables minus the managed shell's removals (invariant 14). A
+    password prompt for an unconfigured target (the user's own sudo) is
+    answered through the same dialog, once; nothing typed there is stored.
 19. **Remote work runs only in the managed runtime, on the right host, after
     its identity checks** (PLAN-v4 phase 6, docs/dev/modules/remote.md). Only a
-    host whose effective ssh right is `true`; every remote command line is
+    host whose modeless ssh right is cc or allow (`true`); every remote command line is
     `exec /bin/sh -c '<script>'` (the login shell only execs; output before a
     random marker is dropped) with no value on it: files and the dialog's
     password go on ssh's stdin (the remote tmux's `load-buffer -`). Every
@@ -523,15 +725,47 @@ plugins/gateway/
     meanwhile), lowering applies at once and is ratcheted. A transfer
     program on a host is a read or a write only by its exact bare name and
     known options (else exec), and every path it names is decided in every
-    workspace it may reach (`ssh_args.decide_path`). Policy never writes or reads
-    Claude Code's permission rules or modes. Snapshot and ticker reads never
-    count as a vault use (`touch=False`), so `lock_after` still locks.
+    workspace it may reach (`ssh_args.decide_path`). Policy never writes
+    Claude Code's permission rules, and reads its mode only from the hook
+    payload or gated's record. Snapshot and ticker reads never count as a
+    vault use (`touch=False`), so `lock_after` still locks. Rights and the
+    restrictions read, exec, write, network, elevation and credential may be
+    per-mode tables (`{ default = ..., auto = ... }`, `default` required;
+    `policy.decide(..., mode=)`): the hook resolves them with
+    `permission_mode`, the stand-ins, web.py and gated with the session's
+    recorded mode or the modeless rule (mode None). `scripts`, `provision`,
+    `env_import`, the grants and `[shell]` take one word. A policy table's
+    allow is the user's explicit allow (lead decision 19.1), which approves
+    only this computer's `network` for the http and download tools; a bare
+    `"allow"` restricts nothing. `[policy]` binds configured hosts and
+    accounts plus this computer's elevation and network commands; it doesn't
+    reach unconfigured hosts and accounts.
 21. **The gateway never changes the system's privilege rules**: no sudoers
     file, no NOPASSWD advice in code, messages or docs
     (`test_no_blanket_passwordless_sudo_advice_anywhere`); passwordless sudo
     only where `sudo -n true` already works; a sudo password is stored or
-    asked per call in the dialog ("Remember it" unticked: used once), and the
-    approval names whom sudo runs as and where before it runs.
+    asked per call in the dialog ("Remember it" unticked: used once; the
+    local and the remote sudo dialog's box starts unticked), and the approval names whom
+    sudo runs as and where before it runs.
+22. **Network commands are one configurable class** (PLAN-0.11 §3, lead
+    decision 19.1, docs/dev/modules/network.md): `[network] commands`
+    (default `"ask"` in every mode, per-mode), `extra`/`drop`, reserved names
+    for the structural members; names in any letter case. The Bash hook
+    judges it for Bash, Monitor, run_in_terminal, the job tools and
+    terminal_send (a job at the mode its tool call carries, "ask" refused
+    there), configured or not: in
+    command position, in subshells, groups, `&`, `$()`, `exec`, `-c`
+    strings, behind sudo and wrappers (`gate with` included) and in an `ssh
+    HOST CMD` remote command, at the stricter of the class and this
+    computer's `network` policy (a policy's allow never raises it). A hit
+    makes the whole command ineligible for the gateway's allow unless
+    `[network] commands` is allow in that mode; then only the network stage
+    of a plain shape is approved, never under `gate with`, in run_in_terminal
+    or a job; under `gate with` the value is at least ask. The known misses
+    are listed (network.md). curl and wget are members, not a special
+    refusal. The http and download tools stay under the `network` policy
+    only, and `policy.decide` never reads `[network]`. The ssh family to
+    unconfigured hosts is not in the class: it is the user's own.
 
 ## Commands
 
@@ -542,22 +776,31 @@ GW_TEST_TMP=DIR pixi run --locked test   # put the temp homes in DIR (it reports
 pixi run --locked python tests/run_tests.py test_form -k widen -x   # some modules / tests (-j N, -q)
 pixi run --locked python tests/run_tests.py test_daemon test_broker   # the daemon and broker (~2 min)
 pixi run --locked python tests/run_tests.py test_dialogs   # the native dialogs: gated's requests, leases, sealed intake, clipboard
+pixi run --locked python tests/run_tests.py test_modes test_posture test_network test_git_standin test_offer test_ask_records
+                                         # PLAN-0.11: per-mode values, the posture (stand-ins, pass-through),
+                                         # the network class, the git stand-in, the passphrase offer, the
+                                         # hook's records of what it asked (browser sign-in: test_accounts_entra,
+                                         # test_accounts_asiml)
 pixi run --locked mutations              # every mutation file, each on its own scratch copy (-j N, -k SUBSTR)
 GW_E2E_TMP=DIR pixi run --locked e2e     # headless claude -p suite on a scratch copy (not part of test; tests/e2e/README.md;
                                          # its `jobs` scenario needs ../checkpoint/plugins/checkpoint next to this repo, else skipped)
 pixi run release-check                   # after `git add -A`: does the index hold the tested tree? (read-only)
+pixi run update-deps                     # the per-release relock (tests/update_deps.py; needs the newest pixi):
+                                         # both locks to conda-forge's newest, requires-pixi, lib.ts's PIXI_TESTED and
+                                         # the docs' quote of it, pixi-unpack = pixi-pack, pijul's newest (all or
+                                         # nothing: a failed step puts every file back); prints what moved, runs the suite
 claude plugin validate .                 # the plugin (and the mod's hooks module)
 claude plugin validate ../..             # the marketplace
 claude plugin test .                     # the mod's hooks/mod/*.test.ts in Claude Code's test kit
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_dialogs.py --tmp DIR --pixi-cache DIR2
+pixi exec --spec python --spec pyte python tests/acceptance_dialogs.py --tmp DIR --pixi-cache DIR2
                                          # the native dialogs live: a real interactive claude through tests/tui
                                          # (scratch config, fake API, the e2e install, telemetry on behind the
                                          # record-only proxy, the observer plugin, --debug-file, recording
                                          # shims for open/osascript/... first on PATH); it builds the e2e
                                          # copy's env first, outside the proxy (a cold DIR2 downloads ~400 MB
                                          # then; a build inside the proxied session can't download), ~3 min after
-pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py [--only t]   # the TUI harness (t: the proxy)
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_managed.py --tmp DIR --pixi-cache DIR2 [--only route,hooks,perms,cancel,print,nomods]
+pixi exec --spec python --spec pyte python tests/tui/selftest.py [--only t]   # the TUI harness (t: the proxy)
+pixi exec --spec python --spec pyte python tests/acceptance_managed.py --tmp DIR --pixi-cache DIR2 [--only route,passthru,hooks,perms,gitask,cancel,print,notready,nomods]
                                          # managed execution live: the gateway's e2e install plus a probe
                                          # plugin (string-form hooks writing env and $0, an env file, bin/,
                                          # a skill with ! injection) against a baseline config without the
@@ -576,24 +819,25 @@ pixi run --locked python tests/acceptance_remote.py --vm VMDIR --tmp DIR [--only
                                          # the remote runtime live: a disposable Linux VM (127.0.0.1:2222 and a private
                                          # sshd in it for the disruptive steps) and a local sshd, real pixi-pack
                                          # artifacts (~1 min); --vm-dir/--vm-sshd-port keep parallel runs on one VM apart
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_terminals.py --tmp DIR --pixi-cache DIR2 [--no-proxy]
+pixi exec --spec python --spec pyte python tests/acceptance_terminals.py --tmp DIR --pixi-cache DIR2 [--no-proxy]
                                          # terminals live: the pane, a full-screen program, prompt, resize, signals,
                                          # takeover with Claude's input queued, hand back, sudo's prompt through
                                          # the dialog (canary scanned everywhere), jobs, a script in the pane refused
                                          # an "ask" ssh/sudo right (pane wording) while a true one works, a restart,
                                          # the main screen (~2.5 min)
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_install.py --tmp DIR [--checkpoint DIR] [--only prereq,cold,warm,update,uninstall,spaced,firstbash]
+pixi exec --spec python --spec pyte python tests/acceptance_install.py --tmp DIR [--checkpoint DIR] [--only prereq,cold,notice,warm,update,uninstall,spaced,firstbash]
                                          # brief 14.1: both plugins from git-source marketplaces with only claude,
                                          # a recording pixi and pixi's git on PATH; cold provisioning, interrupted
                                          # setup, warm/offline start, update after a restart, uninstall, spaced paths;
                                          # on the disposable VM only (ACCEPTANCE_DISPOSABLE_VM=1): vmplain, and vmdrain
                                          # (plain installs, an uninstall while a job and terminal run, with and without
                                          # --keep-data, the ~/.bashrc probe); needs a git on PATH for its git server
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_canaries.py --tmp DIR [--pixi-cache DIR2] [--checkpoint DIR]
+pixi exec --spec python --spec pyte python tests/acceptance_canaries.py --tmp DIR [--pixi-cache DIR2] [--checkpoint DIR]
                                          # brief 14.9/14.13: canaries through every input route, both plugins,
                                          # telemetry on behind the record-only proxy, everything scanned
-pixi exec --spec python=3.12 --spec pyte python tests/acceptance_native_ui.py --tmp DIR [--pixi-cache DIR2] [--only scan,hosts,accounts,export,import,tamper]
-                                         # brief 14.10/14.12: /gate-hosts, /gate-accounts, export/import/tamper,
+pixi exec --spec python --spec pyte python tests/acceptance_native_ui.py --tmp DIR [--pixi-cache DIR2] [--only scan,hosts,accounts,settings,export,import,tamper,signin,passphrase]
+                                         # brief 14.10/14.12: /gate-hosts, /gate-accounts, the settings,
+                                         # export/import/tamper, the browser sign-in, the passphrase offer,
                                          # nothing opened outside Claude Code (shims, ps sampler; strace on Linux)
 ```
 
@@ -611,12 +855,18 @@ folder, runs the release check on throwaway repos, and prints this
 checkout's release check as a note (never a failure while it's
 uncommitted).
 
-pixi: `requires-pixi = ">=0.68.0"`, no upper bound. Tested range 0.68.0 to
-0.82.0 (2026-10-19, macOS arm64, the launcher's own `pixi install --locked
---manifest-path` on a copy with a scratch cache: 0.68.0, 0.69.0, 0.70.0,
-0.81.0, 0.82.0 install pixi.lock unchanged; 0.61.0-0.67.0 refuse lock format
-v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
-`/gate-doctor`'s verdict) and the docs; `test_packaging` keeps them in step.
+pixi: latest only (PLAN-0.11 section 5). `requires-pixi = ">=0.83.0"`, the
+pixi that made the lock (the newest then), no upper bound; `update-deps` sets
+it and `hooks/mod/lib.ts`'s `PIXI_TESTED` together (`CLAUDE_TESTED` is the
+Claude Code of the last acceptance runs; `/gate-doctor` warns below either,
+notes above), and `test_packaging` keeps them, the docs and the pins in step.
+An older pixi refuses the manifest ("requires pixi"): launch.sh records it
+(`$ENVD/.pixi-too-old`, status `pixi_too_old`) and says "pixi self-update".
+The suite needs the pixi `requires-pixi` names too (`pixi self-update`; or,
+keeping an older one installed, run the commands above through `pixi exec
+--spec pixi==VERSION pixi ...` with requires-pixi's VERSION). The launcher's
+own `pixi install --locked --manifest-path` installs pixi.lock unchanged with
+it (`test_packaging`'s lock check runs that pixi).
 
 ## Testing rules
 
@@ -694,11 +944,16 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   the disruptive steps against a private sshd the run starts inside the VM
   (never the VM's own sshd, which other runs may use), the VM user's
   `~/.bashrc` probe restored byte for byte.
-- Sudo defaults in tests: a new install's localhost sudo is `"ask"`, so a
-  test that needs it `true` says so (`harness_sudo.setup_localhost(env,
-  sudo="true")`, approved). A test of an older install uses a vault without
-  the baseline mark (`test_session.OLD_EMPTY`: `vault.empty()` as every
-  gateway before 0.10.0 wrote it).
+- Sudo defaults in tests: a new install's local sudo is not configured (the
+  user's own: no stand-in, no decision), so a test that needs it gated says
+  so (`harness_sudo.setup_localhost(env, sudo=...)`, approved).
+- The posture in tests: a pass-through runs the `user_tools` knob's
+  recording fakes (`harness_posture.user_tools`, `tests/fakes/
+  fake_user_tool.py`, which also answers `ssh -G` from an `-F` table), never
+  the real ssh, git, gh or sudo; unconfigured targets use `.invalid` names;
+  `SSH_AUTH_SOCK`, `GH_TOKEN` and the like carry fake values. The browser
+  sign-in runs against `harness_oauth`'s fake server with gated's `browser`
+  knob (a program that follows the redirect), never `open` or `xdg-open`.
 - The work-identity scan (`test_packaging::test_the_shipped_plugin_names_no_
   work_identity`) holds only sha256 digests of lowercased words and reports
   `file:line: word N`, never the spelling. Use `example.com`, `octocat`,
@@ -754,10 +1009,12 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   urllib, ssl) out of SessionStart: a new env's first loads are paid by
   `ensure-env`'s warm step (`gateway/warm.py`), not by the sync hook.
 - **launch.sh's degraded output must stay byte-identical** to
-  `envfile.env_text("refuse")`, `stub_text`,
-  `launcher_text(state)` in each of its three states (building, pixi
-  missing, build failed), the git reset and `degraded_bash_text(kind)`
-  (tests compare them). Change both together. Its degraded file guard now
+  `envfile.env_text()`, `stub_text` (the git stub's cold pass-through
+  included), `launcher_text(state)` in each of its four states (building,
+  pixi missing, pixi too old, build failed), the cold-window stand-in rule
+  (`maybe_configured`: a `[hosts`/`[accounts` shape in gateway.toml, or
+  `private/configured.json`) and `degraded_bash_text(kind)` (tests compare
+  them). Change both together. Its degraded file guard now
   also denies session transcripts (a `.jsonl` under `*/projects/`, and a
   Grep rooted at or above the `.claude` / `.config/claude` projects folders),
   byte-identical to `hooks_files.DENY_TRANSCRIPT` / `DENY_TRANSCRIPT_SEARCH`.
@@ -795,7 +1052,8 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   the instance's latest props (`inst.props`), never the first render's
   closure (a gated restart changes the public key under a live field). A
   Client takes keys only after a click, Claude Code 2.1.301 sends plugins
-  clicks only in its fullscreen layout (`CLAUDE_CODE_NO_FLICKER=1`; the TUI
+  clicks only in its fullscreen layout (`CLAUDE_CODE_NO_FLICKER=1`, or `/tui
+  fullscreen`, which the dialog's texts name; the TUI
   harness with telemetry on starts on the main screen), Escape returns the
   keys without telling the Client, and the pane's `isFocused` stays false
   while a Client holds the keys: don't build on it. In the test kit,
@@ -815,9 +1073,7 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   below it (`write_driver(native_dialogs=True, popup_wait=..., dialog_timeout=...)`,
   `GW_ASK`). The mod side (pane, field, guard, sealing) is tested in
   `hooks/mod/dialog.test.ts` under `claude plugin test`; the whole path
-  live by `tests/acceptance_dialogs.py`. `ancestry.claude_ancestor` (the old
-  `gate secret` check) is no longer used by any flow; its tests stay with
-  the ancestry module (`harness_ux` still sets `extra["claude_ancestor"]`).
+  live by `tests/acceptance_dialogs.py`.
 - **The sh hooks take the home from the password database** (`hooks/home.sh`),
   like `paths.user_home()`, never `$HOME`. In tests, `launch.sh MODE --test`
   (harness.run_launch adds it) and `post.sh|prompt.sh --test` use
@@ -825,24 +1081,41 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   at all, so a test can't reach the real `~/.config/gateway`. Never run a sh
   hook in a test without `--test` unless its home.sh is replaced by a stub
   (as `tests/test_ux_hooks.py` does).
-- **Managed execution** (`hooks/gate-sh`, `managed.py`): gate-sh's variable
-  lists and credential words are mirrored in `managed.PLATFORM_NAMES`,
-  `CLAUDE_NAMES`, `GATEWAY_NAMES`, `CREDENTIAL_WORDS`, `form.SHELL_PASSED`
-  and `form.CREDENTIAL_NAME` (a test compares them); change both. Before its
+- **Managed execution** (`hooks/gate-sh`, `managed.py`): gate-sh's removal
+  lists and credential words are mirrored in `managed.CLAUDE_CRED_NAMES`
+  (= `envfile.CLAUDE_CRED_NAMES`), `STARTUP_NAMES`, `DROP_PREFIXES`,
+  `GATEWAY_NAMES`, `CREDENTIAL_WORDS`, `form.SHELL_PASSED` and
+  `form.CREDENTIAL_NAME` (a test compares them); change both. Before its
   classification gate-sh may use builtins only and assign no variable (the
   hook passthrough must stay exact: an assigned name that is exported would
   reach the hook). Never put a variable's value on a command line (env's or
-  any other): names only (`test_no_value_reaches_a_command_line`). A test that runs pre_bash.sh
-  as a managed session would must set `CLAUDE_CODE_SHELL_PREFIX` to the copy's
-  `hooks/gate-sh`: without it every Bash and Monitor call goes to Python.
-  The managed rc is `envfile.env_text` plus Claude Code's helpers: it applies
+  any other): names only (`test_no_value_reaches_a_command_line`). The
+  managed rc is `envfile.env_text` plus Claude Code's helpers, the user's
+  bash snapshot and the unshadowing tail (`managed.rc_tail`): it applies
   only while `$DATA/bin` exists (a test makes it). Tests of the tool path
   link the test env's bash into the override's `paths.env_bin()` (no python3
   there, so no env counts as ready). Claude Code honours `CLAUDE_CODE_SHELL`
   only before its first shell use (the snapshot is made then).
 - **The Bash prefilter is a word list** (`pre_bash.sh`, also for the
   gateway's own `job_start` and `terminal_send`). A new command the hook must
-  see needs its trigger word there too. (Since phase 6 a gw
+  see needs its trigger word there too: the network class's names are
+  compared with `form.NETWORK_BUILTIN` and launch.sh's list by a test, the
+  user's `extra` names come from `$DATA/network-words` (every call goes to
+  Python while gateway.toml is newer than it), and git counts only with a
+  remote or config word after it. Words match in any letter case (`grep
+  -i`). A plain account CLI (gh, hf, databricks, crane, pijul) goes to the
+  hook while its stand-in exists in `$DATA/bin` and an account of its kinds
+  is "ask" in some mode (`$DATA/ask-clis`, written with network-words; all
+  of them while that file is missing), so an "ask" account is asked about
+  and recorded. Nothing sends every call to the hook for an "ask" entry
+  (the 0.11 ask marker is gone: a command without a trigger word gets no
+  record, and its stand-in refuses the "ask"), only right after an ask:
+  while a record is pending (`$DATA/asks/*`) every Bash and Monitor call
+  goes to the hook, which drops the session's earlier records. While
+  `$DATA/mode-epoch` exists (a per-mode value makes the mode matter) every
+  call goes to Python, the ones without a trigger word to `hook-mode`,
+  which only records the mode.
+  (Since phase 6 a gw
   `job_start` with a top-level remote `host` always goes to Python: it is
   judged as `ssh HOST CMD`.) It serves checkpoint's
   `job_start` too (its `command`/`argv` are in the payload's JSON text);
@@ -856,16 +1129,18 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
   don't see them; outside auto mode they need the command's `allowed-tools`,
   and a non-zero exit aborts the command (hence `gate status || true`).
 - **If the gateway is installed in your own session**, its hooks apply to
-  you: curl/wget are refused, reading `~/.config/gateway/private` or session
-  transcripts is refused (a Workflow run's `journal.jsonl` is fine), and
-  your Bash runs the stand-ins first on PATH.
+  you: network commands are asked about, reading `~/.config/gateway/private`
+  or session transcripts is refused (a Workflow run's `journal.jsonl` is
+  fine), an AskUserQuestion asking for a secret is refused, and your Bash
+  runs the stand-ins of whatever your gateway.toml configures first on PATH.
 - **pixi**: use `pixi run --locked ...`; pixi-guard, if installed, may
   refuse a bare `python3`.
 - **The approval hook's read rule and text scan** (`hooks_bash.py`) are
-  tuned by tables of probes (`test_hookbash_table`, hundreds of rows in auto
-  and default mode). Run the whole table after any change there, and add rows
-  for both directions (a new deny, and the everyday commands that must keep
-  their result). In the managed-mode text scan only a shell's or su's `-c`
+  tuned by tables of probes (`test_hookbash_table`, hundreds of rows in all
+  six modes, plus a posture section for configured and unconfigured
+  targets). Run the whole table after any change there, and add rows for
+  both directions (a new deny, and the everyday commands that must keep
+  their result). In the route text scan (every mode) only a shell's or su's `-c`
   takes a command string (`gcc -c`, `psql -c` don't); a tracer or sandbox
   (`_EXEC_RUNNERS`: strace, sshpass, tmux, ...) counts only as the program,
   also behind nice/env/timeout, so `sudo apt install strace` keeps its allow;
@@ -915,16 +1190,18 @@ v7). The bounds live in pixi.toml, `hooks/mod/lib.ts` (`PIXI_TESTED_MIN/MAX`,
 
 ## Status
 
-0.9.1 is the last published release. The working tree holds 0.10.0,
-unreleased (CHANGELOG.md): this computer's sudo starts as
-`"ask"` on new installs, tighter auto-mode allows (plain reads only of
-project or temp files; `http`, `download` and `gate forget` no longer
-approved by the gateway), a reworked managed-mode text scan, robustness
-fixes (setup state in gate-sh, npm installs of Claude Code, durable vault
-writes, the run folder's remedy, a second configuration), and the docs moved
-under docs/dev/. Its verification (suite on macOS, Intel through Rosetta
-and Linux; all 1177 mutations; the TUI acceptances on macOS and Linux) is in
-[docs/dev/TESTING.md](docs/dev/TESTING.md), "0.10.0 verification".
+0.11.0 (2026-10-26, tag `v0.11.0`) is the last published release
+(CHANGELOG.md; PLAN-0.11.md): ungated
+unless configured (stand-ins only where something is configured, the user's
+own tools for everything else, removal as a widening), per-mode values for
+every right and restriction, the network class, the git stand-in, browser
+sign-in for azure and ml-catalog, the passphrase offer, masking of every
+tool's output, the AskUserQuestion guard, export/import fixes, and the
+deletions (no backward compatibility: the 0.6 conversion, export formats 1
+and 2, `[settings]`, `managed = "warn"`, the managed refusal, the curl/wget
+refusal, the older-install sudo default). The verification of each release
+(suite, mutations, TUI acceptances, platforms) is in
+[docs/dev/TESTING.md](docs/dev/TESTING.md).
 
 What was never verified live (desktop app, VS Code, mobile, x86_64, Windows,
 the real GitHub, Hugging Face and Azure services, the real model API) and the

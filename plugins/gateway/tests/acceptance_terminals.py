@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Brief 9 and 14.7 in the real TUI: gateway terminals and jobs (PLAN-v4 phase 5).
 
-    pixi exec --spec python=3.12 --spec pyte python tests/acceptance_terminals.py \\
+    pixi exec --spec python --spec pyte python tests/acceptance_terminals.py \\
         --tmp DIR [--keep] [--pixi-cache DIR] [--no-proxy]
 
 The gateway is installed the normal way through the TUI harness's e2e route
@@ -20,7 +20,9 @@ the pane's Client), then a restart, then a main-screen session:
 
   open      terminal_open: the bounded structured screen (seq, lines, cursor,
             alternate screen, title, owner, truncated); /gate-terminal ID
-            shows it in a pane
+            shows it in a pane; the pane's shell has the user's own variables
+            (one set in the session's environment) and none of Claude Code's
+            credential variables (PLAN-0.11 §1.6)
   fullscr   a full-screen program (less from the system): alternate_screen,
             the pane draws it; q leaves it
   prompt    an input prompt (read -p): seen in a read, answered by the agent
@@ -33,17 +35,22 @@ the pane's Client), then a restart, then a main-screen session:
             the screen"); the user types in the same shell (cd, export)
   handback  Hand back: the agent's old seq is refused (stale); after a read it
             types again: the same shell pid, the user's cwd and variable kept
-  sudo      first sudo = true here: a new install's sudo on this computer is
-            "ask" (0.10.0), which a gateway terminal can't use, so the form
-            gets [hosts.localhost] sudo = true and the agent runs gate check
-            localhost: the consent dialog (sudo "ask" -> true) is approved and
-            the sudo-method choice answered "Ask me each time" (nothing
-            stored), as a user would; then
-            sudo typed in the terminal: the stand-in hands it to sudo (the
-            e2e fake, which asks on its tty with echo off, as sudo does);
-            gated opens the credential dialog; a canary typed into its
-            private field reaches that tty only; the agent sees
-            "[credential supplied]"
+  ownsudo   this computer's sudo not configured (PLAN-0.11 §1.5): sudo typed in
+            the terminal is the user's own (a fake first on the session's
+            PATH, which asks on its tty with echo off, as sudo does; no
+            stand-in exists; the step stops unless the pane's `sudo` is that
+            fake, and its sudo line runs only for the fake): its password
+            prompt is answered once through
+            the credential dialog, which offers no "Remember it", and nothing
+            is stored
+  sudo      then sudo = true here: the form gets [hosts.localhost] sudo = true
+            and the agent runs gate check localhost: the consent dialog (its
+            line says what each mode now does) is approved and the
+            sudo-method choice answered "Ask me each time" (nothing stored),
+            as a user would; then sudo typed in the terminal: the stand-in
+            hands it to sudo (the e2e fake); gated opens the credential
+            dialog; a canary typed into its private field reaches that tty
+            only; the agent sees "[credential supplied]"
   jobs      job_start, job_status, job_tail (bounded, scrubbed)
   askright  a script the agent runs in the terminal (sh rights.sh: a sudo
             and an ssh it starts itself; the approval hook sees only the sh
@@ -52,7 +59,8 @@ the pane's Client), then a restart, then a main-screen session:
             cached timestamp); a new host approved in the consent dialog (gate
             check askhost with ssh true; the e2e fake ssh-keyscan gives its
             key, its address only answers with an ssh banner, the key-install
-            choice is cancelled), then narrowed to ssh = "ask": the script's
+            choice is cancelled; the SSH key gate check stored brings the
+            vault passphrase offer: Not now), then narrowed to ssh = "ask": the script's
             ssh is refused with the pane's wording (no connection made) while
             its true sudo still runs; localhost's sudo narrowed to "ask":
             refused the same way, sudo never runs; both refusals audited
@@ -89,6 +97,7 @@ PLUGIN = HERE.parent
 REPO = PLUGIN.parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
+import acceptance_lib as L  # noqa: E402
 from tui import driver, install, proxy, safety, scan  # noqa: E402
 from tui.fakeapi import result_text, tool_results  # noqa: E402
 
@@ -100,10 +109,15 @@ PREBUILD_TIMEOUT = 1800
 FIELD = "click here, then type"
 TAKEN = "input taken by the user; re-read the screen"
 GW = "mcp__plugin_gate_gw__"
-# sudo on this computer set to true (a new install's default is "ask" since 0.10.0); the sudo step
-# approves it in the consent dialog, and every form written after it keeps it until askright's step 3
+# sudo on this computer set to true (unconfigured it is the user's own, PLAN-0.11 §1.5); the
+# sudo step approves it in the consent dialog, and every form written after it keeps it until
+# askright's step 3
 LOCAL_SUDO_TRUE = "[hosts.localhost]\nsudo = true\n"
 SUDO_ASK = "Ask me each time a command needs it"     # gate_setup.SUDO_ASK: nothing stored
+# the user's own variable in the session's environment (a pane keeps it), and one of Claude
+# Code's own credential variables (a pane never gets it; the key it unlocks isn't set)
+USER_VAR = ("ACC_USER_VAR", "from-the-users-environment")
+CC_CRED = ("CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "acc-not-the-users")
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -140,9 +154,9 @@ def screen(s: driver.Session) -> str:
 class Watcher(threading.Thread):
     """Process-table samples: the canary in no argv; every tmux on the private socket."""
 
-    def __init__(self, canary: scan.Canary):
+    def __init__(self, *canaries: scan.Canary):
         super().__init__(daemon=True)
-        self.canary = canary
+        self.canaries = canaries
         self.stop = threading.Event()
         self.samples = 0
         self.argv_hit = False
@@ -157,7 +171,7 @@ class Watcher(threading.Thread):
                 out = ""
             self.samples += 1
             for cmd in out.splitlines():
-                if self.canary.value in cmd:
+                if any(c.value in cmd for c in self.canaries):
                     self.argv_hit = True
                 first = cmd.split()[0] if cmd.split() else ""
                 if os.path.basename(first) == "tmux":
@@ -335,21 +349,22 @@ def gated_pid(gi) -> int | None:
         return None
 
 
-def focus_field(s: driver.Session, tries: int = 5) -> bool:
-    for _ in range(tries):
-        try:
-            s.click_text(FIELD)
-        except LookupError:
-            s.pump(1.0)
-            continue
-        s.pump(0.4)
-        n = screen(s).count("•")
-        s.send("x")
-        if wait(s, lambda: screen(s).count("•") > n, 2.0, 0.1):
-            s.key("backspace")
-            wait(s, lambda: screen(s).count("•") == n, 2.0, 0.1)
-            return True
-    return False
+def bullets(s: driver.Session) -> int:
+    return screen(s).count("•")
+
+
+def focus_field(s: driver.Session, tries: int = 5) -> int | None:
+    """The private field has the keys, and its probe key is gone again
+    (acceptance_lib.focus_private_field): the bullets on the screen with
+    the field empty, or None."""
+    return L.focus_private_field(s, lambda: s.click_text(FIELD), lambda: bullets(s), tries)
+
+
+def type_secret(s: driver.Session, value: str, empty: int) -> bool:
+    """`value` typed into the focused field, the screen showing `empty`
+    bullets plus one per character before Enter (acceptance_lib.type_private);
+    not submitted."""
+    return L.type_private(s, value, lambda: bullets(s), empty)
 
 
 def click_screen(s: driver.Session, tid: str) -> bool:
@@ -398,11 +413,12 @@ def main(argv: list[str]) -> int:
     print(f"acceptance (terminals and jobs): root {root}", flush=True)
     env = {"PIXI_CACHE_DIR": a.pixi_cache or str(root / "pixi-cache")}
     canary = scan.Canary.new("sudo-pw")
-    watcher = Watcher(canary)
+    own_canary = scan.Canary.new("own-sudo-pw")       # the user's own (unconfigured) sudo's
+    watcher = Watcher(canary, own_canary)
     watcher.start()
     t0 = time.time()
     try:
-        run(root, env, canary, watcher, not a.no_proxy)
+        run(root, env, canary, own_canary, watcher, not a.no_proxy)
     finally:
         watcher.stop.set()
         watcher.join(5)
@@ -446,7 +462,8 @@ def main(argv: list[str]) -> int:
     return 1 if failed else 0
 
 
-def run(root: Path, env: dict, canary: scan.Canary, watcher: Watcher, use_proxy: bool) -> None:
+def run(root: Path, env: dict, canary: scan.Canary, own_canary: scan.Canary, watcher: Watcher,
+        use_proxy: bool) -> None:
     PY = env_python()
     with contextlib.ExitStack() as stack:
         h = stack.enter_context(install.Hermetic(root / "h", extra_env=env))
@@ -470,18 +487,34 @@ def run(root: Path, env: dict, canary: scan.Canary, watcher: Watcher, use_proxy:
         (fs / "sudo").write_text(f"#!/bin/sh\nexec '{PY}' -I -S '{PLUGIN}/tests/fakes/fake_sudo.py' "
                                  f"--state '{fs}' \"$@\"\n")
         os.chmod(fs / "sudo", 0o755)
-        state0: dict = {}
+        # the user's own sudo while this computer's isn't configured (PLAN-0.11 §1.5): another
+        # fake (its own password, its own timestamp), first on the session's PATH, so a pane's
+        # `sudo` never reaches the real one
+        us = gi.root / "user-sudo"
+        ub = gi.root / "user-bin"
+        for d in (us, ub):
+            d.mkdir()
+        (us / "config.json").write_text(json.dumps({"password": own_canary.value, "nopasswd": False,
+                                                    "timeout": 900, "sudoers_dir": None}))
+        os.chmod(us / "config.json", 0o600)
+        (us / "log.jsonl").write_text("")
+        (ub / "sudo").write_text(f"#!/bin/sh\nexec '{PY}' -I -S '{PLUGIN}/tests/fakes/fake_sudo.py' "
+                                 f"--state '{us}' \"$@\"\n")
+        os.chmod(ub / "sudo", 0o755)
+        state0: dict = {"user_sudo": us, "user_bin": ub}
         keyscan = setup_ask_rights(root, gi, state0, stack)
         (gi.root / "e2e.json").write_text(json.dumps({"tools": {"sudo": str(fs / "sudo"),
                                                                  "ssh-keyscan": keyscan}}))
         os.chmod(gi.root / "e2e.json", 0o600)
         pages = root / "pages.txt"
         pages.write_text("".join(f"page line {i}\n" for i in range(400)))
-        extra = {**env, "CLAUDE_CODE_NO_FLICKER": "1", **(px.env() if px else {})}
+        extra = {**env, "CLAUDE_CODE_NO_FLICKER": "1", **(px.env() if px else {}),
+                 "PATH": f"{ub}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                 USER_VAR[0]: USER_VAR[1], CC_CRED[0]: CC_CRED[1]}
         s = driver.Session(root / "s1", config_dir=h.inst.config_dir, extra_env=extra,
                            debug_file=True, observer=True, cols=170, rows=56,
                            permission_mode="bypassPermissions", start=False)
-        s.redact(canary.value)
+        s.redact(canary.value, own_canary.value)
         sessions = [s]
         state: dict = dict(state0)
         try:
@@ -492,7 +525,7 @@ def run(root: Path, env: dict, canary: scan.Canary, watcher: Watcher, use_proxy:
                       180, 1.0)
             check("the mod registered this session on gated's UI plane", ok)
             ag = Agent(s)
-            steps(s, ag, gi, pages, canary, fs, state)
+            steps(s, ag, gi, pages, canary, fs, state, own_canary)
         finally:
             s.close()
         if state.get("tid"):
@@ -502,7 +535,7 @@ def run(root: Path, env: dict, canary: scan.Canary, watcher: Watcher, use_proxy:
             s3 = step_main_screen(root, h, gi, {**env, **(px.env() if px else {})}, state, canary)
             if s3 is not None:
                 sessions.append(s3)
-        scans(root, sessions, gi, px, canary, h)
+        scans(root, sessions, gi, px, [canary, own_canary], h)
         # stop the e2e gated (its terminals keep it alive on purpose)
         pid = gated_pid(gi)
         if pid:
@@ -510,7 +543,7 @@ def run(root: Path, env: dict, canary: scan.Canary, watcher: Watcher, use_proxy:
                 os.kill(pid, 15)
 
 
-def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
+def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict, own_canary) -> None:
     print("open: terminal_open, then /gate-terminal", flush=True)
     r = ag.tool("terminal_open", {"cols": 110, "rows": 24})
     ok = r is not None and str(r.get("id", "")).startswith("t_")
@@ -529,6 +562,11 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
     state["pid0"] = pid0
     check("terminal_send returns the screen after the input (the shell ran it)", pid0 is not None,
           json.dumps(r)[:500])
+    r = ag.tool("terminal_send", {"id": tid, "seq": r["seq"], "enter": True,
+                                  "text": f'echo "UV""=${{{USER_VAR[0]}-unset}} CK""=${{{CC_CRED[0]}-unset}}"'})
+    line = next((ln for ln in lines_of(r) if ln.startswith("UV=")), "")
+    check("the pane's shell keeps the user's own variables and none of Claude Code's credential "
+          "variables (PLAN-0.11 §1.6)", line == f"UV={USER_VAR[1]} CK=unset", line or json.dumps(r)[:300])
     s.submit(f"/gate-terminal {tid}")
     ok = wait(s, lambda: f"terminal {tid}" in screen(s) and "PID0=" in screen(s), 30)
     check("/gate-terminal ID opens the pane: header, the screen gated captured", ok, s.dump(20))
@@ -632,16 +670,19 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
           state.get("pid0") is not None and line.startswith(f"PID1={state['pid0']} CWD=/tmp") and
           "GWX=user-was-here" in line, line or json.dumps(r)[:400])
 
+    step_own_sudo(s, ag, gi, state, own_canary)
+
     print("sudo: sudo = true on this machine, approved in the consent dialog", flush=True)
-    # 0.10.0: a new install's sudo here is "ask", and a gateway terminal can't use an "ask" right
-    # (step_ask_rights shows the refusal); the user sets it to true and approves it in the dialog
+    # PLAN-0.11 §1.5: configuring this computer's sudo applies up to "ask" at once, and a gateway
+    # terminal can't use an "ask" right (step_ask_rights shows the refusal); the user sets it to
+    # true and approves it in the dialog
     gi.gateway_home.mkdir(parents=True, exist_ok=True)
     (gi.gateway_home / "gateway.toml").write_text(LOCAL_SUDO_TRUE)
     n0, done = ag.start_bash("gate check localhost", "set up sudo here")
     ok = wait(s, lambda: "Approve" in screen(s) and "localhost" in screen(s), 120)
-    check("sudo: a new install's sudo here is \"ask\": the form's sudo = true waits for the OK, and gate check "
-          "localhost opens the consent dialog naming the change (sudo \"ask\" -> true)",
-          ok and '"ask" -> true' in screen(s) and "Decline" in screen(s), s.dump(25))
+    check("sudo: the form's sudo = true waits for the OK, and gate check localhost opens the consent "
+          f"dialog saying what changes in each mode (\"... {L.CONSENT_APPROVES}\")",
+          ok and L.shows(screen(s), L.CONSENT_APPROVES) and "Decline" in screen(s), s.dump(25))
     picked = False
     if ok:
         press(s, "Approve", lambda: SUDO_ASK in screen(s), settle=4.0)
@@ -661,8 +702,10 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
     # one turn: the sudo line, then (2 s on) a read, then an attempt to type into the prompt
     # (the prompt box itself takes nothing but the gateway's commands while the secret
     # dialog waits: phase 3's guard)
+    # (hash -r: the shell remembered the user's own sudo from the ownsudo step; the stand-in
+    # that configuring sudo put first on PATH comes first again)
     _r1, r2, r3 = ag.turn([("terminal_send", {"id": tid, "seq": r["seq"], "enter": True,
-                                              "text": 'sudo -v && echo "SU""DO-OK" || echo "SU""DO-FAILED"'}, 0),
+                                              "text": 'hash -r; sudo -v && echo "SU""DO-OK" || echo "SU""DO-FAILED"'}, 0),
                            ("terminal_read", {"id": tid}, 2.5),
                            ("terminal_send", {"id": tid, "seq": 0, "text": "guess"}, 0)])
     ok = wait(s, lambda: FIELD in screen(s) and "Password for a gateway terminal" in screen(s), 30)
@@ -673,11 +716,17 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
     show("terminal_read (a password prompt waits)", r2, ("seq", "waiting_auth", "note", "lines"))
     check("the agent can't type into a password prompt", bool(r3) and r3.get("error") == "auth", json.dumps(r3)[:300])
     if ok:
-        check("the dialog's private field takes the keys after a click", focus_field(s), s.dump(15))
-        s.type(canary.value)
-        s.pump(0.3)
-        check("only bullets are drawn in the field", canary.value not in screen(s) and "•" * 8 in screen(s))
-        s.key("enter")
+        empty = focus_field(s)
+        focused = check("the dialog's private field takes the keys after a click (its probe key gone "
+                        "again)", empty is not None, s.dump(15))
+        typed = focused and type_secret(s, canary.value, empty)
+        check("before Enter the field shows one bullet per character typed, and only bullets",
+              typed and canary.value not in screen(s), f"{bullets(s)} bullets on screen for "
+              f"{len(canary.value)} characters")
+        if typed:
+            s.key("enter")
+        else:                     # never send a value the field didn't show whole
+            press(s, "[ Cancel ]", lambda: "Password for a gateway terminal" not in screen(s))
         wait(s, lambda: "Password for a gateway terminal" not in screen(s), 30)
         ag.pane_focus = True
     s.pump(1.5)
@@ -718,6 +767,84 @@ def steps(s, ag: Agent, gi, pages: Path, canary, fs: Path, state: dict) -> None:
           again.get("new") is False, json.dumps(again)[:300])
 
     step_ask_rights(s, ag, gi, fs, state)
+
+
+def step_own_sudo(s, ag: Agent, gi, state: dict, own_canary) -> None:
+    """PLAN-0.11 §1.5: with this computer's sudo not configured there is no sudo
+    stand-in, and the pane's `sudo` is the user's own (here a fake first on the
+    session's PATH; the step stops unless the pane resolves `sudo` to it, and
+    the sudo line itself runs only for the fake). Its password prompt is still
+    seen by gated and answered once through the credential dialog, which
+    offers no "Remember it"; nothing is stored for an unconfigured target."""
+    print("ownsudo: the user's own sudo in a pane, answered once through the dialog", flush=True)
+    tid, us = state.get("tid"), state.get("user_sudo")
+    if not (tid and us):
+        check("ownsudo: set up (terminal, the user's own fake sudo)", False)
+        return
+    bin_sudo = gi.root / "data" / "bin" / "sudo"
+    check("ownsudo: no sudo stand-in while this computer's sudo isn't configured", not bin_sudo.exists(),
+          str(sorted(p.name for p in bin_sudo.parent.iterdir())) if bin_sudo.parent.exists() else "")
+    # the pane's `sudo` must be the fake: it is first only because of the session's PATH order,
+    # and the real sudo must never be handed the canary
+    fake = str(Path(state.get("user_bin") or gi.root / "user-bin") / "sudo")
+    which = None
+    r = ag.tool("terminal_read", {"id": tid})
+    r = ag.tool("terminal_send", {"id": tid, "seq": (r or {}).get("seq", 0), "enter": True,
+                                  "text": L.run_if_fake(fake, 'echo "SUDO""-IS-FAKE"',
+                                                        'echo "SUDO""-IS-OTHER $(command -v sudo)"')})
+    for _ in range(6):
+        which = next((ln.strip() for ln in lines_of(r) if ln.startswith(("SUDO-IS-FAKE", "SUDO-IS-OTHER"))), None)
+        if which is not None:
+            break
+        s.pump(1.0)
+        r = ag.tool("terminal_read", {"id": tid})
+    if not check("ownsudo: the pane's `sudo` is the user's own fake (first on the session's PATH), so the "
+                 "real sudo never sees the canary", which == "SUDO-IS-FAKE", f"{which!r} (the fake: {fake})"):
+        return
+    r = ag.tool("terminal_read", {"id": tid})
+    ag.tool("terminal_send", {"id": tid, "seq": (r or {}).get("seq", 0), "enter": True,
+                              "text": L.run_if_fake(fake, 'sudo -v && echo "OWN""-SUDO-OK" || echo "OWN""-SUDO-FAILED"',
+                                                    'echo "OWN""-SUDO-NOT-THE-FAKE"')})
+    ok = wait(s, lambda: FIELD in screen(s) and "Password for a gateway terminal" in screen(s), 30)
+    check("ownsudo: the user's own sudo's password prompt goes through the credential dialog", ok, s.dump(25))
+    if ok:
+        check("ownsudo: the dialog offers no \"Remember it\" (nothing is stored for an unconfigured "
+              "target)", "Remember" not in screen(s), s.dump(20))
+        empty = focus_field(s)
+        if empty is not None and type_secret(s, own_canary.value, empty):
+            s.key("enter")
+        else:                     # never send a value the field didn't show whole
+            note(f"ownsudo: the field didn't take the value whole ({bullets(s)} bullets on screen for "
+                 f"{len(own_canary.value)} characters); the dialog was cancelled")
+            press(s, "[ Cancel ]", lambda: "Password for a gateway terminal" not in screen(s))
+        wait(s, lambda: "Password for a gateway terminal" not in screen(s), 30)
+        ag.pane_focus = True
+    s.pump(1.5)
+    r = ag.tool("terminal_read", {"id": tid})
+    check("ownsudo: the user's own sudo (the fake, checking its password) accepted it on that tty",
+          has_line(r, lambda ln: ln.startswith("OWN-SUDO-OK")), json.dumps(r)[:400])
+    flog = [json.loads(ln) for ln in (us / "log.jsonl").read_text().splitlines() if ln.strip()]
+    check("ownsudo: it was the user's own sudo that asked (its fake's log: tty, code 0)",
+          bool(flog) and flog[-1].get("how") == "tty" and flog[-1].get("code") == 0,
+          json.dumps([{k: e.get(k) for k in ("how", "code")} for e in flog]))
+    data = vault_of(gi)
+    check("ownsudo: nothing was stored for it (no sudo password for this computer in the vault)",
+          not ((data.get("localhost") or {}).get("sudo")), json.dumps(sorted((data.get("localhost") or {}))))
+
+
+def vault_of(gi) -> dict:
+    """The scratch vault decrypted here with its key (unwrapped), or {} when
+    there is none yet."""
+    home = gi.gateway_home
+    age = next(iter(sorted(gi.root.glob("data/envs/*/.pixi/envs/default/bin/age"))), None)
+    if age is None or not (home / "private" / "vault.age").exists():
+        return {}
+    r = subprocess.run([str(age), "-d", "-i", str(home / "private" / "key.txt"),
+                        str(home / "private" / "vault.age")], capture_output=True, timeout=30)
+    try:
+        return json.loads(r.stdout) if r.returncode == 0 else {}
+    except ValueError:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -868,8 +995,8 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
           has_line(r, lambda ln: ln.startswith("RIGHTS-1 sudo=0")), json.dumps(lines_of(r)[-6:]))
 
     # 2. a new ssh host, approved in the dialog (ssh true), then narrowed to "ask"; localhost's
-    # approved sudo = true stays in the form (without it localhost's sudo would be the new
-    # install's "ask", a narrowing that applies at once)
+    # approved sudo = true stays in the form (taking it out would be a widening, PLAN-0.11 §1.1:
+    # the approved true would keep gating until the OK)
     form.write_text(ask_form(port, "true", "true"))
     n0, done = ag.start_bash(f"gate check {ASK_HOST}", f"set up {ASK_HOST}")
     ok = wait(s, lambda: "Approve" in screen(s) and ASK_HOST in screen(s), 120)
@@ -882,6 +1009,18 @@ def step_ask_rights(s, ag: Agent, gi, fs: Path, state: dict) -> None:
               "banner: Claude's key isn't installed)", ok, s.dump(25))
         if ok:
             press(s, "Cancel", lambda: "Use my own SSH login once" not in screen(s))
+            # gate check stored a new SSH key before that choice: the first secret of this session
+            # without a vault passphrase, so gated offers one once the helper's job ends (PLAN-0.11 §8)
+            ok = wait(s, lambda: L.OFFER_TITLE in screen(s), 60)
+            check("askright: the stored SSH key brings the vault passphrase offer "
+                  f"({L.OFFER_SET} / {L.OFFER_NOT_NOW})",
+                  ok and L.OFFER_SET in screen(s) and L.OFFER_NOT_NOW in screen(s), s.dump(25))
+            if ok:
+                drawn = f"[ {L.OFFER_NOT_NOW} ]"
+                press(s, drawn if drawn in screen(s) else L.OFFER_NOT_NOW, lambda: L.OFFER_TITLE not in screen(s),
+                      settle=3.0)
+                check("askright: Not now closes the offer", wait(s, lambda: L.OFFER_TITLE not in screen(s), 30),
+                      s.dump(15))
     res = ag.finish_bash(n0, done)
     note(f"gate check {ASK_HOST}: {' '.join((res or 'no result').split())[:200]}")
     ag.pane_focus = True
@@ -961,21 +1100,33 @@ def step_main_screen(root: Path, h, gi, extra: dict, state: dict, canary) -> dri
         s.submit(f"/gate-terminal {tid}")
         ok = wait(s, lambda: "main screen" in s.all_text() and f"terminal {tid}" in screen(s), 30)
         check("main screen: the pane says no clicks reach it and offers a line field", ok, s.dump(15))
-        s.type('echo "FROM""-MAIN-SCREEN"')
-        s.pump(0.3)
-        s.key("enter")
-        reached = wait(s, lambda: "FROM-MAIN-SCREEN" in screen(s).replace('FROM""-MAIN', ''), 15)
+        # the line field takes the keys a moment after the pane is drawn: typed before that,
+        # the line went to the prompt box (VM run 10)
+        keys = ok and L.focus_line_field(s, lambda: screen(s))
+        typed = False
+        if keys:
+            s.type('echo "FROM""-MAIN-SCREEN"')
+            # Enter only once the field shows the whole line: a key lost on a loaded machine
+            # would send another command
+            typed = wait(s, lambda: L.LINE_FIELD_HINT not in screen(s) and 'FROM""-MAIN-SCREEN' in screen(s),
+                         15, 0.1)
+            if typed:
+                s.key("enter")
+        reached = typed and wait(s, lambda: "FROM-MAIN-SCREEN" in screen(s).replace('FROM""-MAIN', ''), 15)
         check("a line typed into the pane's field reaches the terminal (the pane shows its output)",
               reached, s.dump(15))
-        if not reached:
-            note("the line field didn't take the keys on the main screen (focus); the buttons remain")
+        if not keys:
+            note("the line field never took the keys on the main screen (a probe key never replaced "
+                 "its placeholder), so nothing was typed; the buttons remain")
+        elif not typed:
+            note("the line field never showed the whole typed line, so Enter wasn't pressed")
         return s
     finally:
         s.close()
 
 
-def scans(root: Path, sessions, gi, px, canary, h) -> None:
-    print("scans: the sudo canary everywhere it must not be", flush=True)
+def scans(root: Path, sessions, gi, px, canaries: list, h) -> None:
+    print("scans: the sudo canaries everywhere they must not be", flush=True)
     places = {
         "the scratch Claude config (transcripts, history, plugin data, caches)": h.inst.config_dir,
         "the gateway's plugin data (gated log, events, terminals.json, audit log)": gi.root / "data",
@@ -992,19 +1143,19 @@ def scans(root: Path, sessions, gi, px, canary, h) -> None:
             check(f"scan: {what} exists to be scanned", False)
             continue
         rep = scan.Report()
-        rep.scan_tree(where, canary)
+        rep.scan_tree(where, *canaries)
         check(f"scan: no canary in {what}", rep.clean(), rep.summary())
     for i, x in enumerate(sessions):
         rep = scan.Report()
         if x.debug_path and x.debug_path.exists():
-            rep.scan_tree(x.debug_path.parent, canary)
+            rep.scan_tree(x.debug_path.parent, *canaries)
             check(f"scan: no canary in session {i + 1}'s --debug-file log", rep.clean(), rep.summary())
         rep = scan.Report()
-        rep.scan_api_log(x.api.log_path, canary)
+        rep.scan_api_log(x.api.log_path, *canaries)
         check(f"scan: no canary in any request session {i + 1} made to the fake Messages API",
               rep.clean(), rep.summary())
         rep = scan.Report()
-        rep.scan_bytes(bytes(x.raw), "pty", canary, ansi=True)
+        rep.scan_bytes(bytes(x.raw), "pty", *canaries, ansi=True)
         check(f"scan: no canary in session {i + 1}'s PTY output", rep.clean(), rep.summary())
     if px is not None:
         n = len(px.requests())

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 
 import harness as H
@@ -151,6 +152,55 @@ def test_dash_n_tolerated_in_password_mode():
         assert r.returncode == 0 and r.stdout == "hi\n", (r.stdout, r.stderr)
 
 
+def _env_names(stdout: str) -> dict[str, str]:
+    out = {}
+    for line in stdout.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.isidentifier():
+            out[k] = v
+    return out
+
+
+def test_configured_sudo_gets_an_allowlisted_environment_so_dash_E_keeps_only_that():
+    """PLAN-0.11 §19.14: a configured sudo hands the system sudo the account
+    CLIs' allowlist (clis.ENV_ALLOW), TERM, the editor variables `sudo -e`
+    reads (SUDO_EDITOR, VISUAL, EDITOR) and, for a stored password, what the
+    askpass needs; never the caller's whole environment. The fake sudo
+    passes on everything it gets (what `sudo -E` does), so the command sees
+    exactly what the stand-in handed over: no token, agent or GW_ name."""
+    from gateway import clis
+    editors = {"SUDO_EDITOR": "/opt/example/bin/ed-a", "VISUAL": "/opt/example/bin/ed-b",
+               "EDITOR": "/opt/example/bin/ed-c"}
+    planted = {"GH_TOKEN": "ghp_PLANTEDtoken0123456789abcd", "SSH_AUTH_SOCK": "/x/agent.sock",
+               "AWS_SECRET_ACCESS_KEY": "planted-aws-secret-0123", "GW_PLANTED": "1",
+               "LD_PRELOAD": "/x/evil.so", "TERM": "xterm-256color", **editors}
+    allowed = set(clis.ENV_ALLOW) | {"TERM"} | set(editors)
+    askpass = {"SUDO_ASKPASS", "GW_ASKPASS_FIFO", "DISPLAY"}
+    sudo_own = {"SUDO_USER", "SUDO_UID", "SUDO_COMMAND", "PWD", "SHLVL", "_",
+                "__CF_USER_TEXT_ENCODING"}
+    for how in ("nopasswd", "password"):
+        with H.gateway_env() as env:         # each its own `sudo -n true` cache
+            HS.setup_localhost(env, sudo="true")
+            if how == "password":
+                with vault.edit() as d:
+                    vault.set_sudo(d, "localhost", paths.local_user(), "correct horse")
+            fake = H.make_fake_sudo(env.root / f"fsudo-{how}", password="correct horse",
+                                    nopasswd=how == "nopasswd")
+            for argv in (["-E", "env"], ["--preserve-env", "env"], ["env"]):
+                r = HS.run_sudo(env, fake, *argv, extra_env=planted)
+                assert r.returncode == 0, (how, argv, r.stderr)
+                seen = _env_names(r.stdout)
+                for name in ("GH_TOKEN", "SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY", "GW_PLANTED",
+                             "LD_PRELOAD", "GW_FAKE_SUDO", "CLAUDE_PID"):
+                    assert name not in seen, (how, argv, name)
+                assert "ghp_PLANTED" not in r.stdout and "planted-aws" not in r.stdout
+                assert seen.get("TERM") == "xterm-256color" and "HOME" in seen, (how, seen)
+                assert {k: seen.get(k) for k in editors} == editors, ("sudo -e's editor", how)
+                extra = set(seen) - allowed - sudo_own - (askpass if how == "password" else set())
+                assert not extra, (how, argv, sorted(extra))
+                assert (how == "password") == ("GW_ASKPASS_FIFO" in seen), (how, sorted(seen))
+
+
 # ---------------------------------------------------------------------------
 # Right checks and -S/-A refusal
 # ---------------------------------------------------------------------------
@@ -190,10 +240,13 @@ def test_ask_from_a_script_or_sh_c_refuses_but_a_pipeline_proceeds():
     with H.gateway_env() as env:
         HS.setup_localhost(env, sudo="ask")
         fake = H.make_fake_sudo(env.root / "fsudo", nopasswd=True)
+        HS.asked("echo", "x")                  # even with the hook's record
         r = HS.run_sudo_from_shell(env, fake, "/bin/sh -c '{sudo}; true'; true", "echo", "x")
         assert r.stdout == "" and "run it as its own command" in r.stderr, r
+        HS.asked("echo", "piped")
         r = HS.run_sudo_from_shell(env, fake, "{sudo} | cat", "echo", "piped")
         assert r.returncode == 0 and r.stdout == "piped\n", r
+        HS.asked("echo", "typed")
         r = HS.run_sudo_from_shell(env, fake, "{sudo}", "echo", "typed")
         assert r.returncode == 0 and r.stdout == "typed\n", r
 
@@ -263,8 +316,82 @@ def test_ask_from_direct_caller_proceeds():
     with H.gateway_env() as env:
         HS.setup_localhost(env, sudo="ask")
         fake = H.make_fake_sudo(env.root / "fsudo", nopasswd=True)
+        HS.asked("echo", "ok")                      # the hook asked about `sudo echo ok`
         r = HS.run_sudo(env, fake, "echo", "ok")   # direct by default
         assert r.returncode == 0 and r.stdout == "ok\n", r.stderr
+
+
+def test_ask_needs_the_hooks_record_of_this_very_command():
+    """Lead decision 19.14: a command Claude typed passes an "ask" only with
+    the approval hook's record of it (the same words, folder and Claude
+    Code), used once; no record (a sourced script's sudo looks typed too)
+    or another command's record is refused, saying to run it on its own."""
+    with H.gateway_env() as env:
+        HS.setup_localhost(env, sudo="ask")
+        fake = H.make_fake_sudo(env.root / "fsudo", nopasswd=True)
+        r = HS.run_sudo(env, fake, "echo", "ok")
+        assert r.returncode != 0 and "didn't ask you about this command" in r.stderr, r
+        assert "run `sudo ...` as its own command" in r.stderr and fake.log() == [], r
+        HS.asked("echo", "other")
+        HS.asked("echo", "ok", cwd=str(env.root))   # another folder
+        r = HS.run_sudo(env, fake, "echo", "ok")
+        assert r.returncode != 0 and "didn't ask you" in r.stderr and fake.log() == [], r
+        HS.asked("echo", "ok")
+        r = HS.run_sudo(env, fake, "echo", "ok")
+        assert r.returncode == 0 and r.stdout == "ok\n", r.stderr
+        r = HS.run_sudo(env, fake, "echo", "ok")
+        assert r.returncode != 0 and "didn't ask you" in r.stderr, "used once"
+        # a sourced script's sudo: typed by Claude's shell, but nothing recorded
+        script = env.root / "deploy.sh"
+        files = HS.write_drivers(env)
+        script.write_text(" ".join(shlex.quote(a) for a in [HS.PY, "-I", str(files["driver"]),
+                                                            "sudo", str(env.root), "id"]) + "\n")
+        n = len(fake.log())
+        r = HS.run_sudo_from_shell(env, fake, f". {shlex.quote(str(script))}")
+        assert r.returncode != 0 and "didn't ask you about this command" in r.stderr, r
+        assert len(fake.log()) == n, "the real sudo never ran"
+
+
+def test_the_sudo_stand_ins_refusals_are_audited_with_their_mode():
+    """Lead decision 19.8 (verify012): each refusal names the mode the
+    stand-in decided in: the session's mode the hook recorded for a command
+    Claude typed, else "modeless"."""
+    with H.gateway_env() as env:
+        HS.setup_localhost(env, sudo='"ask"')
+        fake = H.make_fake_sudo(env.root / "fsudo", nopasswd=True)
+
+        def last() -> dict:
+            return [r for r in audit.read(0) if r.get("event") == "refusal"][-1]
+        r = HS.run_sudo(env, fake, "echo", "ok", extra_env={"GW_STANDIN_MODE": "acceptEdits"})
+        assert r.returncode != 0 and "didn't ask you" in r.stderr, r
+        assert last()["tool"] == "sudo" and last().get("mode") == "acceptEdits", last()
+        r = HS.run_sudo(env, fake, "echo", "ok")
+        assert r.returncode != 0 and last().get("mode") == "modeless", last()
+        # the mode it decided in, not a later read (verify013): the record
+        # answers once, then is gone (gated restarted)
+        r = HS.run_sudo(env, fake, "echo", "ok",
+                        extra_env={"GW_STANDIN_MODE": "acceptEdits", "GW_STANDIN_MODE_ONCE": "1"})
+        assert r.returncode != 0 and "didn't ask you" in r.stderr, r
+        assert last().get("mode") == "acceptEdits", last()
+        HS.setup_localhost(env, sudo="true")
+        r = HS.run_sudo(env, fake, "-S", "echo", "x", extra_env={"GW_STANDIN_MODE": "auto"})
+        assert r.returncode != 0 and "-S/-A" in r.stderr and last().get("mode") == "auto", last()
+        assert fake.log() == []
+
+
+def test_the_sudo_stand_ins_credential_use_is_audited_with_its_mode():
+    """Lead decision 19.8 (verify013): the use line of a stored password
+    names the mode the stand-in decided in, as its refusals do."""
+    with H.gateway_env() as env:
+        HS.setup_localhost(env, sudo="true")
+        with vault.edit() as d:
+            vault.set_sudo(d, "localhost", paths.local_user(), "correct horse")
+        fake = H.make_fake_sudo(env.root / "fsudo", password="correct horse")
+        for extra, want in (({"GW_STANDIN_MODE": "auto"}, "auto"), (None, "modeless")):
+            r = HS.run_sudo(env, fake, "echo", "ok", extra_env=extra)
+            assert r.returncode == 0 and r.stdout == "ok\n", (r.stdout, r.stderr)
+            use = [x for x in audit.read(0) if x.get("event") == "use"][-1]
+            assert use["tool"] == "sudo" and use.get("mode") == want, use
 
 
 def test_dash_S_refused():
@@ -489,19 +616,26 @@ def test_sudo_binary_must_be_trusted_in_production():
 
 def test_missing_password_pop_up_stores_it_and_stale_opens_one_reentry():
     """phase B request (ux): the pop-up stores the password itself (store=),
-    so a late answer is kept; a rejected one opens the re-entry pop-up (here:
-    no screen, so a pending request for `gate secret`) and isn't fed again."""
+    so a late answer is kept, but only when the person ticks Remember it
+    (unticked by default, WS-9: used for that command only); a rejected one
+    opens the re-entry pop-up (here: no screen, so a pending request for
+    `gate secret`) and isn't fed again."""
     import time
     with H.gateway_env() as env:
         HS.setup_localhost(env, sudo="true")
         fake = H.make_fake_sudo(env.root / "fsudo", password="correct horse")
-        dlg = H.FakeDialog(env.root / "dlg", [{"outcome": "ok", "value": "correct horse"}])
+        dlg = H.FakeDialog(env.root / "dlg", [{"outcome": "ok", "value": "correct horse"},
+                                              {"outcome": "ok", "value": "\x00remember\x00correct horse"}])
+        r = HS.run_sudo(env, fake, "echo", "once", extra_env={"GW_FAKE_DIALOG": str(dlg.script)})
+        assert r.returncode == 0 and r.stdout == "once\n", (r.stdout, r.stderr)
+        e = vault.sudo_entry(vault.load(), "localhost", paths.local_user())
+        assert e is None or not e.get("password"), "left unticked: used once, nothing stored"
         r = HS.run_sudo(env, fake, "echo", "root-ok", extra_env={"GW_FAKE_DIALOG": str(dlg.script)})
         assert r.returncode == 0 and r.stdout == "root-ok\n", (r.stdout, r.stderr)
         assert vault.sudo_entry(vault.load(), "localhost", paths.local_user())["password"] == \
             "correct horse"
-        assert [c["kind"] for c in dlg.calls()] == ["secret"]
-        assert "Untick Remember it" in dlg.calls()[0]["message"]
+        assert [c["kind"] for c in dlg.calls()] == ["secret", "secret"]
+        assert "Tick Remember it to keep it" in dlg.calls()[0]["message"]
         assert "passwordless" not in dlg.calls()[0]["message"].lower()
         # rejected later: stale, one re-entry request, the password not fed again
         with vault.edit() as d:
@@ -668,7 +802,8 @@ def test_a_right_switched_off_while_the_dialog_was_open_is_checked_again_before_
 
 def test_the_sudo_dialog_names_its_right_for_gated_and_offers_remember():
     """What the stand-in asks gated for: the right it needs rechecked
-    (localhost's sudo) and the "Remember it" choice, ticked by default; the
+    (localhost's sudo) and the "Remember it" choice, unticked by default like
+    the remote sudo dialog's (WS-9, PLAN-0.11 §9.1: the same note); the
     re-entry dialog after a rejection names the right too."""
     import harness_ux as U
     from gateway import popup
@@ -690,6 +825,9 @@ def test_the_sudo_dialog_names_its_right_for_gated_and_offers_remember():
             pw, asked = sudo._password_for(None, paths.local_user())
             sudo._reenter(paths.local_user())
         assert pw is None and not asked
-        assert seen == [("localhost", "sudo password", sudo.SUDO_CHECK, True),
+        from gateway import ssh_sudo
+        assert sudo.REMEMBER_DEFAULT is False and ssh_sudo.REMEMBER_DEFAULT is False
+        assert sudo.REMEMBER_NOTE == ssh_sudo.REMEMBER_NOTE
+        assert seen == [("localhost", "sudo password", sudo.SUDO_CHECK, False),
                         ("reenter", "sudo password", sudo.SUDO_CHECK)], seen
         assert sudo.SUDO_CHECK == {"section": "hosts", "entry": "localhost", "right": "sudo"}

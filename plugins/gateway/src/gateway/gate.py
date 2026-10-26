@@ -1,8 +1,9 @@
 """The `gate` CLI (SPEC 15).
 
-Here: status [NAME] [--report], migrate, log [N], why, import-ssh [ALIAS...],
-help. The rest dispatch: check, login, forget, rotate -> gate_setup (secret: removed);
-with -> clis.with_main; export, import, copy-to, pubkey -> transfer.
+Here: status [NAME], log [N], why, import-ssh [ALIAS...], help. The rest
+dispatch: check, login, forget, rotate -> gate_setup; with ->
+clis.with_main; export, import, copy-to, pubkey -> transfer. Beside a gateway
+0.6 vault only the commands in BESIDE_V06 run (the rest: vault.V06_MESSAGE).
 """
 from __future__ import annotations
 
@@ -17,17 +18,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import accounts as acctmod
-from . import audit, consent, hooks_session, migrate, paths, testing, vault
+from . import audit, consent, hooks_session, paths, testing, vault
 from . import form as formmod
 
 OK, NO = "✓", "✗"
 USAGE = """gate: the gateway's helper (the form is ~/.config/gateway/gateway.toml)
 
-  gate status [NAME] [--report]   hosts, accounts, rights and what is stored (never a value)
+  gate status [NAME]              hosts, accounts, rights and what is stored (never a value)
   gate check NAME|all             set an entry up now: the user's OK, keys, passwords, tokens
   gate login NAME                 ask for an account's token (or client secret) again
   gate forget NAME [sudo|token|key|signin|host-keys]
                                   forget what is stored for an entry (all, or one kind)
+  gate forget --backups           delete the older vault copies in private/backups (after
+                                  the user's OK in the gateway's dialog)
   gate rotate HOST                give a host a new key
   gate with NAME -- CMD           run CMD with an account's key in its env variable
   gate export [FILE]              everything in one passphrase-protected file
@@ -36,17 +39,26 @@ USAGE = """gate: the gateway's helper (the form is ~/.config/gateway/gateway.tom
   gate pubkey                     this machine's age recipient (what copy-to encrypts to)
   gate log [N]                    the audit log
   gate why                        the last refusal and its fix
-  gate migrate                    convert a gateway 0.6 vault (or show the report)
   gate import-ssh [ALIAS...]      propose form entries from ~/.ssh/config (prints TOML only)
   gate lock                       lock the vault now (when its key has a passphrase;
                                   /gate-unlock in Claude Code unlocks it)
+  gate passphrase [--remove|--start-over]              set or change the vault passphrase,
+                                  remove it, or start over when it is lost (the files kept
+                                  in private/backups), each in the gateway's dialog
   gate host add NAME USER@HOST[:PORT] [KEY=VALUE...]   add a host (then gate check NAME)
   gate host set NAME KEY VALUE    change address, ssh, sudo, scripts, note, runtime or via
+  gate host set NAME ssh|sudo MODE=WORD...             per permission mode, e.g.
+                                  default=ask auto=true plan=false (default required)
+  gate account set NAME use WORD|MODE=WORD...          an account's use: true, ask, cc or
+                                  false, or per permission mode as above
   gate workspace add HOST NAME ROOT [LOCAL]            a named root on a host (and its
                                   folder on this machine); gate workspace remove HOST NAME
-  gate policy set all|HOST|ACCOUNT ACTION allow|ask|deny
-                                  read, exec, write, network, elevation, credential,
-                                  env_import, provision, forward_agent|x11|remote|stdio
+  gate policy set all|HOST|ACCOUNT ACTION allow|ask|deny|cc|MODE=WORD...
+                                  read, exec, write, network, elevation, credential (these
+                                  also cc or per mode), env_import, provision,
+                                  forward_agent|x11|remote|stdio
+  gate network commands VALUE|MODE=WORD...             network commands (curl, wget, ...):
+                                  allow, ask, cc or deny; gate network extra|drop add|remove NAME
   gate accounts [--check NAME|all] [--json]            account states (connected, expired,
                                   revoked, reauthentication required, ...)
   CMD | gate scrub                mask stored secrets and token shapes in CMD's output (optional)
@@ -87,6 +99,9 @@ def _host_state(e: consent.EffectiveHost, meta: dict[str, Any]) -> tuple[str, st
     """(ssh column, sudo column)."""
     if e.new:
         return "waits for your OK (gate check %s)" % e.name, ""
+    if e.is_local and "sudo" not in e.modes:
+        # PLAN-0.11 §1.5: nothing configures this computer's sudo
+        return "sudo: your own (not through the gateway)", ""
     sudo_extra = ""
     if e.is_local:
         user = paths.local_user()
@@ -142,8 +157,11 @@ def _account_state(e: consent.EffectiveAccount, meta: dict[str, Any]) -> tuple[s
         st = "off (use = false)"
     elif am.get("stale"):
         st = "token rejected (gate check %s)" % e.name
-    elif am.get("entra"):
-        st = "signed in"
+    elif e.kind in ("azure", "ml-catalog") and acctmod.entra_stored(am.get("entra_info") or {}):
+        # gate check's rule (an older gateway's sign-in, or one for settings
+        # that changed since, needs a new one)
+        st = ("signed in" if a is not None and acctmod.entra_fits(a, am.get("entra_info") or {})
+              else "needs a new sign-in (gate check %s)" % e.name)
     elif am.get("token"):
         if e.kind == "api-key":
             st = "key saved"
@@ -169,15 +187,11 @@ def render_status(form: formmod.Form, eff: consent.Effective, data: dict[str, An
                                                         "version)" if (data or {}).get("form_last_good")
                                                         else ")"))
         else:
-            # A fresh install: nothing was ever there to go missing. This
-            # computer's sudo as it applies now ("ask" on a new install, true
-            # on one an older gateway set up).
-            lh = eff.hosts.get("localhost")
-            r = lh.sudo if lh is not None else False
-            sudo = "sudo asks each time" if r == "ask" else ("sudo on" if r is True else "sudo off")
+            # A fresh install: nothing was ever there to go missing, and
+            # nothing goes through the gateway (PLAN-0.11 §1.5).
             lines.append("No gateway.toml yet: the gateway creates it at the next session start "
                          "(or ask Claude to add a host or account, which creates it); until then "
-                         f"only this computer's defaults apply ({sudo})")
+                         "nothing goes through the gateway (your own ssh, git, gh and sudo)")
     lines.append("Hosts")
     hw = max([len(n) for n in eff.hosts] + [8]) + 3
     for e in eff.hosts.values():
@@ -195,8 +209,8 @@ def render_status(form: formmod.Form, eff: consent.Effective, data: dict[str, An
     for e in eff.accounts.values():
         who, st = _account_state(e, meta)
         lines.append(f"  {e.name.ljust(aw)}{who.ljust(26)} {st}".rstrip())
-    if eff.others == "mine":
-        lines.append("Other machines and git servers: your own ssh/git setup (others = \"mine\")")
+    lines.append("Anything not in gateway.toml: your own ssh, git, gh and sudo (not through the "
+                 "gateway)")
     if eff.pending:
         lines.append("Waiting for your OK")
         for c in eff.pending:
@@ -208,15 +222,10 @@ def render_status(form: formmod.Form, eff: consent.Effective, data: dict[str, An
     for w in form.warnings[:5]:
         lines.append(f"  warning: {w.render()}")
     if data:
-        imp = consent.imported_rights(data)
-        imported = set(imp["hosts"]) | set(imp["accounts"])
-        orphans = [n for n in list((data.get("hosts") or {})) + list((data.get("accounts") or {}))
-                   if n not in form.hosts and n not in form.accounts and n not in form.disabled]
-        waiting = sorted({n for n in orphans if n in imported})
-        others = sorted({n for n in orphans if n not in imported})
-        if waiting:
-            lines.append("Converted from 0.6, not in the form yet: " + ", ".join(waiting)
-                         + " (copy them from gateway.from-v2.toml into gateway.toml to use them)")
+        others = sorted({n for n in list((data.get("hosts") or {}))
+                         + list((data.get("accounts") or {}))
+                         if n not in form.hosts and n not in form.accounts
+                         and n not in form.disabled})
         if others:
             lines.append("Stored but not in the form: " + ", ".join(others)
                          + " (gate forget NAME removes it)")
@@ -342,28 +351,21 @@ def _remote_lines(name: str, h: Any, e: Any, data: dict[str, Any] | None) -> lis
 
 
 def status(args: list[str]) -> int:
-    report = "--report" in args
-    names = [a for a in args if not a.startswith("-")]
+    if len(args) > 1 or (args and args[0].startswith("-")):
+        _err("gateway: usage: gate status [NAME]")
+        return 2
+    names = args
     notes: list[str] = []
     form, eff, data = hooks_session.prepare(notes, write=False)
-    if report:
-        rec = (data or {}).get("migrated")
-        fail = migrate.last_failure()
-        if rec:
-            _out(rec.get("report") or "gateway: migrated from 0.6 (no report recorded)")
-        elif migrate.needed():
-            _out("gateway: a 0.6 vault is waiting to be migrated"
-                 + (f"; last attempt: {fail['reason']}" if fail else "") + "; run gate migrate")
-        else:
-            _out("gateway: no migration report (this gateway didn't come from 0.6)")
-        return 0
     if names:
         _out(render_entry(names[0], form, eff, data))
         return 0
-    if migrate.needed():
-        fail = migrate.last_failure()
-        notes.append("Migration from 0.6 failed: " + (fail["reason"] if fail else "unknown")
-                     + "; run gate migrate")
+    if vault.v06_waiting():
+        notes.append(vault.V06_MESSAGE)
+    from . import envfile
+    too_old = envfile.pixi_too_old_note()     # the hooks may run on an older env meanwhile
+    if too_old:
+        notes.insert(0, too_old)
     _out(render_status(form, eff, data, notes))
     return 0
 
@@ -422,8 +424,40 @@ def lock_cmd(args: list[str]) -> int:
     return 0
 
 
+PASSPHRASE_USAGE = "gateway: usage: gate passphrase [--remove|--start-over]"
+PASSPHRASE_ACTIONS = {(): "passphrase", ("--remove",): "remove", ("--start-over",): "start-over"}
+PASSPHRASE_OPEN = {
+    "passphrase": "set or change the vault passphrase",
+    "remove": "remove the vault passphrase",
+    "start-over": "start the vault over (its passphrase is lost)",
+}
+
+
+def passphrase_cmd(args: list[str]) -> int:
+    """gate passphrase [--remove|--start-over] (PLAN-0.11 §19.14): gated
+    opens its own dialog in this session to set or change the vault
+    passphrase (the vault unlocked), to remove it, or to start a vault whose
+    passphrase is lost over (its files moved into private/backups). Only the
+    person's answer there changes anything; this returns once it is open."""
+    action = PASSPHRASE_ACTIONS.get(tuple(args))
+    if action is None:
+        _err(PASSPHRASE_USAGE)
+        return 2
+    if vault.key_mode() == "none":
+        _out("gateway: there is no vault yet (it is made when the first credential is stored)")
+        return 0
+    from .daemon import client
+    r = client.vault_passphrase(action)
+    if r.get("available"):
+        _out(f"gateway: the gateway dialog to {PASSPHRASE_OPEN[action]} is open in Claude Code; "
+             "the user answers it there (Claude never sees what is typed)")
+        return 0
+    _err(formmod.strip_unsafe(str(r.get("message") or "gateway: no gateway dialog could open")))
+    return 1
+
+
 # ---------------------------------------------------------------------------
-# log, why, migrate
+# log, why
 # ---------------------------------------------------------------------------
 
 
@@ -463,17 +497,35 @@ def why(args: list[str]) -> int:
     return 0
 
 
-def migrate_cmd(args: list[str]) -> int:
-    r = migrate.run("gate migrate")
-    _out(r.message)
-    if r.report and r.status in ("migrated", "already"):
-        _out(r.report)
-    return 0 if r.ok else 1
-
-
 # ---------------------------------------------------------------------------
 # import-ssh
 # ---------------------------------------------------------------------------
+
+
+def _sanitize(s: str, prefix: str) -> str:
+    """A form name made of `s` (lowercase letters, digits and dashes, starting
+    with a letter, at most 32 characters; `prefix` when nothing is left)."""
+    n = re.sub(r"[^a-z0-9-]+", "-", s.lower())
+    n = re.sub(r"-+", "-", n).strip("-")
+    if not n or not n[0].isalpha():
+        n = f"{prefix}-{n}" if n else prefix
+    return n[:32].rstrip("-")
+
+
+def _fmt_host(h: str) -> str:
+    h = h.strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        return h
+    return f"[{h}]" if ":" in h else h
+
+
+def _fmt_addr(user: str | None, host: str, port: str | int | None) -> str:
+    """A form address: [USER@]HOST[:PORT], an IPv6 host in brackets, no :22."""
+    p = str(port or "").strip()
+    s = (f"{user}@" if user else "") + _fmt_host(host)
+    if p and p != "22":
+        s += f":{p}"
+    return s
 
 
 def _system_ssh() -> str | None:
@@ -589,7 +641,7 @@ def import_ssh(aliases: list[str], config: Path | None = None, ssh_bin: str | No
     names: dict[str, str] = {}
     used = set(form.names()) | formmod.RESERVED
     for a in wanted:
-        n = migrate._sanitize(a, "host")
+        n = _sanitize(a, "host")
         base, i = n, 2
         while n in used and n not in form.hosts:
             n = f"{base[:29]}-{i}"
@@ -608,7 +660,7 @@ def import_ssh(aliases: list[str], config: Path | None = None, ssh_bin: str | No
         user = g.get("user", "")
         host = g.get("hostname", a)
         port = g.get("port", "22")
-        addr = migrate._fmt_addr(user or None, host, port)
+        addr = _fmt_addr(user or None, host, port)
         lines = [""]
         server = formmod.git_server_note(host) or _account_endpoint_note(host, form)
         if server:
@@ -714,33 +766,40 @@ def scrub_cmd(args: list[str]) -> int:
     return 0
 
 
+# Beside a gateway 0.6 vault (vault.v06_waiting) only these run: they write
+# nothing (no vault, key or form) that gateway 0.10.0's conversion would then
+# find. Every other command, unknown ones included, is refused with
+# vault.V06_MESSAGE before it asks the user anything or writes a file.
+BESIDE_V06 = frozenset({"scrub", "status", "log", "why", "import-ssh", "lock"})
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         _out(USAGE)
         return 0
+    from . import asks
+    # this very command, for an "ask" the helpers meet (gate check / rotate /
+    # copy-to on an "ask" host: ssh._user_present; the approval hook's record)
+    asks.begin("gate", argv)
     cmd, rest = argv[0], argv[1:]
     if cmd == "scrub":
-        return scrub_cmd(rest)   # a filter: no migration check, nothing printed before the lines
-    if cmd != "migrate":
-        try:
-            r = migrate.ensure("gate")
-            if r is not None:
-                _err(("gateway: " + r.message) if not r.ok else r.message)
-        except Exception as e:  # noqa: BLE001
-            _err(f"gateway: migration check failed ({type(e).__name__})")
+        return scrub_cmd(rest)   # a filter: nothing printed before the lines
+    if cmd not in BESIDE_V06 and vault.v06_waiting():
+        _err(vault.V06_MESSAGE)
+        return 2
     if cmd == "status":
         return status(rest)
     if cmd == "log":
         return log_cmd(rest)
     if cmd == "why":
         return why(rest)
-    if cmd == "migrate":
-        return migrate_cmd(rest)
     if cmd == "import-ssh":
         return import_ssh_cmd(rest)
     if cmd == "lock" and not rest:
         return lock_cmd(rest)
-    if cmd in ("host", "workspace", "policy", "accounts"):
+    if cmd == "passphrase":
+        return passphrase_cmd(rest)
+    if cmd in ("host", "account", "workspace", "policy", "network", "accounts"):
         from . import manage
         return _phase_b(manage.main, cmd, rest, what=cmd)
     from . import clis, gate_setup, transfer
@@ -748,13 +807,13 @@ def main(argv: list[str]) -> int:
         return _phase_b(gate_setup.check, rest[0], what="check")
     if cmd == "login" and len(rest) == 1:
         return _phase_b(gate_setup.login, rest[0], what="login")
+    if cmd == "forget" and rest == ["--backups"]:
+        return _phase_b(gate_setup.forget_backups, what="forget")
     if cmd == "forget" and len(rest) in (1, 2):
         return _phase_b(gate_setup.forget, rest[0], rest[1] if len(rest) == 2 else None,
                         what="forget")
     if cmd == "rotate" and len(rest) == 1:
         return _phase_b(gate_setup.rotate, rest[0], what="rotate")
-    if cmd == "secret" and len(rest) == 1:
-        return gate_setup.secret_removed(rest[0])
     if cmd == "with":
         return _phase_b(clis.with_main, rest, what="with")
     if cmd == "export" and len(rest) <= 1:

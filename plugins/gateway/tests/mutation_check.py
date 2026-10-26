@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Mutation checks for the security properties (SPEC 20): each mutation
-removes or weakens one guard; the named tests must then FAIL. Files are
-restored afterwards (checked by hash). Run from plugins/gateway:
+removes or weakens one guard; the named tests must then FAIL. Each named
+test first runs once unmutated: one that fails (or names no test) then
+can't tell a kill from its own failure, and its mutations are ERRORs.
+Files are restored afterwards (checked by hash). Run from plugins/gateway:
 
     pixi run --locked python tests/mutation_check.py [-k SUBSTR] [--copy DIR]
 
@@ -13,8 +15,12 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -36,29 +42,21 @@ MUTATIONS = [
      "printf '%s\\n' 'if true; then'",
      "test_envfile::test_launch_degraded_session_matches_python"),
     ("context mentions checkpoint jobs without checkpoint", S + "hooks_session.py",
-     "    out = [*HOWTO, JOBS_HOWTO] if jobs else list(HOWTO)\n",
-     "    out = [*HOWTO, JOBS_HOWTO]\n",
-     "test_session::test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_there"),
+     "    if checkpoint_live():\n        out.append(JOBS_HOWTO)\n",
+     "    if True:\n        out.append(JOBS_HOWTO)\n",
+     "test_session::test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_live"),
     ("context never mentions checkpoint jobs", S + "hooks_session.py",
-     "    out = [*HOWTO, JOBS_HOWTO] if jobs else list(HOWTO)\n",
-     "    out = list(HOWTO)\n",
-     "test_session::test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_there"),
-    ("checkpoint's state folder follows XDG_STATE_HOME under a test override", S + "paths.py",
-     "    if testing.active() is None:\n        x = os.environ.get(\"XDG_STATE_HOME\", \"\")\n",
-     "    if True:\n        x = os.environ.get(\"XDG_STATE_HOME\", \"\")\n",
-     "test_session::test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_there"),
+     "    if checkpoint_live():\n        out.append(JOBS_HOWTO)\n",
+     "    if False:\n        out.append(JOBS_HOWTO)\n",
+     "test_session::test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_live"),
     # --- jobs-lows round 2: a first SessionStart cancelled or killed ---
     ("launch.sh starts SessionStart's Python before the safe env file", "hooks/launch.sh",
      "    : > \"$ENVD/.used\" 2>/dev/null\n    pre_session\n",
      "    : > \"$ENVD/.used\" 2>/dev/null\n",
      "test_envfile::test_launch_writes_the_safe_env_before_python_runs_session_start"),
     ("launch.sh's pre-session step leaves missing stand-ins missing", "hooks/launch.sh",
-     "    if [ ! -f \"$DATA/bin/$n\" ]; then write_stubs 2>/dev/null; break; fi\n",
-     "    if false; then write_stubs 2>/dev/null; break; fi\n",
-     "test_envfile::test_launch_writes_the_safe_env_before_python_runs_session_start"),
-    ("launch.sh's pre-session step leaves a missing git reset missing", "hooks/launch.sh",
-     "  [ -f \"$DATA/git/config\" ] || write_git_reset 2>/dev/null\n  return 0\n",
-     "  return 0\n",
+     "      if [ ! -f \"$DATA/bin/$n\" ]; then write_stubs all 2>/dev/null; break; fi\n",
+     "      if false; then write_stubs all 2>/dev/null; break; fi\n",
      "test_envfile::test_launch_writes_the_safe_env_before_python_runs_session_start"),
     ("the env file is truncated and written in place", S + "envfile.py",
      "    _atomic(Path(path), text, 0o644)\n",
@@ -85,8 +83,10 @@ MUTATIONS = [
      "test_envfile::test_launch_runs_on_an_older_env_while_an_update_builds"),
     # --- review round 2: a narrowing without a vault is persisted ---
     ("ratchet persists nothing before a vault exists", S + "consent.py",
-     "    if not vault.exists():\n        if form is None:\n            form = formmod.load()\n",
-     "    if not vault.exists():\n        return []\n        if form is None:\n            form = formmod.load()\n",
+     "    if not vault.exists():\n        _drop_stale_list()\n        if form is None:\n"
+     "            form = formmod.load()\n",
+     "    if not vault.exists():\n        _drop_stale_list()\n        return []\n        if form is None:\n"
+     "            form = formmod.load()\n",
      "test_session::test_a_narrowing_outlives_a_syntax_error_and_a_deleted_form_without_a_vault"),
     ("ratchet leaves the session-start copy as the last good form", S + "consent.py",
      "        if last_good_ok(form):\n            cur[\"form_last_good\"] = form.used_text\n        vault.save(cur)",
@@ -105,30 +105,54 @@ MUTATIONS = [
      "            rec.pop(k, None)\n            if src.get(k):",
      "            if src.get(k):",
      "test_transfer_roundtrip::test_export_import_round_trip_with_localhost_remap"),
-    ("migration moves store.age before writing", S + "migrate.py",
-     "    target = paths.form_path() if not paths.form_path().exists() else paths.from_v2_form_path()\n",
-     "    os.replace(store, paths.backups_dir() / 'early.age')\n"
-     "    target = paths.form_path() if not paths.form_path().exists() else paths.from_v2_form_path()\n",
-     "test_migrate::test_failure_paths"),
-    ("migration keeps partial writes after a failure", S + "migrate.py",
-     "        for p in reversed(created):\n            with contextlib.suppress(OSError):\n                p.unlink()\n",
-     "        pass\n",
-     "test_migrate::test_failure_paths"),
-    ("migration skips the credential accounting", S + "migrate.py",
-     "        if norm(value) in landed or ref in m.dropped_refs:\n            continue\n",
-     "        continue\n",
-     "test_migrate::test_check_catches"),
-    ("vault.age created while v2 waits", S + "vault.py",
-     "    if not migrating and not p.exists() and paths.v2_store_path().exists():\n",
+    ("an import's vault part takes a field no export writes (events_seen)", S + "transfer.py",
+     "    _keys(v, \"vault\", vault.EXPORT_KEYS)\n",
+     "    _keys(v, \"vault\", (*vault.EXPORT_KEYS, \"events_seen\"))\n",
+     "test_transfer_roundtrip::test_strict_validation_refuses_bad_files"),
+    ("vault.age created beside a gateway 0.6 vault", S + "vault.py",
+     "    if v06_waiting():\n        raise VaultError(V06_MESSAGE)\n",
+     "",
+     "test_vault::test_save_refuses_a_new_vault_beside_a_gateway_06_vault"),
+    ("the 0.6 detector ignores store.age", S + "vault.py",
+     "    return paths.v2_store_path().exists() and not paths.vault_path().exists()\n",
+     "    return False\n",
+     "test_vault::test_save_refuses_a_new_vault_beside_a_gateway_06_vault"),
+    ("a leftover store.age beside the vault still counts as a 0.6 install", S + "vault.py",
+     "    return paths.v2_store_path().exists() and not paths.vault_path().exists()\n",
+     "    return paths.v2_store_path().exists()\n",
+     "test_session::test_a_gateway_06_vault_is_named_once_and_nothing_is_written_beside_it"),
+    ("the ratchet starts a vault (its folder and lock) beside a gateway 0.6 vault", S + "consent.py",
+     "    if vault.v06_waiting():\n        return []\n",
+     "",
+     "test_session::test_a_gateway_06_vault_is_named_once_and_nothing_is_written_beside_it"),
+    ("SessionStart writes the starter beside a gateway 0.6 vault", S + "hooks_session.py",
+     "    if vault.v06_waiting():\n        return\n    if data is None and vault.exists():",
+     "    if data is None and vault.exists():",
+     "test_session::test_a_gateway_06_vault_is_named_once_and_nothing_is_written_beside_it"),
+    ("SessionStart doesn't name a gateway 0.6 vault", S + "hooks_session.py",
+     "    if vault.v06_waiting():\n        msgs.append(vault.V06_MESSAGE)\n    form, eff, data = prepare(msgs, write=True)\n",
+     "    form, eff, data = prepare(msgs, write=True)\n",
+     "test_session::test_a_gateway_06_vault_is_named_once_and_nothing_is_written_beside_it"),
+    ("the vault passphrase's wrap runs age beside a gateway 0.6 vault", S + "daemon/broker.py",
+     "        if vault.v06_waiting():\n            raise BrokerError(vault.V06_MESSAGE)\n        try:\n",
+     "        if False:\n            raise BrokerError(vault.V06_MESSAGE)\n        try:\n",
+     "test_broker::test_a_wrap_beside_a_gateway_06_vault_is_refused"),
+    ("the vault passphrase's wrap lands beside a 0.6 vault that appeared while age ran",
+     S + "daemon/broker.py",
+     "                if vault.v06_waiting():\n                    raise BrokerError(vault.V06_MESSAGE)\n",
+     "                if False:\n                    raise BrokerError(vault.V06_MESSAGE)\n",
+     "test_broker::test_a_wrap_beside_a_gateway_06_vault_is_refused"),
+    ("gate runs check, pubkey, host add, ... beside a gateway 0.6 vault", S + "gate.py",
+     "    if cmd not in BESIDE_V06 and vault.v06_waiting():\n",
      "    if False:\n",
-     "test_vault::test_save_refuses_new_vault_while_v2_waits"),
+     "test_gate::test_beside_a_gateway_06_vault_only_read_only_commands_run"),
     ("raised rights not detected", S + "consent.py",
-     "        if RANK.get(f, 0) > RANK.get(a, 0):\n            W(",
-     "        if False:\n            W(",
+     "    if up:\n        W(_change_text(k, f, a, up, what=what, approves=approves))\n",
+     "    if False:\n        W(_change_text(k, f, a, up, what=what, approves=approves))\n",
      "test_consent::test_consent_sudo_false_to_true"),
     ("effective rights take the form's value", S + "consent.py",
-     "        setattr(e, k, rmin(a, f))\n",
-     "        setattr(e, k, f)\n",
+     "    return f.minimum(a)\n",
+     "    return f\n",
      "test_consent::test_consent_sudo_ask_to_true"),
     ("new addresses count as approved", S + "consent.py",
      "        if _covered(fa, approved_addrs):\n",
@@ -139,17 +163,13 @@ MUTATIONS = [
      "        ok = True\n",
      "test_consent::test_consent_api_key_new_site"),
     ("narrowing doesn't lower the approved snapshot", S + "consent.py",
-     "    if not eff.narrowed and not p_hosts and not p_accts:\n        return []\n",
-     "    return []\n",
+     "    eff = compute(form, data)\n    if not eff.narrowed:\n        return []\n",
+     "    eff = compute(form, data)\n    return []\n",
      "test_consent::test_narrowing_ratchet"),
     ("approve ignores what the pop-up showed", S + "consent.py",
      "            if shown != sorted(c.render() for c in pending):\n",
      "            if False:\n",
      "test_consent::test_approve_records"),
-    ("others = mine applies without an OK", S + "consent.py",
-     "    elif f_oth == \"mine\" and a_oth != \"mine\":\n",
-     "    elif False:\n",
-     "test_consent::test_consent_others_mine"),
     ("private path rendered into context", S + "hooks_session.py",
      "    howto = _howto(eff)\n    text = \"\\n\".join(lines + howto)\n",
      "    howto = _howto(eff)\n    text = \"\\n\".join(lines + howto + [str(paths.private_dir())])\n",
@@ -166,10 +186,6 @@ MUTATIONS = [
      "    return s if isinstance(s, str) and SAFE_ECHO.fullmatch(s) else None\n",
      "    return s if isinstance(s, str) else None\n",
      "test_form::test_case_unsafe_name_never_echoed"),
-    ("env file keeps the user's agent under refuse", S + "envfile.py",
-     "    if others != \"mine\":\n",
-     "    if False:\n",
-     "test_envfile::test_env_file_idempotent_under_every_shell"),
     ("explicit GATE_ACCOUNT skips the bound check", S + "accounts.py",
      "            if not covers(bound, host):\n",
      "            if False:\n",
@@ -207,21 +223,17 @@ MUTATIONS = [
      "",
      "test_harness_run::test_hook_files_ratchets_before_a_form_edit"),
     ("gate/subagent don't persist narrowings", S + "hooks_session.py",
-     "    if not paths.v2_store_path().exists() and (\n            (data is None and not vault.exists())",
-     "    if False and (\n            (data is None and not vault.exists())",
+     "    if ((data is None and not vault.exists())\n",
+     "    if False and ((data is None and not vault.exists())\n",
      "test_gate::test_status_writes_the_vault_only_to_persist"),
     ("a missing form ratchets approvals away", S + "consent.py",
-     "    if form.syntax_error is not None or not form.exists:\n        return []\n    eff = compute(form, data)\n    p_hosts",
-     "    if form.syntax_error is not None:\n        return []\n    eff = compute(form, data)\n    p_hosts",
+     "    if form.syntax_error is not None or not form.exists:\n        return []\n    eff = compute(form, data)\n    if not eff",
+     "    if form.syntax_error is not None:\n        return []\n    eff = compute(form, data)\n    if not eff",
      "test_consent::test_sync_narrowing_never_runs_on_a_missing_form"),
     ("a missing form is replaced by the starter", S + "hooks_session.py",
      "    if last:\n        if write and _create_form(last):\n",
      "    if False:\n        if write and _create_form(last):\n",
      "test_session::test_missing_form_is_restored"),
-    ("migration loser skips the re-check under the locks", S + "migrate.py",
-     "                if not store.is_file() or paths.vault_path().exists():\n                    return _leftover_locked(store, key)\n",
-     "                pass\n",
-     "test_migrate::test_two_processes_racing"),
     ("stand-ins trust CLAUDE_PLUGIN_DATA from the caller", S + "paths.py",
      "    if _TRUST_ENV_DATA:\n        v = _env_abs(\"CLAUDE_PLUGIN_DATA\")\n",
      "    if True:\n        v = _env_abs(\"CLAUDE_PLUGIN_DATA\")\n",
@@ -230,10 +242,6 @@ MUTATIONS = [
      '    paths.trust_plugin_env(mode in HOOKS or mode == "mcp")\n',
      "    paths.trust_plugin_env(True)\n",
      "test_paths_audit::test_run_dispatch_trusts_the_env"),
-    ("git falls back to the user's credential helpers", S + "envfile.py",
-     "    return (GIT_RESET if others != \"mine\" else \"\") + (helper_text or \"\")\n",
-     "    return helper_text or \"\"\n",
-     "test_envfile::test_git_config_resets_credential_helpers"),
     ("stub rewrite leaves a gap", S + "envfile.py",
      "        os.replace(tmp, final / name)\n",
      "        with contextlib.suppress(OSError):\n            (final / name).unlink()\n"
@@ -278,13 +286,13 @@ MUTATIONS = [
     # --- review round 3 ---------------------------------------------------
     # --- rolled back: the gateway doesn't change how Claude's commands end ---
     ("env file: an EXIT trap turns a failed command's exit status into 0", S + "envfile.py",
-     "        f\"GIT_SSH_COMMAND={sq(b / 'ssh')}; RSYNC_RSH={sq(b / 'ssh')}; export GIT_SSH_COMMAND RSYNC_RSH\",\n    ]",
-     "        f\"GIT_SSH_COMMAND={sq(b / 'ssh')}; RSYNC_RSH={sq(b / 'ssh')}; export GIT_SSH_COMMAND RSYNC_RSH\",\n"
-     "        'if [ -n \"${CLAUDE_PID-}\" ]; then trap \\'__gw_rc=$?; trap - EXIT; exit 0\\' EXIT; fi',\n    ]",
+     "        'case \":${PATH-}:\" in *\":$GW_BIN:\"*) ;; *) PATH=\"$GW_BIN${PATH:+:$PATH}\"; export PATH;; esac',\n",
+     "        'case \":${PATH-}:\" in *\":$GW_BIN:\"*) ;; *) PATH=\"$GW_BIN${PATH:+:$PATH}\"; export PATH;; esac',\n"
+     "        'if [ -n \"${CLAUDE_PID-}\" ]; then trap \\'__gw_rc=$?; trap - EXIT; exit 0\\' EXIT; fi',\n",
      "test_envfile::test_a_failed_command_keeps_its_exit_code_in_claudes_shell"),
     ("launch.sh's degraded env file sets an EXIT trap", "hooks/launch.sh",
-     "  printf '  GIT_SSH_COMMAND=%s; RSYNC_RSH=%s; export GIT_SSH_COMMAND RSYNC_RSH\\n' \"$(q \"$B/ssh\")\" \"$(q \"$B/ssh\")\"\n",
-     "  printf '  GIT_SSH_COMMAND=%s; RSYNC_RSH=%s; export GIT_SSH_COMMAND RSYNC_RSH\\n' \"$(q \"$B/ssh\")\" \"$(q \"$B/ssh\")\"\n"
+     "  printf '%s\\n' '  case \":${PATH-}:\" in *\":$GW_BIN:\"*) ;; *) PATH=\"$GW_BIN${PATH:+:$PATH}\"; export PATH;; esac'\n",
+     "  printf '%s\\n' '  case \":${PATH-}:\" in *\":$GW_BIN:\"*) ;; *) PATH=\"$GW_BIN${PATH:+:$PATH}\"; export PATH;; esac'\n"
      "  printf '%s\\n' \"  trap 'exit 0' EXIT\"\n",
      "test_envfile::test_launch_degraded_session_matches_python"),
     ("transcripts: only <projects>/<project>/<name>.jsonl again", S + "paths.py",
@@ -348,10 +356,61 @@ def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def run_selector(sel: str, env: dict[str, str]) -> tuple[int, str]:
+    """`run_tests.py -q -k SUB MODULE` on PLUGIN, as every mutation runs its
+    test: (exit status, the summary line)."""
+    mod, _, sub = sel.partition("::")
+    r = subprocess.run([sys.executable, "tests/run_tests.py", "-q", "-k", sub, mod],
+                       cwd=PLUGIN, capture_output=True, text=True, timeout=600,
+                       env=dict(env, GW_TEST_NO_LITTER_CHECK="1"))
+    return r.returncode, (r.stdout.strip().splitlines() or ["?"])[-1]
+
+
+BASELINE_JOBS = 2   # test modules run side by side (as `pixi run test` does); one module's in turn
+
+
+def baseline(sels: list[str]) -> dict[str, str]:
+    """Each named test once, unmutated, on PLUGIN, the way a mutation runs it
+    (mutations.md finding 2: a test that fails on every copy, mutated or
+    not, counted as a kill). selector -> "" when it passes, else why it
+    can't judge a mutation. Modules run BASELINE_JOBS at a time, each with
+    its own GW_TEST_TMP; a module's selectors in turn, as its tests never
+    run side by side in the suite either."""
+    groups: dict[str, list[str]] = {}
+    for sel in sels:
+        groups.setdefault(sel.partition("::")[0], []).append(sel)
+    base = os.environ.get("GW_TEST_TMP") or tempfile.gettempdir()
+
+    def module(mod_sels: list[str]) -> list[tuple[str, str]]:
+        tmp = tempfile.mkdtemp(prefix="baseline-", dir=base)
+        out = []
+        try:
+            for sel in mod_sels:
+                try:
+                    rc, tail = run_selector(sel, dict(os.environ, GW_TEST_TMP=tmp))
+                except subprocess.TimeoutExpired:
+                    rc, tail = 1, "timed out after 600 s"
+                m = re.search(r"(\d+) passed, (\d+) failed", tail)
+                if rc == 0 and m and int(m.group(1)) > 0 and m.group(2) == "0":
+                    out.append((sel, ""))
+                elif m and m.group(1) == "0" and m.group(2) == "0":
+                    out.append((sel, f"names no test ({tail})"))
+                else:
+                    out.append((sel, f"fails without the mutation ({tail})"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return out
+    with ThreadPoolExecutor(max_workers=BASELINE_JOBS) as ex:
+        return {sel: why for res in ex.map(module, groups.values()) for sel, why in res}
+
+
 def main(argv: list[str]) -> int:
     """`-k SUBSTR` picks mutations by name; `--copy DIR` mutates a copy of
     plugins/gateway (tests/run_mutations.py makes one) instead of this
-    checkout, so nobody else's test run ever sees a mutated file."""
+    checkout, so nobody else's test run ever sees a mutated file. Before
+    any mutation, every named test runs once unmutated (`baseline`); a
+    mutation whose snippet isn't found exactly once, or whose test fails
+    (or names no test) without it, is an ERROR, never a kill."""
     global PLUGIN
     argv = list(argv)
     if "--copy" in argv:
@@ -359,36 +418,44 @@ def main(argv: list[str]) -> int:
         PLUGIN = Path(argv[k + 1]).resolve()
         del argv[k:k + 2]
     pat = argv[argv.index("-k") + 1] if "-k" in argv else None
-    killed = survived = 0
-    for name, rel, old, new, sel in MUTATIONS:
+    killed = survived = errors = 0
+    todo = []
+    for mut in MUTATIONS:
+        name, rel, old, _new, _sel = mut
         if pat and pat not in name:
+            continue
+        if (PLUGIN / rel).read_text().count(old) != 1:
+            print(f"  ERROR {name}: the snippet isn't found exactly once in {rel}")
+            errors += 1
+            continue
+        todo.append(mut)
+    t0 = time.time()
+    broken = baseline(list(dict.fromkeys(m[4] for m in todo)))
+    print(f"baseline: {len(broken)} named tests run unmutated in {time.time() - t0:.0f}s, "
+          f"{sum(1 for why in broken.values() if why)} can't judge a mutation")
+    for name, rel, old, new, sel in todo:
+        if broken[sel]:
+            print(f"  ERROR {name}: its test {sel} {broken[sel]}")
+            errors += 1
             continue
         f = PLUGIN / rel
         orig = f.read_text()
         h = sha(f)
-        if orig.count(old) != 1:
-            print(f"  ERROR {name}: the snippet isn't found exactly once in {rel}")
-            survived += 1
-            continue
-        mod, _, sub = sel.partition("::")
         try:
             f.write_text(orig.replace(old, new))
-            r = subprocess.run([sys.executable, "tests/run_tests.py", "-q", "-k", sub, mod],
-                               cwd=PLUGIN, capture_output=True, text=True, timeout=600,
-                               env=dict(os.environ, GW_TEST_NO_LITTER_CHECK="1"))
+            rc, tail = run_selector(sel, dict(os.environ))
         finally:
             f.write_text(orig)
             assert sha(f) == h, f"{rel} was not restored"
-        tail = (r.stdout.strip().splitlines() or ["?"])[-1]
         m = re.search(r"(\d+) passed, (\d+) failed", tail)
-        if r.returncode != 0 and m and int(m.group(2)) > 0:
+        if rc != 0 and m and int(m.group(2)) > 0:
             killed += 1
             print(f"  killed   {name}  ({sel}: {tail})")
         else:
             survived += 1
             print(f"  SURVIVED {name}  ({sel}: {tail})")
-    print(f"\n{killed} mutations killed, {survived} survived")
-    return 1 if survived else 0
+    print(f"\n{killed} mutations killed, {survived} survived, {errors} errors")
+    return 1 if survived or errors else 0
 
 
 if __name__ == "__main__":

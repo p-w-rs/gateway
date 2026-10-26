@@ -4,7 +4,7 @@ synthetic canaries through every input route, authorized service access,
 alternate read paths, and a scan of everything either plugin, Claude Code,
 its telemetry and a nosy third-party mod could have recorded.
 
-    pixi exec --spec python=3.12 --spec pyte python tests/acceptance_canaries.py \\
+    pixi exec --spec python --spec pyte python tests/acceptance_canaries.py \\
         --tmp DIR [--keep] [--pixi-cache DIR] [--checkpoint DIR]
 
 The gateway (e2e route) and checkpoint (check@checkpoint) are installed from
@@ -18,11 +18,13 @@ here, never printed and never in a prompt.
 
 Steps (acceptance_dialogs.py's steps reused, with checkpoint recording every
 tool call):
-  sudo      the consent for the form's sudo = true first (a new install's sudo
-            here is "ask" since 0.10.0: Approve), then
+  sudo      the consent for the form's sudo = true first (configuring this
+            computer's sudo applies up to "ask" at once, true waits for the
+            OK: Approve), then
             the sudo dialog: typing BEFORE the click (held back by the guard),
             a wrong value (validation: "That didn't work"), a partial value
-            then the focus moved away (Escape: dropped), the right value (Enter)
+            then the focus moved away (Escape: dropped), the right value
+            (Enter); the passphrase offer that follows: Not now
   paste     a canary PASTED (bracketed paste) into the prompt box while a
             secret dialog waits: held back, never submitted; the dialog then
             cancelled (nothing stored)
@@ -35,6 +37,16 @@ tool call):
             typed into the dialog, then the gw http tool calls the service
             with the account: the service receives the key (by hash), echoes
             it back in its body, and the tool result Claude gets is masked
+  webfetch  an api-key account kept for this step alone (webkey: its key typed
+            into the dialog), then WebFetch of a page the harness serves on
+            https://127.0.0.1 (a scratch CA added to NODE_EXTRA_CA_CERTS): the
+            summary the fake model gives quotes webkey's key, and the tool
+            result Claude gets is masked (PostToolUse's ".*" matcher,
+            PLAN-0.11 §9.1). That key is in WebFetch's raw result, which
+            every plugin's hook gets before the gateway masks it: it is left
+            out of the observer, debug-log and PTY scans (a stated limit).
+            The Browser pane is the desktop app's only: unit-tested with a
+            recorded payload, not here
   vault     /gate-unlock sets a vault passphrase (two fields), /gate-lock,
             /gate-unlock with a wrong passphrase (refused), then the right one
   alt       alternate read and execution paths, as Claude would try them: the
@@ -53,7 +65,8 @@ telemetry payload, the observer's records, the gateway's data (gated log,
 events, audit log, terminals), its home (form, encrypted vault), its run dir,
 checkpoint's state (journal, spool, sessions, registry) and its export
 bundle, the session homes (shell history files), the probe's outputs, the
-process-table argv samples and the PTY output. Prints one line per check and
+process-table argv samples and the PTY output (the webfetch key: not in the
+observer's records, the debug log or the PTY). Prints one line per check and
 a JSON summary to --tmp/acceptance-canaries.json; exits non-zero on any
 failure.
 """
@@ -80,6 +93,7 @@ REPO = PLUGIN.parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
 import acceptance_dialogs as AD  # noqa: E402
+import acceptance_lib as L  # noqa: E402
 from tui import driver, install, proxy, safety, scan  # noqa: E402
 from tui.fakeapi import result_text, tool_results  # noqa: E402
 
@@ -191,7 +205,7 @@ def main(argv: list[str]) -> int:
     print(f"acceptance (canaries, both plugins): root {root}", flush=True)
     env = {"PIXI_CACHE_DIR": a.pixi_cache or str(root / "pixi-cache")}
     names = ("sudo-right", "sudo-wrong", "focus-partial", "guard-typed", "clipboard", "token-after-kill",
-             "pasted", "service-key", "vault-pass", "vault-wrong")
+             "pasted", "service-key", "webfetch-key", "vault-pass", "vault-wrong")
     C = {n: scan.Canary.new(n) for n in names}
     shims, shim_log = AD.path_shims(root)
     env["PATH"] = AD.shimmed_path(shims)
@@ -279,8 +293,21 @@ def run(root: Path, env: dict, C: dict, watcher, svc: Service, ck_src: Path) -> 
         (gi.gateway_home / "gateway.toml").write_text(AD.FORM)
         proj = root / "proj"
         proj.mkdir()
+        # the webfetch step's page: https://127.0.0.1 with a scratch CA, which the
+        # session trusts beside the record-only proxy's (NODE_EXTRA_CA_CERTS);
+        # the domain preflight is skipped (a project setting), the proxy would
+        # answer it
+        pxe = px.env()
+        try:
+            site = L.TlsSite(root / "tls", WEB_PAGE)
+            pxe["NODE_EXTRA_CA_CERTS"] = str(site.ca_bundle(pxe.get("NODE_EXTRA_CA_CERTS")))
+        except (OSError, RuntimeError) as ex:
+            site = None
+            check("webfetch: a scratch CA and a certificate for 127.0.0.1 are made (openssl)", False, str(ex))
+        (proj / ".claude").mkdir()
+        (proj / ".claude" / "settings.json").write_text(json.dumps({"skipWebFetchPreflight": True}))
         s = driver.Session(root / "s1", proj, config_dir=h.inst.config_dir,
-                           extra_env={**env, **px.env(), "CLAUDE_CODE_NO_FLICKER": "1"},
+                           extra_env={**env, **pxe, "CLAUDE_CODE_NO_FLICKER": "1"},
                            replies=[AD.bash("gate check localhost", "set up sudo"), "sudo step answered"],
                            debug_file=True, observer=True, cols=170, rows=50,
                            permission_mode="bypassPermissions", start=False)
@@ -298,7 +325,8 @@ def run(root: Path, env: dict, C: dict, watcher, svc: Service, ck_src: Path) -> 
             AD.step_sudo(s, gi, C["sudo-right"], C["sudo-wrong"], C["focus-partial"], C["guard-typed"])
             form2 = (AD.FORM + AD.ACCOUNTS
                      + '\n[accounts.pastey]\nkind = "api-key"\nsites = ["api.pastey.example"]\n'
-                     + '\n[accounts.svc]\nkind = "api-key"\nsites = ["127.0.0.1"]\nauth = "bearer"\n')
+                     + '\n[accounts.svc]\nkind = "api-key"\nsites = ["127.0.0.1"]\nauth = "bearer"\n'
+                     + '\n[accounts.webkey]\nkind = "api-key"\nsites = ["api.webkey.example"]\n')
             (gi.gateway_home / "gateway.toml").write_text(form2)
             step_paste(s, C["pasted"])
             s.api.script([AD.bash("gate check clip", "add the clip account"), "clip step answered"])
@@ -310,12 +338,16 @@ def run(root: Path, env: dict, C: dict, watcher, svc: Service, ck_src: Path) -> 
             s.api.script([AD.bash("gate check reload", "add reload"), "reload step answered"])
             AD.step_reload(s, gi)
             step_service(s, svc, C["service-key"])
-            receipts(gi, C)
+            if site is not None:
+                step_webfetch(s, site, C["webfetch-key"])
+            receipts(gi, C, webfetch=site is not None)
             step_vault(s, gi, C["vault-pass"], C["vault-wrong"])
             step_alt(s, gi, proj)
             s.pump(2.0)
         finally:
             s.close()
+            if site is not None:
+                site.close()
         bundle = step_export(root, h, p, home)
         scans(root, s, gi, px, C, h, home, bundle, proj)
 
@@ -345,23 +377,33 @@ def step_paste(s, pasted) -> None:
     AD.wait(s, lambda: "paste step answered" in s.all_text(), 60)
 
 
-def step_service(s, svc: Service, key) -> None:
-    print("service: an api-key account bound to a local service; the gw http tool", flush=True)
-    s.api.script([AD.bash("gate check svc", "add the service account"), "svc step answered"])
-    s.submit("add the svc account")
-    ok = AD.wait(s, lambda: "Approve" in AD.screen(s) and "svc" in AD.screen(s), 120)
+def add_api_key(s, name: str, key, step: str) -> tuple[bool, bool]:
+    """gate check NAME for an api-key account the form just gained: the
+    consent (Approve), then its key typed into the private field. (the
+    dialog opened, the key was taken)."""
+    s.api.script([AD.bash(f"gate check {name}", f"add the {name} account"), f"{name} step answered"])
+    s.submit(f"add the {name} account")
+    ok = AD.wait(s, lambda: "Approve" in AD.screen(s) and name in AD.screen(s), 120)
     if ok:
-        AD.press(s, "Approve", lambda: "api key for svc" in AD.screen(s))
-    ok = AD.wait(s, lambda: "api key for svc" in AD.screen(s) and AD.FIELD in AD.screen(s), 60)
-    check("service: the svc key dialog opens after the OK", ok, s.dump(20))
+        AD.press(s, "Approve", lambda: f"api key for {name}" in AD.screen(s))
+    ok = AD.wait(s, lambda: f"api key for {name}" in AD.screen(s) and AD.FIELD in AD.screen(s), 60)
+    check(f"{step}: the {name} key dialog opens after the OK", ok, s.dump(20))
     if not ok:
-        return
+        return False, False
     AD.focus_field(s)
     s.type(key.value)
     s.key("enter")
-    ok = AD.wait(s, lambda: AD.FIELD not in AD.screen(s), 60)
-    check("service: the key typed into the private field is taken", ok, s.dump(20))
-    AD.wait(s, lambda: "svc step answered" in s.all_text(), 60)
+    taken = AD.wait(s, lambda: AD.FIELD not in AD.screen(s), 60)
+    check(f"{step}: the key typed into the private field is taken", taken, s.dump(20))
+    AD.wait(s, lambda: f"{name} step answered" in s.all_text(), 60)
+    return True, taken
+
+
+def step_service(s, svc: Service, key) -> None:
+    print("service: an api-key account bound to a local service; the gw http tool", flush=True)
+    opened, _taken = add_api_key(s, "svc", key, "service")
+    if not opened:
+        return
     n0 = len(s.api.main_requests())
     s.api.script([{"tool": HTTP, "input": {"url": f"http://127.0.0.1:{svc.port}/echo", "account": "svc"}},
                   "service answered"])
@@ -377,7 +419,46 @@ def step_service(s, svc: Service, key) -> None:
     SUMMARY["service_requests"] = len(svc.hashes)
 
 
-def receipts(gi, C) -> None:
+WEB_PAGE = ("<!doctype html><html><head><title>gateway acceptance page</title></head>"
+            "<body><p>The gateway acceptance page: nothing secret here.</p></body></html>\n")
+
+
+def step_webfetch(s, site, key) -> None:
+    """PLAN-0.11 §9.1, §14: WebFetch's result passes the PostToolUse hook like
+    any tool's. The page itself holds nothing secret (its text goes to the
+    model's summarizer, which is a model request); the fake model's summary
+    quotes the stored key of an account kept for this step alone (webkey),
+    and the tool result Claude gets must show it masked. The fake API
+    answers summaries with its default text, set to that summary only for
+    this turn. That key reaches Claude Code unmasked (the raw result), so
+    scans() leaves it out where other plugins' hooks and Claude Code's own
+    debug log see a tool's raw result."""
+    print("webfetch: a page the harness serves over https; the tool result masked", flush=True)
+    _opened, taken = add_api_key(s, "webkey", key, "webfetch")
+    if not taken:
+        return              # not stored: quoting it would only plant an unmasked canary
+    n0 = len(s.api.main_requests())
+    summary = f"The page is the gateway acceptance page. It quotes {key.value} as an example."
+    s.api.script([{"tool": "WebFetch", "input": {"url": site.url, "prompt": "What does the page say?"}},
+                  "webfetch answered"], default_text=summary)
+    try:
+        s.submit("read the acceptance page")
+        AD.wait(s, lambda: len(s.api.main_requests()) >= n0 + 2, 180)
+    finally:
+        s.api.script([], default_text="ok")
+    reqs = s.api.main_requests()
+    res = "\n".join(result_text(b) for b in tool_results(reqs[n0 + 1])) if len(reqs) > n0 + 1 else ""
+    SUMMARY["webfetch_result_head"] = res[:200].replace(key.value, "<k>")
+    fetched = bool(site.paths)
+    check("webfetch: Claude Code fetched the harness's https page (127.0.0.1, a scratch CA)", fetched,
+          f"requests seen by the page: {site.paths}; the tool result: {res[-300:].replace(key.value, '<k>')}")
+    if fetched:
+        check("webfetch: the tool result Claude gets has the quoted stored key masked (***)",
+              "***" in res and key.value not in res, res[-300:].replace(key.value, "<k>"))
+    AD.wait(s, lambda: "webfetch answered" in s.all_text(), 30)
+
+
+def receipts(gi, C, webfetch: bool = True) -> None:
     age = AD.age_binary(gi.root)
     if age is None:
         check("the gateway's age binary is found to read the scratch vault", False)
@@ -392,6 +473,9 @@ def receipts(gi, C) -> None:
     check("broker receipt (after gated was killed): killme's token is the canary typed after the restart",
           sha(tok("killme")) == sha(C["token-after-kill"].value))
     check("broker receipt (service): svc's key is the typed canary", sha(tok("svc")) == sha(C["service-key"].value))
+    if webfetch:
+        check("broker receipt (webfetch): webkey's key is the typed canary",
+              sha(tok("webkey")) == sha(C["webfetch-key"].value))
     check("nothing stored for the pasted (cancelled), queued (cancelled/declined) and reloaded (cancelled) requests",
           not tok("pastey") and not tok("qa") and not tok("qb") and not tok("reload"))
 
@@ -486,8 +570,14 @@ def step_export(root: Path, h, p, home: Path) -> Path | None:
 def scans(root: Path, s, gi, px, C: dict, h, home: Path, bundle: Path | None, proj: Path) -> None:
     print("scans: every canary everywhere it must not be", flush=True)
     secret = [C[n] for n in ("sudo-right", "sudo-wrong", "focus-partial", "clipboard", "token-after-kill",
-                             "service-key", "vault-pass", "vault-wrong")]
+                             "service-key", "webfetch-key", "vault-pass", "vault-wrong")]
     allc = list(C.values())
+    # The webfetch step's key reaches Claude Code unmasked (WebFetch's raw result): every
+    # plugin's PostToolUse hook gets it before the gateway's answer masks it, and Claude Code's
+    # debug log and screen may show what the hooks got. Scanned where the masking answers for
+    # it (the model's requests, transcripts, telemetry, both plugins' own records), not there.
+    raw = [C["webfetch-key"]]
+    not_raw = lambda cs: [c for c in cs if c not in raw]  # noqa: E731
     places = {
         "the scratch Claude config (transcripts, history, plugin data, caches)": h.inst.config_dir,
         "the gateway's data (gated log, events, audit log, terminals, managed shell)": gi.root / "data",
@@ -506,20 +596,26 @@ def scans(root: Path, s, gi, px, C: dict, h, home: Path, bundle: Path | None, pr
             continue
         rep = scan.Report()
         exclude = [gi.root / "fake-sudo", gi.root / "fake-clip"]
-        rep.scan_tree(where, *(allc if what.startswith(("checkpoint", "the scratch Claude", "the proxied",
-                                                          "the session")) else secret), exclude=exclude)
+        cs = allc if what.startswith(("checkpoint", "the scratch Claude", "the proxied", "the session")) else secret
+        if what.startswith("the observer"):
+            cs = not_raw(cs)
+        rep.scan_tree(where, *cs, exclude=exclude)
         check(f"scan: no canary in {what}", rep.clean(), rep.summary())
     rep = scan.Report()
     if s.debug_path and s.debug_path.exists():
-        rep.scan_tree(s.debug_path.parent, *secret, exclude=[s.observer.root] if s.observer else [])
+        rep.scan_tree(s.debug_path.parent, *not_raw(secret), exclude=[s.observer.root] if s.observer else [])
         check("scan: no canary in the --debug-file log", rep.clean(), rep.summary())
     rep = scan.Report()
     rep.scan_api_log(s.api.log_path, *allc)
-    check("scan: no canary (typed, pasted, guarded, service key, vault passphrases) in any fake-API request "
-          "(the model's inputs, tool results included)", rep.clean(), rep.summary())
+    check("scan: no canary (typed, pasted, guarded, service key, the webfetch key, vault passphrases) in any "
+          "fake-API request (the model's inputs, tool results included)", rep.clean(), rep.summary())
     rep = scan.Report()
-    rep.scan_bytes(bytes(s.raw), "pty", *[c for c in secret if c.id not in ("vault-wrong",)], ansi=True)
+    rep.scan_bytes(bytes(s.raw), "pty", *[c for c in not_raw(secret) if c.id not in ("vault-wrong",)], ansi=True)
     check("scan: no typed or stored canary in the PTY output (bullets only)", rep.clean(), rep.summary())
+    note("documented limit: a tool's raw result reaches every plugin's PostToolUse hook before the gateway "
+         "masks it, so the webfetch step's key (in WebFetch's raw result) is left out of the observer, "
+         "--debug-file and PTY scans above; it is scanned in the model's requests, transcripts, telemetry "
+         "and both plugins' own records")
     n = len(px.requests())
     check(f"telemetry: first-party requests captured before encryption and scanned ({n})", n > 0)
     SUMMARY["telemetry_requests"] = n

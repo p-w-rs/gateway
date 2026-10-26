@@ -2285,7 +2285,9 @@ the acceptance's PID0 line). 0.9.1 hadn't shipped, so the version stays.
 
 ## 0.10.0 decisions (2026-10-22)
 
-What the 0.10.0 fix rounds decided, and why. The details are in the module
+What the 0.10.0 fix rounds decided, and why (0.11.0 removed the install
+mark and its older-install default, and made unconfigured sudo the user's
+own: see the next section). The details are in the module
 docs (sudo.md, managed.md, daemon.md, accounts.md) and CLAUDE.md's
 invariants 3, 5, 11, 14 and 17.
 
@@ -2327,6 +2329,179 @@ invariants 3, 5, 11, 14 and 17.
   says to write the command out. The scan's known misses are listed in
   managed.md; it is a guardrail, the stand-ins and the vault are the
   boundary.
+
+## 0.11.0 decisions (2026-10-23 to 2026-10-24)
+
+The user approved eight decisions for 0.11.0; [PLAN-0.11.md](PLAN-0.11.md)
+implements them, its section 18 lists what its reviews changed or rejected,
+and its section 19 holds the lead's decisions, which win over the rest. In
+short:
+
+- **Ungated unless configured** (decision 1). The gateway stands only
+  between Claude and the hosts and accounts gateway.toml configures; anything
+  else uses the user's own tools, untouched, with no gateway decision. It
+  reverses v3's "unlisted machines are refused". Consequences accepted and
+  documented: Claude's shell holds the user's own agent and tokens, and any
+  route around a stand-in can reach a configured host with them, so a host's
+  limits bind only if the user's own credentials don't also open it; this
+  computer's sudo is the user's own until configured, and then works only
+  where it needs no password. "Configured" is sticky: the form, the approved
+  snapshot and `private/configured.json`; taking a target out is a widening,
+  and a broken form never lets a configured target through. Stand-ins exist
+  only where something configured can be reached, so a new install shadows
+  nothing. Rejected: global `[policy]` read/exec/write/credential denies
+  reaching unconfigured hosts (the hook can't judge a host it knows nothing
+  about, and refusing all unconfigured ssh would undo the decision);
+  re-seeding the starter with `[hosts.localhost] sudo = "ask"`.
+- **Per-mode values** (decision 2). Every right and restriction can differ
+  per Claude Code permission mode, one order everywhere (deny < ask < cc <
+  allow < unconfigured), a table must name `default`, a bare `true` keeps its
+  meaning (allow in auto and bypass only), dontAsk gets cc, plan never
+  allows. Callers with no mode (jobs, terminals, scripts, gated) use the
+  strictest word of every mode but plan. Rejected: ranking cc with ask where
+  Claude Code prompts anyway (its allow rules can make cc wider); dropping
+  dontAsk. Lead decision 1: an explicit `allow` the user writes for a mode
+  is honoured (the network class, the http and download tools); defaults
+  never approve. Lead decision 3: the recorded mode carries an epoch, so a
+  stand-in never reads a record older than the last mode it was told.
+- **Network commands are one class** (decision 3): curl, wget and the rest
+  are asked about by default in every mode, behind sudo and wrappers too,
+  and a hit not allowed in that mode keeps the gateway's allow off the
+  whole command (lead decision 19.1: an explicit allow approves). It is a
+  guardrail; the known misses are listed (network.md). curl and wget lost
+  their special refusal.
+- **No backward compatibility** (decision 4): the 0.6 conversion, export
+  formats 1 and 2, the 0.10.0 install mark and its older-install sudo
+  default, npm's `cli.js` detection, `[settings]`, `managed = "warn"`, the
+  managed refusal and the curl/wget refusal are deleted. A 0.6 vault is
+  converted with the published 0.10.0 first; a detector refuses to create a
+  vault beside one.
+- **Latest only** (decision 5): every dependency `"*"`, `requires-pixi` the
+  newest pixi, one tested pixi and Claude Code, `pixi run update-deps` at
+  each release; an older env is used only on the lock's Python minor.
+- **git decides by repository** (decision 6): in a repository with a
+  configured remote every git command runs the env's git with its own
+  read-only global config, an allowlisted environment and the gateway's
+  settings at command-line scope; everything else runs the user's git. Lead
+  decision 9: local commands there still run while the vault is locked or
+  the entry is broken; anything that contacts the remote is refused. The
+  stand-in's body lives in `githelper.py`, one process, for speed. Rejected:
+  putting only the identities in `GIT_CONFIG_GLOBAL` (a repository's
+  `user.email` could then replace the account's).
+- **Browser sign-in with PKCE** (decision 7) for azure and ml-catalog: the
+  gateway's confirm dialog is the gate, the browser opens by absolute path
+  only after Open, the callback lands on 127.0.0.1, the tokens go straight
+  into the vault, browser-automation tools are refused meanwhile. Lead
+  decision 5: a stored credential that doesn't fit the approved account is
+  refused at use. Lead decision 12: a browser sign-in's refresh token isn't
+  exported (an imported one could never be used).
+- **The vault passphrase is offered, not forced** (decision 8): after a
+  stored secret, until the user answers Set passphrase or Not now.
+- **Lead decision 10**: an account CLI run by its path is refused while an
+  account of its kind exists (its destination can't be told from the
+  words); by its name, the stand-in passes an unconfigured destination to
+  the user's own tool. **Lead decision 11**: a consent or import confirm
+  longer than one dialog comes in parts, applied only after the last.
+- **Lead decision 13 (WS-9)**: while anything is "ask", every Bash call
+  goes to the Bash hook (`$DATA/ask-marker`), about 0.1 s each with a vault:
+  the hidden-command rule can't refuse a `source ./deploy.sh` it never
+  sees, and the stand-ins can't tell its `ssh box` from a typed one.
+  Rejected: more trigger words (any command can hide a program). An
+  account that lists `owners` covers only those and its login (before, the
+  only account of its kind covered every owner whatever it listed, so a
+  personal repository went through a work account's key); listing the
+  first owner is a widening. `sudoedit` and `huggingface-cli` are refused
+  by their bare names where their configured counterpart exists (no
+  stand-in supplies them); the local sudo dialog's Remember it starts
+  unticked, like the remote one.
+- **WS-9 review fixes**: a command that hides what runs in Claude's shell
+  (a sourced file, eval, exec, a variable as the program or `-c` string, a
+  function) is asked about while an entry is "ask", not refused: Claude
+  Code's prompt is the consent an "ask" needs, and the refusal broke
+  `source .venv/bin/activate`, `eval "$(pyenv init -)"` and the like for
+  anyone with `sudo = "ask"`. Rejected: refusing them (a venv or pyenv
+  can't be used), and allowing them (the gap reopens). xargs, parallel and
+  find -exec get no decision for an "ask": what they run has no shell
+  parent, so `typed_by_claude` already refuses an "ask" there; nor does a
+  job. Every restriction a stand-in passes as "ask" for a typed command
+  counts (exec, read, network, the forwarding grants: ssh's
+  `_policy_gate`), not only the rights. The lock's cap on this computer's
+  sudo is no "ask" the user wrote and counts for nothing, and the marker is
+  never removed while the vault can't be read (the unlock brings the
+  approved "ask" back with no form load). "owners listed" waits only for
+  the only account of its kind for a host: beside another one, listing
+  owners takes nothing out.
+- **Lead decision 14 (WS-10a): an "ask" is proved by a record** for every
+  stand-in, replacing the ask marker and the hidden-command ask above. The
+  Bash hook notes each ssh, sudo, account-CLI and git stage it asks about
+  (`asks.py`: Claude Code's process, the real folder, the tool and its
+  exact words, the entries), and a stand-in passes an "ask" only for a
+  typed command with a matching record, once, within 15 minutes. What a
+  sourced file, eval or a function runs never has one, so it needs no
+  prompt (`source .venv/bin/activate` runs) and its stand-in refuses the
+  "ask"; a stage whose words or folder the hook can't spell out is denied
+  up front, since the stand-in would refuse after the OK. Rejected: a
+  record that matches any words (a hidden ssh could take the typed one's),
+  and recording what the hook can't read. The records sit in the user's
+  run folder: a guardrail, like the typed walk. Program names are compared
+  without letter case (macOS's file systems ignore it); the allow step
+  still approves only the plain lower-case name. A job's network class is
+  judged at its payload's mode (nothing re-checks it when the job runs).
+- **WS-10a review: a record lives until the session's next call.** The hook
+  writes its record when it answers "ask", before the user decides, so a
+  declined prompt, one Claude Code couldn't show (`-p`), a stage that never
+  ran (`false && sudo x`) or an account asked about but not chosen left a
+  record a later sourced file could use for 15 minutes. Now the next Bash or
+  Monitor call's hook drops the session's earlier records before anything
+  of it runs, and pre_bash.sh sends every such call to the hook while one is
+  pending (`$DATA/asks`, a link to the run folder's records, so the sh needs
+  no process to look): one Python start, right after an ask only. (None
+  was written in dontAsk; see the release verification's fixes below.)
+  Rejected for now: binding the record to the asked
+  tool call through the typed shell's command line, which would follow
+  Claude Code's script shape (`eval '<command>'`) and fail closed for every
+  "ask" when that changes. The cost of the choice: a command started while
+  an asked one runs (two read-only calls at once, a subagent's, a
+  background command whose asked stage starts after Claude's next command)
+  drops its record, so the asked one is refused after the OK and is run
+  again by itself. The hook also asks about the account the CLI stand-in
+  will choose (`clis.chosen`, GATE_ACCOUNT included) rather than every
+  "ask" account its destination may use; `gate with` follows the account's
+  use and credential policy; `gate check|rotate|copy-to` on an "ask" host
+  need the record too. scp and sftp on "ask" stay refused: the ssh they
+  start would need a proof from the scp process (as git's gated parent
+  gives), left for the lead.
+- **Release verification fixes (verify012).** (1) On Linux the browser
+  sign-in's listener kept listening for up to 0.5 s after the sign-in
+  ended: `close()` doesn't wake a thread waiting in `accept()`, so a
+  connection then completed its handshake (never served). `Listener.close`
+  now shuts the socket down first (macOS can't shut down a listener, but
+  wakes a blocked `accept()` on close), waits for the serve thread, and a
+  connection accepted after that is closed unanswered; the accept no
+  longer polls, and the listener's own timer ends it at its deadline.
+  (2) Claude Code 2.1.310 shows a hook's "ask" in dontAsk too, so the
+  hook's record is written there as in every mode (without it the
+  stand-in refused after the user's Yes). Seen live: in dontAsk a plain
+  `true` gets no gateway decision and Claude Code refuses it, an explicit
+  `dontAsk = "allow"` is approved, and "ask" prompts. (3) Lead decision 8:
+  the stand-ins' refusals (ssh, sudo, the account CLIs, git's credential
+  helper, a pass-through loop) and `gate`'s now name their mode: the one
+  the stand-in read (`_CALL["mode"]`), else the session's recorded mode,
+  else "modeless" (`modes.standin_audit_mode`); `gate` and asiml decide
+  modeless. A web tool's refusal before it read the mode still names none.
+- **Its review's fixes (verify013).** (1) A sign-in's end stops the
+  listener (`Listener.stop`: the socket shut down, nothing that blocks) and
+  removes the marker under the sign-ins' lock, before the waiters hear of
+  it; the wait for the serve thread comes after. Before, a connection made
+  as the end was announced still reached the listener (a 410 page).
+  (2) Lead decision 8 for credential uses too: every `audit.use` names the
+  mode the use was decided in, as the refusals do (the stand-ins' own
+  mode, the http tool's, "modeless" for gated, `gate` and asiml), and so
+  does an Entra mint (`entra.access_token(..., mode=)`, its own use line).
+  A test scans `src/` for an `audit.refusal`, `audit.use` or mint call
+  without a mode.
+- **Not in 0.11.0**: the stored-value paste check (about 0.1 s per prompt;
+  an open question for the user, PLAN-0.11 §9.7).
 
 ## Rejected alternatives
 

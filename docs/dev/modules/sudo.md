@@ -1,9 +1,22 @@
 # sudo group: local sudo, ancestry, bashparse, the Bash approval hook
 
-Group **sudo**. Modules (all Python 3.12 stdlib):
+Group **sudo**. Modules (all stdlib, on the lock's Python):
 `src/gateway/sudo.py`, `ancestry.py`, `bashparse.py`, `hooks_bash.py`, and the
 sh prefilter `hooks/pre_bash.sh`. Contract: [SPEC-v3.md](../SPEC-v3.md) §8,
-§9.1, §10; API conventions: [MODULES-v3.md](../MODULES-v3.md).
+§9.1, §10, with [PLAN-0.11.md](../PLAN-0.11.md) §1.5, §2, §3 and §9.5 where
+they differ; API conventions: [MODULES-v3.md](../MODULES-v3.md). The hook's
+route checks are in [managed.md](managed.md#alternate-routes), the network
+class in [network.md](network.md).
+
+**0.11.0 in short.** This computer's sudo is the user's own unless
+`[hosts.localhost] sudo` (or an elevation restriction here) configures it:
+then the sudo stand-in exists (`envfile.standins_for`), otherwise there is
+none and the hook gives sudo no decision (`hooks_bash.UNCONFIGURED_SUDO =
+None`). Every right and restriction is read per permission mode: the hook in
+the payload's mode, the stand-in in the session's recorded mode for a command
+Claude typed, else the modeless rule. The hook's allow step needs the
+effective word `allow` in that mode (a bare `true`: auto and bypass). curl and
+wget are no longer a special refusal; they are network-class members.
 
 ## ancestry.py (SPEC 10)
 
@@ -141,11 +154,28 @@ times itself with it (`hooks_session.session_hook`).
 
 ## sudo.py (SPEC 9.1)
 
-`main(argv)` — the local sudo stand-in:
+`main(argv)` — the local sudo stand-in, present only while this computer's
+sudo is configured. `_rights_now()` decides first (PLAN-0.11 §1.5):
+
+- **Unconfigured sudo, an elevation restriction only** (`word ==
+  modes.UNCONFIGURED`): the restriction's deny refuses, its "ask" needs a
+  command Claude typed, otherwise **pass-through**: `envfile.pass_through`
+  runs the user's own sudo with the full argv and the environment unchanged
+  (nothing supplied, nothing asked).
+- **Configured but refused** (`eff.refusal("localhost")`: the form gone, the
+  configured list only, a disabled entry): refused with the reason. A vault
+  that can't be read (locked: `vault.VaultLocked`): after the form's own
+  refusals (off in this mode, a policy deny), refused with the vault's own
+  message (`_UNREADABLE`), whoever runs it and before any record is looked
+  at, since the password and the approval are inside it (PLAN-0.11 §19.16).
+- **Gated** otherwise, with the steps below. The word is the session's
+  recorded mode's (`modes.current_for`) for a command Claude typed, else the
+  modeless rule's; a value waiting for the user's OK, or a removed `sudo`
+  key whose removal waits, keeps gating with the approved value.
 
 1. `/usr/bin/sudo` must be root-owned + setuid (tests use the fake sudo through
    `testing.override(tools={"sudo": …})`); otherwise it refuses.
-2. localhost sudo right `false` → refuse; `"ask"` unless
+2. localhost sudo `deny` → refuse; `"ask"` unless
    `ancestry.typed_by_claude()` (whatever `scripts` says) → refuse (`run it as
    its own command so Claude Code can ask you (not inside a script, sh -c,
    xargs or a wrapper)`; inside a checkpoint job, culprit `checkpoint`, the
@@ -155,12 +185,8 @@ times itself with it (`hooks_session.session_hook`).
    the user to set it to true.`; inside a gateway terminal or job, culprit
    `gateway-terminal`, `ASK_PANE` = `consent.pane_ask_message`: `gateway: a
    gateway terminal or job can't use the "ask" right for sudo on this machine
-   (nobody can be asked about what runs there); ...`). While a passphrase
-   vault is locked (`vault.VaultLocked`) the rights come from the new
-   install's defaults, so a `true` or unsaid sudo here is `"ask"` (fails
-   closed); each of these refusals then ends with
-   `consent.LOCKED_SUDO_NOTE` (unlock it with `/gate-unlock`), as do the
-   approval hook's prompt and job refusal for it.
+   (nobody can be asked about what runs there); ...`). A locked vault never
+   gets here (above).
 3. `-S`/`-A` → refuse, including the long forms `--stdin`/`--askpass` and any
    getopt abbreviation of them (`--std`, `--ask`, `--a`). sudo's options are
    scanned the way sudo does (getopt `+`: stop at the first non-option word;
@@ -172,17 +198,28 @@ times itself with it (`hooks_session.session_hook`).
 4. `probe_nopasswd()` (`sudo -n true`, cached 10 min per user in the run dir):
    success → `exec /usr/bin/sudo` untouched — nothing stored, nothing asked,
    for any caller.
+   Every way the configured stand-in runs the system sudo (this exec, step
+   5's, a gateway terminal's, step 6's askpass run) hands it `sudo_env()`:
+   `clis.ENV_ALLOW` and `ENV_EXTRA` (TERM, and SUDO_EDITOR, VISUAL and
+   EDITOR for `sudo -e`) from the caller's environment,
+   plus SUDO_ASKPASS, GW_ASKPASS_FIFO and DISPLAY for the askpass; never
+   the caller's whole environment (since 0.11 the user's own, tokens and
+   agent included), so `sudo -E` / `--preserve-env` keep only that
+   (PLAN-0.11 §19.14). The pass-through of an unconfigured sudo is the
+   user's own and keeps everything.
 5. A password is needed and the caller isn't direct → exec the real sudo with no
    password and print the one-line "got no password" message (NOPASSWD still
    works; `scripts = true` makes a non-direct caller count as direct).
 6. Direct caller: password from `localhost.sudo[USER]` (vault), or a verified
    secret pop-up (`popup.secret` with `store=`/`load=`: the helper stores a
    late answer after the requester's exit 75, a sudo that joined the same
-   pop-up re-reads the vault; the prompt says that unticking Remember it
-   uses the password once). The dialog names localhost's sudo right for gated's
-   recheck (`SUDO_CHECK`: switched off while the dialog is open, the value
-   is never handed over, stored or used) and offers "Remember it", ticked
-   (unticked: used for this command, never stored); once a dialog gave the
+   pop-up re-reads the vault, when it was kept; the prompt says to tick
+   Remember it to keep it, `REMEMBER_NOTE`, the remote dialog's words). The
+   dialog names localhost's sudo right for gated's recheck (`SUDO_CHECK`:
+   switched off while the dialog is open, the value is never handed over,
+   stored or used) and offers "Remember it", unticked like the remote one
+   (`REMEMBER_DEFAULT`, since 0.11.0: used for this command, never stored,
+   unless the person ticks it); once a dialog gave the
    password, the stand-in reads the effective right again (`_rights_now`)
    before sudo runs (PLAN-v4 phase 3 review). A stale password opens the one
    re-entry pop-up (`popup.reenter`, with the same check) and is refused,
@@ -225,8 +262,13 @@ Linux; not tried on a real Linux machine, unit-tested with a faked
 `/proc` status). With no trusted sudo at all the stand-in and `verify_local`
 say so with the next step (`UNTRUSTED`: ask the user
 to run the root command in their own terminal). Known limit: the stub used
-while the env builds execs `/usr/bin/sudo`, which NixOS doesn't have (sudo
-works through the gateway once setup finishes).
+while the env builds (written only while gateway.toml may configure
+something) execs `/usr/bin/sudo`, which supplies nothing and which NixOS
+doesn't have (sudo works through the gateway once setup finishes).
+
+**In a gateway terminal** an unconfigured sudo is the user's own: it asks on
+the pane's tty, and gated's terminal password dialog passes the answer once
+(nothing is stored; terminals.md).
 
 Also, for `gate check`: `probe_nopasswd(user=None)` and
 `verify_local(password) -> (ok, message)` (`sudo -k; sudo -S -v`).
@@ -266,29 +308,71 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
 ## hooks_bash.py (SPEC 8)
 
 `main(payload) -> decision | None`. Decision order (all reasons start with
-`gateway:`; every deny is audited via `audit.refusal` for `gate why`):
+`gateway:`; every deny is audited via `audit.refusal` for `gate why`, with
+the mode it used).
 
-1. deny `curl`/`wget` in command position (any stage), also behind
-   `command` (not `-v`/`-V`), `builtin`, `busybox`, `env` (`-S` strings are
-   split), `nohup`, `nice`, `stdbuf`, `time`, `ionice`, `chrt`, `taskset`,
-   `setsid`, macOS's `arch` (`-arm64`, `-arch NAME`; `_ARCH_VALUE`),
-   `timeout`, `xargs`, `sudo`, `doas`, `caffeinate` and shell
-   reserved words (`if`, `then`, `do`, `!`, ...); `_unwrap(argv, fork)`.
-   Also `az … get-access-token` for Bash and Monitor (round 2: the az
+**Since 0.11.0** (PLAN-0.11), on top of the order below:
+
+- **The mode.** `_mode(payload)` reads `permission_mode`
+  (`modes.from_payload`; empty, missing or unknown is default and never
+  allows). Every right and restriction is the effective per-mode word
+  (`eff.word(entry, key, mode)`, `_right`, `_policy_hits`): deny, WAIT (a
+  value waiting for the user's OK), ask, cc (no decision) or allow. Jobs and
+  `terminal_send` are judged at the stricter of their payload's mode and the
+  modeless rule (`_job_short`, `JOB_MODES`). `record_mode` posts the mode to
+  gated (and keeps `$DATA/mode-epoch`) when some per-mode value would look
+  different to a stand-in in different modes.
+- **The posture.** A target the configured set doesn't name gets no
+  decision from the rights (an unconfigured host, account, or this
+  computer's unconfigured sudo: `UNCONFIGURED_SUDO = None`). The route
+  checks, the hidden-command rule and the other elevation tools
+  (`_alternate_route`, `_route_text`, `_hidden_rule`, `_other_elevation`)
+  run in every mode and refuse only what reaches a configured target
+  (program names compared without letter case: `_prog`); what a command
+  that hides what it runs reaches gets no record, so a stand-in refuses an
+  "ask" there ([managed.md](managed.md#alternate-routes)).
+- **The records** (lead decision 19.14, `asks.py`): for each ssh, sudo,
+  account-CLI, git and `gate` stage it answers "ask" for (`gate with NAME
+  --`: the account, `_with_asks`; `gate check|rotate|copy-to`: the host),
+  the hook notes the exact words, folder, Claude Code and entries (`_pend`,
+  `_ASK_PENDING`, written by `_record_asks` once the answer is "ask", in
+  every mode: Claude Code asks in dontAsk too), and denies a stage whose
+  words or folder it can't spell out
+  (`ASK_WORDS`, `ASK_WHERE`); the stand-in passes an "ask" only with a
+  matching record (`asks.standin`). Every Bash and Monitor call first drops
+  the records this session's earlier calls left (`_drop_asks`, `asks.drop`:
+  a prompt declined or never shown, a stage that never ran; a removal that
+  fails refuses the call, `ASK_UNCLEARED`). A hidden stage beside an asked
+  one, and text the parser can't follow, get the fallback's records too
+  (`_fallback_asks` names every "ask" target, `_fallback_records` records
+  the ssh, sudo, account-CLI and `gate with` commands it reads, not twice).
+  The sudo stand-in's `_rights_now` checks it after the typed walk.
+- **A locked vault** (`_LOCKED`, the daemon's own message): a right the hook
+  can't read is denied with it (`_deny_wait`), and so is this computer's
+  configured sudo wherever the hook would ask about it, the fallback's
+  hidden text and jobs included (`_locked_sudo`; PLAN-0.11 §19.16): the
+  stand-in needs the vault, so an ask only led to a refusal after the
+  user's OK.
+- **The network class** (`_network`, [network.md](network.md)) replaces the
+  curl/wget refusal: deny before any ask, ask joins the asks, cc nothing,
+  an explicit `[network] commands` allow lets the allow step approve the
+  network stage; any other hit keeps the allow off the whole command.
+- **git** in a configured repository is judged up front (`_git_judge`,
+  accounts.md): its entries' rights and restrictions in the mode; an "ask"
+  writes the record the gated git needs.
+
+1. deny, also behind `command` (not `-v`/`-V`), `builtin`, `busybox`, `env`
+   (`-S` strings are split), `nohup`, `nice`, `stdbuf`, `time`, `ionice`,
+   `chrt`, `taskset`, `setsid`, macOS's `arch` (`-arm64`, `-arch NAME`;
+   `_ARCH_VALUE`), `timeout`, `xargs`, `sudo`, `doas`, `caffeinate` and shell
+   reserved words (`if`, `then`, `do`, `!`, ...; `_unwrap(argv, fork)`):
+   `az … get-access-token` for Bash and Monitor (round 2: the az
    stand-in gives tokens only to programs; not for the Terminal panel).
-   Also (review round 5, `_deny_gate_user`) `gate secret` for every tool,
-   the Terminal panel included (`DENY_GATE_SECRET`, since PLAN-v4 phase 3:
-   "gate secret was removed: credentials are typed only into the gateway's
-   own dialog in Claude Code ..."): its subcommand read after `_unwrap` with
-   and without the forking wrappers, and, when a stage hides what runs (a
-   shell, `eval`, `exec`, `source`, a loop, `xargs`, `find -exec`, `su`; see
-   `_runs_hidden`) or the parser gives up, the words `gate secret` anywhere
-   in the text (quotes removed; `_names_gate_secret`). And `gate
-   export|import|copy-to` in the Terminal panel and in a job
+   Also (`_deny_gate_dialogs`) `gate export|import|copy-to` in the Terminal
+   panel and in a job, also behind the forking wrappers
    (`GATE_TERMINAL_SUBCMDS`: their dialogs need a command Claude runs with
-   the Bash tool in the session). A command
-   that only names the words (`grep 'gate secret' README.md`) is judged as
-   any other.
+   the Bash tool in the session). (The removed `gate secret` has no rule of
+   its own since 0.11.0.)
 2. deny naming `~/.config/gateway/private` / the v2 key+store / the run dir
    (via `paths.Protected`: resolved, case-insensitive, hard links), `age -d` on
    them, a direct `git credential` / helper / askpass run, or setting
@@ -326,7 +410,7 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
    Home resolution uses `$HOME` and the password-database home; under a test
    override only the test's home, so tests never stat or glob the real
    `~/.config/gateway`.
-3. deny a gateway verb whose **form** right is `false`, the verb looked up
+3. deny a gateway verb whose **form** right is deny in the mode, the verb looked up
    behind the exec-style wrappers above (`_command`: not timeout/xargs/sudo,
    which the stand-ins see as an intermediate). Remote sudo: `sudo` in command
    position in what the remote runs (ssh's command, rsync's `--rsync-path`,
@@ -342,7 +426,7 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
    Host words resolve like the ssh stand-in's `_classify`: any case,
    `gw-NAME`, addresses; ssh's value-taking options are the stand-in's own
    table (`-B`, `-P` included).
-4. ask when a gateway verb's **form** right is `"ask"` (ssh, local sudo, the
+4. ask when a gateway verb's **form** right is `"ask"` in the mode (ssh, local sudo, the
    remote host's sudo for a remote command with a sudo word). The stand-ins
    give an "ask" right only to a command Claude typed
    (`ancestry.typed_by_claude`), so:
@@ -363,10 +447,12 @@ An fd number only starts a word (`abc2>f` is the word `abc2` and `> f`).
      Claude's shell, which the stand-in can't tell from Claude's own
      command), and a name computed at run time (`$(printf ask)host`); a
      guardrail, like the prefilter.
-5. allow (only in `auto`/`bypassPermissions`) when every stage is an allowed
-   gateway verb on a host with the **effective** right `true`, a `gate`
-   subcommand (`status check login rotate why log export import copy-to
-   migrate scrub` — never `with`, nor `forget`, which deletes stored secrets
+5. allow when every stage is an allowed gateway verb on a target whose
+   **effective** right is allow in the mode (a bare `true`: auto and
+   bypassPermissions only; never git or an account CLI) and every policy
+   decision for it allows, or, in auto and bypassPermissions only
+   (`BARE_ALLOW_MODES`), a `gate` subcommand (`status check login rotate
+   why log export import copy-to scrub` — never `with`, nor `forget`, which deletes stored secrets
    with no dialog and no backup: the reviewer or a prompt decides), or a
    benign command (`cd pwd echo printf true : test [ ls cat head tail wc grep
    sort uniq date sleep`). The ones that read (`pwd test [ ls cat head tail wc
@@ -500,7 +586,8 @@ list (`sudo rsync -a --delete /empty/ /`, `sudo rm -rf /usr/bin`) are still
 allowed, as SPEC 8 specifies. ssh's remote command is not checked against the
 list (SPEC 8 applies it to local sudo only).
 
-Steps 1–4 run in every permission mode; step 5 only in auto/bypass. When a
+Steps 1–4 run in every permission mode, each value read in that mode; step 5
+only where the value is allow in that mode. When a
 command names `gateway.toml`/`config/gateway` (e.g. `sed -i`), `consent.ratchet`
 runs first so a narrow-then-raise within one session still needs the user's OK.
 
@@ -520,9 +607,11 @@ runs first so a narrow-then-raise within one session still needs the user's OK.
   tty, so a sudo'd shell either runs a `-c` string or reads commands from a
   pipe (`echo 'rm -rf /' | sudo bash`), both hidden from the list
   (verification 2026-10). The classifier judges them instead.
-- **`sudo curl`**, `command curl`, `busybox wget` and other wrapped spellings
-  are denied like `curl` (round 1); an organization's managed `Bash(curl *)` ask
-  rule, where there is one, still applies to whatever the hook doesn't decide.
+- **Wrapped network commands** (`sudo curl`, `command curl`, `busybox wget`)
+  are found behind the same wrappers; since 0.11.0 they are network-class
+  hits (asked about by default; network.md), no longer a refusal of curl and
+  wget. An organization's managed `Bash(curl *)` rule, where there is one,
+  still applies to whatever the hook doesn't decide.
 - **scp/sftp/rsync on an "ask" right are denied, not asked** (round 1): the
   stand-in would refuse after the prompt (only a command Claude typed gets an
   "ask" right), so the hook says so first. The user's Terminal panel, which
@@ -534,9 +623,21 @@ runs first so a narrow-then-raise within one session still needs the user's OK.
 
 POSIX-sh prefilter: silent `exit 0` unless the payload (minus its own
 `transcript_path` field, which always names a .jsonl under .../claude/projects)
-contains a trigger word as a whole word (`sudo ssh scp sftp rsync curl wget
-gate gateway age credential GIT_TRACE_REDACT key.txt claude jsonl az`; `az`
-since round 2, for the deny of `az … get-access-token`); on a hit
+contains a trigger word as a whole word (`sudo ssh scp sftp rsync gate
+gateway age credential GIT_TRACE_REDACT key.txt claude jsonl az su doas
+pkexec runuser osascript slogin sudoedit huggingface-cli`; `az` since round
+2, for the deny of `az … get-access-token`; the elevation tools and the
+tools with no stand-in since 0.11.0; git with a remote or config word after
+it; the network class and `$DATA/network-words`, see network.md), matched
+without letter case (`grep -Ei`); a plain account CLI (gh, hf, databricks,
+crane, pijul) while its stand-in exists in `$DATA/bin` and `$DATA/ask-clis`
+names it (all of them while that file is missing), so an "ask" account is
+asked about and recorded; every Bash and Monitor call while an ask record
+is pending (`$DATA/asks`, a link to the run folder's records), so the hook
+drops the session's earlier ones; while `$DATA/mode-epoch` exists, every
+call goes to Python (a trigger-free one to `launch.sh hook-mode`, which
+only records the mode).
+On a hit
 it pipes the payload to `launch.sh hook-bash`. The whole payload is matched, so a `cwd` under `~/.config/gateway`
 also routes a trigger-free command such as `cat key.txt` to the Python hook.
 `age` also fires on `vault.age`/`cache.age`, and `key.txt` (the age identity)
@@ -728,11 +829,7 @@ like a failed Bash command.
 |---|---|---|
 | no blanket NOPASSWD advice anywhere | the passwordless installer (local and remote, its root script, gate check's choice that offered it, the sudoers test overrides) is removed; every message and doc that recommended a sudoers rule is reworded | `test_sudo_nopasswd::test_no_blanket_passwordless_sudo_advice_anywhere` (scans src, hooks, skills, commands, README, docs/dev/modules, CAPABILITIES); `test_gate_check_offers_to_store_or_ask_and_never_a_sudoers_rule` |
 | passwordless sudo only when already configured | `probe_nopasswd` (`sudo -n true`): when it works, nothing is stored or asked; gate check skips the step | `test_passwordless_sudo_already_configured_is_used_and_nothing_is_asked` |
-| per-call password via the dialog, remember or not | gate check offers "Store the sudo password" (`SUDO_STORE`) or "Ask me each time a command needs it" (`SUDO_ASK`, `vault.sudo_choice` = `ask`); a command's sudo dialog has Remember it, ticked (unticked: used for that command, never stored); a stored password is kept as it is | `test_gate_check_store_choice_is_remembered`, `test_a_stored_password_is_used_as_it_is_without_a_choice`, `test_gate_check_remote_offers_store_or_ask`; `test_sudo_standin::test_missing_password_pop_up_stores_it_and_stale_opens_one_reentry` |
+| per-call password via the dialog, remember or not | gate check offers "Store the sudo password" (`SUDO_STORE`) or "Ask me each time a command needs it" (`SUDO_ASK`, `vault.sudo_choice` = `ask`); a command's sudo dialog has Remember it, unticked at first (used for that command, never stored, unless ticked); a stored password is kept as it is | `test_gate_check_store_choice_is_remembered`, `test_a_stored_password_is_used_as_it_is_without_a_choice`, `test_gate_check_remote_offers_store_or_ask`; `test_sudo_standin::test_missing_password_pop_up_stores_it_and_stale_opens_one_reentry` |
 | a sudoers that wants a terminal (requiretty, use_pty) | sudo's own words (`NEEDS_TTY`) after a relayed password → `NEEDS_TTY_MSG`: run it in a gateway terminal (`terminal_open` + `terminal_send`), where sudo has a tty and its prompt opens the credential dialog (terminals.md) | `test_a_sudoers_that_wants_a_terminal_points_to_a_gateway_terminal` |
 | the target identity visible before elevation | the approval hook adds a `systemMessage` to an allow or ask decision: `gateway: sudo runs as USER on this machine (user@host)` / `on NAME (user@address)`, USER from sudo's `-u`/`--user` (else root; anything that isn't a plain name or `#uid` is "another user"); never on the command's own output | `test_policy::test_the_target_of_sudo_is_named_before_it_runs`; mutation "the elevation notice always says root" |
 | elevation policy | `_rights_now` applies `policy.decide(eff, "elevation")` (localhost `sudo`, `[hosts.localhost.policy] elevation`, `[policy] elevation`); remote sudo the same in `ssh._host` (with exec's restrictions) | `test_sudo_nopasswd::test_elevation_policy_refuses_sudo_with_its_rule_and_the_target_is_named`, `test_policy::test_remote_sudo_follows_the_elevation_policy`; mutations in `mutations_policy.py` |
-
-Gateway 0.8 and earlier could install `/etc/sudoers.d/` files named after the
-gateway; nothing removes them automatically (the README's uninstall section
-says to delete such a file and check the rest with `sudo visudo -c`).

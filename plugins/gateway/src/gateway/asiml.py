@@ -9,10 +9,14 @@ asiml uses. Transfers ask the catalog for a short-lived, role-limited
 storage pass and hand it to `dvc` (the gateway's dvc feature env) through an
 isolated config; the pass is scrubbed from all output.
 
-The API token is an Entra access token for the catalog's API scope. The scope
-is pinned in the vault (`bound.scope`) at sign-in; if it isn't set yet the
-scope is read once from the bound host's /api/config. The host must be bound
-(consent), so a changed host can't redirect the token. Every catalog request
+The API token is an Entra access token for the catalog's API scope, from the
+account's browser sign-in (PLAN-0.11 §7, run by gated: daemon/oauth.py): a
+fixed authority (the account's own `tenant`, "organizations" by default),
+the client id from the bound catalog's /api/config and the fixed scope
+`api://{clientId}/access_as_user`, pinned in the vault at sign-in. Each run
+checks that the catalog still names the pinned client id; a change refuses
+until a new sign-in. The host must be bound (consent), so a changed host
+can't redirect the token. Every catalog request
 goes through entra.urlopen: redirects are never followed (a 3xx would make
 urllib resend the Bearer token to another host), proxy variables and CA
 overrides are ignored.
@@ -22,7 +26,8 @@ a direct caller (Claude's own command), or for any caller when the account
 has `scripts = true`; `init` and `status` use no credential and aren't gated.
 
 `dvc_main` is the `dvc` stand-in: inside an `.asiml` workspace, `dvc pull` and
-`dvc push` delegate to `asiml pull` / `asiml push`; anything else is refused.
+`dvc push` delegate to `asiml pull` / `asiml push`; every other dvc command,
+and any outside a workspace, runs the user's own dvc (PLAN-0.11 §1.4).
 """
 from __future__ import annotations
 
@@ -141,34 +146,52 @@ def base_url(host: str) -> str:
 _CFG: dict[str, dict[str, Any]] = {}
 
 
+def fetch_catalog_config(host: str, timeout: float = 30) -> dict[str, Any]:
+    """The catalog's /api/config, read now (gated's sign-in reads it at each
+    sign-in), through entra.urlopen. Only its clientId (a GUID) is ever used:
+    never an authority, a tenant or a scope it names."""
+    try:
+        with entra.urlopen(base_url(host) + "/api/config", timeout=timeout) as r:
+            cfg = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        why = "it answered with a redirect, which isn't followed" if entra.is_redirect(e) \
+            else f"HTTP {e.code}"
+        raise _g(f"gateway: could not read the catalog's sign-in configuration ({why})")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise _g(f"gateway: could not read the catalog's sign-in configuration ({type(e).__name__})")
+    if not isinstance(cfg, dict) or not formmod.GUID_RE.fullmatch(str(cfg.get("clientId") or "")):
+        raise _g("gateway: the catalog's /api/config has no valid clientId")
+    return cfg
+
+
 def catalog_config(host: str) -> dict[str, Any]:
+    """fetch_catalog_config, once per process."""
     if host not in _CFG:
-        try:
-            with entra.urlopen(base_url(host) + "/api/config", timeout=30) as r:
-                cfg = json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            why = "it answered with a redirect, which isn't followed" if entra.is_redirect(e) \
-                else f"HTTP {e.code}"
-            raise _g(f"gateway: could not read the catalog's sign-in configuration ({why})")
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise _g(f"gateway: could not read the catalog's sign-in configuration ({type(e).__name__})")
-        if not formmod.GUID_RE.fullmatch(str(cfg.get("clientId") or "")):
-            raise _g("gateway: the catalog's /api/config has no valid clientId")
-        _CFG[host] = cfg
+        _CFG[host] = fetch_catalog_config(host)
     return _CFG[host]
 
 
 def api_scope(account: formmod.Account, data: dict[str, Any]) -> str:
+    """The API scope of the account's browser sign-in (PLAN-0.11 §7.4): fixed
+    around the client id pinned at the sign-in, and only while the catalog
+    still names that client id (a change refuses until a new sign-in, whose
+    confirm dialog shows it)."""
     rec = (data.get("accounts") or {}).get(account.name) or {}
-    pinned = (rec.get("bound") or {}).get("scope")
-    if pinned:
-        return pinned
-    cfg = catalog_config(account.host)
-    return f"api://{cfg['clientId']}/access_as_user"
+    ent = rec.get("entra") or {}
+    pinned = str(ent.get("client_id") or "")
+    if not ent.get("refresh_token") or ent.get("kind") != "browser" \
+            or not formmod.GUID_RE.fullmatch(pinned):
+        raise _g(f"gateway: {account.name} isn't signed in; run gate check {account.name} while "
+                 "the user is here (a browser sign-in)")
+    if str(catalog_config(account.host).get("clientId")) != pinned:
+        raise _g(f"gateway: the catalog's sign-in settings changed since {account.name} signed in "
+                 f"(its client id); run gate check {account.name} while the user is here: the "
+                 "sign-in dialog shows the change")
+    return entra.catalog_scopes(pinned)[0]
 
 
 def api_token(account: formmod.Account, data: dict[str, Any]) -> str:
-    return entra.access_token(account.name, api_scope(account, data))
+    return entra.access_token(account.name, api_scope(account, data), mode="modeless")   # asiml: modeless
 
 
 def _api(account: formmod.Account, data: dict[str, Any], method: str, path: str,
@@ -430,7 +453,7 @@ def main(argv: list[str], tool: str = "asiml") -> int:
         print(f"gateway: asiml has no '{formmod.safe(action) or 'that'}' command", file=sys.stderr)
         return 2
     except AsimlError as e:
-        audit.refusal(tool, None, str(e))
+        audit.refusal(tool, None, str(e), mode="modeless")   # asiml: the modeless rule
         print(str(e), file=sys.stderr)
         return 2
     except entra.EntraError as e:
@@ -553,14 +576,13 @@ def _cmd_read(action: str, rest: list[str], form, eff, data, tool: str = "asiml"
 
 
 def dvc_main(argv: list[str]) -> int:
-    """dvc pull|push inside an .asiml workspace -> asiml pull|push (SPEC 9.5)."""
+    """dvc pull|push inside an .asiml workspace -> asiml pull|push (SPEC 9.5).
+    Every other dvc command, and any outside an .asiml workspace, is the
+    user's own dvc (PLAN-0.11 §1.4: envfile.pass_through; 127 when there is
+    none)."""
+    from . import envfile
     root = find_workspace(Path(os.getcwd()))
-    if root is None:
-        print("gateway: dvc is only run through the gateway inside an asiml workspace; "
-              "use asiml here", file=sys.stderr)
-        return 2
-    if not argv or argv[0] not in ("pull", "push"):
-        print("gateway: inside an asiml workspace, only 'dvc pull' and 'dvc push' are run "
-              "(they delegate to asiml); use asiml for anything else", file=sys.stderr)
-        return 2
+    if root is None or not argv or argv[0] not in ("pull", "push"):
+        return envfile.pass_through("dvc", list(argv), None,
+                                    entries=["dvc pull and dvc push in an asiml workspace"])
     return main([argv[0]], tool="dvc")

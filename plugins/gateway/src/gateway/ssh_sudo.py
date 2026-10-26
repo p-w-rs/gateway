@@ -61,6 +61,13 @@ VERIFY_TTL = 600
 ASK_LIMIT = 6
 MIN_PASSWORD = MIN_LITERAL
 PROBE_CMD = "sudo -n true"
+# The remote sudo dialog's "Remember it" box starts unticked (PLAN-0.11
+# §9.1, 27g): a password typed for a command is used for that call only,
+# since while it is staged on the host Claude's own command could read it;
+# the person ticks the box to keep it (ssh.py's _sudo_password).
+REMEMBER_DEFAULT = False
+REMEMBER_NOTE = ("Tick Remember it to keep it for later commands (unticked, it is used for this "
+                 "command only).")
 
 # The effective uid of the askpass's parent ($PPID): /proc on Linux (real,
 # effective, saved, fs), else /bin/ps (BSD and procps: `uid` is effective).

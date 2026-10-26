@@ -3,7 +3,7 @@
 // stand beneath the plugin and play the engine and gated (/ui/manage over the
 // socket) and launch.sh (process.run).
 import { expect, mock, test } from 'claude-code/testing'
-import { accountLine, editArgv, hostLine, lastLine, needsCredential, parseManage, words } from './manage.ts'
+import { ACCOUNTS_EDIT_HINT, EDIT_HINT, accountLine, editArgv, hostLine, lastLine, modeText, modeTokens, needsCredential, parseManage, words } from './manage.ts'
 
 const HOME = '/Users/tester'
 const CONFIG = `${HOME}/.claude`
@@ -13,7 +13,7 @@ const statusJson = (): string => JSON.stringify({
   state: 'ready', root: '/plugin', data: `${CONFIG}/plugins/data/gate-inline`,
   env: `${CONFIG}/plugins/data/gate-inline/envs/0123456789ab`, lock: '0123456789ab', warm: true, older: '',
   build_running: false, install_log: false, pixi: `${HOME}/.pixi/bin/pixi`, pixi_version: 'pixi 0.81.0',
-  home: `${HOME}/.config/gateway`, form: true, vault: true, vault_v2: false,
+  home: `${HOME}/.config/gateway`, form: true, vault: true, managed: true,
 }) + '\n'
 const daemonJson = (): string => JSON.stringify({
   ok: true, version: '0.9.0', protocol: 1, pid: 777, epoch: 3, started: 1792450000, uptime: 5,
@@ -73,6 +73,102 @@ test('an edit line becomes one fixed gate subcommand, nothing else', () => {
   expect(lastLine('gateway: added host build\ngateway: 1 change for build waits\n', '')).toBe('gateway: 1 change for build waits')
 })
 
+test('PLAN-0.11 §2.9: MODE=WORD tokens after the key make a per-mode table, in exactly that shape', () => {
+  expect(editArgv('host set lab sudo default=ask auto=true plan=false')).toEqual(
+    { argv: ['gate', 'host', 'set', 'lab', 'sudo', 'default=ask', 'auto=true', 'plan=false'], entry: 'lab' })
+  expect(editArgv('host set localhost sudo manual=cc dontAsk=allow')).toEqual(
+    { argv: ['gate', 'host', 'set', 'localhost', 'sudo', 'manual=cc', 'dontAsk=allow'], entry: 'localhost' })
+  expect(editArgv('host set lab ssh default=true')).toEqual({ argv: ['gate', 'host', 'set', 'lab', 'ssh', 'default=true'], entry: 'lab' })
+  expect(editArgv('host set lab ssh cc')).toEqual({ argv: ['gate', 'host', 'set', 'lab', 'ssh', 'cc'], entry: 'lab' })
+  expect(editArgv('host set lab note "a=b"')).toEqual({ argv: ['gate', 'host', 'set', 'lab', 'note', 'a=b'], entry: 'lab' })
+  expect(editArgv('policy set all network default=ask auto=allow')).toEqual(
+    { argv: ['gate', 'policy', 'set', 'all', 'network', 'default=ask', 'auto=allow'], entry: 'settings' })
+  expect(editArgv('policy set lab exec cc')).toEqual({ argv: ['gate', 'policy', 'set', 'lab', 'exec', 'cc'], entry: 'lab' })
+  expect(editArgv('network commands ask')).toEqual({ argv: ['gate', 'network', 'commands', 'ask'], entry: 'settings' })
+  expect(editArgv('network commands default=ask bypassPermissions=allow')).toEqual(
+    { argv: ['gate', 'network', 'commands', 'default=ask', 'bypassPermissions=allow'], entry: 'settings' })
+  expect(editArgv('network extra add dig')).toEqual({ argv: ['gate', 'network', 'extra', 'add', 'dig'], entry: 'settings' })
+  expect(editArgv('network drop remove http-server')).toEqual({ argv: ['gate', 'network', 'drop', 'remove', 'http-server'], entry: 'settings' })
+  for (const bad of [
+    'host set lab sudo auto=true',                     // no default
+    'host set lab sudo default=ask default=true',      // a mode twice
+    'host set lab sudo default=ask manual=true',       // default and manual are one mode
+    'host set lab sudo default=ask bypass=true bypassPermissions=deny',
+    'host set lab sudo default=maybe',                 // not a word
+    'host set lab sudo Default=ask',                   // modes are spelled exactly
+    'host set lab sudo default=ask auto',              // a bare word among tokens
+    'host set lab sudo ask true',                      // two words
+    'host set lab sudo default=ask;rm',                // nothing after the word
+    'host set lab note a b',                           // only ssh and sudo take several words
+    'host set lab address default=ask auto=true',
+    'policy set lab exec default=ask auto=sometimes',
+    'policy set lab exec maybe',
+    'network commands',
+    'network commands default=ask extra=x',
+    'network extra add "a b"', 'network extra add ..', 'network extra keep dig', 'network other add dig',
+  ]) {
+    expect('error' in editArgv(bad)).toBe(true)
+  }
+  expect(modeTokens(['default=ask', 'plan=deny', 'acceptEdits=cc', 'auto=true', 'bypass=allow', 'dontAsk=false'])).toBe(true)
+  expect(modeTokens([])).toBe(false)
+})
+
+test("WS-9: an account's use from the edit line, one word or per mode, like a host's ssh and sudo", () => {
+  expect(editArgv('account set gh use ask')).toEqual({ argv: ['gate', 'account', 'set', 'gh', 'use', 'ask'], entry: 'gh' })
+  expect(editArgv('account set gh-work use default=ask auto=true plan=false')).toEqual(
+    { argv: ['gate', 'account', 'set', 'gh-work', 'use', 'default=ask', 'auto=true', 'plan=false'], entry: 'gh-work' })
+  expect(editArgv('account set gh use manual=cc dontAsk=allow')).toEqual(
+    { argv: ['gate', 'account', 'set', 'gh', 'use', 'manual=cc', 'dontAsk=allow'], entry: 'gh' })
+  for (const bad of [
+    'account set gh use auto=true',                    // no default
+    'account set gh use default=ask default=true',     // a mode twice
+    'account set gh use ask true',                     // two words
+    'account set gh use default=ask;rm',
+    'account set gh login octocat',                    // only use
+    'account set gh token abc',
+    'account set Gh use ask',                          // not a name
+    'account set gh use',
+    'account gh use ask',
+  ]) {
+    expect('error' in editArgv(bad)).toBe(true)
+  }
+  expect(EDIT_HINT).toContain('account set NAME use WORD|MODE=WORD...')
+  expect(ACCOUNTS_EDIT_HINT.startsWith('account set NAME use ')).toBe(true)
+  for (const line of ACCOUNTS_EDIT_HINT.split(' | ')) expect(EDIT_HINT.includes(line.split(' ')[0]!)).toBe(true)
+})
+
+test('a per-mode value is drawn in words, never as an object (§2.8)', () => {
+  const all = (w: string) => ({ default: w, plan: w, acceptEdits: w, auto: w, bypass: w, dontAsk: w })
+  expect(modeText(all('cc'))).toBe('cc')
+  expect(modeText({ ...all('ask'), auto: 'allow', plan: 'deny' })).toBe('Manual: ask · Plan: deny · Auto: allow')
+  const v = parseManage({
+    ...MANAGE,
+    hosts: [{ ...MANAGE.hosts[1], modes: { sudo: { ...all('ask'), auto: 'allow' }, ssh: { default: 'cc' }, bad: all('cc') } }],
+    accounts: [{ ...MANAGE.accounts[0], modes: { use: { ...all('deny'), bypass: 'cc' } } }],
+  })!
+  expect(v.hosts[0]!.modes).toEqual({ sudo: { ...all('ask'), auto: 'allow' } })   // an incomplete map is dropped
+  expect(hostLine(v.hosts[0]!)).toBe('lab: remote u@lab.example.com; reachable yes, auth yes, runtime ready; sudo Manual: ask · Auto: allow; exec deny, write ask; forwarding: agent; 1 change wait for your OK')
+  expect(accountLine(v.accounts[0]!)).toBe('gh (github): connected (octo, fine-grained personal access token); checked 2026-10-20 10:00; use Manual: deny · Bypass permissions: cc')
+  expect(JSON.stringify(hostLine(v.hosts[0]!))).not.toContain('{')
+})
+
+test('a per-mode policy is drawn in words per mode, never as one modeless word (§2.9)', () => {
+  const all = (w: string) => ({ default: w, plan: w, acceptEdits: w, auto: w, bypass: w, dontAsk: w })
+  const v = parseManage({
+    ...MANAGE,
+    hosts: [{ ...MANAGE.hosts[1], rights: { ...MANAGE.hosts[1]!.rights, write: 'deny' },
+              policy_modes: { write: { ...all('allow'), auto: 'deny' }, network: all('cc'),
+                              forward_agent: { ...all('allow'), plan: 'deny' }, read: { default: 'deny' } } }],
+    accounts: [{ ...MANAGE.accounts[0], policy_modes: { write: { ...all('ask'), bypass: 'deny' }, network: all('allow'),
+                                                        credential: 'deny' } }],
+  })!
+  // write's table, not the modeless "write deny"; a uniform allow or cc is no
+  // restriction (left out); an incomplete map or a word falls back to the modeless word
+  expect(hostLine(v.hosts[0]!)).toBe('lab: remote u@lab.example.com; reachable yes, auth yes, runtime ready; exec deny, write Manual: allow · Auto: deny, forward_agent Manual: allow · Plan: deny; 1 change wait for your OK')
+  expect(accountLine(v.accounts[0]!)).toBe('gh (github): connected (octo, fine-grained personal access token); checked 2026-10-20 10:00; write Manual: ask · Bypass permissions: deny')
+  expect(JSON.stringify([hostLine(v.hosts[0]!), accountLine(v.accounts[0]!)])).not.toContain('{')
+})
+
 function world(on: any) {
   const fetches: string[] = []
   const runs: string[][] = []
@@ -92,7 +188,9 @@ function world(on: any) {
   on('process.run', (_$: any, e: any) => {
     if (e.argv[2] === 'gate') {
       runs.push(e.argv.slice(2))
-      const out = e.argv[3] === 'host' ? "gateway: added host build\ngateway: 1 change for build waits for the user's OK in the gateway dialog: gate check build\n" : 'gateway: build is up to date\n'
+      const out = e.argv[3] === 'host' ? "gateway: added host build\ngateway: 1 change for build waits for the user's OK in the gateway dialog: gate check build\n"
+        : e.argv[3] === 'account' ? "gateway: gh: use set\ngateway: 1 change for gh waits for the user's OK in the gateway dialog: gate check gh\n"
+          : 'gateway: build is up to date\n'
       return { value: { exitCode: 0, stdout: out, stderr: '' } }
     }
     return { value: { exitCode: 0, stdout: e.argv[2] === 'gated' ? daemonJson() : statusJson(), stderr: '' } }
@@ -157,4 +255,20 @@ test('/gate-accounts shows each state and runs the check or the credential dialo
   await ui.press({ key: 'login-az' })
   await settle()
   expect(w.runs[1]).toEqual(['gate', 'login', 'az'])
+})
+
+test('WS-9: /gate-accounts has an edit line: an account use per mode, then the consent check', async ($: any, on: any) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await settle()
+  await $.command.run({ command: 'gate-accounts', args: '', origin: { kind: 'composer' } })
+  const ui = await mountPane($, 'gate-accounts', 'Gateway accounts')
+  expect(JSON.stringify(await ui.drawn())).toContain(ACCOUNTS_EDIT_HINT)
+  await ui.input({ key: 'edit', text: 'account set gh use default=ask auto=true' })
+  await settle()
+  expect(w.runs[0]).toEqual(['gate', 'account', 'set', 'gh', 'use', 'default=ask', 'auto=true'])
+  expect(w.runs[1]).toEqual(['gate', 'check', 'gh'])                  // the raise waits for the OK
+  await ui.input({ key: 'edit', text: 'account set gh token x' })
+  await settle()
+  expect(w.runs.length).toBe(2)
 })

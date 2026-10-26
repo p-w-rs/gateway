@@ -6,6 +6,7 @@ import subprocess
 
 import harness  # noqa: F401
 import harness_ssh as H
+import harness_posture as HP
 
 
 def _box(s: H.SshEnv) -> H.Sshd:
@@ -56,8 +57,11 @@ def test_ssh_copy_scp_reuses_master_and_refuses() -> None:
                            (("-o", "ProxyCommand=id"), "ProxyCommand isn't allowed")):
             r = s.run("scp", *opts, str(f), f"box:{t.dir}/c.txt")
             assert r.returncode == 2 and want in r.stderr, (opts, r)
-        r = s.run("scp", str(f), f"nowhere:{t.dir}/c.txt")
-        assert r.returncode != 0 and "nowhere isn't in gateway.toml" in r.stderr, r
+        # an unconfigured remote: the user's own scp (PLAN-0.11 §1.4)
+        d = HP.user_tools(s.env, "scp")
+        s.set(user_tools=str(d))
+        r = s.run("scp", str(f), f"nowhere.invalid:{t.dir}/c.txt")
+        assert r.returncode == 0 and HP.runs(d, "scp")[-1]["argv"][-1].startswith("nowhere."), r
         assert not (t.dir / "c.txt").exists()
 
 

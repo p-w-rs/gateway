@@ -57,26 +57,12 @@ a script it runs, starts would pass the walk (its parent, or its parent's
 parent, is `CLAUDE_PID`). The culprit is TERMINAL, for the stand-ins' pane
 wording (consent.pane_ask_message).
 
-`claude_ancestor(home) -> reason | None` (SPEC 6, 15: `gate secret` and the
-other terminal paths behind a one-time code): walks the whole parent chain
-and names why this process counts as started from Claude Code: an ancestor
-whose executable (by path) is Claude Code's (basename `claude`, under
-`~/.local/share/claude/versions/`, the desktop app's bundled copy under
-`~/Library/Application Support/Claude/claude-code/`, npm's
-`.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`, or node running
-npm's `.../@anthropic-ai/claude-code/cli.js` as its script), or whose pid is
-`CLAUDE_PID`, or a chain that can't be read (a parent pid that can't be
-read, a loop, too deep; a process of the user's own whose executable can't
-be read, except OpenSSH's session process under a root sshd, which Linux
-makes unreadable). Another user's process whose executable can't be read
-(root's sshd, login, sudo on Linux) isn't Claude Code, which runs as the
-user; the walk goes on above it. Above an unreadable process of the user's
-own the walk goes on too, so a Claude Code process further up is named
-instead of UNREADABLE (on macOS the path of an executable deleted or
-replaced while it runs can't be read: a login shell or tmux after a `brew
-upgrade` or `port upgrade`; callers tell the user so). A process detached
-from Claude's tree (a double fork, a terminal window it opens) isn't seen:
-defence in depth behind the one-time code, not a boundary.
+`is_claude_exe(exe, home) -> bool` (gated's session registration,
+daemon/peers.py): is an executable path (from the kernel) Claude Code's:
+basename `claude`, under `~/.local/share/claude/versions/`, the desktop
+app's bundled copy under `~/Library/Application Support/Claude/claude-code/`,
+or npm's `.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`.
+`claude_install(exe, home)` says which of these it is, for /gate-doctor.
 """
 from __future__ import annotations
 
@@ -454,7 +440,15 @@ def typed_by_claude() -> tuple[bool, str]:
     return ok, culprit
 
 
-def _typed_walk() -> tuple[bool, str]:
+def typed_from(pid: int) -> tuple[bool, str]:
+    """typed_by_claude's walk for a process whose parent is `pid` (not this
+    one): the gated git's own process, which the git stand-in became by exec
+    (githelper.gated_parent asks it for the ssh stand-in and the credential
+    helper that git starts)."""
+    return _typed_walk(pid)
+
+
+def _typed_walk(start: int | None = None) -> tuple[bool, str]:
     claude = _claude_pid()
     if claude is None:
         return (False, "?")
@@ -463,7 +457,7 @@ def _typed_walk() -> tuple[bool, str]:
         # job's own shell (gated's start file exports CLAUDE_PID=$$ for
         # is_direct). Claude Code asks about nothing run in a pane.
         return (False, TERMINAL)
-    pid = os.getppid()
+    pid = os.getppid() if start is None else start
     seen: set[int] = set()
     for _ in range(MAX_DEPTH):
         if pid == claude:
@@ -490,24 +484,19 @@ def _typed_walk() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Started from Claude Code? (gate secret and the other one-time-code paths)
+# Is an executable Claude Code's? (gated's sessions, /gate-doctor)
 # ---------------------------------------------------------------------------
 
 CLAUDE_EXE = "claude"
 CLAUDE_VERSIONS = (".local", "share", "claude", "versions")
 DESKTOP_CLAUDE = ("Library", "Application Support", "Claude", "claude-code")
-# npm's @anthropic-ai/claude-code (any prefix: npm, pnpm, yarn, bun). From
-# 2.1.113 its bin is bin/claude.exe, the platform package's native binary
-# that the postinstall links or copies over a placeholder (npm view: the
-# "bin" field; 2.1.308 checked 2026-10-22); its fallback launcher runs the
-# platform package's binary, named claude. Before that, bin was cli.js, run
-# by node: `node <...>/bin/claude ARGS`, the script a link to cli.js.
+# npm's @anthropic-ai/claude-code (any prefix: npm, pnpm, yarn, bun): its bin
+# is bin/claude.exe, the platform package's native binary that the
+# postinstall links or copies over a placeholder (npm view: the "bin" field;
+# 2.1.308 checked 2026-10-22); its fallback launcher runs the platform
+# package's binary, named claude.
 NPM_PACKAGE = "/node_modules/@anthropic-ai/claude-code/"
 NPM_NATIVE = NPM_PACKAGE + "bin/claude.exe"
-NPM_CLI = NPM_PACKAGE + "cli.js"
-_NODE_EXE = re.compile(r"^node(?:js)?[0-9]*$")
-SSHD_COMMS = frozenset({"sshd", "sshd-session"})
-UNREADABLE = "a process tree that can't be read"
 
 
 def is_claude_exe(exe: str, home: str | os.PathLike[str] | None = None) -> bool:
@@ -525,37 +514,9 @@ def is_claude_exe(exe: str, home: str | os.PathLike[str] | None = None) -> bool:
     return False
 
 
-def is_claude_node(exe: str, argv: list[str] | None) -> bool:
-    """Is this an npm install of Claude Code before 2.1.113: an executable
-    named node (nodejs, node22, ...) whose first argument, with no node
-    option before it, is an absolute path that resolves to an existing
-    .../node_modules/@anthropic-ai/claude-code/cli.js? (npm's shim runs
-    `node <prefix>/bin/claude`, a link to cli.js. Options before the script
-    could make another script the program, so they aren't accepted.)"""
-    if not _NODE_EXE.match(os.path.basename(exe)) or not argv or len(argv) < 2:
-        return False
-    script = argv[1]
-    if not os.path.isabs(script):
-        return False
-    try:
-        real = os.path.realpath(script)
-    except (OSError, ValueError):
-        return False
-    return real.endswith(NPM_CLI) and os.path.isfile(real)
-
-
-def is_claude_process(pid: int, exe: str, home: str | os.PathLike[str] | None = None) -> bool:
-    """Is `pid` (whose executable path is `exe`) Claude Code: its binary
-    (is_claude_exe), or node running npm's cli.js (is_claude_node)?"""
-    return is_claude_exe(exe, home) or is_claude_node(exe, _argv(pid))
-
-
-def claude_install(exe: str, argv: list[str] | None = None,
-                   home: str | os.PathLike[str] | None = None) -> str:
+def claude_install(exe: str, home: str | os.PathLike[str] | None = None) -> str:
     """How the Claude Code whose executable is `exe` was installed, in words
     for /gate-doctor ("" when it isn't recognized as Claude Code)."""
-    if is_claude_node(exe, argv):
-        return "npm (node and cli.js, a version before 2.1.113)"
     if exe.endswith(NPM_NATIVE) or "/node_modules/@anthropic-ai/claude-code-" in exe:
         return "npm (its native binary)"
     if home is not None:
@@ -567,64 +528,3 @@ def claude_install(exe: str, argv: list[str] | None = None,
     if os.path.basename(exe) == CLAUDE_EXE:
         return "an executable named claude (" + exe + ")"
     return ""
-
-
-def _owner(pid: int) -> tuple[int | None, str]:
-    """(effective uid or None, kernel comm name) of `pid`."""
-    if sys.platform == "darwin":  # pragma: no cover - macOS only
-        short = _mac_shortinfo(pid)
-        if short is None:
-            return None, ""
-        return int(short.pbsi_uid), short.pbsi_comm.decode("utf-8", "replace")
-    uid: int | None = None
-    comm = ""
-    try:
-        with open(f"/proc/{pid}/status") as f:
-            for line in f:
-                if line.startswith("Uid:"):
-                    uid = int(line.split()[2])
-                    break
-        with open(f"/proc/{pid}/stat", "rb") as fb:
-            raw = fb.read()
-        comm = raw[raw.find(b"(") + 1:raw.rfind(b")")].decode("utf-8", "replace")
-    except (OSError, ValueError, IndexError):
-        pass
-    return uid, comm
-
-
-def claude_ancestor(home: str | os.PathLike[str] | None = None) -> str | None:
-    """Why this process counts as started from Claude Code (an ancestor's
-    executable path, `CLAUDE_PID`, or UNREADABLE), or None. See the module
-    docstring. A process of the user's own whose executable can't be read
-    makes the answer UNREADABLE, but the walk goes on above it first: a
-    Claude Code process further up is the better reason (review round 5:
-    macOS can't read the path of an executable deleted or replaced while it
-    runs, such as a login shell or tmux after `brew upgrade` or `port
-    upgrade`, so UNREADABLE alone mostly means the user's own terminal)."""
-    claude = _claude_pid()
-    me = os.geteuid()
-    pid = os.getppid()
-    seen: set[int] = set()
-    unreadable = False
-    for _ in range(MAX_DEPTH):
-        if pid <= 0 or pid in seen:
-            return UNREADABLE
-        seen.add(pid)
-        if claude is not None and pid == claude:
-            return "CLAUDE_PID"
-        exe = _exe_path(pid)
-        if exe:
-            if is_claude_process(pid, exe, home):
-                return exe
-        else:
-            uid, comm = _owner(pid)
-            if comm == CLAUDE_EXE:
-                return CLAUDE_EXE
-            if uid is None:
-                return UNREADABLE
-            if uid == me and not (comm in SSHD_COMMS and _owner(_ppid(pid))[0] == 0):
-                unreadable = True    # refused either way; look on for Claude Code above it
-        if pid == 1:
-            return UNREADABLE if unreadable else None
-        pid = _ppid(pid)
-    return UNREADABLE

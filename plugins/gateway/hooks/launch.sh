@@ -2,7 +2,7 @@
 # The gateway's launcher (SPEC 18). POSIX sh; runs before Python exists.
 #
 #   launch.sh hook-session        SessionStart (sync); degraded output while the env builds
-#   launch.sh hook-subagent|hook-bash|hook-files|hook-post|hook-prompt|hook-filechanged
+#   launch.sh hook-subagent|hook-bash|hook-files|hook-post|hook-prompt|hook-filechanged|hook-mcp
 #   launch.sh mcp                 the MCP server (waits up to 4 s for the env, else exits 1)
 #   launch.sh ensure-env          build the pixi env (async SessionStart hook, or the mod's
 #                                 session.start), then write the managed shell's files
@@ -209,16 +209,38 @@ PY="$ENVD/.pixi/envs/default/bin/python3"
 
 ready() { [ -x "$PY" ] && [ -e "$ENVD/.ready" ]; }
 
+# The lock's Python minor ("3.15"): the python package of pixi.lock's default
+# environment, one minor on every platform; "" when it can't be told (no
+# lock, no python, or two minors). envfile.lock_python_minor reads the same.
+lock_py_minor() {
+  awk '
+    /^environments:/ { e = 1; next }
+    e && /^[^ ]/ { exit }
+    e && /^  [^ ]/ { d = ($0 == "  default:"); next }
+    d && /^      - conda: .*\/python-[0-9]+\.[0-9]+\.[^\/]*$/ {
+      s = $0; sub(/.*\/python-/, "", s); split(s, v, "."); m = v[1] "." v[2]
+      if (f == "") f = m; else if (f != m) bad = 1
+    }
+    END { if (!bad) print f }' "$ROOT/pixi.lock" 2>/dev/null
+}
+
 # The newest other env that finished building, or "": while an update's env
 # builds (a new pixi.lock), hooks, the MCP server and (through the stubs
 # Python writes) the stand-ins keep running on it; the code is stdlib-only,
-# so an older env's Python runs it.
+# so an older env's Python runs it, but only one on the lock's Python minor
+# (its bin/python3.MINOR): new code never runs on the previous Python (a 3.12
+# env with code for 3.15; PLAN-0.11 section 5). Without one the cold paths
+# apply until the new env is ready.
 older_env() {
   best=""
+  _m=
+  _mk=
   for d in "$DATA/envs"/*; do
     [ -d "$d" ] || continue
     case ${d##*/} in "$SHA"|*.*) continue ;; esac
     [ -x "$d/.pixi/envs/default/bin/python3" ] && [ -e "$d/.ready" ] || continue
+    if [ -z "$_mk" ]; then _m=$(lock_py_minor); _mk=1; fi
+    [ -n "$_m" ] && [ -x "$d/.pixi/envs/default/bin/python$_m" ] || continue
     if [ -z "$best" ] || [ -n "$(find "$d/.ready" -newer "$best/.ready" 2>/dev/null)" ]; then
       best=$d
     fi
@@ -244,9 +266,11 @@ q() {
   esac
 }
 
-# The env file: byte-identical to envfile.env_text("refuse"). Everything after
+# The env file: byte-identical to envfile.env_text(). Everything after
 # GW_BIN= runs only while the stand-in folder exists (env.sh is sourced by
-# other launchers too, such as checkpoint jobs, also after an uninstall).
+# other launchers too, such as checkpoint jobs, also after an uninstall); in
+# Claude Code's own shell (CLAUDECODE) it also unsets Claude Code's own
+# credential variables and the present stand-ins' aliases and functions.
 # shellcheck disable=SC2016  # the $ signs are meant literally
 env_text() {
   B="$DATA/bin"
@@ -256,14 +280,13 @@ env_text() {
   printf 'GW_BIN=%s\n' "$(q "$B")"
   printf '%s\n' 'if [ -d "$GW_BIN" ]; then'
   printf '%s\n' '  case ":${PATH-}:" in *":$GW_BIN:"*) ;; *) PATH="$GW_BIN${PATH:+:$PATH}"; export PATH;; esac'
-  printf '%s\n' '  if [ "${GW_GITCFG_SET-}" != 1 ]; then'
-  printf '%s\n' '    GW_GITCFG_SET=1; export GW_GITCFG_SET'
-  printf '%s\n' '    _n=${GIT_CONFIG_COUNT:-0}'
-  printf '    export GIT_CONFIG_KEY_$_n=include.path GIT_CONFIG_VALUE_$_n=%s\n' "$(q "$DATA/git/config")"
-  printf '%s\n' '    GIT_CONFIG_COUNT=$((_n+1)); export GIT_CONFIG_COUNT; unset _n'
+  printf '%s\n' '  if [ -n "${CLAUDECODE-}" ]; then'
+  printf '%s\n' '    unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_CLIENT_KEY CLAUDE_CODE_CLIENT_KEY_PASSPHRASE CLAUDE_CODE_CLIENT_CERT CLAUDE_CODE_HOST_CREDS_FILE ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN'
+  printf '%s\n' "    for _gw_n in $STUB_STANDINS; do"
+  printf '%s\n' '      if [ -f "$GW_BIN/$_gw_n" ]; then unalias "$_gw_n" 2>/dev/null || :; unset -f "$_gw_n" 2>/dev/null || :; fi'
+  printf '%s\n' '    done'
+  printf '%s\n' '    unset _gw_n'
   printf '%s\n' '  fi'
-  printf '  GIT_SSH_COMMAND=%s; RSYNC_RSH=%s; export GIT_SSH_COMMAND RSYNC_RSH\n' "$(q "$B/ssh")" "$(q "$B/ssh")"
-  printf '%s\n' '  unset SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS SSH_ASKPASS_REQUIRE GIT_ASKPASS GITHUB_TOKEN GH_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_TOKEN AZURE_STORAGE_KEY AZURE_STORAGE_SAS_TOKEN AZURE_STORAGE_CONNECTION_STRING AZURE_CLIENT_SECRET ARM_CLIENT_SECRET ARM_ACCESS_KEY DATABRICKS_TOKEN DATABRICKS_CLIENT_SECRET DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE'
   printf '%s\n' 'fi'
 }
 
@@ -283,8 +306,29 @@ stub() {
   if [ "$name" = sudo ]; then
     printf '%s\n' 'exec /usr/bin/sudo "$@"'
   else
+    if [ "$name" = git ]; then git_cold; fi
     printf 'echo %s >&2\nexit 75\n' "$_QSTILL"
   fi
+}
+
+# The git stub's way while no env can run Python (byte-identical to
+# envfile.git_cold_lines(); PLAN-0.11 §6.6): with nothing that may be
+# configured (maybe_configured's rule, at run time), the user's own git,
+# found as envfile.user_tool finds it; else still setting up.
+# shellcheck disable=SC2016
+git_cold() {
+  printf 'if [ ! -f %s ] && ! grep -Eq %s %s 2>/dev/null; then\n' "$_QCONF" "$_QERE" "$_QFORM"
+  printf '%s\n' '  _gw_ifs=$IFS; IFS=:; set -f'
+  printf '%s\n' '  for _gw_d in ${PATH-}:/usr/local/bin:/opt/homebrew/bin:/opt/local/bin:/usr/bin:/bin; do'
+  printf '%s\n' '    case $_gw_d in /*) ;; *) continue ;; esac'
+  printf '    case $_gw_d/ in %s/*|%s/*) continue ;; esac\n' "$_QENVS" "$_QPIXI"
+  printf '%s\n' '    [ -f "$_gw_d/.gateway-standins" ] && continue'
+  printf '%s\n' '    [ -f "$_gw_d/git" ] && [ -x "$_gw_d/git" ] || continue'
+  printf '%s\n' '    if [ "$_gw_d/git" = /usr/bin/git ] && [ -x /usr/bin/xcode-select ] && ! /usr/bin/xcode-select -p >/dev/null 2>&1; then continue; fi'
+  printf '%s\n' '    IFS=$_gw_ifs; set +f; exec "$_gw_d/git" "$@"'
+  printf '%s\n' '  done'
+  printf '%s\n' '  IFS=$_gw_ifs; set +f'
+  printf '%s\n' 'fi'
 }
 
 GONE="gateway: this launcher points at a gateway plugin that isn't there any more (uninstalled, or updated since the last Claude Code session); start a Claude Code session with the plugin to renew it, or delete ~/.config/gateway/gate if you uninstalled the gateway"
@@ -317,6 +361,12 @@ write_launcher() {
 
 # Each stub is replaced atomically inside the existing folder (temp file, then
 # mv -f = rename), so $DATA/bin never goes missing (same as envfile.write_stubs).
+# `write_stubs all` writes the full base set (envfile.BASE_STANDINS: the cold
+# window, while something may be configured; Python narrows it to what the
+# configured set needs), `write_stubs helpers` only gate and the helpers (and
+# removes the stand-ins: nothing is configured). Either way the folder gets
+# its marker (envfile.STANDIN_MARKER), which the pass-through's PATH lookup
+# skips.
 write_stubs() {
   B="$DATA/bin"
   if [ -L "$B" ] || { [ -e "$B" ] && [ ! -d "$B" ]; }; then rm -f "$B"; fi
@@ -325,18 +375,28 @@ write_stubs() {
   _QDATA=$(q "$DATA"); _QPY=$(q "$PY"); _QREADY=$(q "$ENVD/.ready"); _QRUN=$(q "$ROOT/run.py")
   _QPYC=$(q "pycache_prefix=$PYC")
   _QSTILL=$(q "$STILL")
+  _h=$(gw_home)
+  _QCONF=$(q "$_h/private/configured.json"); _QFORM=$(q "$_h/gateway.toml")
+  _QERE=$(q "$CONFIGURED_ERE"); _QENVS=$(q "$DATA/envs"); _QPIXI=$(q "$ROOT/.pixi")
   names=" "
   made=""
-  for spec in "sudo shim sudo" "ssh shim ssh" "scp shim scp" "sftp shim sftp" "gh shim gh" \
-              "hf shim hf" "databricks shim databricks" "crane shim crane" "pijul shim pijul" \
-              "asiml shim asiml" "gate gate" "git-credential-gateway git-credential" \
-              "gate-askpass askpass"; do
+  _specs=
+  if [ "${1-all}" = all ]; then
+    for n in $STUB_STANDINS; do _specs="$_specs $n:shim:$n"; done
+  fi
+  for spec in $_specs gate:gate git-credential-gateway:git-credential gate-askpass:askpass; do
+    _ifs=$IFS; IFS=:
     # shellcheck disable=SC2086
     set -- $spec
+    IFS=$_ifs
     n=$1; shift
     if stub "$n" "$@" > "$B/.$n.tmp.$$"; then made="$made $n"; else rm -f "$B/.$n.tmp.$$"; fi
     names="$names$n "
   done
+  if [ "$(cat "$B/.gateway-standins" 2>/dev/null)" != "$MARKER_TEXT" ]; then
+    printf '%s\n' "$MARKER_TEXT" > "$B/.gateway-standins.tmp.$$" && chmod 644 "$B/.gateway-standins.tmp.$$" &&
+      mv -f "$B/.gateway-standins.tmp.$$" "$B/.gateway-standins" || rm -f "$B/.gateway-standins.tmp.$$"
+  fi
   chmod 755 "$B"/.*.tmp.$$ 2>/dev/null        # one chmod for all of them
   for n in $made; do
     t="$B/.$n.tmp.$$"
@@ -364,33 +424,47 @@ write_env_file() {
   if env_text > "$t" 2>/dev/null && mv -f "$t" "$CLAUDE_ENV_FILE" 2>/dev/null; then :; else rm -f "$t"; fi
 }
 
-# The base stand-ins (envfile.BASE_STANDINS, write_stubs below).
-STUB_NAMES="sudo ssh scp sftp gh hf databricks crane pijul asiml gate git-credential-gateway gate-askpass"
+# The stand-ins of the base set and the helpers (envfile.STANDIN_NAMES,
+# envfile.HELPERS; write_stubs above), and the stand-in folder's marker text
+# (envfile.MARKER_TEXT, without its newline).
+STUB_STANDINS="sudo ssh scp sftp git gh hf databricks crane pijul asiml az dvc"
+STUB_HELPERS="gate git-credential-gateway gate-askpass"
+MARKER_TEXT="gateway stand-ins: user_tool skips this folder"
 
-# Before Python runs SessionStart: the env file (others = "refuse"), and the
-# stand-ins and the git reset when one is missing, so a session whose hook
-# Claude Code cancels (its 20 s limit) or that is killed still runs Claude's
-# commands through the stand-ins, without the user's agent and tokens.
-# Python then writes all of it for the form (envfile.sync).
+# May something be configured (PLAN-0.11 §1.2's cold rule, before any Python
+# can tell)? gateway.toml has a line that starts the hosts or accounts table
+# in any shape TOML allows: a header ([hosts.box], [hosts], ["hosts".box]),
+# a dotted key (hosts.box.address = ...) or an inline table (hosts = {...},
+# accounts = {...}); or the configured list (private/configured.json)
+# exists. Wider than needed is safe: a stand-in passes an unconfigured
+# target to the user's own tool.
+maybe_configured() {
+  _h=$(gw_home)
+  [ -f "$_h/private/configured.json" ] && return 0
+  [ -f "$_h/gateway.toml" ] &&
+    grep -Eq "^[[:space:]]*\\[?\\[?[[:space:]]*[\"']?(hosts|accounts)[\"']?[[:space:]]*[].=]" "$_h/gateway.toml" 2>/dev/null
+}
+# The same ERE for the git stub's cold pass-through (git_cold; envfile.CONFIGURED_ERE).
+CONFIGURED_ERE="^[[:space:]]*\\[?\\[?[[:space:]]*[\"']?(hosts|accounts)[\"']?[[:space:]]*[].=]"
+
+# Before Python runs SessionStart: the env file, and the stubs when one is
+# missing: the full base set while something may be configured (so a
+# session whose hook Claude Code cancels, its 20 s limit, or that is killed
+# still runs a configured target's commands through the stand-ins), else
+# only gate and the helpers (a brand-new install shadows nothing). Python
+# then writes what the configured set needs (envfile.sync).
 pre_session() {
   write_env_file
-  for n in $STUB_NAMES; do
-    if [ ! -f "$DATA/bin/$n" ]; then write_stubs 2>/dev/null; break; fi
-  done
-  [ -f "$DATA/git/config" ] || write_git_reset 2>/dev/null
-  return 0
-}
-
-# The git include file while the env builds: the global credential-helper
-# reset (byte-identical to envfile.git_config_text("refuse")).
-write_git_reset() {
-  mkdir -p "$DATA/git" || return 1
-  t="$DATA/git/.config.tmp.$$"
-  if printf '[credential]\n\thelper =\n' > "$t" && chmod 644 "$t" && mv -f "$t" "$DATA/git/config"; then
-    :
+  if maybe_configured; then
+    for n in $STUB_STANDINS $STUB_HELPERS; do
+      if [ ! -f "$DATA/bin/$n" ]; then write_stubs all 2>/dev/null; break; fi
+    done
   else
-    rm -f "$t"
+    for n in $STUB_HELPERS; do
+      if [ ! -f "$DATA/bin/$n" ]; then write_stubs helpers 2>/dev/null; break; fi
+    done
   fi
+  return 0
 }
 
 # JSON string escaping for messages that carry a path.
@@ -566,6 +640,7 @@ ensure_env() {
   trap 'rm -rf "$LOCKD"' EXIT
   trap 'trap - EXIT; [ -n "$cpid" ] && kill "$cpid" 2>/dev/null; exit 143' HUP INT TERM
   rc=1
+  rm -f "$ENVD/.pixi-too-old"
   if cp "$ROOT/pixi.toml" "$ROOT/pixi.lock" "$ENVD/"; then
     "$P" install --locked --manifest-path "$ENVD/pixi.toml" > "$ENVD/install.log" 2>&1 &
     cpid=$!
@@ -576,6 +651,8 @@ ensure_env() {
     if [ "$prc" -eq 0 ] && [ -x "$PY" ]; then
       : > "$ENVD/.ready"
       rc=0
+    else
+      note_pixi_too_old "$P"
     fi
   fi
   rm -rf "$LOCKD"
@@ -602,11 +679,47 @@ build_failed() {
   [ -f "$ENVD/install.log" ] && [ ! -e "$ENVD/.ready" ] && ! lock_live
 }
 
+# pixi refused the manifest because it is older than requires-pixi ("this
+# project requires pixi '>=0.83.0', but you have pixi 0.81.0"): the versions
+# go to $ENVD/.pixi-too-old, two key=value lines (found=, needed=) that
+# status, the not-ready texts and gate status read. Each sed takes the words,
+# each tr keeps only version characters of them (no quote, backslash or $
+# reaches the JSON or sh texts). The next build attempt removes it.
+note_pixi_too_old() {
+  _l=$(grep "requires pixi '" "$ENVD/install.log" 2>/dev/null | head -n 1)
+  [ -n "$_l" ] || return 0
+  _need=$(printf '%s\n' "$_l" | sed -n "s/.*requires pixi '\([^']*\)'.*/\1/p" | tr -cd '0-9A-Za-z.,<>=!*~ ')
+  _have=$(printf '%s\n' "$_l" | sed -n 's/.*you have pixi \([0-9][^ ,]*\).*/\1/p' | tr -cd '0-9A-Za-z.+-')
+  [ -n "$_have" ] || _have=$("$1" --version 2>/dev/null | head -n 1 | sed -n 's/[^0-9]*\([0-9][^ ]*\).*/\1/p' | tr -cd '0-9A-Za-z.+-')
+  if printf 'found=%s\nneeded=%s\n' "$_have" "$_need" > "$ENVD/.pixi-too-old.$$"; then
+    mv -f "$ENVD/.pixi-too-old.$$" "$ENVD/.pixi-too-old"
+  else
+    rm -f "$ENVD/.pixi-too-old.$$"
+  fi
+}
+
+# Is the last build's failure pixi's "requires pixi" refusal? Sets GW_TOOOLD
+# to the words the not-ready texts use ("pixi 0.81.0 is too old (the gateway
+# needs pixi >=0.83.0)"; envfile.pixi_too_old_words), and GW_PFOUND and
+# GW_PNEED to the versions.
+pixi_too_old() {
+  GW_PFOUND= GW_PNEED= GW_TOOOLD=
+  [ -f "$ENVD/.pixi-too-old" ] && build_failed || return 1
+  while IFS='=' read -r _k _v; do
+    case $_k in found) GW_PFOUND=$_v ;; needed) GW_PNEED=$_v ;; esac
+  done < "$ENVD/.pixi-too-old"
+  if [ -n "$GW_PFOUND" ]; then GW_TOOOLD="pixi $GW_PFOUND is too old"; else GW_TOOOLD="this pixi is too old"; fi
+  [ -z "$GW_PNEED" ] || GW_TOOOLD="$GW_TOOOLD (the gateway needs pixi $GW_PNEED)"
+  return 0
+}
+
 # What a stand-in says while the gateway can't run, by state: pixi missing,
 # the build failed (retried only at the next session start), or building.
 not_ready_text() {
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "$NOPIXI"
+  elif pixi_too_old; then
+    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; tell the user to update pixi (pixi self-update) and start a new session"
   elif build_failed; then
     printf '%s' "gateway: the gateway's setup failed (log: $ENVD/install.log); it is retried at the next session start; tell the user"
   else
@@ -618,6 +731,8 @@ not_ready_text() {
 launcher_not_ready_text() {
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "$LNOPIXI"
+  elif pixi_too_old; then
+    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; update pixi (pixi self-update), then start a new Claude Code session"
   elif build_failed; then
     printf '%s' "gateway: the gateway's setup failed (log: $ENVD/install.log); start a new Claude Code session to retry"
   else
@@ -627,13 +742,15 @@ launcher_not_ready_text() {
 
 # Claude's context while the gateway can't run, by the same states.
 not_ready_context() {
-  tail="sudo works as usual; ssh, gh, gate and the other gateway commands refuse until then, so don't retry them. Never ask the user for a password, token or key in chat."
+  tail="until then the gateway's commands for the machines and accounts in gateway.toml (ssh, gh, gate, ...) refuse, so don't retry them; anything else uses the user's own tools. Never ask the user for a password, token or key in chat."
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "Gateway (plugin): the gateway can't set itself up because pixi isn't installed. Tell the user once to install it from https://pixi.sh and start a new session; $tail"
+  elif pixi_too_old; then
+    printf '%s' "Gateway (plugin): the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Tell the user once to update pixi (pixi self-update) and start a new session; $tail"
   elif build_failed; then
     printf '%s' "Gateway (plugin): the gateway's first-time setup failed (log: $(json_esc "$ENVD/install.log")); it is retried at the next session start. Tell the user once; $tail"
   else
-    printf '%s' "Gateway (plugin): first-time setup is still running. sudo works as usual; ssh, gh and the other gateway commands say they are still setting up until it finishes (about a minute). Never ask the user for a password, token or key in chat."
+    printf '%s' "Gateway (plugin): first-time setup is still running. The gateway's commands for the machines and accounts in gateway.toml (ssh, gh, ...) say they are still setting up until it finishes (about a minute); anything else uses the user's own tools. Never ask the user for a password, token or key in chat."
   fi
 }
 
@@ -641,11 +758,16 @@ degraded_session() {
   LSTILL=$(launcher_not_ready_text)
   STILL=$(not_ready_text)
   write_env_file
-  write_stubs 2>/dev/null
-  write_git_reset 2>/dev/null
+  if maybe_configured; then
+    write_stubs all 2>/dev/null
+  else
+    write_stubs helpers 2>/dev/null
+  fi
   write_launcher 2>/dev/null
   if ! find_pixi >/dev/null 2>&1; then
     msg="gateway: pixi isn't installed, so the gateway can't set itself up. Install it from https://pixi.sh, then start a new session."
+  elif pixi_too_old; then
+    msg="gateway: the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Update pixi: pixi self-update, then start a new session."
   elif build_failed; then
     msg="gateway: setting up failed; see $(json_esc "$ENVD/install.log") (it is retried at every session start)"
   else
@@ -793,22 +915,26 @@ gw_home() {
 # hooks_bash decides in full once the env is ready; until then this denies,
 # by text, what it can recognize in sh: reads of the gateway's private folder
 # (and of ~/.config/gateway other than gateway.toml), session transcripts,
-# credential helpers / age -d / access tokens / token-bearing command lines,
-# and, once a vault exists, curl and wget. Everything else gets no decision
-# (Claude Code's own permissions apply). It reads only what pre_bash.sh
-# forwards (its trigger words), like the Python hook. The deny lines are
-# byte-identical to envfile.degraded_bash_text(KIND) (tests compare them).
+# credential helpers / age -d / access tokens / token-bearing command lines.
+# The network class (PLAN-0.11 §3.4) is asked about, or denied while
+# gateway.toml has a [network] table (sh can't read its value). Everything
+# else gets no decision (Claude Code's own permissions apply). It reads only
+# what pre_bash.sh forwards (its trigger words), like the Python hook. Its
+# lines are byte-identical to envfile.degraded_bash_text(KIND) (tests compare
+# them).
 DEG_HEAD="gateway: still setting up (first run), so its guard works in a reduced form:"
 DEG_TAIL="is refused until setup finishes (about a minute; if it can't finish, the session's first gateway message says why)."
+DEG_ASK_TAIL="is asked about until setup finishes (about a minute; if it can't finish, the session's first gateway message says why)."
 degraded_bash_text() {
+  _d=deny; _t=$DEG_TAIL
   case $1 in
     private) _w="anything naming the gateway's private folder, keys or vault (~/.config/gateway other than gateway.toml)" ;;
     transcript) _w="reading Claude Code's session transcripts" ;;
     cred) _w="running a credential helper, decrypting with age, printing an access token or passing a token on the command line" ;;
-    fetch) _w="curl and wget (a vault exists; the http tool replaces them once setup finishes)" ;;
-    managed) _w="running Bash outside the gateway's managed shell (it isn't active in this session: Claude Code's mods are off, older than 2.1.287, or another shell prefix is set)" ;;
+    network) _w="running a network command (curl, wget, nc, nmap, ...)"; _d=ask; _t=$DEG_ASK_TAIL ;;
+    network_table) _w="running a network command (curl, wget, nc, nmap, ...; gateway.toml's [network] table can't be read until then)" ;;
   esac
-  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "%s %s %s"}}\n' "$DEG_HEAD" "$_w" "$DEG_TAIL"
+  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "%s", "permissionDecisionReason": "%s %s %s"}}\n' "$_d" "$DEG_HEAD" "$_w" "$_t"
 }
 
 DEG_SHAPES='gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|hf_[A-Za-z0-9]{10,}|glpat-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}|AGE-SECRET-KEY-1|-----BEGIN [A-Z0-9 ]*PRIVATE KEY|[Aa]uthorization: *([Bb]earer|[Bb]asic|[Tt]oken) '
@@ -825,17 +951,29 @@ DEG_PRIVATE_GLOB='\.config/[^/[:space:]]*[][*?]'
 DEG_CONFIG='(^|[^a-z0-9_])\.config([^a-z0-9_.-]|$)'
 DEG_GATEWORD='(^|[^a-z0-9_-])gate(way|[][*?])'
 DEG_TREE='(^|[^a-z0-9_-])(-[a-z]*r[a-z]*|--recursive|-a|--archive|tar|zip|rsync|rg|ag|find|cp|scp)([^a-z0-9_-]|$)'
-DEG_CRED='git_trace_redact|git-credential|gate-askpass|get-access-token|(^|[^a-z0-9_-])git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+credential([^a-z0-9_-]|$)|(^|[^a-z0-9_-])gate[[:space:]]+secret([^a-z0-9_-]|$)|(^|[^a-z0-9_.-])age[[:space:]][^|;&]*(-d|--decrypt)([^a-z0-9_-]|$)'
-DEG_FETCH='(^|[^a-z0-9_-])(curl|wget)([^a-z0-9_-]|$)'
+DEG_CRED='git_trace_redact|git-credential|gate-askpass|get-access-token|(^|[^a-z0-9_-])git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+credential([^a-z0-9_-]|$)|(^|[^a-z0-9_.-])age[[:space:]][^|;&]*(-d|--decrypt)([^a-z0-9_-]|$)'
+# The network class (PLAN-0.11 §3.1), as pre_bash.sh reads it: its names
+# (DEG_NET_NAMES is form.NETWORK_BUILTIN; a test compares the lists) and the
+# user's `extra` names from $DATA/network-words, never glued to a dot, a dash
+# or a colon after them; the structural members by their shapes (openssl's
+# TLS client and server, an HTTP server, a busybox applet, rsync to a
+# daemon, /dev/tcp and /dev/udp). Matched on the payload with JSON's \n, \r
+# and \t made spaces and quotes and backslashes dropped, without letter case
+# (macOS's file systems ignore it: CURL runs curl), but php's server flag
+# keeps its case (-S; DEG_NET_PHP).
+DEG_NET_NAMES='curl|wget|wget2|aria2c|xh|http|https|lynx|w3m|links|links2|nmap|nping|masscan|zmap|rustscan|hping3|ssh-keyscan|nc|ncat|netcat|socat|telnet|ftp|tftp|lftp|smbclient|certutil|tcpdump|tshark|nikto|sqlmap|hydra|gobuster|ffuf|nuclei|arp-scan|iperf3'
+DEG_NET_SHAPES='/dev/(tcp|udp)/|(^|[^A-Za-z0-9_.-])openssl[[:space:]]+s_(client|server|time)([^A-Za-z0-9_]|$)|-[A-Za-z]*m[[:space:]]*(http\.server|SimpleHTTPServer|http)([^A-Za-z0-9_.]|$)|-run[[:space:]]+-e[[:space:]]*httpd|(^|[^A-Za-z0-9_.-])busybox[[:space:]]+httpd|(^|[^A-Za-z0-9_.-])rsync[[:space:]][^;&|]*(rsync://|[^/:[:space:]]::)'
+DEG_NET_PHP='(^|[^A-Za-z0-9_.-])[Pp][Hh][Pp][0-9.]*[[:space:]]([^;&|]*[[:space:]])?-S'
+# A [network] table in gateway.toml (a header [network] or [network.x], or a
+# top-level network key before the first header).
+gw_network_table() {
+  [ -f "$1" ] && awk '/^[[:space:]]*\[[[:space:]]*"?network"?[[:space:]]*[].]/ { f = 1 }
+    /^[[:space:]]*\[/ { t = 1 }
+    !t && /^[[:space:]]*"?network"?[[:space:]]*[.=]/ { f = 1 }
+    END { exit !f }' "$1" 2>/dev/null
+}
 
 degraded_bash() {
-  # Managed mode (PLAN-v4 phase 4): pre_bash.sh sets GW_MANAGED_CHECK for a
-  # Bash or Monitor call when the mod's prefix isn't active. Without Python
-  # the effective mode can't be read from the vault, so it counts as "on" (the
-  # default): refused, never run in the user's own shell.
-  if [ "${GW_MANAGED_CHECK-}" = 1 ]; then
-    degraded_bash_text managed; return 0
-  fi
   # The payload without its transcript paths and cwd (they name Claude's own
   # folders on every call), as the prefilter does.
   _raw=$(printf '%s' "$GW_PAYLOAD" | sed 's/"[a-z_]*transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"//g; s/"cwd"[[:space:]]*:[[:space:]]*"[^"]*"//g')
@@ -865,10 +1003,30 @@ degraded_bash() {
   if printf '%s' "$_lt" | grep -Eq -- "$DEG_CRED" || printf '%s' "$_raw" | grep -Eq -- "$DEG_SHAPES"; then
     degraded_bash_text cred; return 0
   fi
-  _h=$(gw_home)
-  if { [ -e "$_h/private/vault.age" ] || [ -e "$_h/store.age" ]; } &&
-     printf '%s' "$_lt" | grep -Eq -- "$DEG_FETCH"; then
-    degraded_bash_text fetch; return 0
+  _names=$DEG_NET_NAMES
+  if [ -f "$DATA/network-words" ]; then
+    while IFS= read -r _x || [ -n "$_x" ]; do
+      case $_x in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+      _e=; _r=$_x
+      while :; do
+        case $_r in
+          *.*) _e="$_e${_r%%.*}\\."; _r=${_r#*.} ;;
+          *) _e="$_e$_r"; break ;;
+        esac
+      done
+      _names="$_names|$_e"
+    done < "$DATA/network-words"
+  fi
+  _dn=$(printf '%s' "$_raw" | sed -e 's/\\[nrt]/ /g' -e "s/[\"'\\\\]//g")
+  if printf '%s' "$_dn" | grep -Eiq -- "(^|[^A-Za-z0-9_.-])($_names)([^A-Za-z0-9_.:-]|\$)|$DEG_NET_SHAPES" ||
+     printf '%s' "$_dn" | grep -Eq -- "$DEG_NET_PHP"; then
+    _h=$(gw_home)
+    if gw_network_table "$_h/gateway.toml"; then
+      degraded_bash_text network_table
+    else
+      degraded_bash_text network
+    fi
+    return 0
   fi
   return 0
 }
@@ -895,16 +1053,17 @@ if [ "$mode" = status ]; then
   esac
   _old=$(older_env)
   _h=$(gw_home)
-  # vault: the v3 vault (private/vault.age). vault_v2: an unmigrated 0.6 vault
-  # (store.age), converted once setup finishes; the cold Bash guard already
-  # counts either as "a vault exists", so the doctor must not say "no vault"
-  # when one is sitting there (existence only; never read).
+  # pixi_too_old: the last build failed on pixi's "requires pixi" refusal,
+  # with the pixi it found and the requires-pixi it needs
+  _too=false GW_PFOUND= GW_PNEED=
+  if [ "$_state" = failed ] && pixi_too_old; then _too=true; fi
+  # vault: the vault (private/vault.age; existence only, never read).
   # managed: the managed shell's settings are written (gate-sh runs nothing before)
-  printf '{"state": "%s", "root": "%s", "data": "%s", "env": "%s", "lock": "%s", "warm": %s, "managed": %s, "older": "%s", "build_running": %s, "install_log": %s, "pixi": "%s", "pixi_version": "%s", "home": "%s", "form": %s, "vault": %s, "vault_v2": %s}\n' \
+  printf '{"state": "%s", "root": "%s", "data": "%s", "env": "%s", "lock": "%s", "warm": %s, "managed": %s, "older": "%s", "build_running": %s, "install_log": %s, "pixi": "%s", "pixi_version": "%s", "pixi_too_old": %s, "pixi_found": "%s", "pixi_needed": "%s", "home": "%s", "form": %s, "vault": %s}\n' \
     "$_state" "$(json_esc "$ROOT")" "$(json_esc "$DATA")" "$(json_esc "$ENVD")" "$SHA" \
     "$(jb test -e "$ENVD/.warm")" "$(jb test -f "$DATA/managed/conf")" "$(json_esc "$_old")" "$(jb lock_live)" "$(jb test -f "$ENVD/install.log")" \
-    "$(json_esc "$_pixi")" "$(json_esc "$_pv")" "$(json_esc "$_h")" \
-    "$(jb test -f "$_h/gateway.toml")" "$(jb test -e "$_h/private/vault.age")" "$(jb test -e "$_h/store.age")"
+    "$(json_esc "$_pixi")" "$(json_esc "$_pv")" "$_too" "$(json_esc "$GW_PFOUND")" "$(json_esc "$GW_PNEED")" "$(json_esc "$_h")" \
+    "$(jb test -f "$_h/gateway.toml")" "$(jb test -e "$_h/private/vault.age")"
   exit 0
 fi
 

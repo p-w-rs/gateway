@@ -93,10 +93,6 @@ def form_path() -> Path:
     return home() / "gateway.toml"
 
 
-def from_v2_form_path() -> Path:
-    return home() / "gateway.from-v2.toml"
-
-
 def launcher_path() -> Path:
     return home() / "gate"
 
@@ -143,17 +139,21 @@ def pending_dir() -> Path:
     return private_dir() / "pending"
 
 
-# v2 files (migration reads them; the file guard protects them)
+def configured_path() -> Path:
+    """The configured list (PLAN-0.11 §1.1): a non-secret mirror of the
+    approved snapshot's reach, readable while the vault is locked
+    (consent.write_listed / load_listed)."""
+    return private_dir() / "configured.json"
+
+
+# gateway 0.6's vault and key (never read; the file guard protects them, and
+# vault.v06_waiting tells a 0.6 install apart)
 def v2_store_path() -> Path:
     return home() / "store.age"
 
 
 def v2_key_path() -> Path:
     return home() / "key.txt"
-
-
-def v2_lock_path() -> Path:
-    return home() / ".lock"
 
 
 def ensure_home() -> Path:
@@ -266,6 +266,38 @@ def git_dir() -> Path:
 
 def git_config_path() -> Path:
     return git_dir() / "config"
+
+
+def git_global_path() -> Path:
+    """The gated git's read-only global config (PLAN-0.11 §6.3; 0444, init
+    defaults)."""
+    return git_dir() / "global"
+
+
+def mode_epoch_path() -> Path:
+    """The recorded mode's epoch marker (PLAN-0.11 §2.4, modes.set_marker):
+    present while the effective form makes the session's mode matter, so
+    pre_bash.sh sends every call to Python and gated's record stays fresh."""
+    return data_dir() / "mode-epoch"
+
+
+def network_words_path() -> Path:
+    """[network] extra's names for pre_bash.sh's prefilter (PLAN-0.11 §3.4),
+    one per line, written whole on a form load that changes them."""
+    return data_dir() / "network-words"
+
+
+def ask_clis_path() -> Path:
+    """The account CLIs an "ask" account may serve, for pre_bash.sh (lead
+    decision 19.14), one per line, written whole beside network-words."""
+    return data_dir() / "ask-clis"
+
+
+def network_form_link() -> Path:
+    """A symlink to gateway.toml beside network-words, so pre_bash.sh can
+    tell with a built-in test (`-nt`) that the form changed since the words
+    were written, without looking up the user's home (a process)."""
+    return data_dir() / "network-form"
 
 
 def envs_dir() -> Path:
@@ -449,16 +481,11 @@ def contract_path() -> Path:
     return contract_dir() / "contract.json"
 
 
-def checkpoint_state_dir() -> Path:
-    """The checkpoint plugin's state folder (`${XDG_STATE_HOME:-~/.local/state}/
-    checkpoint`, as checkpoint's state.home()). Only its existence is read:
-    Claude's context mentions checkpoint jobs when it is there (SPEC 13).
-    Under a test override: in the test's home, whatever XDG_STATE_HOME says."""
-    if testing.active() is None:
-        x = os.environ.get("XDG_STATE_HOME", "")
-        if os.path.isabs(x):
-            return Path(x) / "checkpoint"
-    return user_home() / ".local" / "state" / "checkpoint"
+def checkpoint_seen_path() -> Path:
+    """<run>/checkpoint-seen (PLAN-0.11 §9.4): gated touches it whenever a
+    checkpoint client calls a CONTRACT-v1 route; Claude's context mentions
+    checkpoint jobs while it is younger than a day (hooks_session)."""
+    return run_dir(create=False) / "checkpoint-seen"
 
 
 # ---------------------------------------------------------------------------
@@ -552,9 +579,12 @@ E2E_TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/
                   "/private/var/folders")
 _E2E_CHARS = re.compile(r"[A-Za-z0-9/._-]+")
 # e2e.json keys passed on to testing.override (anything else is ignored).
+# `user_tools`: a folder of recording fakes for the user's own tools, which
+# a pass-through runs instead of the real ssh, git, sudo (PLAN-0.11 §1.3,
+# §13: the e2e suite and the TUI acceptances never run the real ones).
 E2E_KNOBS = {"dialog": str, "tools": dict, "machine_id": str, "system_git": bool,
              "ssh_remote_euid": str, "popup_wait": (int, float), "popup_lifetime": (int, float),
-             "dialog_timeout": (int, float), "clipboard": str}
+             "dialog_timeout": (int, float), "clipboard": str, "user_tools": str}
 
 
 def code_root() -> Path:
@@ -676,6 +706,8 @@ def e2e_config(root: Path, uid: int | None = None) -> dict:
     if tools is not None:
         out["tools"] = {str(n): str(p) for n, p in tools.items()
                         if isinstance(p, str) and os.path.isabs(p)}
+    if "user_tools" in out and not os.path.isabs(out["user_tools"]):
+        del out["user_tools"]             # a folder relative to some cwd: never
     return out
 
 

@@ -8,7 +8,8 @@ cleanup on every exit path, the unavailable surfaces (claude -p, mods off,
 mobile, VS Code), the lease plane, the clipboard override (a test never
 reaches the real clipboard; only root's fixed programs in production), the
 pause, restart survival without secrets on disk, the remember choice, the
-two-field passphrase, the guard, the browser sign-ins staying unavailable.
+two-field passphrase, the guard, a service principal without its own client
+told what to add before any dialog (the browser sign-in: mutations_sso.py).
 Mutations of the mod (hooks/mod/) are killed by `claude plugin test` on the
 copy (test_mod), skipped where no claude binary is found (then they would
 survive: run them where claude is installed). Same format and runner as
@@ -131,8 +132,8 @@ MUTATIONS = [
     # --- the recheck at the call sites (phase 3 review: no production dialog
     # named its right, so gated's recheck never ran for sudo or ssh) ------------
     ("the sudo stand-in's dialog names no right for gated's recheck", S + "sudo.py",
-     "store=store, load=load, remember=True, check=SUDO_CHECK)\n",
-     "store=store, load=load, remember=True)\n",
+     "remember=REMEMBER_DEFAULT,\n                                      check=SUDO_CHECK)\n",
+     "remember=REMEMBER_DEFAULT)\n",
      TD + "test_daemon_sudo_standin_a_right_switched_off_while_its_dialog_is_open_is_never_used"),
     ("the sudo stand-in doesn't read the right again after its dialog", S + "sudo.py",
      "    if asked:\n",
@@ -147,8 +148,8 @@ MUTATIONS = [
      '"right": "sudo"}',
      "test_ux_gate_setup::test_check_sudo_dialogs_name_the_rights_gated_rechecks"),
     ("the remote sudo dialog names no right", S + "ssh.py",
-     '                     check=host_check(name, "ssh", "sudo"), remember=True)\n',
-     '                     remember=True)\n',
+     '                     check=host_check(name, "ssh", "sudo"), remember=ssh_sudo.REMEMBER_DEFAULT)\n',
+     '                     remember=ssh_sudo.REMEMBER_DEFAULT)\n',
      "test_ssh_sudo::test_ssh_sudo_dialog_names_its_rights_offers_remember_and_rechecks"),
     ("remote sudo places a dialog's password without reading the rights again", S + "ssh.py",
      "    if fresh:\n        _rights_after_dialog(name)\n",
@@ -234,11 +235,11 @@ MUTATIONS = [
      "                keep = True\n",
      TD + "test_daemon_sudo_standin_remember_unticked_runs_once_and_stores_nothing"),
     ("the sudo stand-in's dialog offers no Remember it", S + "sudo.py",
-     "store=store, load=load, remember=True, check=SUDO_CHECK)\n",
-     "store=store, load=load, check=SUDO_CHECK)\n",
+     "store=store, load=load, remember=REMEMBER_DEFAULT,\n",
+     "store=store, load=load,\n",
      TD + "test_daemon_sudo_standin_control_unchanged_right_runs_and_stores"),
     ("the remote sudo dialog offers no Remember it", S + "ssh.py",
-     '                     check=host_check(name, "ssh", "sudo"), remember=True)\n',
+     '                     check=host_check(name, "ssh", "sudo"), remember=ssh_sudo.REMEMBER_DEFAULT)\n',
      '                     check=host_check(name, "ssh", "sudo"))\n',
      "test_ssh_sudo::test_ssh_sudo_dialog_names_its_rights_offers_remember_and_rechecks"),
     ("gated takes a post without the remember choice as unticked", DS + "dialogs.py",
@@ -249,10 +250,10 @@ MUTATIONS = [
      '        if r.kind == "passphrase" and (len(values) != 2 or values[0] != values[1]):\n',
      '        if False:\n',
      TD + "test_store_two_passphrase_fields_must_match_and_paste_is_one_field_only"),
-    ("a browser-only sign-in opens dialogs anyway", S + "gate_setup.py",
-     "        p.error = popup.signin_unavailable(a.kind, name)\n",
+    ("a service principal without its own client opens dialogs anyway", S + "gate_setup.py",
+     "        p.error = SP_NEEDS_CLIENT.format(name=name)\n",
      "        pass\n",
-     "test_ux_gate_setup::test_browser_and_device_code_signins_are_unavailable_and_say_what_works"),
+     "test_ux_gate_setup::test_no_device_code_and_a_service_principal_without_its_client_says_what_works"),
     ("the unavailable message points at a terminal command", S + "popup.py",
      '    return (f"gateway: {why}, so nothing was asked ({p}). Tell the user once: it can be given "\n'
      '            f"in the gateway\'s dialog {WHERE}, {how}.")\n',
@@ -376,6 +377,67 @@ MUTATIONS = [
      "    if (values.length === 2 && values[0] !== values[1]) {\n",
      "    if (false) {\n",
      MOD),
+    # --- vault care from chat (PLAN-0.11 §19.14) ---------------------------------
+    ("a changed passphrase isn't put in place (the old one keeps opening the key)", DS + "broker.py",
+     "                os.replace(tmp, wrapped)\n                _fsync_dir(wrapped.parent)\n"
+     "                self.touch()\n",
+     "                self.touch()\n",
+     "test_dialogs::test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed"),
+    ("the passphrase is removed without the person's OK", DS + "lifecycle.py",
+     "                lambda _r, _v: self._remove_answer(), kind=\"confirm\")\n",
+     "                lambda _r, _v: self._remove_answer(), kind=\"confirm\") \\\n"
+     "                if self._remove_answer()[0] else {}\n",
+     "test_dialogs::test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed"),
+    ("a removed passphrase is offered again (the person chose none)", DS + "broker.py",
+     "                if vault.offer_state(data) != vault.OFFER_DECLINED:\n"
+     "                    vault.decline_offer(data)\n                    vault.save(data)\n",
+     "                pass\n",
+     "test_dialogs::test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed"),
+    ("the vault starts over without the person's OK", DS + "lifecycle.py",
+     "                lambda _r, _v: self._start_over_answer(), kind=\"confirm\")\n",
+     "                lambda _r, _v: self._start_over_answer(), kind=\"confirm\") \\\n"
+     "                if self._start_over_answer()[0] else {}\n",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
+    ("an unlocked vault (its passphrase known) can start over", DS + "lifecycle.py",
+     "            if state != \"locked\":\n                return no(state, \"gateway: the vault isn't "
+     "locked behind a lost passphrase (\"\n",
+     "            if state not in (\"locked\", \"unlocked\"):\n                return no(state, "
+     "\"gateway: the vault isn't locked behind a lost passphrase (\"\n",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
+    ("a start-over deletes the vault's files instead of moving them", S + "vault.py",
+     "            os.rename(src, dest / name)\n",
+     "            src.unlink()\n",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
+    ("the broker starts over a vault unlocked while the confirm waits (its live files moved)",
+     DS + "broker.py",
+     "            if self._identity is not None:\n"
+     "                raise BrokerError(\"gateway: the vault is unlocked, so its passphrase isn't lost: \"\n",
+     "            if False:\n"
+     "                raise BrokerError(\"gateway: the vault is unlocked, so its passphrase isn't lost: \"\n",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
+    ("the broker removes the passphrase of a vault locked while the confirm waits", DS + "broker.py",
+     "            if self.mode() != \"wrapped\" or self._identity is None:\n"
+     "                raise BrokerError(\"gateway: the vault must be unlocked (with a passphrase) to \"\n"
+     "                                  \"remove its passphrase\")\n",
+     "            if self.mode() != \"wrapped\":\n"
+     "                raise BrokerError(\"gateway: the vault must be unlocked (with a passphrase) to \"\n"
+     "                                  \"remove its passphrase\")\n",
+     "test_dialogs::test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed"),
+    ("a changed passphrase goes in place without unwrapping it to compare", DS + "broker.py",
+     "                if read_identity(back) != ident:\n",
+     "                if False:\n",
+     "test_broker::test_a_passphrase_change_that_fails_its_check_changes_nothing"),
+    ("removing the passphrase logs no event", DS + "broker.py",
+     "        self.emit(\"vault.unwrapped\")\n", "",
+     "test_dialogs::test_daemon_an_unlocked_vaults_passphrase_is_changed_or_removed"),
+    ("a start-over logs no event", DS + "broker.py",
+     "        self.emit(\"vault.started_over\")\n", "",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
+    ("the unlock dialog doesn't say what to do about a lost passphrase", DS + "lifecycle.py",
+     "                    \"Passphrase lost? Cancel, then gate passphrase --start-over (or ask Claude) \"\n"
+     "                    \"moves this vault aside, nothing deleted, so you can start again.\"]\n",
+     "                    ]\n",
+     "test_dialogs::test_daemon_a_vault_whose_passphrase_is_lost_starts_over"),
 ]
 
 

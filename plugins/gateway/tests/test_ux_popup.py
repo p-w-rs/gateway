@@ -85,16 +85,219 @@ def test_verification_reasks_up_to_three_times_and_never_stores_a_failing_value(
 def test_default_buttons():
     from gateway import consent
     with U.ux_env(U.answers(("ok",), ("ok", "x"), ("cancelled",))) as env:
-        ch = [consent.Change("box", "widen", "sudo false -> true")]
+        ch = [consent.Change("box", "widen", "sudo on box: in every mode you are asked (was: "
+                                                "refused in every mode)")]
         assert popup.consent("box", ch) == "ok"
         popup.secret("box", "token", "Type it.", lazy=False)
         assert popup.hostkey("box", ["ssh-ed25519 SHA256:" + "A" * 43], ["ssh-ed25519 SHA256:" + "B" * 43],
                              lazy=False) == "cancelled"
         c = env.dialog.calls()
         assert c[0]["kind"] == "confirm" and c[0]["default"] == "Decline", "consent defaults to Decline"
-        assert "sudo false -> true" in c[0]["message"] and "Approve?" in c[0]["message"]
+        assert "sudo on box: in every mode you are asked" in c[0]["message"] and \
+            "Approve?" in c[0]["message"]
         assert c[1]["kind"] == "secret"
         assert c[2]["kind"] == "confirm" and c[2]["default"] == "Cancel", "hostkey defaults to Cancel"
+
+
+def _rows(lines: list[str], width: int = 72) -> int:
+    """The rows lines take in a pane `width` columns wide, wrapped at spaces
+    (a longer word broken), counted in characters here on its own, not with
+    popup's helper: never more rows than the pane's own wrap, which also
+    keeps the spaces and counts a wide character as two columns."""
+    import textwrap
+    return sum(max(1, len(textwrap.wrap(ln, width, break_on_hyphens=False))) for ln in lines)
+
+
+def _long_changes(n: int) -> list:
+    """n change lines, some long enough to wrap (each ends with its number)."""
+    from gateway import consent
+    return [consent.Change("box", "widen", f"environment import VAR_{i:03d} (its value reaches "
+                           "Claude's commands" + (" and a long tail" * 25 if i % 4 == 0 else "")
+                           + f"; end {i:03d})") for i in range(n)]
+
+
+def test_a_consent_dialog_longer_than_one_dialog_comes_in_parts_never_dropping_a_line():
+    """PLAN-0.11 §19.11 (WS-8): gated and the pane show at most 40 lines of a
+    dialog (a longer one lost its tail silently, the Approve question
+    included). A longer consent dialog comes in parts, "part i of n", each
+    within the limit and every change line whole; nothing is approved before
+    the last part's Approve (on_ok), and a Decline on any part changes
+    nothing; more than 10 parts is refused without a dialog."""
+    from gateway.daemon import dialogs as dmod
+    assert popup.DIALOG_LINES == dmod.MAX_LINES
+    assert f".slice(0, {popup.DIALOG_LINES})" in (H.PLUGIN / "hooks" / "mod" / "dialog.ts").read_text()
+    short = _long_changes(3)
+    assert popup.consent_pages("box", short) == [popup.consent_text("box", short)], "one dialog as before"
+    ch = _long_changes(70)
+    pages = popup.consent_pages("box", ch, extra_lines=["Host key of box: SHA256:x"])
+    n = len(pages)
+    assert 2 < n <= popup.CONSENT_PARTS, n
+    for i, page in enumerate(pages, 1):
+        lines = page.split("\n")
+        assert _rows(lines) <= popup.DIALOG_LINES and all(len(ln) <= dmod.MAX_LINE for ln in lines), i
+        assert lines[0].endswith(f"(part {i} of {n}):"), lines[0]
+        assert lines[-1].startswith(f"Part {i} of {n}. "), lines[-1]
+        assert ("Approve all of this" in lines[-1]) is (i == n), lines[-1]
+        assert ("Nothing is approved before the last part" in lines[-1]) is (i < n), lines[-1]
+    shown = " ".join(" ".join(p.split()) for p in pages)
+    for c in ch:
+        assert " ".join(c.what.split()) in shown, c.what
+    assert "Host key of box: SHA256:x" in pages[-1]
+    for c in ch:            # a change line is never split across two parts
+        assert sum(" ".join(c.what.split()) in " ".join(p.split()) for p in pages) == 1, c.what
+    for answers, want, approved in (([("ok",)] * n, "ok", True),
+                                    ([("cancelled",)], "cancelled", False),
+                                    ([("ok",)] * (n - 1) + [("cancelled",)], "cancelled", False)):
+        with U.ux_env(U.answers(*answers)) as env:
+            mark = env.root / "approved"
+            got = popup.consent("box", ch, extra_lines=["Host key of box: SHA256:x"],
+                                on_ok=lambda: mark.write_text("approved"))
+            calls = env.dialog.calls()
+            assert got == want and mark.exists() is approved, (got, want, len(calls))
+            assert len(calls) == len(answers), "a Decline ends it at once"
+            assert [c["message"] for c in calls] == pages[:len(calls)]
+            assert all(c["kind"] == "confirm" and c["default"] == "Decline" for c in calls)
+            assert all(c["title"].endswith(f"(part {i} of {n})") for i, c in enumerate(calls, 1))
+    many = _long_changes(500)
+    assert popup.consent_pages("box", many) is None
+    with U.ux_env(U.answers(("ok",))) as env:
+        assert popup.consent("box", many, on_ok=lambda: (env.root / "approved").write_text("x")) == "failed"
+        assert env.dialog.calls() == [] and not (env.root / "approved").exists()
+        assert "more than 10 gateway dialogs, so none was opened" in popup._LAST_REASON, \
+            popup._LAST_REASON
+
+
+def test_a_dialog_part_is_sized_by_the_rows_the_pane_shows_and_its_question_names_the_part():
+    """mac-tui D: a part was sized by its lines, so 36 change lines of ~100
+    characters took ~78 rows of a docked pane (~75 columns) and the pane
+    opened scrolled past "part 1 of 2". Now every dialog of a consent, one
+    or a part, fits DIALOG_LINES rows at PANE_COLUMNS (72) columns wrapped
+    as the pane wraps them, and the question beside the buttons repeats
+    "Part i of n"."""
+    from gateway import consent
+    assert popup.PANE_COLUMNS == 72
+    assert popup.pane_rows("") == 1 and popup.pane_rows("x" * 72) == 1
+    assert popup.pane_rows("x" * 73) == 2, "a word longer than a row is broken"
+    assert popup.pane_rows(("word " * 15).strip()) == 2, "74 characters wrap at a space"
+    wide = [consent.Change("settings", "widen", f"environment import TOOL_HOME_{i:02d} (its value "
+                           "reaches Claude's commands, and a little more text)") for i in range(30)]
+    assert all(90 <= len(c.what) <= 110 for c in wide), [len(c.what) for c in wide]
+    text = popup.consent_text("settings", wide)
+    assert text.count("\n") + 1 <= popup.DIALOG_LINES < _rows(text.split("\n")), \
+        "its lines fit one dialog, its rows don't"
+    pages = popup.consent_pages("settings", wide)
+    assert pages is not None and len(pages) >= 2, pages
+    n = len(pages)
+    for i, page in enumerate(pages, 1):
+        lines = page.split("\n")
+        assert _rows(lines) <= popup.DIALOG_LINES, (i, _rows(lines))
+        assert lines[-1].startswith(f"Part {i} of {n}. "), lines[-1]
+    shown = " ".join(" ".join(p.split()) for p in pages)
+    assert all(" ".join(c.what.split()) in shown for c in wide)
+    short = [consent.Change("box", "widen", f"ssh {i}") for i in range(10)]
+    assert popup.consent_pages("box", short) == [popup.consent_text("box", short)]
+    # the helper both dialogs use: a group stays together where it fits, a
+    # part never starts with a blank line, and n is the real count
+    parts = popup.dialog_parts([["a" * 100, "  b"], [""], ["c"] * 30], lambda i, n: [f"H {i}/{n}"],
+                               lambda i, n: ["", f"Part {i} of {n}. q"], 10, rows=20)
+    assert parts is not None and len(parts) == 3, parts
+    assert parts[0][1:] == ["a" * 100, "  b", "", "Part 1 of 3. q"] and parts[1][1] == "c", parts
+    assert [p[0] for p in parts] == ["H 1/3", "H 2/3", "H 3/3"]
+    assert all(_rows(p) <= 20 for p in parts)
+    assert popup.dialog_parts([["c"]] * 100, lambda i, n: [], lambda i, n: [], 3, rows=10) is None
+
+
+def _wide_rows(lines: list[str], width: int = 72) -> int:
+    """The rows lines take in a pane `width` columns wide, a character of
+    East Asian width W or F two columns: words kept whole where they fit, a
+    wider one broken where the row ends (counted here on its own, not with
+    popup's helper; it never counts more rows than the pane's wrap)."""
+    import unicodedata
+    total = 0
+    for ln in lines:
+        rows, col = 1, 0
+        for k, word in enumerate(ln.split(" ")):
+            widths = [2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in word]
+            gap = 1 if k else 0
+            if col + gap + sum(widths) <= width:
+                col += gap + sum(widths)
+                continue
+            if sum(widths) <= width:
+                rows, col = rows + 1, sum(widths)
+                continue
+            col += gap
+            for c in widths:
+                if col + c > width:
+                    rows, col = rows + 1, 0
+                col += c
+        total += rows
+    return total
+
+
+def _ssh_changes(k: int) -> list:
+    """k one-row change lines."""
+    from gateway import consent
+    return [consent.Change("box", "widen", f"ssh {i}") for i in range(k)]
+
+
+def test_a_dialog_in_parts_sits_exactly_on_its_limits():
+    """WS-11b review: the limits were tested only from afar, so an
+    off-by-one in each survived. Exactly DIALOG_LINES rows are one dialog
+    and one row more comes in parts (gated keeps 40 lines: a 41st, the
+    question, was dropped); exactly CONSENT_PARTS parts are shown and one
+    more is refused; a part never starts with a blank line."""
+    for k, n in ((36, 1), (37, 2)):         # heading, blank, k changes, blank, question
+        lines = popup.consent_text("box", _ssh_changes(k)).split("\n")
+        assert len(lines) == _rows(lines) == k + 4, (k, len(lines))
+        pages = popup.consent_pages("box", _ssh_changes(k))
+        assert pages is not None and len(pages) == n, (k, pages and len(pages))
+        assert all(len(p.split("\n")) <= popup.DIALOG_LINES for p in pages), k
+    # dialog_parts: max_parts parts are returned, one more is None
+    none: list = []
+    assert len(popup.dialog_parts([["c"]] * 30, lambda i, n: none, lambda i, n: none, 3, rows=10)) == 3
+    assert popup.dialog_parts([["c"]] * 31, lambda i, n: none, lambda i, n: none, 3, rows=10) is None
+    # the longest consent shown takes exactly CONSENT_PARTS parts
+    lo, hi = 1, 2000                         # lo is shown, hi is refused
+    assert popup.consent_pages("box", _ssh_changes(lo)) is not None
+    assert popup.consent_pages("box", _ssh_changes(hi)) is None
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if popup.consent_pages("box", _ssh_changes(mid)) is None:
+            hi = mid
+        else:
+            lo = mid
+    assert len(popup.consent_pages("box", _ssh_changes(lo))) == popup.CONSENT_PARTS, lo
+    # a blank line that would open a part is left out (and one closing it)
+    parts = popup.dialog_parts([["a"] * 10, ["", "b", ""]], lambda i, n: none, lambda i, n: none, 10,
+                               rows=10)
+    assert parts == [["a"] * 10, ["b"]], parts
+
+
+def test_a_dialog_part_counts_wide_characters_as_two_columns():
+    """WS-11b review: pane_rows counted characters, but the pane counts
+    columns, and a Chinese, Japanese or Korean character (East Asian width
+    W or F) takes two: 12 PATH imports of folders named with 70 of them came
+    out as one dialog that took ~52 rows of the pane. Now such a character
+    takes two columns, as the pane's own wrap counts it (wrap-ansi's hard
+    wrap without trimming: a space after a row a word filled exactly starts
+    the next row)."""
+    from gateway import consent
+    assert popup.cells("ab") == 2 and popup.cells("文字") == 4 and popup.cells("é") == 1
+    assert popup.pane_rows("文" * 36) == 1 and popup.pane_rows("文" * 37) == 2
+    assert popup.pane_rows("x" + "文" * 36) == 2 and popup.pane_rows("文" * 70) == 2
+    assert popup.pane_rows("a" * 72 + " " + "b" * 10) == 2, "the space starts the next row"
+    assert popup.pane_rows("a" * 72 + " " + "b" * 72) == 3, "...where a row-wide word doesn't fit"
+    ch = [consent.Change("settings", "widen", f"PATH import /data/{i:02d}/" + "文" * 70
+                         + " (Claude's commands find the programs in that folder)") for i in range(12)]
+    text = popup.consent_text("settings", ch).split("\n")
+    assert _rows(text) <= popup.DIALOG_LINES < _wide_rows(text), \
+        "counted in characters it fits one dialog, in columns it doesn't"
+    pages = popup.consent_pages("settings", ch)
+    assert pages is not None and len(pages) >= 2, pages
+    for page in pages:
+        assert _wide_rows(page.split("\n")) <= popup.DIALOG_LINES, _wide_rows(page.split("\n"))
+    shown = " ".join(" ".join(p.split()) for p in pages)
+    assert all(" ".join(c.what.split()) in shown for c in ch)
 
 
 def test_the_remember_choice_decides_what_is_stored():

@@ -1,6 +1,9 @@
 """asiml (SPEC 9.5): init/clone/pull/push/status/search/show/files against a
 fake catalog API and a fake dvc, plus the dvc delegation. The storage pass
-(SAS) must never reach the output."""
+(SAS) must never reach the output. The catalog's browser sign-in (PLAN-0.11
+§7.4, run by gated): a fixed authority, tenant and scope whatever the
+catalog's /api/config names, the client id pinned, and a changed client id
+refused until a new sign-in."""
 from __future__ import annotations
 
 import os
@@ -9,7 +12,8 @@ from pathlib import Path
 
 import harness as H
 import harness_accounts as HA
-from gateway import entra, vault
+import harness_oauth as HO
+from gateway import consent, entra, gate_setup, vault
 
 SCOPE = "api://99999999-8888-7777-6666-555555555555/access_as_user"
 APITOK = "CATAPI-TOKEN-0123456789abcdef"
@@ -40,9 +44,16 @@ def _fake_dvc(env) -> str:
     return str(p)
 
 
-def _setup(env, cat):
-    form = f'[accounts.catalog]\nkind = "ml-catalog"\nhost = "{cat.host}"\n'
-    HA.build_vault(env, form, bound_scope={"catalog": SCOPE})
+CID = "99999999-8888-7777-6666-555555555555"
+# the browser sign-in's record (PLAN-0.11 §7): its refresh token, the client
+# id it pinned (the catalog's), the tenant
+SIGNED_IN = {"refresh_token": "CAT-REFRESH-0", "client_id": CID, "tenant_id": "organizations",
+             "kind": "browser", "refreshed": "x", "scope": f"api://{CID}/access_as_user offline_access"}
+
+
+def _setup(env, cat, form: str | None = None):
+    form = form or f'[accounts.catalog]\nkind = "ml-catalog"\nhost = "{cat.host}"\n'
+    HA.build_vault(env, form, bound_scope={"catalog": SCOPE}, entra={"catalog": dict(SIGNED_IN)})
     with vault.locked():
         vault.cache_put("catalog", SCOPE, APITOK, time.time() + 3600)
     HA.install_fakes(env, dvc=_fake_dvc(env))
@@ -181,16 +192,18 @@ def test_dvc_delegates_only_pull_push_in_workspace():
                 with HA._patched_direct(), HA.capture_fds() as box:
                     rc = asiml.dvc_main(["pull"])
                 assert rc == 0, box["err"].decode()
+                # every other dvc command is the user's own dvc (PLAN-0.11 §1.4;
+                # none on this machine: 127)
                 with HA.capture_fds() as box2:
                     rc2 = asiml.dvc_main(["repro"])
-                assert rc2 == 2 and "only 'dvc pull'" in box2["err"].decode()
+                assert rc2 == 127 and "dvc isn't installed here" in box2["err"].decode()
             finally:
                 os.chdir(old)
     finally:
         cat.close()
 
 
-def test_dvc_outside_workspace_refused():
+def test_dvc_outside_a_workspace_is_the_users_own():
     from gateway import asiml
     with H.gateway_env() as env:
         HA.set_direct((True, ""))
@@ -201,7 +214,7 @@ def test_dvc_outside_workspace_refused():
         try:
             with HA.capture_fds() as box:
                 rc = asiml.dvc_main(["pull"])
-            assert rc == 2 and "inside an asiml workspace" in box["err"].decode()
+            assert rc == 127 and "dvc isn't installed here" in box["err"].decode()
         finally:
             os.chdir(old)
 
@@ -247,10 +260,7 @@ def test_asiml_not_direct_refused_unless_scripts():
                 assert rc == 2 and "got no credential" in err, (argv, err)
             assert not _api_calls(cat)
             # scripts = true on the account: allowed even when not direct
-            HA.build_vault(env, CAT_SCRIPTS_FORM.format(host=cat.host),
-                           bound_scope={"catalog": SCOPE})
-            with vault.locked():
-                vault.cache_put("catalog", SCOPE, APITOK, time.time() + 3600)
+            _setup(env, cat, CAT_SCRIPTS_FORM.format(host=cat.host))
             HA.set_direct(lambda tool, entry_scripts=False:
                           (True, "make") if entry_scripts else (False, "make"))
             rc, out, err = HA.run_asiml(["search", "demo"], str(wd))
@@ -374,3 +384,168 @@ def test_dvc_runs_with_a_site_cache_in_a_folder_of_its_own():
         rc, out, err = asiml._run_dvc(wd, ["status"], None)
         want = paths.user_home() / ".local" / "share" / "asiml" / "site-cache"
         assert rc == 0 and f"SITE={want}" in out, (out, err)
+
+
+# ---------------------------------------------------------------------------
+# The catalog's browser sign-in (PLAN-0.11 §7.4)
+# ---------------------------------------------------------------------------
+
+OTHER = "77777777-6666-5555-4444-333333333333"
+
+
+def test_a_catalog_naming_another_client_id_is_refused_until_a_new_sign_in():
+    from gateway import asiml
+    cat = HA.CatalogServer()
+    try:
+        with H.gateway_env() as env:
+            _setup(env, cat)
+            wd = Path(env.root) / "cid"
+            wd.mkdir()
+            asiml._CFG.clear()
+            rc, out, err = HA.run_asiml(["search", "demo"], str(wd))
+            assert rc == 0, err
+            cat.client_id = OTHER                    # the catalog names another app now
+            asiml._CFG.clear()
+            n = len(_api_calls(cat))
+            rc, out, err = HA.run_asiml(["search", "demo"], str(wd))
+            assert rc == 2 and "changed since catalog signed in" in err and "gate check catalog" in err, err
+            assert len(_api_calls(cat)) == n, "no token went out"
+            # gate check sees it too: a new sign-in (whose dialog shows the change)
+            data = vault.load()
+            form = env.form()
+            p = gate_setup.plan_for("catalog", form, consent.compute(form, data), data)
+            assert p.needs_signin and p.browser and any("another client id" in x for x in p.notes)
+    finally:
+        cat.close()
+
+
+def test_a_catalog_sign_in_from_an_older_gateway_is_refused():
+    from gateway import asiml
+    cat = HA.CatalogServer()
+    try:
+        with H.gateway_env() as env:
+            _setup(env, cat)
+            from gateway import adapters
+            rec = vault.load()["accounts"]["catalog"]
+            assert adapters.credential_of("ml-catalog", rec) == "browser sign-in"
+            with vault.edit() as d:
+                d["accounts"]["catalog"]["entra"].pop("kind")
+            assert adapters.credential_of("ml-catalog", vault.load()["accounts"]["catalog"]) == "refresh token"
+            asiml._CFG.clear()
+            wd = Path(env.root) / "old"
+            wd.mkdir()
+            rc, out, err = HA.run_asiml(["search", "demo"], str(wd))
+            assert rc == 2 and "isn't signed in" in err and "browser sign-in" in err, err
+            assert not _api_calls(cat)
+    finally:
+        cat.close()
+
+
+def test_the_catalog_sign_in_has_a_fixed_authority_tenant_and_scope_and_pins_the_client():
+    """The catalog's /api/config names an authority, a tenant and a Graph
+    scope: none is used. The authority is the gateway's, the tenant the
+    account's own ("organizations" by default), the scope fixed around the
+    catalog's client id, which the vault pins."""
+    from gateway import asiml
+    evil = HA.RecorderServer(reply={"ok": True})
+    cat = HA.CatalogServer(extra_config={"authority": evil.url, "tenantId": "22222222-2222-2222-2222-222222222222",
+                                         "scope": "https://graph.microsoft.com/.default"})
+    try:
+        form = f'[accounts.models]\nkind = "ml-catalog"\nhost = "{cat.host}"\n'
+        with HO.sso(form) as s:
+            pid = HO.gate(s, "check", "models")
+            d = s.mod.dialog(HO.is_signin)
+            want = f"api://{CID}/access_as_user offline_access"
+            assert d["signin"] == {"account": "models", "kind": "ml-catalog", "tenant": "organizations",
+                                   "client": CID, "scope": want, "host": cat.host,
+                                   "previous_client": ""}, d["signin"]
+            s.mod.open(d)
+            rc, out, err = HO.result(s, pid)
+            assert rc == 0 and "models ready: signed in" in out, (out, err)
+            # (the vault passphrase offer after the first stored secret, PLAN-0.11 §8: dismissed)
+            s.mod.post("/ui/dialog/cancel",
+                       {"id": s.mod.dialog(lambda d: d.get("offer") == "passphrase")["id"]})
+            az = s.srv.authorize[0]
+            assert az["tenant"] == "organizations" and az["scope"] == want and az["client_id"] == CID
+            assert HO.opened(s.log)[0]["url"].startswith(f"{s.srv.authority}/organizations/")
+            assert not evil.calls, "nothing went to an authority the catalog named"
+            rec = vault.load()["accounts"]["models"]
+            assert rec["entra"]["client_id"] == CID and rec["entra"]["kind"] == "browser"
+            assert rec["entra"]["tenant_id"] == "organizations"
+            assert rec["bound"]["scope"] == f"api://{CID}/access_as_user"
+            # asiml uses the sign-in (its refresh token mints the API token)
+            HA.install_fakes(s.de.env, dvc=_fake_dvc(s.de.env))
+            HA.set_direct((True, ""))
+            asiml._CFG.clear()
+            wd = Path(s.de.root) / "ws"
+            wd.mkdir()
+            rc, out, err = HA.run_asiml(["search", "demo"], str(wd))
+            assert rc == 0 and "demo" in out, err
+            # (gated cached the sign-in's access token under the pinned API scope)
+            assert [c["auth"] for c in _api_calls(cat)] == ["Bearer SSO-ACCESS-1"], cat.calls
+            # the catalog names another client now: gate check signs in again, and the
+            # dialog shows the change (cancelled here: nothing changes)
+            cat.client_id = OTHER
+            pid = HO.gate(s, "check", "models")
+            d = s.mod.dialog(HO.is_signin)
+            assert d["signin"]["client"] == OTHER and d["signin"]["previous_client"] == CID, d["signin"]
+            assert d["signin"]["scope"] == f"api://{OTHER}/access_as_user offline_access"
+            s.mod.post("/ui/dialog/cancel", {"id": d["id"]})
+            rc, out, err = HO.result(s, pid)
+            assert rc == 1 and "another client id" in err, err
+            assert vault.load()["accounts"]["models"]["entra"]["client_id"] == CID
+    finally:
+        cat.close()
+        evil.close()
+
+
+def test_gated_signs_in_only_a_catalog_that_is_bound():
+    """§7.4: the host must be approved (bound) before gated reads its
+    /api/config or asks for a sign-in to it."""
+    from types import SimpleNamespace
+
+    from gateway import asiml
+    from gateway.daemon import oauth
+    cat = HA.CatalogServer()
+    try:
+        with H.gateway_env() as env:
+            _setup(env, cat)
+            d = SimpleNamespace(broker=SimpleNamespace(read=lambda touch=True: vault.load()))
+            asiml._CFG.clear()
+            p = oauth.params_for(d, "catalog")
+            assert p.client_id == CID and p.host == cat.host and p.kind == "ml-catalog"
+            with vault.edit() as data:
+                data["accounts"]["catalog"]["bound"]["hosts"] = []
+            try:
+                oauth.params_for(d, "catalog")
+                raise AssertionError("gated would sign in to a catalog that isn't bound")
+            except oauth.SignInError as e:
+                assert e.code == "unbound" and e.status == 409, (e.code, e.message)
+    finally:
+        cat.close()
+
+
+def test_a_catalogs_changed_tenant_needs_a_new_sign_in():
+    """A sign-in made for another tenant than the approved one's isn't used:
+    gate check asks for a new one, and the status says so."""
+    from gateway import asiml
+    cat = HA.CatalogServer()
+    try:
+        with H.gateway_env() as env:
+            form_text = (f'[accounts.catalog]\nkind = "ml-catalog"\nhost = "{cat.host}"\n'
+                         'tenant = "contoso.onmicrosoft.com"\n')
+            _setup(env, cat, form_text)          # signed in for "organizations"
+            asiml._CFG.clear()
+            form, data = env.form(), vault.load()
+            eff = consent.compute(form, data)
+            p = gate_setup.plan_for("catalog", form, eff, data)
+            assert p.needs_signin and p.browser and not p.changes, p
+            assert "catalog ready: needs a new sign-in" in gate_setup.status_line("catalog", form, eff, data)
+            with vault.edit() as d:
+                d["accounts"]["catalog"]["entra"]["tenant_id"] = "contoso.onmicrosoft.com"
+            data = vault.load()
+            p = gate_setup.plan_for("catalog", form, consent.compute(form, data), data)
+            assert not p.needs_signin, p
+            assert "catalog ready: signed in" in gate_setup.status_line("catalog", form, eff, data)
+    finally:
+        cat.close()

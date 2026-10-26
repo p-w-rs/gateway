@@ -1,43 +1,42 @@
-"""The managed shell (PLAN-v4 phase 4; docs/dev/modules/managed.md).
+"""The managed shell (PLAN-v4 phase 4; PLAN-0.11 §1.6; docs/dev/modules/managed.md).
 
-In managed mode (`[shell] managed = "on"`, the default, or "warn") the
-gateway mod sets CLAUDE_CODE_SHELL_PREFIX to the shipped `hooks/gate-sh` at
-session start, and GW_MANAGED_DIR to `$DATA/managed`, where this module
-writes what gate-sh needs:
+In managed mode (`[shell] managed = "on"`, the default) the gateway mod sets
+CLAUDE_CODE_SHELL_PREFIX to the shipped `hooks/gate-sh` at session start,
+and GW_MANAGED_DIR to `$DATA/managed`, where this module writes what gate-sh
+needs:
 
 - `conf`: one KEY=VALUE per line (gate-sh reads it with `read`, never
-  sources it): the managed bash, the rc, the PATH, the imported variable
-  names, the user's own agent/token names when `others = "mine"`, the form's
-  path and the `sync` stub (gate-sh renews the files when gateway.toml is
-  newer than conf, so a narrowing applies to the next command even before
-  FileChanged runs);
+  sources it): the managed bash, the rc, the stand-in folder, the approved
+  import_path folders, the form's path and the `sync` stub (gate-sh renews
+  the files when gateway.toml is newer than conf, so a narrowing applies to
+  the next command even before FileChanged runs);
 - `rc.bash`: what the managed bash sources in place of Claude Code's shell
-  snapshot: the env file's text (git include, GIT_SSH_COMMAND, the stand-ins
-  first), Claude Code's own helpers the snapshot carried (rg from its
-  embedded copy when none is on PATH, its pkill guard), never the user's rc;
+  snapshot: the env file's text, Claude Code's own helpers (rg from its
+  embedded copy when none is on PATH, its pkill guard), then the user's bash
+  snapshot (its aliases, functions and options; a zsh snapshot gives only
+  its PATH, which gate-sh reads), the managed PATH again, and the
+  unshadowing tail: in POSIX mode, every function and alias named after a
+  present stand-in, or after a builtin the tail relies on, removed, then
+  `hash -r`, every line alias-proof (a backslash on each command word, no
+  reserved word), so nothing in the snapshot shadows a stand-in;
 - `state.json`: the mode, the PATH and variables with their origins, the
   bash version, readiness and pending widenings, for /gate-doctor (the mod)
   and `gate status`;
-- `bin/`: the runtime tools on the managed PATH (bash from the gateway env,
-  and pixi, the plugin's own prerequisite), as symlinks;
 - `sync`: a stub like the stand-ins' that runs `run.py managed-sync`.
 
-The PATH is: the stand-ins ($DATA/bin), the runtime tools, the approved
-import_path folders (form order), then /usr/bin:/bin:/usr/sbin:/sbin; gate-sh
-appends other plugins' bin/ folders last, as Claude Code does. Variables:
-the platform ones gate-sh names (HOME, USER, LOGNAME, LANG, LC_*, TERM,
-TMPDIR, TZ, PWD, the XDG base folders, macOS's text encoding), SHELL (the
-managed bash), Claude Code's own (CLAUDECODE, CLAUDE_*, GIT_EDITOR, AI_AGENT,
-COREPACK_ENABLE_AUTO_PIN, NoDefaultCurrentDirectoryInExePath), the managed
-shell's folder (GW_MANAGED_DIR, so a Claude Code started from a command stays
-managed), the approved import_env names; never a credential-looking name
-(TOKEN, SECRET, PASSW, PASSPHRASE, CRED, API_KEY, CLIENT_KEY, AUTH, COOKIE,
-...), except the user's own agent and token variables after `others = "mine"`
-was approved. gate-sh removes every other variable by name (`env -u`), so no
-value reaches a command line.
+The environment is the user's (Claude Code's, inherited) minus, by name:
+Claude Code's own credential variables (every CLAUDE_* or ANTHROPIC_* name
+with a credential word, and CLAUDE_CRED_NAMES), the variables that make a
+shell run code or change its parsing (STARTUP_NAMES, every BASH_FUNC_*), and
+the gateway's GW_* names but GW_MANAGED_DIR. hooks/gate-sh holds the same
+lists (tests/test_managed.py compares them); `dropped()` is its rule in
+Python, and `fallback_shell()` the shell gate-sh runs a script in while the
+managed shell isn't ready. The PATH is the present stand-ins ($DATA/bin), then the snapshot's
+PATH (the inherited one without a snapshot), then other plugins' bin/
+folders, then the approved import_path folders. Nothing here reads a secret:
+the effective settings come from consent.compute.
 
-Files are written whole (temp file, then rename). Nothing here reads a
-secret: the effective settings come from consent.compute.
+Files are written whole (temp file, then rename).
 
 `inspect()` is the host inspection behind the gw MCP tool `host_inspect`:
 what this machine offers (login-shell PATH folders, toolchain folders,
@@ -59,30 +58,34 @@ from typing import Any
 from . import envfile, paths, testing
 
 SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
-# In step with hooks/gate-sh (tests/test_managed.py compares the two).
-PLATFORM_NAMES = ("HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "TZ", "PWD",
-                  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
-                  "XDG_RUNTIME_DIR", "__CF_USER_TEXT_ENCODING")
-CLAUDE_NAMES = ("CLAUDECODE", "GIT_EDITOR", "AI_AGENT", "COREPACK_ENABLE_AUTO_PIN",
-                "NoDefaultCurrentDirectoryInExePath")
+# In step with hooks/gate-sh (tests/test_managed.py compares the two): what
+# the managed shell removes from the inherited environment (PLAN-0.11 §1.6).
+CLAUDE_CRED_NAMES = envfile.CLAUDE_CRED_NAMES
+STARTUP_NAMES = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND", "CDPATH",
+                 "IFS", "GLOBIGNORE", "BASH_XTRACEFD")
+DROP_PREFIXES = ("GW_", "BASH_FUNC_")
 # The managed shell's own folder (the mod sets it with the prefix): a Claude
 # Code started from a command keeps the prefix, so it needs this too.
 GATEWAY_NAMES = ("GW_MANAGED_DIR",)
 # Substrings of a credential-looking name (gate-sh's gw_credlike; also what
-# import_env refuses, form.CREDENTIAL_NAME). They cover Claude Code's own
-# credential variables (2.1.301's lists: CLAUDE_CODE_OAUTH_TOKEN,
-# CLAUDE_CODE_CLIENT_KEY_PASSPHRASE, CLAUDE_CODE_CLIENT_KEY/_CERT,
-# CLAUDE_CODE_HOST_CREDS_FILE, ...), which the CLAUDE_* names would pass.
+# import_env refuses, form.CREDENTIAL_NAME). A CLAUDE_* or ANTHROPIC_* name
+# holding one is Claude Code's own credential (2.1.301's lists:
+# CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_CLIENT_KEY_PASSPHRASE, ...).
 CREDENTIAL_WORDS = ("TOKEN", "SECRET", "PASSW", "PASSPHRASE", "CRED", "API_KEY", "APIKEY",
                     "ACCESS_KEY", "PRIVATE_KEY", "CLIENT_KEY", "CLIENT_CERT", "AUTH", "COOKIE",
                     "SESSION_KEY")
+# The not-ready fallback (gate-sh's gw_fallback_shell; a test compares): the
+# shell that made the script's snapshot, found the way Claude Code (2.1.310)
+# finds its shell, in its usual places. Never /bin/sh: dash has no `source`,
+# so the snapshot would be skipped.
+FALLBACK_SHELLS = ("bash", "zsh")
+FALLBACK_DIRS = ("/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin")
 STATE_VERSION = 1
 GATE_SH = "gate-sh"
 
 MODE_WORDS = {
-    "on": "on (Claude's Bash runs in the gateway's managed bash)",
-    "warn": ("warn (managed while Claude Code's mods run; without them Claude's commands run in "
-             "your own shell, with a notice each session)"),
+    "on": ("on (Claude's Bash runs in the gateway's bash 5 with your own environment; without "
+           "Claude Code's mods, in your own shell, with a notice each session)"),
     "off": "off (Claude's Bash runs in Claude Code's own shell, with your login setup)",
 }
 
@@ -93,6 +96,70 @@ def credential_like(name: str) -> bool:
     return any(w in up for w in CREDENTIAL_WORDS)
 
 
+def dropped(name: str) -> bool:
+    """Does the managed shell remove this inherited variable (gate-sh's rule,
+    PLAN-0.11 §1.6)? Claude Code's own credentials, the startup and parsing
+    variables, BASH_FUNC_*, GW_* but GW_MANAGED_DIR, and a name no shell
+    takes as a variable (one holding a blank no shell imports: kept)."""
+    import re as _re
+    if any(c in name for c in " \t"):
+        return False
+    if name in GATEWAY_NAMES:
+        return False
+    if name.startswith(DROP_PREFIXES) or not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return True
+    if name.startswith(("CLAUDE_", "ANTHROPIC_")) and credential_like(name):
+        return True
+    return name in CLAUDE_CRED_NAMES or name in STARTUP_NAMES
+
+
+def shell_family(path: str) -> str:
+    """What Claude Code calls the shell at `path` (its snapshot's name):
+    "zsh" when the path holds zsh, else "bash" when it holds bash, else ""."""
+    return "zsh" if "zsh" in path else "bash" if "bash" in path else ""
+
+
+def snapshot_family(snapshot: str | None) -> str:
+    """The shell that made a Claude Code shell snapshot, from its name
+    (snapshot-zsh-*, snapshot-bash-*), or "" (none, or another name)."""
+    name = os.path.basename(snapshot or "")
+    return next((f for f in FALLBACK_SHELLS if name.startswith(f"snapshot-{f}-")), "")
+
+
+def fallback_shell(environ: dict[str, str], dirs: tuple[str, ...] = FALLBACK_DIRS,
+                   snapshot: str | None = None) -> str | None:
+    """The shell gate-sh runs a script in while the managed shell isn't
+    ready (gw_fallback_shell, PLAN-0.11 §19.15): the one that made the
+    script's snapshot, found the way Claude Code finds its shell:
+    CLAUDE_CODE_SHELL, then SHELL, then the preferred shell on PATH, in
+    `dirs`, the other in `dirs`, the other on PATH (bash is preferred when
+    SHELL holds "bash", else zsh). The first that fits: an absolute path
+    without '=' to an executable file whose shell_family is the snapshot's
+    (any bash or zsh without a snapshot). PATH lookups take absolute folders
+    only. None: there is none, and gate-sh refuses the script (126)."""
+    want = snapshot_family(snapshot)
+
+    def fits(p: str) -> bool:
+        f = shell_family(p)
+        return (p.startswith("/") and "=" not in p and bool(f) and (not want or f == want)
+                and os.path.isfile(p) and os.access(p, os.X_OK))
+    path = [d for d in environ.get("PATH", "").split(":") if d.startswith("/") and "=" not in d]
+
+    def which(name: str) -> str | None:
+        p = next((f"{d}/{name}" for d in path
+                  if os.path.isfile(f"{d}/{name}") and os.access(f"{d}/{name}", os.X_OK)), None)
+        return p if p is not None and fits(p) else None
+
+    def places(name: str) -> str | None:
+        return next((f"{d}/{name}" for d in dirs if fits(f"{d}/{name}")), None)
+    shell = environ.get("SHELL", "")
+    first, second = ("bash", "zsh") if "bash" in shell else ("zsh", "bash")
+    for c in (environ.get("CLAUDE_CODE_SHELL", ""), shell):
+        if fits(c):
+            return c
+    return which(first) or places(first) or places(second) or which(second)
+
+
 # ---------------------------------------------------------------------------
 # Locations
 # ---------------------------------------------------------------------------
@@ -100,10 +167,6 @@ def credential_like(name: str) -> bool:
 
 def managed_dir() -> Path:
     return paths.data_dir() / "managed"
-
-
-def runtime_dir() -> Path:
-    return managed_dir() / "bin"
 
 
 def conf_path() -> Path:
@@ -164,28 +227,6 @@ def env_bash() -> Path:
     if o:
         return Path(o)
     return paths.env_bin() / "bash"
-
-
-def find_pixi() -> str | None:
-    """The pixi launch.sh would use (its find_pixi: PATH first, then the
-    usual install folders), or None."""
-    o = testing.get("pixi")
-    if o is not None:
-        return o or None
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        if d and d != str(paths.bin_dir()):
-            c = Path(d) / "pixi"
-            if c.is_file() and os.access(c, os.X_OK):
-                return str(c)
-    home = os.environ.get("HOME", "")
-    cands = [os.environ.get("PIXI_HOME", f"{home}/.pixi") + "/bin", f"{home}/.local/bin",
-             "/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin",
-             "/home/linuxbrew/.linuxbrew/bin"]
-    for d in cands:
-        c = Path(d) / "pixi"
-        if c.is_file() and os.access(c, os.X_OK):
-            return str(c)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -259,20 +300,30 @@ def imports_allowed(eff: Any, host: str | None = None) -> bool:
         return False
 
 
+def import_path(eff: Any) -> list[str]:
+    """The approved import_path folders, while the env_import policy allows
+    them (imports_allowed)."""
+    return list(eff.shell.import_path) if imports_allowed(eff) else []
+
+
+SNAPSHOT_PATH = "$PATH"
+
+
 def path_plan(eff: Any) -> list[tuple[str, str]]:
-    """[(folder, origin)] in PATH order (gate-sh appends other plugins'
-    bin/ folders at run time)."""
+    """[(folder, origin)] in PATH order: the stand-ins, the user's own PATH
+    (SNAPSHOT_PATH: the snapshot's, read by gate-sh at run time), the
+    approved imports. gate-sh adds other plugins' bin/ folders the snapshot's
+    PATH lacks before the imports."""
     form = getattr(eff, "form", None)
     line = getattr(getattr(form, "shell", None), "path_line", None)
     out: list[tuple[str, str]] = [
         (str(paths.bin_dir()), "the gateway's stand-ins"),
-        (str(runtime_dir()), "the gateway's runtime tools (bash, pixi)"),
+        (SNAPSHOT_PATH, "your own PATH (Claude Code's shell snapshot, else its own PATH)"),
     ]
-    for p in (eff.shell.import_path if imports_allowed(eff) else []):
+    for p in import_path(eff):
         src = host_source(p)
         out.append((p, f"gateway.toml [shell] import_path{_line(line)}"
                        + (f"; {src}" if src else "")))
-    out += [(d, "system") for d in SYSTEM_DIRS]
     seen: set[str] = set()
     uniq = []
     for d, o in out:
@@ -283,32 +334,21 @@ def path_plan(eff: Any) -> list[tuple[str, str]]:
 
 
 def env_plan(eff: Any) -> list[tuple[str, str]]:
-    """[(name, origin)] for the variables the managed shell takes from
-    Claude Code's environment beyond the fixed platform and Claude Code
-    ones."""
+    """[(name, origin)] for the variables [shell] import_env names (the
+    inherited environment keeps them anyway, minus the removals)."""
     form = getattr(eff, "form", None)
     line = getattr(getattr(form, "shell", None), "env_line", None)
-    out = [(n, f"gateway.toml [shell] import_env{_line(line)}")
-           for n in (eff.shell.import_env if imports_allowed(eff) else [])]
-    out += [(n, 'others = "mine" (your own ssh agent and token variables)')
-            for n in mine_names(eff)]
-    return out
-
-
-def mine_names(eff: Any) -> list[str]:
-    return list(envfile.ENV_UNSET) if getattr(eff, "others", "refuse") == "mine" else []
+    return [(n, f"gateway.toml [shell] import_env{_line(line)}")
+            for n in (eff.shell.import_env if imports_allowed(eff) else [])]
 
 
 def conf_text(eff: Any) -> str:
-    imports = [n for n in (eff.shell.import_env if imports_allowed(eff) else [])
-               if not credential_like(n)]
     lines = [
         "# gateway: the managed shell's settings for hooks/gate-sh (regenerated; read, never sourced)",
         f"bash={env_bash()}",
         f"rc={rc_path()}",
-        "path=" + ":".join(d for d, _ in path_plan(eff)),
-        "env=" + " ".join(imports),
-        "mine=" + " ".join(mine_names(eff)),
+        f"standins={paths.bin_dir()}",
+        "imports=" + ":".join(import_path(eff)),
         f"form={paths.form_path()}",
         f"sync={sync_path()}",
         f"unlocked={unlocked_marker()}",
@@ -347,15 +387,75 @@ pkill() {
 }
 '''
 
-RC_HEADER = ("# gateway: the managed shell's rc (PLAN-v4 phase 4), sourced by the gateway's bash in\n"
-             "# place of Claude Code's shell snapshot; regenerated at every session start, after a\n"
-             "# change of gateway.toml and after an approval. Not the user's rc: no profile, no\n"
-             "# aliases, no functions of the user's.\n")
+RC_HEADER = ("# gateway: the managed shell's rc (PLAN-v4 phase 4; PLAN-0.11 §1.6), sourced by the\n"
+             "# gateway's bash in place of Claude Code's shell snapshot (its $1: a bash snapshot,\n"
+             "# sourced here); regenerated at every session start, after a change of gateway.toml\n"
+             "# and after an approval.\n")
+# The commands the unshadowing tail relies on: their functions and aliases go
+# first (POSIX mode puts the special builtins before functions; the others
+# are taken out by name).
+TAIL_BUILTINS = ("command", "builtin", "hash", "type", "unalias", "unset", "exec", "source", ".",
+                 "test", "shopt", "trap", "readonly")
+# The tail's refusals: a shell expansion error (`${VAR:?TEXT}`), which ends a
+# non-interactive bash (status 127) whatever any function or trap does, so
+# `. RC && COMMAND` never runs the command. (The word of a double-quoted
+# ${VAR:?WORD}: no `, $, ", ' or } in them.)
+TAIL_NO_POSIX = ("gateway: the managed shell could not enter POSIX mode (is POSIXLY_CORRECT "
+                 "read-only in your shell snapshot?), so the stand-ins of the gateway could be "
+                 "shadowed; the command was not run")
+TAIL_READONLY = ("gateway: your shell snapshot makes a function read-only that the managed shell "
+                 "must remove (one named after a gateway stand-in, or a builtin its rc uses), so "
+                 "it would shadow the stand-in; the command was not run. Take readonly -f out "
+                 "of your shell profile")
+
+
+def rc_tail() -> str:
+    """The rc's last lines (PLAN-0.11 §1.6): POSIX mode by assignment; the
+    snapshot's DEBUG, RETURN and ERR traps cleared (they run code before
+    each command, when a sourced file returns, or after a failure, and could
+    define a function after the tail); the functions and aliases of
+    TAIL_BUILTINS and of every stand-in present in $DATA/bin (each checked
+    with `test -e` at run time) removed; then fail closed (TAIL_NO_POSIX,
+    TAIL_READONLY) when POSIX mode didn't take or one of those functions
+    survived (read-only), checked with the special builtin `readonly -f`;
+    POSIX mode left (which turns alias expansion off in a non-interactive
+    bash: back on where the user's snapshot had it on), `hash -r`. After the
+    user's snapshot every line is alias-proof: a backslash before each
+    command word, no reserved word."""
+    b = paths.bin_dir()
+    names = " ".join(TAIL_BUILTINS)
+    out = ["# the stand-ins can't be shadowed: nothing below may be an alias or a function",
+           "PATH=$_gw_path",
+           "_gw_ea=${BASHOPTS-}",
+           "POSIXLY_CORRECT=y",
+           "\\trap - DEBUG RETURN ERR",
+           f"\\unset -f {names} 2>/dev/null",
+           f"\\unalias {names} 2>/dev/null",
+           "\\export PATH"]
+    for n in envfile.STANDIN_NAMES:
+        q = envfile.sq(b / n)
+        out.append(f"\\test -e {q} && \\unset -f {n} 2>/dev/null")
+        out.append(f"\\test -e {q} && \\unalias {n} 2>/dev/null")
+    out += ['_gw_ok=${SHELLOPTS#"${SHELLOPTS%%posix*}"}',
+            f'\\: "${{_gw_ok:?{TAIL_NO_POSIX}}}"']
+    out += [f"\\readonly -f {n} 2>/dev/null && _gw_ok=" for n in TAIL_BUILTINS]
+    out += [f"\\test -e {envfile.sq(b / n)} && \\readonly -f {n} 2>/dev/null && _gw_ok="
+            for n in envfile.STANDIN_NAMES]
+    out += [f'\\: "${{_gw_ok:?{TAIL_READONLY}}}"',
+            "\\unset POSIXLY_CORRECT",
+            '\\test "${_gw_ea#*expand_aliases}" != "$_gw_ea" && \\shopt -s expand_aliases',
+            "\\unset _gw_ea _gw_path _gw_ok", "\\hash -r", "\\:"]
+    return "\n".join(out) + "\n"
+
+
+RC_SNAPSHOT = """# the user's own bash snapshot (aliases, functions, options), then the managed PATH again
+_gw_path=$PATH
+case ${1-} in */shell-snapshots/snapshot-bash-*.sh) if [ -r "$1" ]; then . "$1" 2>/dev/null || :; fi ;; esac
+"""
 
 
 def rc_text(eff: Any) -> str:
-    return (RC_HEADER + envfile.env_text(getattr(eff, "others", "refuse")) + RC_HELPERS
-            + ":\n")
+    return RC_HEADER + envfile.env_text() + RC_HELPERS + RC_SNAPSHOT + rc_tail()
 
 
 def bash_version(bash: Path) -> str:
@@ -405,25 +505,6 @@ def _write(p: Path, text: str, mode: int) -> None:
     envfile._atomic(p, text, mode)
 
 
-def _link(name: str, target: str | None) -> None:
-    """runtime_dir()/name -> target (replaced atomically), or removed."""
-    d = runtime_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    final = d / name
-    if not target:
-        with contextlib.suppress(FileNotFoundError):
-            final.unlink()
-        return
-    with contextlib.suppress(OSError):
-        if final.is_symlink() and os.readlink(final) == target:
-            return
-    tmp = d / f".{name}.{os.getpid()}.tmp"
-    with contextlib.suppress(FileNotFoundError):
-        tmp.unlink()
-    os.symlink(target, tmp)
-    os.replace(tmp, final)
-
-
 def sync(form: Any, eff: Any, *, vault_readable: bool = True) -> dict[str, Any]:
     """Write the managed shell's files for these effective settings. Each
     step is independent; failures are collected (no secrets in messages)."""
@@ -434,12 +515,9 @@ def sync(form: Any, eff: Any, *, vault_readable: bool = True) -> dict[str, Any]:
     except OSError as e:
         done["errors"].append(f"managed: {type(e).__name__}")
         return done
-    bash = env_bash()
     prefix: list[Path] = []
     steps = [
         ("gate-sh", lambda: prefix.append(_gate_sh_for_prefix())),
-        ("runtime", lambda: (_link("bash", str(bash) if bash.exists() else None),
-                             _link("pixi", find_pixi()))),
         ("sync", lambda: _write(sync_path(), envfile.stub_text(
             "managed-sync", ("managed-sync",), "gateway: renews the managed shell's settings"),
             0o755)),
@@ -514,15 +592,15 @@ def status_lines(eff: Any) -> list[str]:
     bash = env_bash()
     out.append(f"  bash: {_tilde(str(bash))}" + (f" ({ver})" if ver else
                                                  " (not ready yet: the gateway is still setting up)"))
-    out.append("  PATH (in order; other plugins' bin/ folders follow):")
+    out.append("  PATH (in order; other plugins' bin/ folders come before the imports):")
     for d, o in path_plan(eff):
         out.append(f"    {_tilde(d)}  ({o})")
     envs = env_plan(eff)
-    out.append("  Environment: HOME, USER, LOGNAME, LANG, LC_*, TERM, TMPDIR, TZ, PWD, the XDG "
-               "folders, SHELL (the managed bash), Claude Code's own CLAUDE_* and GIT_EDITOR "
-               "(no credential-looking name), GW_MANAGED_DIR"
-               + ("; imported: " + ", ".join(f"{n} ({o})" for n, o in envs) if envs else
-                  "; nothing imported"))
+    out.append("  Environment: yours (Claude Code's), minus Claude Code's own credential "
+               "variables, the shell startup variables (BASH_ENV, ENV, BASH_FUNC_*, ...) and the "
+               "gateway's internal GW_* names; SHELL is the managed bash"
+               + ("; [shell] import_env: " + ", ".join(f"{n} ({o})" for n, o in envs) if envs
+                  else ""))
     pend = [c.render() for c in getattr(eff, "pending", []) if c.entry == "settings"]
     if pend:
         out.append("  waiting for your OK: " + "; ".join(pend) + " (gate check settings)")

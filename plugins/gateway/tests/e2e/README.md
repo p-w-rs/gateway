@@ -9,8 +9,8 @@ pick, and that no secret shows up anywhere. It is not part of
 `pixi run test`.
 
 ```
-pixi run e2e                    # all ten scenarios (about 7 minutes, a few cents)
-pixi run e2e --only ssh,git     # some: context ssh git web refuse default leak notice midturn jobs
+pixi run e2e                    # every scenario (about 10 minutes, a few cents)
+pixi run e2e --only ssh,git     # some: context ssh git web refuse default modes leak notice midturn jobs
 pixi run e2e --keep             # keep the scratch folders and the transcripts
 pixi run e2e --save DIR         # copy report.json, stream-json, debug logs, audit log to DIR
 ```
@@ -109,34 +109,51 @@ any doubt stops the run. The pixi env is then built into `ROOT/data` with
 - local sudo: the real `/usr/bin/sudo`, but through a guard script that
   runs it only as `sudo -n true` (the NOPASSWD probe and the one command
   the suite runs); anything else is refused.
+- the user's own tools: recording fakes named ssh, scp, sftp, git, gh, hf
+  and sudo (`tests/fakes/fake_user_tool.py`, through e2e.json's
+  `user_tools`). A stand-in that passes an unconfigured target through
+  runs one of them, never the real tool: each run is logged (argv, cwd,
+  `GW_PASSTHRU`) and prints `fake TOOL ran`.
+- `work/pushprobe`: a repository with one commit and no remote, pushed to
+  the "ask" host's URL in `refuse`.
+- for `modes`, a probe plugin (`fixtures/modeprobe`) loaded beside the
+  gateway: its SessionStart and Bash PreToolUse hooks log each payload's
+  `permission_mode` string and session id, nothing else, and decide
+  nothing.
 
 `gateway.toml` and the vault are written through the gateway's own API
 (`vault`, `consent.approve_all`) with generated fake secrets: two git
 tokens (one shaped like `ghp_…`), an API key, the remote sudo password,
-the hosts' ssh keys, and a fake `GITHUB_TOKEN` planted in Claude's
-environment (the env file must unset it).
+the hosts' ssh keys, a fake `GITHUB_TOKEN` planted in Claude's environment
+(the user's own: since 0.11 it stays in Claude's shell, PLAN-0.11 §1.10)
+and a fake `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE` (Claude Code's own: it must
+never reach Claude's shell).
 
 ## The sessions and what is checked
 
 `claude -p --plugin-dir ROOT/plugin --permission-mode auto --model haiku
 --output-format stream-json --verbose --include-hook-events --debug-file …`,
 each with a fixed list of commands and at most 90 s (210 s for `notice` and
-`midturn`, which wait for Claude Code's 45 s "waiting for input" notice); the account's
+`midturn`, which wait for Claude Code's 45 s "waiting for input" notice; 60 s
+for each `modes` session); the account's
 claude.ai connectors are switched off (`ENABLE_CLAUDEAI_MCP_SERVERS=false`)
-so only the gateway's MCP server loads.
+so only the gateway's MCP server loads. `default` runs in Claude Code's
+default mode (`manual` on the latest Claude Code, `default` before), and
+`modes` once in every mode `claude --help` lists.
 
 | scenario | checks |
 |---|---|
-| context | SessionStart context lists the hosts and accounts and says e2e mode; the env file (stand-ins first on PATH, git include, `GIT_SSH_COMMAND`/`RSYNC_RSH`, `SSH_AUTH_SOCK` and `GITHUB_TOKEN` unset) applies in foreground, background and subagent Bash; SubagentStart context |
+| context | SessionStart context lists the hosts and accounts and says e2e mode, and has no checkpoint job lines while gated hasn't seen checkpoint ("ckoff", PLAN-0.11 §9.4); the env file applies in foreground, background and subagent Bash: the stand-ins for the configured hosts and accounts (ssh, sudo, git) first on PATH, no git include, `GIT_SSH_COMMAND` or `RSYNC_RSH`, the user's own `SSH_AUTH_SOCK` and `GITHUB_TOKEN` kept, Claude Code's `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE` gone; SubagentStart context |
 | ssh | `ssh e2ehost echo …`, `ssh e2ehost sudo whoami` (staged askpass, fake sudo log), `scp`, `rsync`, `ssh e2ebehind …` (via the jump), `sudo -n true`: no denial, output right, and for each the stream shows the hook's `allow` and the debug log `Hook approved tool use` right before the dispatch, a permission decision of a few ms and no classifier line; audit `use` lines |
-| git | clone/push over http: `e2eorg/*` with the work token as `x-access-token`, `e2euser/*` with the default account, the commit email from the account's identity include, audit lines |
-| web | `curl` denied with the gateway's message; the http tool listed at start and called without ToolSearch; the key sent as a bearer header; an echoed key comes back as `***` |
-| refuse | `ssh e2enosudo sudo whoami` denied (`gateway: sudo is off for e2enosudo`); `ssh e2eask …` a permission denial (nobody can answer an `ask` in `-p`); `ssh nosuchhost.invalid …` refused with `isn't in gateway.toml`; `gate secret e2ehost` denied by the hook (round 5: the user's command); refusals in the audit log |
-| default | default mode: the allowed ssh is not auto-approved (denied in `-p`), curl still denied |
+| git | clone/push over http through the git stand-in (the gated git): `e2eorg/*` with the work token as `x-access-token`, `e2euser/*` with the default account, the commit email from the account's identity include, audit lines; the clone's own config names no gateway helper or include (command scope); `git status` outside any configured repository and `git ls-remote` of an `.invalid` remote run the user's own git (the fake) with the full argv, and only the remote one writes a `passthrough` audit line (no argv) |
+| web | `curl` asked about by the hook (the network class, `[network] commands` "ask" by default), so a permission denial in `-p`, and nothing reaches the API; the http tool listed at start and called without ToolSearch; the key sent as a bearer header; an echoed key comes back as `***`; no hook decision for the http tool |
+| refuse | `ssh e2enosudo sudo whoami` denied (`gateway: sudo is off for e2enosudo`); `ssh e2eask …` a permission denial (nobody can answer an `ask` in `-p`); `git -C pushprobe push e2eask:…` asked about up front (the hook names ssh on e2eask), a permission denial; `ssh nosuchhost.invalid …` passed through to the user's own ssh (the fake gets the full argv and `GW_PASSTHRU=ssh:1:…`; one `passthrough` audit line without the argv); refusals in the audit log |
+| default | Claude Code's default mode (`--permission-mode manual`): the allowed ssh gets no allow from the gateway (denied in `-p`), curl still asked about |
+| modes | one session per `--permission-mode` choice `claude --help` lists, with the probe plugin: the payload's `permission_mode` in PreToolUse (and SessionStart, where it is there) is a string `modes.from_payload` knows, for the key the choice means (PLAN-0.11 §2.1's table; an unknown one fails and names what to add), and the gateway's hook allows `ssh e2ehost` (a bare `ssh = true`) only in auto and bypass; the strings seen are listed for the table |
 | leak | `cat notes.txt` (a file holding the API key and the sudo password) comes back masked; a failed `cd sub && false` is an error result with its own exit code (the round 3 EXIT trap is rolled back) and `pwd` then shows the old cwd, `cd sub` then `pwd` the new one (Claude Code's cwd tracking); `cat ../leak.txt; exit 3` (a token shape) keeps `Exit code 3` and gets the gateway's PostToolUseFailure warning; a Monitor command without `| gate scrub` runs (the round 3 rule is rolled back), one with the optional `| gate scrub` runs too; round 5: a Read of `notes.txt` comes back masked, and a Write and an Edit of a plain file in the project pass with no hook output (the file guard's sh fast path; PostToolUse skips edit tools) |
 | notice | round 4: a background `cat notes.txt; printf 'Continue? [y/N] '; sleep 70` runs as typed (the `2>&1 \| gate scrub` rule is rolled back) and its "waiting for interactive input" notice (the raw planted values) is held back by the prompt hook while Claude is idle (hook output or audit `leak` event); a failing background `ls ./no-such-e2e-file > bg-fail.txt 2>&1` is reported by Claude Code with its real exit code; the same stall run in the foreground with a 4 s timeout is moved to the background and its notice is held back too (two `leak` events) |
 | midturn | round 4: the same notice arriving while a foreground `perl -e 'sleep 60'` runs (a queued attachment) is held back too |
-| jobs | optional (skipped without a checkpoint checkout next to the repo): one session with this plugin and a copy of checkpoint's plugin (`ROOT/ck/checkpoint/plugins/checkpoint`, its pixi env built there), `CHECKPOINT_HOME` = the gateway's e2e state folder and `CHECKPOINT_GATEWAY_ENV` = the e2e env.sh (`run_e2e.checkpoint_env`: both inside the root, set explicitly; a watcher reads checkpoint's MCP server's environment with `ps eww` and kills the session at once if either differs, `server_env_verdict`); a `CLAUDE.md` in the work folder for this session only (`scenarios.JOBS_PROJECT`) and the prompt's first line say what the folder, the hosts and the secrets are and what the task is (see below); the gateway's context mentions checkpoint jobs (from SessionStart, or from the first prompt's hook when SessionStart was cancelled; the detail gives hook-session's time); job steps through `job_start`: an env probe (env.sh applied: stand-ins first, git include, `SSH_AUTH_SOCK` and `GITHUB_TOKEN` unset; no hook `allow`), `ssh e2ehost echo` and `ssh e2ehost sudo whoami` (the staged askpass), an `argv` ssh job, curl / `ssh e2eask` / a cat of the private folder denied with the gateway's messages and no job created, `sh askscript.sh` reaching `ssh e2eask` refused by the stand-in in the job wording (not "run it as its own command"), `job_tail` of a `cat notes.txt` job masked; no job prints OpenSSH's "ControlSocket ... already exists" line; no planted secret in the other job logs or checkpoint's registry |
+| jobs | optional (skipped without a checkpoint checkout next to the repo): one session with this plugin and a copy of checkpoint's plugin (`ROOT/ck/checkpoint/plugins/checkpoint`, its pixi env built there), `CHECKPOINT_HOME` = the gateway's e2e state folder and `CHECKPOINT_GATEWAY_ENV` = the e2e env.sh (`run_e2e.checkpoint_env`: both inside the root, set explicitly; a watcher reads checkpoint's MCP server's environment with `ps eww` and kills the session at once if either differs, `server_env_verdict`); a `CLAUDE.md` in the work folder for this session only (`scenarios.JOBS_PROJECT`) and the prompt's first line say what the folder, the hosts and the secrets are and what the task is (see below); afterwards checkpoint is live (gated touched `<run>/checkpoint-seen` during the session, so the next session's context has the job lines; this session's own context is reported, since checkpoint may reach gated after SessionStart); job steps through `job_start`: an env probe (env.sh applied: the stand-ins first, no git include, `GIT_SSH_COMMAND` or `RSYNC_RSH`; no hook `allow`), `ssh e2ehost echo` and `ssh e2ehost sudo whoami` (the staged askpass), an `argv` ssh job, curl (the network class asks, and nobody can be asked in a job) / `ssh e2eask` / a cat of the private folder denied with the gateway's messages and no job created, `sh askscript.sh` reaching `ssh e2eask` refused by the stand-in in the job wording (not "run it as its own command"), `job_tail` of a `cat notes.txt` job masked; no job prints OpenSSH's "ControlSocket ... already exists" line; no planted secret in the other job logs or checkpoint's registry |
 
 **The jobs scenario and Claude Code's classifier.** The gateway never
 approves a job (DECISIONS, "Checkpoint jobs"), so in auto mode Claude Code's
@@ -168,14 +185,21 @@ the fake dialog saw no pop-up.
 marker; the marker is ignored when absent, outside a temp folder (named
 folder or the plugin itself), not owned by the user, writable by others,
 symlinked, or with group/other bits on a folder; the production call yields
-to a test override; e2e.json keeps only known keys; the e2e override still
+to a test override; e2e.json keeps only known keys (`user_tools` only as an
+absolute folder); the e2e override still
 guards the real private folder; SessionStart says e2e mode; and
 `launch.sh e2e-root` (hooks/e2e.sh) agrees with Python on every case; and
 for the jobs scenario, that checkpoint counts only as a whole plugin next to
 the gateway repo, that its state folder and env file stay inside the e2e
 root, and that the kill switch accepts only those two values; and that a
 step Claude Code's classifier denied is "not reached", while a denial by
-the gateway's hook or a step that ran never is.
+the gateway's hook or a step that ran never is; and for `modes`, that the
+probe's records are read per session and that a payload string the gateway
+doesn't know, or one for another mode, fails the check.
+`tests/test_acceptance_lib.py` runs the helpers the suite shares with the TUI
+acceptances (`tests/acceptance_lib.py`: the recording fakes, the
+`--permission-mode` choices, the strings looked for) and keeps each string
+in step with the code that prints it.
 `tests/test_hookbash_remote_sudo.py` covers the hook fix the suite found
 (remote sudo and the host's sudo right). `tests/mutations_e2e.py` (in
 `pixi run mutations`) weakens each of these guards in turn.

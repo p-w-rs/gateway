@@ -18,7 +18,13 @@ from typing import Any
 from . import paths
 from . import form as formmod
 
-WORDS = {True: "on", "ask": "ask", False: "off"}
+WORDS = {True: "on", "ask": "ask", False: "off", "cc": "cc"}
+
+
+def _word(v: Any) -> str:
+    """A right in a snapshot: on, ask, off, cc, or "per mode" for a six-mode
+    map (PLAN-0.11 §2.7)."""
+    return "per mode" if isinstance(v, dict) else WORDS.get(v, "?") if isinstance(v, (bool, str)) else "?"
 
 
 def _seen_path():
@@ -53,9 +59,7 @@ def describe_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     (consent.snapshot shapes). Names are validated form entry names."""
     out: list[str] = []
     o_set, n_set = (old.get("settings") or {}), (new.get("settings") or {})
-    if o_set.get("others", "refuse") != n_set.get("others", "refuse"):
-        out.append(f"others = \"{n_set.get('others', 'refuse')}\"")
-    o_sh = o_set.get("shell") if isinstance(o_set.get("shell"), dict) else {}
+    o_sh =o_set.get("shell") if isinstance(o_set.get("shell"), dict) else {}
     n_sh = n_set.get("shell") if isinstance(n_set.get("shell"), dict) else {}
     if o_sh.get("managed", "on") != n_sh.get("managed", "on"):
         out.append(f"managed shell now \"{n_sh.get('managed', 'on')}\"")
@@ -71,14 +75,14 @@ def describe_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
             if h.get("addresses"):
                 bits.append(_addr(h["addresses"][0]))
             if "ssh" in h:
-                bits.append(f"ssh {WORDS.get(h.get('ssh'), '?')}")
-            bits.append(f"sudo {WORDS.get(h.get('sudo'), '?')}")
+                bits.append(f"ssh {_word(h.get('ssh'))}")
+            bits.append(f"sudo {_word(h.get('sudo'))}")
             out.append(f"{n}: new host (" + ", ".join(bits) + ")")
             continue
         a, b = oh[n], nh[n]
         for k in ("ssh", "sudo"):
             if k in b and a.get(k) != b.get(k):
-                out.append(f"{n}: {k} now {WORDS.get(b.get(k), '?')}")
+                out.append(f"{n}: {k} now {_word(b.get(k))}")
         if bool(a.get("scripts")) != bool(b.get("scripts")):
             out.append(f"{n}: scripts now {'on' if b.get('scripts') else 'off'}")
         oa = [_addr(x) for x in a.get("addresses") or []]
@@ -141,13 +145,21 @@ def main(payload: dict) -> dict | None:
         managed.sync(form, eff, vault_readable=not (vault.exists() and data is None))
     except Exception:  # noqa: BLE001
         pass
+    # the stand-ins on PATH follow the configured set (PLAN-0.11 §1.2)
+    from . import envfile
+    envfile.sync_standins(form, eff)
+    consent.sync_network_words(eff)          # pre_bash.sh's extra trigger words (WS-3)
     lines: list[str] = []
     if not form.exists:
-        restore = ("; the next session restores the last good version"
-                   if (data or {}).get("form_last_good") else "")
-        lines.append("gateway: gateway.toml was removed; until it's back only this computer's "
-                     f"defaults apply (your approvals are kept{restore}). Put it back, or ask "
-                     "Claude to write a new one.")
+        if form.from_last_good:
+            # PLAN-0.11 §1.1: the last good version applies meanwhile
+            lines.append("gateway: gateway.toml was removed; until it's back the gateway uses the "
+                         "last good version (your approvals are kept; the next session restores "
+                         "it). Put it back, or ask Claude to write a new one.")
+        else:
+            lines.append("gateway: gateway.toml was removed; until it's back only this computer's "
+                         "defaults apply and the hosts and accounts it named are refused (your "
+                         "approvals are kept). Put it back, or ask Claude to write a new one.")
         return {"systemMessage": "\n".join(lines)}
     snap = consent.snapshot(form)
     try:

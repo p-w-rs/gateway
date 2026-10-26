@@ -104,10 +104,14 @@ _ULID = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _SAFE_REF = re.compile(r"[A-Za-z0-9_.:@/+-]{1,120}")
 ON_PAUSE = ("continue", "interrupt", "suspend", "detach")
-# the variables a pane may take from its caller's environment besides the
-# approved imports (managed conf env= and mine=): the platform's
-PLATFORM_PASS = ("LANG", "TZ", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-                 "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "__CF_USER_TEXT_ENCODING")
+# a pane takes its caller's variables (the user's, Claude Code's environment)
+# minus the managed shell's removals (managed.dropped; PLAN-0.11 §1.6), at
+# most ENV_MAX of them, but never these: the start file sets them itself, or
+# tmux does
+ENV_MAX = 400
+ENV_VALUE_MAX = 8192
+PANE_SETS = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "SHLVL", "_", "TERM",
+             "COLUMNS", "LINES", "CLAUDE_PID", "TMUX", "TMUX_PANE")
 KEEP_NAMES = ("HOME|USER|LOGNAME|LANG|LC_*|TERM|TMPDIR|TZ|XDG_*|__CF_USER_TEXT_ENCODING|SHLVL|"
               "PWD|OLDPWD|COLUMNS|LINES")
 
@@ -429,8 +433,8 @@ def session_key(s: Any) -> str:
 
 
 def read_conf() -> dict[str, str]:
-    """The managed shell's conf (managed.py writes it): bash, rc, path, env,
-    mine. {} when it isn't there yet."""
+    """The managed shell's conf (managed.py writes it): bash, rc, standins,
+    imports, ... {} when it isn't there yet."""
     from .. import managed
     try:
         text = managed.conf_path().read_text(encoding="utf-8")
@@ -443,6 +447,37 @@ def read_conf() -> dict[str, str]:
         k, _, v = line.partition("=")
         out[k.strip()] = v
     return out
+
+
+def env_kept(given: dict[Any, Any]) -> dict[str, str]:
+    """The caller's variables a pane keeps (Claude Code's environment, or a
+    contract job's `env`, as the managed shell keeps them: PLAN-0.11 §1.6):
+    the first ENV_MAX that are a shell name with a string value of at most
+    ENV_VALUE_MAX characters, valid UTF-8 and without NUL, minus PANE_SETS
+    (set here or by tmux) and the managed shell's removals. Anything else is
+    skipped, never an error: a session's environment often holds an
+    exported function (BASH_FUNC_x%%) or a long value (direnv's)."""
+    from .. import managed
+    out: dict[str, str] = {}
+    for name, value in given.items():
+        if len(out) >= ENV_MAX:
+            break
+        if not isinstance(name, str) or not isinstance(value, str) or not _NAME.fullmatch(name):
+            continue
+        if "\x00" in value or len(value) > ENV_VALUE_MAX or not _utf8(value):
+            continue
+        if name in PANE_SETS or managed.dropped(name):
+            continue
+        out[name] = value
+    return out
+
+
+def _utf8(s: str) -> bool:
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:            # a lone surrogate (from JSON's \udcXX)
+        return False
+    return True
 
 
 def env_plan(caller_env: Any) -> tuple[str, str, dict[str, str], str]:
@@ -459,21 +494,16 @@ def env_plan(caller_env: Any) -> tuple[str, str, dict[str, str], str]:
     rc = conf.get("rc") or ""
     if not (rc and os.path.isabs(rc) and os.path.isfile(rc)):
         rc = ""
-    path = conf.get("path") or ":".join([str(paths.bin_dir()), str(managed.runtime_dir()),
-                                         *managed.SYSTEM_DIRS])
-    allowed_imports = set(conf.get("env", "").split())
-    mine = set(conf.get("mine", "").split())
-    exports: dict[str, str] = {}
     given = caller_env if isinstance(caller_env, dict) else {}
-    for name, value in list(given.items())[:200]:
-        if not isinstance(name, str) or not isinstance(value, str) or not _NAME.fullmatch(name):
-            continue
-        if "\x00" in value or len(value) > 8192:
-            continue
-        platform = name in PLATFORM_PASS or name.startswith("LC_")
-        if platform or (name in allowed_imports and not managed.credential_like(name)) or \
-                name in mine:
-            exports[name] = value
+    exports = env_kept(given)
+    # PATH: the stand-ins, the caller's PATH, the approved imports (conf)
+    caller_path = given.get("PATH") if isinstance(given.get("PATH"), str) \
+        and _utf8(given["PATH"]) else ""
+    dirs = [str(paths.bin_dir())]
+    dirs += [d for d in (caller_path or "").split(":") if d.startswith("/")] or \
+        list(managed.SYSTEM_DIRS)
+    dirs += [d for d in conf.get("imports", "").split(":") if d.startswith("/")]
+    path = ":".join(dict.fromkeys(d for d in dirs if "\n" not in d))
     exports["HOME"] = str(paths.user_home())
     user = paths.local_user()
     exports["USER"] = user
@@ -1700,7 +1730,7 @@ class Supervisor:
         from .. import audit
         with contextlib.suppress(Exception):
             audit.use("gated", p.host, None, ["ssh", p.host, f"gateway {what} {p.id}"],
-                      remote_runtime=True)
+                      remote_runtime=True, mode="modeless")       # gated: the modeless rule
 
     def start_job(self, session: Any, *, agent: str = "", argv: Any = None, command: Any = None,
                   cwd: Any = None, host: Any = None, workspace: Any = "", task_ref: Any = "",

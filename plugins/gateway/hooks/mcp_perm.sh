@@ -17,12 +17,14 @@
 #                                     judges what they type or run (Bash's denies; never
 #                                     allow), then Claude Code's mode decides
 #   terminal_signal, terminal_close, job_signal -> no decision (Claude Code's mode decides)
-#   http, download                 -> no decision, in every mode, for any method, with or
-#                                     without an account: a request can carry data out or
-#                                     use an account's credential, so Claude Code's mode
-#                                     decides (a prompt in default and plan mode, the
-#                                     reviewer in auto); web.py still keeps a credential to
-#                                     its account's sites and applies the policy
+#   http, download                 -> Python decides (launch.sh hook-mcp, hooks_mcp.py;
+#                                     PLAN-0.11 §2.10): the network policy in the
+#                                     payload's mode (this machine's, and an account's
+#                                     own with an account) gives deny or ask, an
+#                                     explicit per-mode allow of the user's gives allow
+#                                     in that mode (never with an account), anything else
+#                                     no decision, so nothing is approved by default;
+#                                     never an allow from sh. Python not ready: no output
 #   anything else                  -> no output (Claude Code's mode decides)
 #
 # Only TOP-LEVEL keys of tool_input count: a "host" or "action" key inside an
@@ -30,7 +32,16 @@
 # tokenized properly: escape sequences are neutralized first (so every
 # remaining double quote delimits a string), then awk splits on quotes and
 # tracks the object depth outside strings.
+#
+#   mcp_perm.sh [--test]   --test (the test runner only) passes launch.sh's --test on
+#                          (GATEWAY_TEST_ROOT); without it launch.sh never uses that root
 set -u
+
+case $0 in */*) here=${0%/*} ;; *) here=. ;; esac   # dirname, without a process
+test_mode=""
+if [ "${1-}" = "--test" ] && [ -n "${GATEWAY_TEST_ROOT-}" ]; then
+  case $GATEWAY_TEST_ROOT in /*) test_mode=--test ;; esac
+fi
 
 input=$(cat)
 
@@ -93,6 +104,8 @@ END {
     if (hasaction == 0 || (hasaction == 1 && action == "status")) print "allow-runtime-read"
     else print "none"
     exit }
+  if (tool == "mcp__plugin_gate_gw__http" || tool == "mcp__plugin_gate_gw__download") {
+    print "python"; exit }
   print "none"
 }')
 
@@ -105,6 +118,8 @@ case $decision in
   allow-term-read) allow "gateway: a bounded, scrubbed read of a gateway terminal or job (nothing is typed or run)" ;;
   allow-term-open) allow "gateway: an idle managed shell or a window size (nothing of the model's runs)" ;;
   allow-runtime-read) allow "gateway: a read of a remote host's identity and runtime readiness (nothing is run or staged)" ;;
+  # shellcheck disable=SC2086  # $test_mode is empty or one word
+  python) printf '%s' "$input" | sh "$here/launch.sh" hook-mcp $test_mode 2>/dev/null ;;
   *) : ;;
 esac
 exit 0

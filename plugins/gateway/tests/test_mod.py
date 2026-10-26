@@ -182,24 +182,26 @@ def test_vendored_tweetnacl_is_the_published_file_but_for_its_last_line():
     assert "nacl.setPRNG(" in seal and "crypto.getRandomValues(" in seal and "\nsetPrng()\n" in seal
 
 
-def _lib_matrix() -> list[tuple[str, list[str], str, str]]:
+def _lib_matrix() -> list[tuple[str, list[str], str]]:
     text = (H.PLUGIN / "hooks" / "mod" / "lib.ts").read_text()
     rows = re.findall(r"\{ feature: '([^']+)', cells: \{ terminal: '(\w+)', desktop: '(\w+)', "
                       r"vscode: '(\w+)', mobile: '(\w+)', print: '(\w+)', remote: '(\w+)' \}, "
-                      r"min: '([^']+)', withoutMods: (true|false) \}", text)
-    return [(r[0], list(r[1:7]), r[7], "yes" if r[8] == "true" else "no") for r in rows]
+                      r"withoutMods: (true|false) \}", text)
+    assert "min:" not in text.split("export const CAPABILITIES", 1)[1].split("]", 1)[0], \
+        "latest only: no minimum version per row"
+    return [(r[0], list(r[1:7]), "yes" if r[7] == "true" else "no") for r in rows]
 
 
-def _doc_matrix() -> list[tuple[str, list[str], str, str]]:
+def _doc_matrix() -> list[tuple[str, list[str], str]]:
     text = (H.REPO / "docs" / "CAPABILITIES.md").read_text()
-    head = "| Feature | terminal | desktop | VS Code | mobile | -p / SDK | Remote Control | minimum | without mods |"
-    assert head in text
+    head = "| Feature | terminal | desktop | VS Code | mobile | -p / SDK | Remote Control | without mods |"
+    assert head in text and "| minimum |" not in text
     out = []
     for line in text.split(head, 1)[1].splitlines()[2:]:
         if not line.startswith("|"):
             break
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        out.append((cells[0], cells[1:7], cells[7], cells[8]))
+        out.append((cells[0], cells[1:7], cells[7]))
     return out
 
 
@@ -212,4 +214,4 @@ def test_the_capability_matrix_in_the_docs_is_the_one_the_doctor_prints():
     allowed = {"yes", "no", "planned", "untested"}
     assert all(set(r[1]) <= allowed for r in lib)
     # every guard works without mods (Anthropic can switch mods off)
-    assert all(r[3] == "yes" for r in lib if "classic hooks" in r[0] or "Cold-start guard" in r[0])
+    assert all(r[2] == "yes" for r in lib if "classic hooks" in r[0] or "Cold-start guard" in r[0])

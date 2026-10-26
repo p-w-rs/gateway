@@ -1,4 +1,4 @@
-"""The test fakes themselves (fake sudo, fake dialog, v2 builder) and run.py's
+"""The test fakes themselves (fake sudo, fake dialog) and run.py's
 dispatch and failure policies."""
 from __future__ import annotations
 
@@ -78,18 +78,6 @@ def test_fake_dialog_outcomes():
         assert [c["outcome"] for c in calls] == ["ok", "cancelled", "unavailable", "timeout", "cancelled"]
         assert calls[0]["kind"] == "secret" and calls[0]["message"] == "msg"
         env.o.dialog = str(d.script)  # how popup.py (phase B) finds it
-
-
-def test_v2_builder_round_trip():
-    with H.gateway_env():
-        paths.ensure_home()
-        data = {"version": 2, "secrets": {"A": {"value": "x" * 10, "hosts": ["a.example.com"]}},
-                "sudo": {}, "accounts": {}}
-        H.write_v2_vault(paths.home(), data)
-        assert paths.v2_store_path().exists() and paths.v2_key_path().exists()
-        back = H.read_v2_vault(paths.home())
-        assert back["secrets"] == data["secrets"] and back["version"] == 2
-        assert b"xxxxxxxxxx" not in paths.v2_store_path().read_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +225,11 @@ def test_hook_failure_policies():
             assert code == 0 and out == "", mode
 
 
-def test_shims_refuse_and_never_run_the_system_tool():
-    """A stand-in that can't serve (unknown host, no account, no fake sudo)
-    refuses; the user's own ssh/gh/sudo found on PATH never runs instead."""
+def test_shims_never_run_a_tool_from_path_under_a_test_override():
+    """With nothing configured the stand-ins pass through to the user's own
+    tool (PLAN-0.11 §1.3); under a test override that is only the
+    `user_tools` knob's folder, never PATH: with no knob nothing is found
+    (127) and the ssh/gh/sudo found on PATH never runs."""
     with H.gateway_env() as env:
         fake = env.root / "sysbin"
         fake.mkdir()
@@ -253,15 +243,17 @@ def test_shims_refuse_and_never_run_the_system_tool():
         saved = sys.stderr
         sys.stderr = err
         try:
-            for tool in ("ssh", "sudo", "asiml"):
-                assert run.run_shim(tool, ["x"]) != 0, tool
+            for tool in ("ssh", "sudo"):
+                assert run.run_shim(tool, ["x"]) == 127, tool
+            assert run.run_shim("asiml", ["x"]) != 0
             assert run.run_shim("nonsense", []) == 2
         finally:
             sys.stderr = saved
             os.environ["PATH"] = old or ""
         assert "isn't available in this build yet" not in err.getvalue()
-        assert "x isn't in gateway.toml" in err.getvalue(), err.getvalue()
-        assert not marker.exists(), "the user's own ssh/gh/sudo must never run in their place"
+        assert "gateway: ssh isn't installed here" in err.getvalue() and \
+            "gateway: sudo isn't installed here" in err.getvalue(), err.getvalue()
+        assert not marker.exists(), "a tool from PATH never runs under a test override"
 
 
 def test_mcp_serves_http_and_download():
@@ -298,20 +290,25 @@ def test_dispatch_unknown_mode_and_subprocess_hooks():
                                                            "tool_input": {"file_path": str(paths.vault_path())}})
         assert r.returncode == 0 and json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         r = H.run_py(env, "--test", "hook-bash", payload={"tool_input": {"command": "sudo ls"}})
-        # no form yet: sudo on this computer is "ask" by default, so Claude Code asks
-        assert r.returncode == 0 and \
-            json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask", r.stdout
+        # no form yet: sudo on this computer is the user's own (PLAN-0.11 §1.5), no decision
+        assert r.returncode == 0 and r.stdout == "", r.stdout
         env.write_form("[hosts.localhost]\nsudo = false\n")
         r = H.run_py(env, "--test", "hook-bash", payload={"tool_input": {"command": "sudo ls"}})
         assert r.returncode == 0 and \
             json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", r.stdout
 
 
-def test_stand_in_triggers_migration():
+def test_stand_ins_and_the_mcp_server_never_convert_a_06_vault():
+    """No entry point converts a gateway 0.6 vault any more (run.py had a
+    migration hook for the stand-ins and the MCP server): a stand-in beside
+    store.age runs as on an install with no vault, and store.age, key.txt
+    and the missing vault.age stay as they were."""
+    import inspect
+    assert "migrat" not in inspect.getsource(run).lower()
     with H.gateway_env() as env:
         paths.ensure_home()
-        H.write_v2_vault(paths.home(), {"version": 2, "secrets": {"K": {"value": "v" * 16, "hosts": ["k.example.com"]}},
-                                        "sudo": {}, "accounts": {}})
+        paths.v2_store_path().write_bytes(b"age-encryption.org/v1 a 0.6 store")
+        paths.v2_key_path().write_text("AGE-SECRET-KEY-1NOTAREALKEY\n")
         old = os.environ.get("PATH")
         os.environ["PATH"] = str(env.root / "empty")
         saved, sys.stderr = sys.stderr, io.StringIO()
@@ -321,8 +318,9 @@ def test_stand_in_triggers_migration():
         finally:
             sys.stderr = saved
             os.environ["PATH"] = old or ""
-        assert "migrated your 0.6 vault" in msg and paths.vault_path().exists()
-        assert not paths.v2_store_path().exists()
+        assert "migrat" not in msg and "0.6" not in msg, msg
+        assert not paths.vault_path().exists()
+        assert paths.v2_store_path().read_bytes() == b"age-encryption.org/v1 a 0.6 store"
 
 
 def test_gate_entry_drops_proxy_and_ca_variables():

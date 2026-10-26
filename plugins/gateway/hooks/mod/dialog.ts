@@ -19,11 +19,14 @@ export const GUARD_TEXT = "click the gateway dialog's field first, then type the
 export const MAIN_KEYS = '/gate-dialog, then Tab and Enter'
 // What Paste leaves behind: gated reads the clipboard and never clears it.
 export const PASTE_NOTE = 'Paste leaves the value on your clipboard: clear it yourself afterwards (copy something else).'
-// How to get the fullscreen view, where the field takes a click and keys.
-export const FULLSCREEN_HINT = 'For a field you can type into, quit Claude Code and start it with CLAUDE_CODE_NO_FLICKER=1 (its fullscreen view).'
+// How to get the fullscreen view, where the field takes a click and keys:
+// Claude Code's own /tui fullscreen (it restarts and resumes the session;
+// the command and its words are in Claude Code 2.1.310).
+export const FULLSCREEN_CMD = '/tui fullscreen'
+export const FULLSCREEN_HINT = `For a field you can type into, type ${FULLSCREEN_CMD} (Claude Code's fullscreen view; it restarts and resumes this session).`
 // The guard's words where the field can't take keys: the terminal's main
 // screen (no clicks reach plugins there) and a pane the person closed.
-export const GUARD_MAIN_TEXT = `a gateway dialog waits for a secret, so typing here is held back: this terminal can't type into its field (the main screen); copy the secret and press the dialog's Paste from clipboard (${MAIN_KEYS}; it stays on your clipboard), or start Claude Code with CLAUDE_CODE_NO_FLICKER=1 to type it there`
+export const GUARD_MAIN_TEXT = `a gateway dialog waits for a secret, so typing here is held back: this terminal can't type into its field (the main screen); copy the secret and press the dialog's Paste from clipboard (${MAIN_KEYS}; it stays on your clipboard), or type ${FULLSCREEN_CMD} (it restarts and resumes the session) to type it there`
 export const GUARD_CLOSED_TEXT = "a gateway dialog waits for a secret, so typing here is held back: /gate-dialog shows it again (type or paste it there, or cancel it)"
 // What the guard lets into the prompt box while a secret dialog waits: one
 // of the gateway's own commands being typed (so /gate-dialog can bring the
@@ -39,11 +42,72 @@ export const MAIN_SCREEN = `This terminal can't type into the gateway's field: i
 // typing nor Paste works (review round 2). The Paste button stays (a test
 // override's clipboard program works anywhere); these texts say what to do.
 export const NO_DISPLAY = "this Linux session has no graphical display (no DISPLAY or WAYLAND_DISPLAY), so the gateway can't read a clipboard"
-export const NO_DISPLAY_TODO = "quit Claude Code and start it with CLAUDE_CODE_NO_FLICKER=1 (its fullscreen view, where the field takes a click and keys), or set the credential from a Claude Code session in this machine's desktop (where Paste works)"
+export const NO_DISPLAY_TODO = `type ${FULLSCREEN_CMD} (Claude Code's fullscreen view, where the field takes a click and keys; it restarts and resumes the session), or set the credential from a Claude Code session in this machine's desktop (where Paste works)`
 export const NO_DISPLAY_MAIN = `Neither typing nor Paste can work in this terminal: it shows Claude Code's main screen, where clicks don't reach plugins, so the field can't take keys; and ${NO_DISPLAY}. Cancel this dialog, then ${NO_DISPLAY_TODO}, and ask again. Don't type it into the prompt.`
 export const NO_DISPLAY_PASTE = `Paste from clipboard can't work here: ${NO_DISPLAY}. Type the secret into the field.`
 export const GUARD_NODISPLAY_TEXT = 'a gateway dialog waits for a secret, so typing here is held back: neither typing nor Paste can work in this terminal (the main screen, and no graphical display for the clipboard); /gate-dialog shows what to do'
 export const UNAVAILABLE_SURFACE = "Credential entry isn't available on this surface (it has no private field). Answer it at the computer, in the terminal or the desktop app, or cancel."
+
+// The browser sign-in's confirm dialog (PLAN-0.11 §7.1): gated sends only its
+// validated fields (`signin`), the words are this fixed template. Open makes
+// gated bind its 127.0.0.1 listener and open the system browser; nothing
+// happens before it, and Cancel is focused first. The Open answer carries the
+// display and desktop variables the browser needs on Linux, and
+// SSH_CONNECTION (over ssh a Mac's browser opens on its own screen):
+// SIGNIN_ENV, in register.tsx's order.
+export const SIGNIN_WHAT = 'browser sign-in'
+export const SIGNIN_ENV: readonly string[] = ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_CURRENT_DESKTOP', 'XDG_DATA_DIRS', 'SSH_CONNECTION']
+export const SIGNIN_UNREADABLE = "The gateway sent a browser sign-in this pane can't show; press Cancel."
+export const SIGNIN_NOTE = "Open starts the sign-in in your system browser; its result goes straight into the gateway's vault, never to Claude. Nothing happens before you press Open."
+export type Signin = { account: string; kind: string; tenant: string; client: string; scope: string; host: string; previous_client: string }
+
+const SIGNIN_NAME = /^[a-z][a-z0-9-]{0,31}$/
+const SIGNIN_GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+const SIGNIN_TENANT = /^[A-Za-z0-9.-]{1,100}$/
+const SIGNIN_HOST = /^[A-Za-z0-9_.@:-]{1,48}$/
+const SIGNIN_SCOPE = /^[A-Za-z0-9._:/~-]{1,200}( [A-Za-z0-9._:/~-]{1,200}){0,8}$/
+
+// The sign-in's fields, each checked again here; null when any isn't valid.
+export function parseSignin(v: unknown): Signin | null {
+  if (typeof v !== 'object' || v === null) return null
+  const o = v as Record<string, unknown>
+  const s = (k: string): string => (typeof o[k] === 'string' ? (o[k] as string) : '')
+  const out: Signin = { account: s('account'), kind: s('kind'), tenant: s('tenant'), client: s('client'), scope: s('scope'), host: s('host'), previous_client: s('previous_client') }
+  if (!SIGNIN_NAME.test(out.account) || !SIGNIN_TENANT.test(out.tenant) || !SIGNIN_GUID.test(out.client) || !SIGNIN_SCOPE.test(out.scope)) return null
+  if (out.kind === 'ml-catalog' ? !SIGNIN_HOST.test(out.host) : out.kind !== 'azure' || out.host !== '') return null
+  if (out.previous_client !== '' && !SIGNIN_GUID.test(out.previous_client)) return null
+  return out
+}
+
+export function signinTitle(s: Signin): string {
+  return `Sign in to ${s.account} in your browser`
+}
+
+export function signinLines(s: Signin): string[] {
+  const lines = [s.kind === 'ml-catalog'
+    ? `Claude asks to sign in to the model catalog ${s.host} as you (account ${s.account}), in your web browser.`
+    : `Claude asks to sign in to Azure as you (account ${s.account}), in your web browser.`]
+  lines.push(`Tenant: ${s.tenant}`)
+  lines.push(s.kind === 'ml-catalog' ? `Client id (from the catalog): ${s.client}` : `Client id: ${s.client}`)
+  if (s.previous_client !== '') lines.push(`The catalog's client id changed since the last sign-in (it was ${s.previous_client}).`)
+  lines.push(`Scope: ${s.scope}`)
+  lines.push(SIGNIN_NOTE)
+  return lines
+}
+
+// The vault passphrase offer (PLAN-0.11 §8): gated's own choice dialog
+// (daemon/offer.py) after a secret was stored while the vault's key has no
+// passphrase; gated sends only `offer: "passphrase"`, the words are this
+// fixed template. The options are gated's too (an answer must be one of
+// them): Set passphrase opens the set-a-passphrase dialog, Not now stops the
+// offer for good, Cancel (or Escape) leaves it for a later store.
+export const OFFER_WHAT = 'vault passphrase offer'
+export const OFFER_TITLE = 'Protect the vault with a passphrase?'
+export const OFFER_LINES: readonly string[] = [
+  'Without one, any program running as you can read the stored secrets.',
+  "Set passphrase opens the gateway's dialog to set one. Not now: the gateway won't offer it again (/gate-unlock sets one any time).",
+]
+export const OFFER_OPTIONS: readonly string[] = ['Set passphrase', 'Not now']
 
 export type DialogView = {
   id: string
@@ -69,6 +133,7 @@ export type DialogView = {
   state: string
   expires_in: number
   pub: string
+  signin: Signin | null
 }
 
 export type QueueItem = { id: string; kind: string; entry: string; what: string }
@@ -98,7 +163,7 @@ export function parseDialog(v: unknown): DialogView | null {
   const id = str(o, 'id', 64)
   if (!ID.test(id)) return null
   const remember = o.remember === true ? true : o.remember === false ? false : null
-  return {
+  const d: DialogView = {
     id, kind: str(o, 'kind', 20), title: str(o, 'title', 120), entry: str(o, 'entry', 64),
     what: str(o, 'what', 48), target: str(o, 'target', 120), lines: strs(o, 'lines'),
     options: strs(o, 'options', 120), checked: strs(o, 'checked', 120), default: str(o, 'default'),
@@ -106,7 +171,19 @@ export function parseDialog(v: unknown): DialogView | null {
     default_cancel: o.default_cancel === true, fields: num(o, 'fields'), remember,
     paste: o.paste === true, input: o.input === true, attempt: num(o, 'attempt') || 1,
     max: num(o, 'max') || 3, error: str(o, 'error', 300), state: str(o, 'state', 20),
-    expires_in: num(o, 'expires_in'), pub: str(o, 'pub', 64),
+    expires_in: num(o, 'expires_in'), pub: str(o, 'pub', 64), signin: null,
+  }
+  if (o.offer === 'passphrase' && d.kind === 'choice') {
+    // the passphrase offer: the fixed template, never gated's own words
+    return { ...d, title: OFFER_TITLE, lines: [...OFFER_LINES], options: [...OFFER_OPTIONS], cancel_label: 'Cancel', default_cancel: false }
+  }
+  if (o.signin === undefined || o.signin === null) return d
+  // a browser sign-in: the fixed template, never gated's own words
+  const s = d.kind === 'confirm' ? parseSignin(o.signin) : null
+  return {
+    ...d, signin: s, title: s !== null ? signinTitle(s) : 'Browser sign-in',
+    lines: s !== null ? signinLines(s) : [SIGNIN_UNREADABLE], ok_label: 'Open', cancel_label: 'Cancel',
+    default_cancel: true,
   }
 }
 
@@ -229,8 +306,10 @@ export function waitingLine(d: DialogView): string {
 // A short fixed line for a dialog that ended (a toast): never a value.
 export function resultText(r: Recent): string | undefined {
   const w = who(r)
+  if (r.what === OFFER_WHAT && r.outcome === 'ok') return `vault passphrase: ${r.note || 'answered'}`
   switch (r.outcome) {
     case 'ok':
+      if (r.what === SIGNIN_WHAT) return `${w}: opened in your browser`
       return r.what === 'consent' ? `approved: ${r.entry}` : `${w}: supplied`
     case 'cancelled':
       return `${w}: cancelled`

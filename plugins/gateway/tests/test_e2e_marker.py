@@ -189,11 +189,17 @@ def test_e2e_config_keeps_only_known_knobs():
             "dialog": "/x/fake-dialog", "tools": {"sudo": "/x/sudo", "ssh": "rel/ssh"},
             "machine_id": "E2E-1", "popup_wait": 5, "system_git": True,
             "home": "/somewhere/else", "data": "/elsewhere", "entry": ["/bin/sh"],
-            "popup_lifetime": "30", "dialog_timeout": True}))
+            "popup_lifetime": "30", "dialog_timeout": True, "user_tools": "/x/user-tools"}))
         os.chmod(cfg, 0o600)
         got = paths.e2e_config(c.root)
         assert got == {"dialog": "/x/fake-dialog", "tools": {"sudo": "/x/sudo"},
-                       "machine_id": "E2E-1", "popup_wait": 5, "system_git": True}, got
+                       "machine_id": "E2E-1", "popup_wait": 5, "system_git": True,
+                       "user_tools": "/x/user-tools"}, got
+        # the folder of the user's own tools (recording fakes for a pass-through,
+        # PLAN-0.11 §1.3) counts only when absolute, like the tools
+        for bad in ("user-tools", "./x", "", ["/x"], True):
+            cfg.write_text(json.dumps({"user_tools": bad, "machine_id": "E2E-2"}))
+            assert paths.e2e_config(c.root) == {"machine_id": "E2E-2"}, (bad, paths.e2e_config(c.root))
         os.chmod(cfg, 0o666)
         assert paths.e2e_config(c.root) == {}            # a config others could write
         os.chmod(cfg, 0o600)
@@ -378,3 +384,80 @@ def test_e2e_jobs_judges_the_job_step_that_ran_even_after_a_classifier_denial():
     assert SC._job_call(types.SimpleNamespace(calls=[ran, cls1, ran2]), "jobssh") is ran2
     assert SC._job_call(retried, "leak") is None
     assert [c.name for c in C.classifier] == ["b"] and not C.failed
+
+
+def test_e2e_modes_reads_each_sessions_payload_strings_and_knows_only_the_gateways_table():
+    """The modes scenario (PLAN-0.11 §2.1, §14): the probe plugin's hook
+    (run_e2e.MODEPROBE_REC, run by sh here on a recorded payload's shape)
+    keeps only the event, the session id and permission_mode; its records
+    are read per session; a payload string passes only when
+    modes.from_payload knows it and it means the key of the
+    --permission-mode choice (an empty or missing mode, another mode's
+    string or a choice the table lacks fails)."""
+    R = _run_e2e()
+    import scenarios as SC
+    base = _tmp("gwmp-")
+    try:
+        log = base / "modeprobe.log"
+        rec = base / "rec.sh"
+        rec.write_text(R.MODEPROBE_REC.replace("@LOG@", str(log)))
+        payloads = [
+            ("PreToolUse", {"session_id": "s-1", "hook_event_name": "PreToolUse",
+                            "tool_input": {"command": 'echo "permission_mode": "plan"'},
+                            "permission_mode": "acceptEdits", "cwd": "/w"}),
+            ("SessionStart", {"session_id": "s-1", "source": "startup"}),
+            ("PreToolUse", {"permission_mode": "default", "session_id": "s-2"}),
+            # the key twice, on lines of their own (a tool input that is an object): still one record
+            ("PreToolUse", {"session_id": "s-4", "tool_input": {"permission_mode": "plan"},
+                            "permission_mode": "auto"}),
+        ]
+        for ev, p in payloads:
+            r = subprocess.run(["/bin/sh", str(rec), ev], input=json.dumps(p, indent=1), text=True,
+                               capture_output=True, timeout=30, env={"PATH": "/usr/bin:/bin"})
+            assert r.returncode == 0 and r.stdout == "", r
+        text = log.read_text()
+        assert text == ("PreToolUse\ts-1\tacceptEdits\nSessionStart\ts-1\t-\n"
+                        "PreToolUse\ts-2\tdefault\nPreToolUse\ts-4\tauto\n"), text
+        assert "echo" not in text and "/w" not in text
+        assert SC.mode_records(text + "a bad line\n", "s-1") == {"PreToolUse": ["acceptEdits"],
+                                                                 "SessionStart": [""]}
+        assert SC.mode_records(text, "s-3") == {}
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    for choice, payload in (("auto", "auto"), ("manual", "default"), ("manual", "manual"),
+                            ("default", "default"), ("bypassPermissions", "bypassPermissions"),
+                            ("plan", "plan"), ("acceptEdits", "acceptEdits"), ("dontAsk", "dontAsk")):
+        assert SC.mode_verdict(choice, [payload, payload])[0] is True, (choice, payload)
+    for choice, payload in (("bypassPermissions", "bypass"), ("auto", "default"), ("manual", ""),
+                            ("dontAsk", "dontask"), ("auto", "Auto"), ("plan", "manual")):
+        ok, why = SC.mode_verdict(choice, [payload])
+        assert ok is False and choice in why, (choice, payload, why)
+    assert SC.mode_verdict("auto", ["auto", "default"])[0] is False
+    ok, why = SC.mode_verdict("newmode", ["newmode"])
+    assert ok is False and "isn't in the gateway's table" in why
+    assert SC.mode_verdict("auto", []) == (None, "no payload recorded")
+
+
+def test_e2e_reads_the_hooks_decisions_and_what_the_env_probe_must_print():
+    """hook_decisions: each PreToolUse decision a call got, in order (stream
+    hook output, spaced or not); probe_want: the stand-ins first on PATH, no
+    git include or transport variables, the user's own SSH_AUTH_SOCK and
+    GITHUB_TOKEN kept and Claude Code's credential variable gone in Claude's
+    Bash; in a job only the gateway's part. Every scenario run_e2e offers
+    exists, in the same order."""
+    R = _run_e2e()
+    import e2elib as L
+    import scenarios as SC
+    assert list(R.SCENARIOS) == list(SC.SCENARIOS), (R.SCENARIOS, list(SC.SCENARIOS))
+    c = L.ToolCall("toolu_1", "Bash", {"command": "curl x"}, hook_outputs=[
+        '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask"}}',
+        '{"hookSpecificOutput":{"permissionDecision":"allow"}}', "not json", ""])
+    assert SC.hook_decisions(c) == ["ask", "allow"]
+    assert SC.hook_decisions(None) == []
+    w = SC.probe_want(Path("/r/data"))
+    assert (w["path_first"], w["ssh"], w["sudo"], w["git"]) == (
+        "/r/data/bin", "/r/data/bin/ssh", "/r/data/bin/sudo", "/r/data/bin/git")
+    assert w["git_include"] == w["git_ssh_command"] == w["rsync_rsh"] == "" == w["client_key_pass"]
+    assert w["ssh_auth_sock"] == w["github_token"] == w["claude_pid"] == "set"
+    j = SC.probe_want(Path("/r/data"), job=True)
+    assert set(j) == {"path_first", "ssh", "sudo", "git", "git_include", "git_ssh_command", "rsync_rsh"}

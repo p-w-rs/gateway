@@ -49,6 +49,18 @@ if os.environ.get("GW_ASKPASS_WAIT"):         # gate-askpass's FIFO deadline (ro
 if os.environ.get("GW_FAKE_DIALOG"):          # a fake dialog for the pop-up paths
     kw.update(dialog=os.environ["GW_FAKE_DIALOG"], popup_wait=20, popup_lifetime=30,
               dialog_timeout=30)
+if os.environ.get("GW_USER_TOOLS"):           # the user's own tools (PLAN-0.11 pass-through)
+    kw["user_tools"] = os.environ["GW_USER_TOOLS"]
+if os.environ.get("GW_STANDIN_MODE"):         # the session's mode the hook recorded (current_for)
+    from gateway import modes
+    _m = [os.environ["GW_STANDIN_MODE"]]
+    _once = bool(os.environ.get("GW_STANDIN_MODE_ONCE"))   # read once, then gone (gated restarted)
+
+    def _current_for(caller):
+        if caller != "standin" or not _m:
+            return None
+        return _m.pop() if _once else _m[0]
+    modes.current_for = _current_for
 with testing.override(root, tools=tools, **kw):
     if mode == "sudo":
         raise SystemExit(sudo.main(rest))
@@ -226,6 +238,15 @@ def clean_env(env, extra: dict[str, str] | None = None, claude_pid: str | None =
 # ---------------------------------------------------------------------------
 # Running the sudo stand-in
 # ---------------------------------------------------------------------------
+
+
+def asked(*args: str, cwd: str | None = None) -> None:
+    """The approval hook's record that Claude Code asked about `sudo ARGS`
+    in `cwd` (the folder the stand-in runs in: this test's own by default),
+    as hooks_bash writes it when it answers "ask" (asks.record; lead
+    decision 19.14). The stand-in passes an "ask" only with one."""
+    from gateway import asks
+    asks.record("sudo", asks.session(), cwd or os.getcwd(), list(args), [("hosts", "localhost")])
 
 
 def run_sudo(env, fake, *args, input=None, extra_env=None, claude_pid="self",

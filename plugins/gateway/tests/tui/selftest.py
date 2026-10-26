@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end self-test of the TUI harness on this machine.
 
-    pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py [--tmp DIR] [--keep] [--only a,c]
+    pixi exec --spec python --spec pyte python tests/tui/selftest.py [--tmp DIR] [--keep] [--only a,c]
         [--gateway DIR]
 
 Sections:

@@ -65,10 +65,11 @@ def test_background_and_monitor_commands_are_judged_like_any_bash_command():
             for k, (d, why) in got.items():
                 assert d == want, (cmd, k, d, why)
                 assert "gate scrub`" not in why, (cmd, k, why)
-        # the denies still apply, with their own reasons
+        # the denies and asks still apply, with their own reasons (a network
+        # command is asked about: PLAN-0.11 §3)
         for bg, tool in ((True, "Bash"), (None, "Monitor")):
             d, why = _decide("curl http://x", background=bg, tool=tool)
-            assert d == "deny" and "http tool" in why, (tool, why)
+            assert d == "ask" and "curl is a network command" in why, (tool, why)
             d, why = _decide("cat ~/.config/gateway/private/key.txt", background=bg, tool=tool)
             assert d == "deny" and "private keys" in why, (tool, why)
         # outside auto mode: no allow, and no deny either

@@ -1,7 +1,7 @@
 """Registered Claude Code sessions and the plane checks.
 
-A session is a live Claude Code process (by executable path, or node running
-npm's cli.js by its argv: peers.is_claude) that registered:
+A session is a live Claude Code process (by executable path: peers.is_claude)
+that registered:
 
 - the mod, from inside that process (`POST /ui/register`: the peer pid must
   be the claimed claude_pid and its executable Claude Code's): a UI session;
@@ -27,6 +27,13 @@ Plane rules (every connection first: the peer's uid is the daemon's):
               peer is a gateway entry point whose mode the route allows
     contract  a registered session is a strict ancestor of the peer
     local     the peer is a gateway entry point (any session or none)
+    mode      /agent/session/mode (PLAN-0.11 §2.4): a gateway hook records its
+              session's permission mode, a stand-in or the gw MCP server reads
+              it; the session is the nearest Claude Code on the peer's real
+              process chain, registered (never through a gateway terminal's
+              pane, never an outer session past an unregistered inner one)
+    signin    /agent/signin/* (PLAN-0.11 §7.1): the gate command below a
+              registered session, as for the dialog lease
 
 The UI process itself is never on the agent or contract plane (strict
 ancestor), and an agent or contract peer is never on the UI plane: "the
@@ -104,6 +111,11 @@ class Registry:
         # the supervisor's mapping (daemon/terminals.py): a process inside a
         # gateway terminal or job belongs to that pane's owner session
         self.pane_session: Any = None
+        # each session's recorded permission mode (PLAN-0.11 §2.4): pid ->
+        # (the session's start time, mode key, the epoch marker's epoch it was
+        # posted under); memory only, so a restarted daemon has none until a
+        # hook posts one (the modeless rule meanwhile)
+        self.modes: dict[int, tuple[float | None, str, str | None]] = {}
         self._load()
 
     # -- persistence ---------------------------------------------------------
@@ -153,6 +165,7 @@ class Registry:
             old = self.sessions.get(pid)
             if old is not None and old.start != start:
                 old = None                    # a reused pid: a new process
+                self.modes.pop(pid, None)     # (and the old one's mode with it)
             # the executable checked when this process first registered (later
             # its path may be gone, or read "<path> (deleted)" on Linux)
             exe = (old.exe if old is not None and old.exe else "") or peers.exe(pid) or ""
@@ -171,6 +184,7 @@ class Registry:
 
     def unregister(self, pid: int) -> bool:
         with self.lock:
+            self.modes.pop(pid, None)
             if self.sessions.pop(pid, None) is None:
                 return False
             self._save()
@@ -181,6 +195,8 @@ class Registry:
         with self.lock:
             dead = [p for p, s in self.sessions.items() if not self._valid(s)]
             gone = [self.sessions.pop(p) for p in dead]
+            for p in dead:
+                self.modes.pop(p, None)
             if dead:
                 self._save()
             live = len(self.sessions)
@@ -230,6 +246,47 @@ class Registry:
             if s is not None and self.live(s.pid) is not None:
                 return s
         return None
+
+    def chain_session(self, pid: int) -> Session | None:
+        """The session of the Claude Code process nearest above `pid` on its
+        real process chain (never `pid` itself), or None when that process
+        isn't registered: a Claude Code started inside another one's session
+        is a session of its own, never the outer one's, until it registers
+        (a hook's record registers it). Unlike ancestor_session, never
+        through a gateway terminal's or job's pane: nothing started there is
+        a command Claude typed or a hook Claude Code ran."""
+        for p in peers.chain(pid)[1:]:
+            s = self.live(p)
+            if s is not None:
+                return s
+            if self.claude_ok(p):
+                return None               # a Claude Code that isn't registered (yet)
+        return None
+
+    # -- the recorded permission mode (PLAN-0.11 §2.4) -------------------------
+    def set_mode(self, s: Session, mode: str, epoch: str | None = None) -> None:
+        """Record `mode` (a key, modes.normalize) for session `s`, under the
+        epoch marker's `epoch` (modes.set_marker; None: posted without one)."""
+        with self.lock:
+            self.modes[s.pid] = (s.start, mode, epoch)
+
+    def mode_of(self, s: Session) -> str | None:
+        """The mode recorded for session `s`: only for the same process (pid
+        and start time) the record was made for."""
+        with self.lock:
+            rec = self.modes.get(s.pid)
+        if rec is None or rec[0] != s.start:
+            return None
+        return rec[1]
+
+    def mode_under(self, s: Session, epoch: str | None) -> str | None:
+        """mode_of, only when the record was posted under `epoch` (a record
+        from before the marker was made again may be stale: modes.py)."""
+        with self.lock:
+            rec = self.modes.get(s.pid)
+        if rec is None or rec[0] != s.start or rec[2] != epoch:
+            return None
+        return rec[1]
 
     def count(self) -> int:
         with self.lock:
@@ -354,6 +411,46 @@ def check_term(reg: Registry, peer: peers.Peer) -> tuple[Session, peers.Entry]:
     if s is None:
         raise Denied(403, "not_registered", "gateway: this program isn't running inside a Claude "
                      "Code session the gateway knows (start a new Claude Code session)")
+    return s, entry
+
+
+# The session's permission mode (PLAN-0.11 §2.4, /agent/session/mode): the
+# Python hooks record it (they read permission_mode from the hook payload);
+# the stand-ins and the gw MCP server read it. Both only from their real
+# process chain below a registered session (Registry.chain_session).
+MODE_RECORD_MODES = ("hook-",)
+MODE_READ_MODES = ("shim ", "mcp")
+
+
+def check_mode(reg: Registry, peer: peers.Peer, record: bool) -> tuple[Session, peers.Entry]:
+    entry = peers.entry_of(peer.pid)
+    want = MODE_RECORD_MODES if record else MODE_READ_MODES
+    if entry is None or not mode_allowed(entry.mode, want):
+        raise _refused(peer, entry, "peer", "gateway: only the gateway's hooks record the session's "
+                       "permission mode" if record else "gateway: only the gateway's stand-ins "
+                       "and MCP server read the session's permission mode")
+    s = reg.chain_session(peer.pid)
+    if s is None:
+        raise Denied(403, "not_registered", "gateway: this program isn't running inside a Claude "
+                     "Code session the gateway knows (start a new Claude Code session)")
+    return s, entry
+
+
+# The browser sign-in's lease (PLAN-0.11 §7.1, /agent/signin/*): `gate check`
+# or account setup, below a registered session, as for the dialog lease.
+SIGNIN_MODES = ("gate", "shim gate")
+
+
+def check_signin(reg: Registry, peer: peers.Peer) -> tuple[Session, peers.Entry]:
+    entry = peers.entry_of(peer.pid)
+    if entry is None or not mode_allowed(entry.mode, SIGNIN_MODES):
+        raise _refused(peer, entry, "peer", "gateway: a browser sign-in is started only by the "
+                       "gateway's own gate command (gate check NAME)")
+    s = reg.ancestor_session(peer.pid)
+    if s is None:
+        raise Denied(403, "not_registered", "gateway: no sign-in can start: this program isn't "
+                     "running inside a Claude Code session the gateway knows (start a new Claude "
+                     "Code session)")
     return s, entry
 
 

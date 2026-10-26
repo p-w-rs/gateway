@@ -208,119 +208,41 @@ def test_typed_by_claude_refuses_inside_a_gateway_terminal_or_job():
 
 
 # ---------------------------------------------------------------------------
-# claude_ancestor: `gate secret` refuses under any Claude Code ancestor
-# (defence in depth for the no-screen path; the one-time code stays)
+# Claude Code by its executable path (is_claude_exe: gated's sessions;
+# claude_install: /gate-doctor)
 # ---------------------------------------------------------------------------
 
 HOME = "/Users/u"
-ME = os.geteuid()
 VERSIONS_BIN = HOME + "/.local/share/claude/versions/2.1.301"
 DESKTOP_BIN = (HOME + "/Library/Application Support/Claude/claude-code/2.1.299/4fa9694b7975/"
                "claude.app/Contents/MacOS/claude")
 
 
-def _walk(rows, tail=1, claude_pid=None, home=HOME):
-    """ancestry.claude_ancestor() over a faked process table: `rows` are
-    (exe or None, uid, comm) from this process's parent upward; the last
-    row's parent is `tail` (1: init, readable, root; 0: a parent that can't be
-    read; "loop": back to the first row)."""
-    base = os.getppid()
-    pids = [base] + [910000 + k for k in range(1, len(rows))]
-    table = {}
-    for k, (exe, uid, comm) in enumerate(rows):
-        parent = pids[k + 1] if k + 1 < len(rows) else (pids[0] if tail == "loop" else tail)
-        table[pids[k]] = (parent, exe, uid, comm)
-    table.setdefault(1, (0, "/sbin/launchd", 0, "launchd"))
-    saved = (ancestry._exe_path, ancestry._ppid, ancestry._owner, os.environ.get("CLAUDE_PID"))
-    ancestry._exe_path = lambda pid: table.get(pid, (0, None, None, ""))[1]
-    ancestry._ppid = lambda pid: table.get(pid, (0, None, None, ""))[0]
-    ancestry._owner = lambda pid: (table[pid][2], table[pid][3]) if pid in table else (None, "")
-    if claude_pid is None:
-        os.environ.pop("CLAUDE_PID", None)
-    else:
-        os.environ["CLAUDE_PID"] = str(pids[claude_pid])
-    try:
-        return ancestry.claude_ancestor(home)
-    finally:
-        ancestry._exe_path, ancestry._ppid, ancestry._owner = saved[:3]
-        if saved[3] is None:
-            os.environ.pop("CLAUDE_PID", None)
-        else:
-            os.environ["CLAUDE_PID"] = saved[3]
+def test_claude_code_is_recognised_by_its_executable_path():
+    """A binary named claude, the native installer's versions folder and the
+    desktop app's bundled copy under the person's home: nothing else (the
+    desktop app itself and its helper, another home's versions folder,
+    node, a shell)."""
+    for exe in ("/opt/homebrew/bin/claude", VERSIONS_BIN, DESKTOP_BIN,
+                HOME + "/Library/Application Support/Claude/claude-code/2.1.299/x/node"):
+        assert ancestry.is_claude_exe(exe, HOME), exe
+    assert not ancestry.is_claude_exe(VERSIONS_BIN), "the versions folder counts under the home only"
+    for exe in ("/Applications/Claude.app/Contents/MacOS/Claude",
+                "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/"
+                "Claude Helper",
+                "/Users/other/.local/share/claude/versions/2.1.301", "/opt/x/bin/node", "/bin/zsh"):
+        assert not ancestry.is_claude_exe(exe, HOME), exe
+    assert ancestry.claude_install(VERSIONS_BIN, HOME).startswith("the native installer")
+    assert ancestry.claude_install(DESKTOP_BIN, HOME) == "the desktop app's own copy"
+    assert ancestry.claude_install("/opt/homebrew/bin/claude", HOME).startswith(
+        "an executable named claude")
+    assert ancestry.claude_install("/opt/x/bin/node", HOME) == ""
 
 
-def test_claude_ancestor_finds_claude_code_anywhere_up_the_chain():
-    term = [("/bin/zsh", ME, "zsh"), ("/usr/bin/login", 0, "login"),
-            ("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", ME, "Terminal")]
-    assert _walk(term) is None, "the user's own terminal"
-    # Claude Code by its binary: a native install (versions folder), the
-    # desktop app's bundled copy, anything named claude; directly above or
-    # several processes up (env -i, a script, a terminal multiplexer, sudo)
-    for claude in ("/opt/homebrew/bin/claude", VERSIONS_BIN, DESKTOP_BIN,
-                   HOME + "/Library/Application Support/Claude/claude-code/2.1.299/x/node"):
-        assert _walk([("/bin/zsh", ME, "zsh"), (claude, ME, "claude")]) == claude, claude
-        deep = [("/bin/sh", ME, "sh"), ("/usr/bin/env", ME, "env"), ("/opt/x/bin/python3", ME, "python3"),
-                ("/opt/local/bin/tmux", ME, "tmux"), ("/usr/bin/sudo", 0, "sudo"),
-                ("/opt/local/bin/bash", ME, "bash"), (claude, ME, "claude"),
-                ("/Applications/Claude.app/Contents/MacOS/Claude", ME, "Claude")]
-        assert _walk(deep) == claude, claude
-    # CLAUDE_PID names an ancestor whatever its binary (an npm install runs node)
-    assert _walk([("/bin/zsh", ME, "zsh"), ("/opt/x/bin/node", ME, "node")], claude_pid=1) == "CLAUDE_PID"
-    # the desktop app itself (its Terminal panel's shells run under its helper) isn't Claude Code
-    app = [("/bin/zsh", ME, "zsh"),
-           ("/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
-            ME, "Claude Helper"), ("/Applications/Claude.app/Contents/MacOS/Claude", ME, "Claude")]
-    assert _walk(app) is None
-    # the versions folder of another home isn't this user's Claude Code
-    assert _walk([("/bin/zsh", ME, "zsh"), ("/Users/other/.local/share/claude/versions/2.1.301", ME,
-                                            "2.1.301")]) is None
-
-
-def test_claude_ancestor_refuses_a_chain_it_cant_read():
-    unread = ancestry.UNREADABLE
-    assert _walk([("/bin/zsh", ME, "zsh"), ("/opt/local/bin/tmux", ME, "tmux")], tail=0) == unread
-    assert _walk([("/bin/zsh", ME, "zsh"), ("/opt/local/bin/tmux", ME, "tmux")], tail="loop") == unread
-    # a process of the user's own whose executable can't be read
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, ME, "tmux")]) == unread
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, None, "")]) == unread
-    # ... also with readable processes above it (review round 5: the walk
-    # goes on, so Claude Code further up is named instead; the macOS case of
-    # a login shell whose executable an upgrade replaced while it ran)
-    term = [("/opt/local/bin/bash", ME, "bash"), (None, ME, "bash"), ("/usr/bin/login", 0, "login"),
-            ("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", ME, "Terminal")]
-    assert _walk(term) == unread
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, ME, "tmux"), ("/bin/zsh", ME, "zsh"),
-                  (VERSIONS_BIN, ME, "2.1.301")]) == VERSIONS_BIN
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, ME, "tmux"), ("/opt/x/bin/node", ME, "node")],
-                 claude_pid=2) == "CLAUDE_PID"
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, ME, "tmux")], tail=0) == unread
-    # ... named like sshd but not under a root sshd
-    assert _walk([("/bin/bash", ME, "bash"), (None, ME, "sshd"), ("/opt/x/sshd", ME, "sshd")]) == unread
-    # an unreadable process named claude is Claude Code
-    assert _walk([("/bin/zsh", ME, "zsh"), (None, 0, "claude")]) == "claude"
-    # too deep
-    assert _walk([("/bin/sh", ME, "sh")] * (ancestry.MAX_DEPTH + 2)) == unread
-
-
-def test_claude_ancestor_passes_linux_logins_it_can_only_partly_read():
-    """Linux hides the executable of root's processes (sshd, login, sudo) and
-    of OpenSSH's non-dumpable session process from the user: a login over
-    ssh, the console's login and sudo stay usable, and the walk goes on above
-    them (Claude Code runs as the user, so it is never one of them)."""
-    ssh_login = [("/bin/bash", ME, "bash"), (None, ME, "sshd-session"), (None, 0, "sshd")]
-    assert _walk(ssh_login) is None
-    assert _walk([("/bin/bash", ME, "bash"), (None, ME, "sshd"), (None, 0, "sshd")]) is None
-    assert _walk([("/bin/bash", ME, "bash"), (None, 0, "login")]) is None
-    above = [("/bin/bash", ME, "bash"), (None, 0, "sudo"), ("/bin/zsh", ME, "zsh"),
-             (VERSIONS_BIN, ME, "claude")]
-    assert _walk(above) == VERSIONS_BIN, "sudo in between hides nothing above it"
-
-
-def test_npms_claude_code_counts_as_claude_code_and_no_other_node_script():
-    """GW-COMPAT-1: npm's @anthropic-ai/claude-code is Claude Code: its
-    native binary (bin/claude.exe, since 2.1.113) by path, and before that
-    node running its cli.js (npm's shim, <prefix>/bin/claude, links to it) by
-    argv; node running anything else isn't."""
+def test_npms_claude_code_counts_by_its_native_binary_only():
+    """npm's @anthropic-ai/claude-code is Claude Code by its native binary
+    (bin/claude.exe): a claude.exe anywhere else isn't, and node running the
+    package's cli.js (npm installs before 2.1.113) isn't either."""
     import tempfile
     from pathlib import Path
     with tempfile.TemporaryDirectory(dir=H.tmp_base()) as d:
@@ -328,35 +250,10 @@ def test_npms_claude_code_counts_as_claude_code_and_no_other_node_script():
         pkg = pre / "lib" / "node_modules" / "@anthropic-ai" / "claude-code"
         pkg.mkdir(parents=True)
         (pkg / "cli.js").write_text("// cli\n")
-        (pre / "bin").mkdir()
-        (pre / "bin" / "claude").symlink_to(pkg / "cli.js")
-        other = Path(d) / "other.js"
-        other.write_text("// other\n")
         native = str(pkg / "bin" / "claude.exe")
-        node = "/opt/x/bin/node"
         assert ancestry.is_claude_exe(native)
         assert ancestry.claude_install(native) == "npm (its native binary)"
-        # a claude.exe anywhere else isn't (only npm's package folder names it so)
-        for exe in (str(Path(d) / "bin" / "claude.exe"), str(pre / "node_modules" / "claude-code" / "bin" / "claude.exe")):
+        for exe in (str(Path(d) / "bin" / "claude.exe"),
+                    str(pre / "node_modules" / "claude-code" / "bin" / "claude.exe"),
+                    "/opt/x/bin/node", str(pkg / "cli.js")):
             assert not ancestry.is_claude_exe(exe) and ancestry.claude_install(exe) == "", exe
-        for argv in ([node, str(pre / "bin" / "claude"), "--resume"], [node, str(pkg / "cli.js")],
-                     ["/usr/bin/nodejs", str(pkg / "cli.js")]):
-            assert ancestry.is_claude_node(argv[0], argv), argv
-            assert ancestry.claude_install(argv[0], argv).startswith("npm (node"), argv
-        for argv in ([node, str(other)], [node, "--require", str(pkg / "cli.js"), str(other)],
-                     [node, "-r", str(pkg / "cli.js")], ["/opt/x/bin/python3", str(pkg / "cli.js")],
-                     [node, "cli.js"], [node, str(pkg / "nope" / "cli.js")], [node], None):
-            assert not ancestry.is_claude_node(argv[0] if argv else node, argv), argv
-            assert ancestry.claude_install(argv[0] if argv else node, argv) == "", argv
-        # the ancestor walk (gate secret's check) finds it too, by argv
-        argvs = {}
-        saved = ancestry._argv
-        ancestry._argv = lambda pid: argvs.get(pid)
-        try:
-            argvs[910001] = [node, str(pre / "bin" / "claude")]
-            assert _walk([("/bin/zsh", ME, "zsh"), (node, ME, "node")]) == node
-            argvs[910001] = [node, str(other)]
-            assert _walk([("/bin/zsh", ME, "zsh"), (node, ME, "node")]) is None
-            assert _walk([("/bin/zsh", ME, "zsh"), (native, ME, "claude.exe")]) == native
-        finally:
-            ancestry._argv = saved

@@ -144,30 +144,6 @@ def test_merges_restore_sentinels_and_refuse_changes_to_what_was_hidden():
     assert "gh-me" not in broker.merge(allv, cur, broker.ALL, key)["accounts"]
 
 
-def test_a_merge_keeps_the_vaults_own_baseline_mark():
-    """The baseline mark is the vault's own: a writer that leaves it out
-    can't drop it (a new install would get an older one's sudo true), one
-    that adds it or changes it can't put it on an older vault or change it;
-    with no vault yet the server merges against empty(), which has it."""
-    key = os.urandom(32)
-    sudo = broker.scope_for("shim sudo")
-    cur = _sample()
-    assert cur[vault.BASELINE_KEY] == vault.BASELINE
-    w = broker.make_view(cur, sudo, key)
-    assert w[vault.BASELINE_KEY] == vault.BASELINE, "the view shows it"
-    del w[vault.BASELINE_KEY]
-    assert broker.merge(w, cur, sudo, key)[vault.BASELINE_KEY] == vault.BASELINE
-    w[vault.BASELINE_KEY] = 1
-    assert broker.merge(w, cur, broker.ALL, key)[vault.BASELINE_KEY] == vault.BASELINE
-    older = _sample()
-    del older[vault.BASELINE_KEY]
-    w = broker.make_view(older, broker.ALL, key)
-    w[vault.BASELINE_KEY] = vault.BASELINE
-    assert vault.BASELINE_KEY not in broker.merge(w, older, broker.ALL, key)
-    first = {k: v for k, v in vault.empty().items() if k != vault.BASELINE_KEY}
-    assert broker.merge(first, vault.empty(), sudo, key)[vault.BASELINE_KEY] == vault.BASELINE
-
-
 def test_the_token_cache_is_scoped_and_merged():
     cache = {"tokens": {"gh-me|repo": {"value": "t1", "expires": 9e9},
                         "az-work|https://x": {"value": "t2", "expires": 9e9}}}
@@ -258,6 +234,47 @@ def test_a_wrap_that_fails_its_check_keeps_key_txt():
         assert vault.key_mode() == "unwrapped" and b.state() == "unwrapped"
         assert not list(paths.private_dir().glob(".key.wrapped*"))
         assert vault.load()["accounts"]["gh-me"]["token"]["value"]
+
+
+def test_a_passphrase_change_that_fails_its_check_changes_nothing():
+    """Broker.change_passphrase writes the new key.wrapped beside the old one
+    and unwraps it to compare before it goes in place (PLAN-0.11 §19.14): a
+    new file that unwraps to another key, or not at all, is never put in
+    place; the old passphrase keeps opening the key, no temp file stays and
+    the broker stays unlocked. Then a good change works."""
+    from gateway import agepass
+    new = "a different long test passphrase"
+    with H.gateway_env():
+        vault.save(_sample())
+        b = broker.Broker()
+        with _as_daemon(b):
+            b.set_passphrase(PASS)
+            before = paths.wrapped_key_path().read_bytes()
+            other = subprocess.run([str(H.ENV_BIN / "age-keygen")], capture_output=True, text=True,
+                                   check=True, timeout=30).stdout
+            assert broker.read_identity(other) != b.identity()
+            real = agepass.encrypt
+            for fake in (lambda _d, pw: real(other.encode("ascii"), pw),     # another key
+                         lambda _d, _pw: b"age-encryption.org/v1 not really\n"):
+                agepass.encrypt = fake
+                try:
+                    b.change_passphrase(new)
+                except broker.BrokerError as e:
+                    assert "failed its check" in str(e) and "nothing changed" in str(e), e
+                else:
+                    raise AssertionError("a change that failed its check went through")
+                finally:
+                    agepass.encrypt = real
+                assert paths.wrapped_key_path().read_bytes() == before
+                assert not list(paths.private_dir().glob(".key.wrapped*"))
+                assert b.state() == "unlocked"
+            b.lock("explicit")
+            b.unlock(PASS)                                # the old passphrase still opens it
+            b.change_passphrase(new)
+            assert paths.wrapped_key_path().read_bytes() != before
+            b.lock("explicit")
+            b.unlock(new)
+            assert b.read()["accounts"]["gh-me"]["token"]["value"] == "ghp_tokenvalue_for_gh_me_0001"
 
 
 def test_wrap_refusals():
@@ -359,12 +376,14 @@ def test_the_sudo_stand_in_gets_its_password_through_the_daemon():
         fake, drv = _sudo_env(de)
         de.wrap(PASS)
         fc = de.claude()
+        fc.asked("sudo", ["echo", "via-broker"], [("hosts", "localhost")])   # the hook asked (the lock's cap)
         r = fc.run([H.PY, "-I", "-S", drv, de.root, "shim", "sudo", "echo", "via-broker"],
                    env=_proc_env(de, fc))
         assert r.returncode == 0 and r.stdout == "via-broker\n", (r.stdout, r.stderr)
         log = fake.log()
         assert any(e.get("how") == "A" for e in log) and log[-1]["ran"] == ["echo", "via-broker"]
-        # locked: a clear refusal, nothing run, the session has a screen
+        # locked: a clear refusal up front (no record needed: the hook refuses
+        # it too, PLAN-0.11 §19.16), nothing run, the session has a screen
         st, body = fc.http("POST", "/ui/vault/lock")
         assert st == 200 and body["locked"] and de.health()["vault"] == "locked"
         n = len(fake.log())
@@ -376,6 +395,7 @@ def test_the_sudo_stand_in_gets_its_password_through_the_daemon():
         r = hl.run([H.PY, "-I", "-S", drv, de.root, "shim", "sudo", "echo", "x"], env=_proc_env(de, hl))
         assert r.returncode == 1 and r.stderr.strip() == server.LOCKED_HEADLESS, r.stderr
         assert de.unlock(PASS)[0] == 200
+        fc.asked("sudo", ["echo", "again"], [("hosts", "localhost")])
         r = fc.run([H.PY, "-I", "-S", drv, de.root, "shim", "sudo", "echo", "again"],
                    env=_proc_env(de, fc))
         assert r.returncode == 0 and "again" in r.stdout, r.stderr
@@ -434,14 +454,16 @@ def test_hooks_and_gate_report_a_locked_vault():
         env = de.env.subprocess_env(de.extra_env())
         run_py = [H.PY, "-I", "-S", *H.PYX, str(H.PLUGIN / "run.py"), "--test"]
         # box's ssh right is in the form but its approval is in the (locked) vault:
-        # the hook says the vault is locked, not "waits for the user's OK"
-        payload = {"tool_name": "Bash", "tool_input": {"command": "ssh box ls"},
-                   "permission_mode": "auto", "session_id": "s", "cwd": str(de.root)}
-        r = fc.run(run_py + ["hook-bash"], env=env, input=json.dumps(payload))
-        out = json.loads(r.stdout)
-        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert reason == server.LOCKED_INTERACTIVE, reason
+        # the hook says the vault is locked, not "waits for the user's OK"; so
+        # it does for the configured sudo here, never an "ask" (PLAN-0.11 §19.16)
+        for command in ("ssh box ls", "sudo ls"):
+            payload = {"tool_name": "Bash", "tool_input": {"command": command},
+                       "permission_mode": "auto", "session_id": "s", "cwd": str(de.root)}
+            r = fc.run(run_py + ["hook-bash"], env=env, input=json.dumps(payload))
+            out = json.loads(r.stdout)
+            reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+            assert out["hookSpecificOutput"]["permissionDecision"] == "deny", (command, out)
+            assert reason == server.LOCKED_INTERACTIVE, (command, reason)
         r = fc.run(run_py + ["hook-session"], env=env, input=json.dumps({"session_id": "s"}))
         out = json.loads(r.stdout)
         assert __import__("gateway.hooks_session", fromlist=["x"]).VAULT_LOCKED in out["systemMessage"]
@@ -568,6 +590,7 @@ def test_a_stand_in_outside_a_known_session_is_refused_with_the_reason():
         _fake, drv = _sudo_env(de)
         de.wrap(PASS)
         stranger = de.claude(register=False)
+        stranger.asked("sudo", ["echo", "x"], [("hosts", "localhost")])
         r = stranger.run([H.PY, "-I", "-S", drv, de.root, "shim", "sudo", "echo", "x"],
                          env=_proc_env(de, stranger))
         assert r.returncode == 1 and "isn't running inside a Claude Code session the gateway " \
@@ -946,6 +969,53 @@ def test_a_wrap_refuses_a_key_txt_replaced_while_age_ran():
         assert not list(paths.private_dir().glob(".key.wrapped*"))
 
 
+def test_a_wrap_beside_a_gateway_06_vault_is_refused():
+    """A gateway 0.6 vault (store.age, no vault.age) is converted by gateway
+    0.10.0, never here, so nothing is written beside it. A key.txt there (`gate
+    pubkey` makes one) is never wrapped: /gate-unlock's wrap is refused with
+    vault.V06_MESSAGE before age runs, and again under the flock when store.age
+    shows up while age ran. key.txt stays; no key.wrapped or key.recipient."""
+    from gateway import agepass
+    with H.gateway_env():
+        paths.ensure_home()
+        paths.v2_store_path().write_bytes(b"age-encryption.org/v1 a 0.6 store")
+        vault.ensure_key()
+        key_before = paths.key_path().read_bytes()
+        assert vault.v06_waiting() and vault.key_mode() == "unwrapped"
+        b = broker.Broker()
+        real = agepass.encrypt
+        ran: list[int] = []
+
+        def counting(plain, pw):
+            ran.append(1)
+            return real(plain, pw)
+
+        def store_age_meanwhile(plain, pw):
+            out = real(plain, pw)
+            paths.v2_store_path().write_bytes(b"age-encryption.org/v1 a 0.6 store, written meanwhile")
+            return out
+
+        for what, enc in (("before age", counting), ("under the flock", store_age_meanwhile)):
+            agepass.encrypt = enc
+            try:
+                b.set_passphrase(PASS)
+            except broker.BrokerError as e:
+                assert str(e) == vault.V06_MESSAGE, (what, e)
+            else:
+                raise AssertionError(f"wrapped the key beside a gateway 0.6 vault ({what})")
+            finally:
+                agepass.encrypt = real
+            assert paths.key_path().read_bytes() == key_before, what
+            assert not paths.wrapped_key_path().exists() and not paths.recipient_path().exists(), what
+            assert not list(paths.private_dir().glob(".key.wrapped*")), what
+            assert vault.key_mode() == "unwrapped" and b.state() == "unwrapped", what
+            assert not paths.vault_path().exists(), what
+            if what == "before age":
+                assert not ran, "age ran before the 0.6 check"
+                paths.v2_store_path().unlink()       # appears only while age runs next
+        assert paths.v2_store_path().exists()
+
+
 def test_a_stand_in_starts_the_daemon_on_demand_and_a_new_daemon_is_locked():
     """With a wrapped key a stand-in that finds no daemon starts one (it
     detaches and outlives the stand-in); a new daemon holds the key locked,
@@ -956,6 +1026,7 @@ def test_a_stand_in_starts_the_daemon_on_demand_and_a_new_daemon_is_locked():
         fc = de.claude()
         de.stop()
         assert de.wait_for(lambda: de.health() is None)
+        fc.asked("sudo", ["echo", "x"], [("hosts", "localhost")])
         r = fc.run([H.PY, "-I", "-S", drv, de.root, "shim", "sudo", "echo", "x"], env=_proc_env(de, fc))
         assert r.returncode == 1 and r.stderr.strip() == server.LOCKED_INTERACTIVE, r.stderr
         h = de.health()

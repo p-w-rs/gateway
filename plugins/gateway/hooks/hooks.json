@@ -1,5 +1,5 @@
 {
-  "description": "Gateway v3: Claude's environment and context (SessionStart, SubagentStart), the gateway daemon started and the session registered with it (async SessionStart), the approval hook for sudo/ssh/gate (PreToolUse Bash|Monitor, the user's Terminal panel, checkpoint's job_start and the gateway's own job_start and terminal_send), the gateway tools' decisions, the file guard (fails closed; also the desktop app's session export and transcript search), output scrubbing and form checks (PostToolUse; also checkpoint's job_tail, job_status and job_stop, which return a job's log), warnings for failed calls whose output Claude Code shows unmasked (PostToolUseFailure), the paste guard (UserPromptSubmit) and gateway.toml changes (FileChanged). See docs/dev/SPEC-v3.md sections 7, 8, 12 and 14. The hooks module (mod/register.tsx; Claude Code 2.1.287+ terminal, 2.1.286+ desktop) adds the setup status line, provisioning at session start, the immediate /gate-doctor, the gateway's native dialogs, the terminal pane (/gate-terminal) and managed execution (CLAUDE_CODE_SHELL_PREFIX -> hooks/gate-sh: Claude's commands run in the gateway's own bash); every guard stays in the classic hooks, which hold when mods are off (the Bash hook then denies in managed mode: managed shell unavailable).",
+  "description": "Gateway v3: Claude's environment and context (SessionStart, SubagentStart), the gateway daemon started and the session registered with it (async SessionStart), the approval hook for sudo/ssh/gate (PreToolUse Bash|Monitor, the user's Terminal panel, checkpoint's job_start and the gateway's own job_start and terminal_send), the gateway tools' decisions, the browser-automation tools denied while a browser sign-in runs and AskUserQuestion denied when it asks for a secret (PreToolUse, hooks/tool_guard.sh), the file guard (fails closed; also the desktop app's session export and transcript search), output scrubbing and form checks (PostToolUse, every tool: post.sh skips only those whose response is fixed text or Claude's own input), warnings for failed calls whose output Claude Code shows unmasked (PostToolUseFailure, every tool), the paste guard (UserPromptSubmit) and gateway.toml changes (FileChanged). See docs/dev/SPEC-v3.md sections 7, 8, 12 and 14. The hooks module (mod/register.tsx) adds the setup status line, provisioning at session start, the immediate /gate-doctor, the gateway's native dialogs, the /gate-hosts, /gate-accounts and /gate-terminal panes and managed execution (CLAUDE_CODE_SHELL_PREFIX -> hooks/gate-sh: Claude's commands run in the gateway's own bash); every guard stays in the classic hooks, which hold when mods are off (Claude's commands then run in the user's own shell, judged as usual, with a notice once per session).",
   "modules": ["./mod/register.tsx"],
   "hooks": {
     "SessionStart": [
@@ -77,6 +77,28 @@
         ]
       },
       {
+        "matcher": "mcp__Claude_Browser__.*|mcp__claude-in-chrome__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/tool_guard.sh"],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/tool_guard.sh"],
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
@@ -103,7 +125,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts|mcp__ccd_session_mgmt__list_events|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status|mcp__plugin_check_jobs__job_stop)$",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
@@ -116,7 +138,7 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "^(Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts|mcp__ccd_session_mgmt__list_events|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status|mcp__plugin_check_jobs__job_stop)$",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",

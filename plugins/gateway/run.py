@@ -3,7 +3,9 @@
 and hooks/launch.sh; it puts its own src/ on sys.path).
 
     run.py hook-session | hook-session-async | hook-subagent      SessionStart / SubagentStart
-    run.py hook-bash | hook-files | hook-post | hook-prompt | hook-filechanged
+    run.py hook-bash | hook-files | hook-post | hook-prompt | hook-filechanged | hook-mcp
+    run.py hook-mode                                              pre_bash.sh: record the session's
+                                                                  mode only (no decision)
     run.py mcp                                                    MCP stdio server
     run.py shim TOOL ARGS...                                      a stand-in (sudo, ssh, gh, ...)
     run.py askpass                                                gate-askpass (sudo -A)
@@ -53,10 +55,12 @@ HOOKS = {
     "hook-post": ("hooks_post", "main", "open"),
     "hook-prompt": ("hooks_prompt", "main", "block"),
     "hook-filechanged": ("hooks_filechanged", "main", "open"),
+    "hook-mcp": ("hooks_mcp", "main", "open"),
+    "hook-mode": ("modes", "hook_main", "open"),
     "hook-daemon": ("hooks_session", "daemon_main", "open"),
 }
 TEST_MODES = set(HOOKS) | {"mcp", "gated"}
-SHIMS = ("sudo", "ssh", "scp", "sftp", "gh", "hf", "databricks", "crane", "pijul", "asiml",
+SHIMS = ("sudo", "ssh", "scp", "sftp", "git", "gh", "hf", "databricks", "crane", "pijul", "asiml",
          "az", "dvc", "gate")
 
 
@@ -95,23 +99,6 @@ def run_hook(mode: str) -> int:
     return 0
 
 
-def _ensure_migrated(trigger: str) -> None:
-    """SPEC 4: any v3 process may be the first; a stand-in or the MCP server
-    migrates too (two stat calls when there is nothing to do)."""
-    try:
-        from gateway import paths
-        if not paths.v2_store_path().is_file() or paths.vault_path().exists():
-            return  # the common case: nothing to migrate, no extra imports
-        from gateway import migrate
-        r = migrate.ensure(trigger)
-    except Exception as e:  # noqa: BLE001
-        print(f"gateway: migration check failed ({type(e).__name__})", file=sys.stderr)
-        return
-    if r is not None:
-        print(("gateway: " + r.message) if not r.ok
-              else f"{r.message} (gate status --report shows what changed)", file=sys.stderr)
-
-
 # Dropped from the environment of the gate CLI (it runs in Claude's Bash and
 # verifies tokens the user just typed): a proxy or a CA Claude chose must
 # never see them. gate_setup's own client ignores both already; this is the
@@ -129,8 +116,11 @@ def _gate_env(args: list) -> None:
 
 def _vault_locked(tool: str) -> str | None:
     """A wrapped vault key the gateway daemon holds locked (or can't reach):
-    the refusal to print before the tool runs (its rights are in the vault
-    too), else None. The first scoped read is kept for this process."""
+    the refusal to print before asiml runs (always an ml-catalog account's:
+    its rights are in the vault too), else None. The other stand-ins read the
+    vault themselves: a locked one still classifies through the configured
+    list, so an unconfigured target passes through to the user's own tool and
+    only a configured one is refused with this text (PLAN-0.11 §1.1)."""
     try:
         from gateway import vault
         if not vault.brokered() or not vault.exists():
@@ -150,8 +140,7 @@ def _vault_locked(tool: str) -> str | None:
 
 
 def run_shim(tool: str, args: list) -> int:
-    if tool != "gate":
-        _ensure_migrated(f"shim {tool}")
+    if tool == "asiml":
         locked = _vault_locked(tool)
         if locked:
             print(locked, file=sys.stderr)
@@ -163,6 +152,9 @@ def run_shim(tool: str, args: list) -> int:
         if tool == "sudo":
             from gateway import sudo
             return int(sudo.main(args) or 0)
+        if tool == "git":
+            from gateway import githelper
+            return int(githelper.git_main(args) or 0)
         if tool in ("gh", "hf", "databricks", "crane", "pijul", "az"):
             from gateway import clis
             return int(clis.main(tool, args) or 0)
@@ -178,8 +170,9 @@ def run_shim(tool: str, args: list) -> int:
             return int(gate.main(args) or 0)
     except NotImplementedError:
         # Interim (until the phase-B stand-in exists): refuse. Never fall back to
-        # the system tool: it would use the user's own keys, agent and logins,
-        # which others = "refuse" keeps away from Claude.
+        # the user's own tool: the stand-in exists because something
+        # configured is reachable, and only its own classification may pass
+        # a target through (PLAN-0.11 §1.3).
         print(f"gateway: {tool} isn't available in this build yet (the gateway's {tool} "
               "stand-in comes in a later update); tell the user once and carry on",
               file=sys.stderr)
@@ -222,7 +215,6 @@ def dispatch(mode: str, args: list) -> int:
     if mode in HOOKS:
         return run_hook(mode)
     if mode == "mcp":
-        _ensure_migrated("mcp")
         from gateway import mcp_server
         mcp_server.main()
         return 0

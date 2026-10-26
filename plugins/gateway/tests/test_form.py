@@ -38,20 +38,147 @@ def case(cid: str, text: str):
 def _(f):
     assert f.ok and list(f.hosts) == ["localhost"]
     h = f.hosts["localhost"]
-    assert h.sudo == "ask" and not h.explicit and h.ssh is False, \
-        "no [hosts.localhost]: sudo on this computer asks each time (the default)"
+    assert not h.explicit and h.ssh is False
+    # PLAN-0.11 §1.5: the implicit localhost is kept for every reader, with its
+    # sudo not configured; the legacy attribute keeps the strict "ask"
+    assert not h.sudo_configured and h.mode_value("sudo") is None and "sudo" not in h.modes
+    assert h.sudo == "ask", "a reader that doesn't know the marker gets the strict value"
 
 
-@case("localhost_table_without_sudo_asks", "[hosts.localhost]\nscripts = true\n")
+@case("localhost_table_without_sudo_isnt_configured", "[hosts.localhost]\nscripts = true\n")
 def _(f):
     h = f.hosts["localhost"]
     assert f.ok and h.explicit and h.scripts is True
-    assert h.sudo == "ask", "a [hosts.localhost] that doesn't say sudo asks each time"
+    assert not h.sudo_configured and h.mode_value("sudo") is None and h.sudo == "ask"
 
 
 @case("localhost_says_sudo_true_keeps_it", "[hosts.localhost]\nsudo = true\n")
 def _(f):
-    assert f.ok and f.hosts["localhost"].sudo is True, "a form that says sudo = true keeps it"
+    h = f.hosts["localhost"]
+    assert f.ok and h.sudo is True and h.sudo_configured, "a form that says sudo = true keeps it"
+    assert h.mode_value("ssh") is None
+
+
+# --- PLAN-0.11 §2: per-mode values ------------------------------------------
+
+
+@case("per_mode_rights_and_their_strict_legacy_words",
+      '[hosts.localhost]\nsudo = { default = "ask", auto = true, plan = false }\n'
+      '[hosts.box]\naddress = "box.example.com"\nssh = { manual = true, bypassPermissions = "cc" }\n'
+      'sudo = cc\n')
+def _(f):
+    assert f.ok, f.report_lines()
+    lh, b = f.hosts["localhost"], f.hosts["box"]
+    assert lh.sudo_configured and lh.modes["sudo"].map() == {
+        "default": "ask", "plan": "deny", "acceptEdits": "ask", "auto": "allow", "bypass": "ask",
+        "dontAsk": "ask"}
+    assert lh.sudo == "ask", "the legacy attribute holds the modeless word"
+    assert b.modes["ssh"].word("default") == "allow" and b.modes["ssh"].word("bypass") == "cc"
+    assert b.modes["ssh"].word("plan") == "cc", "plan never executes"
+    assert b.ssh is True and b.modes["sudo"].map() == {m: "cc" for m in b.modes["sudo"].map()}
+    assert b.sudo is True
+
+
+@case("per_mode_table_mistakes_turn_the_entry_off",
+      '[hosts.a]\naddress = "a.example.com"\nssh = { auto = true }\n'
+      '[hosts.b]\naddress = "b.example.com"\nsudo = { default = "ask", turbo = true }\n'
+      '[hosts.c]\naddress = "c.example.com"\nsudo = { default = "maybe" }\n'
+      '[hosts.d]\naddress = "d.example.com"\nssh = { default = "ask", manual = true }\n'
+      '[accounts.g]\nkind = "github"\nuse = { default = "sometimes" }\n')
+def _(f):
+    assert set(f.disabled) == {"a", "b", "c", "d", "g"}, f.disabled
+    assert "needs default" in f.disabled["a"] and "turbo, which isn't a mode" in f.disabled["b"]
+    assert "twice" in f.disabled["d"] and f.disabled_kinds == {"g": "github"}
+
+
+@case("account_use_takes_ask_and_a_table",
+      '[accounts.g]\nkind = "github"\nuse = ask\n'
+      '[accounts.h]\nkind = "huggingface"\nuse = { default = "cc", dontAsk = "deny" }\n'
+      '[accounts.k]\nkind = "api-key"\nsites = []\nuse = "ask"\n')
+def _(f):
+    g, h = f.accounts["g"], f.accounts["h"]
+    assert g.modes["use"].word("auto") == "ask" and g.use is False, \
+        "an account's legacy use is True only where the modeless word is cc"
+    assert h.use is False and h.modes["use"].word("default") == "cc"
+    assert "k" in f.disabled and "sites is empty" in f.disabled["k"], "an \"ask\" use may send"
+
+
+@case("policy_restrictions_take_tables_and_cc_one_word_keys_dont",
+      '[policy]\nwrite = { default = "ask", bypass = "deny" }\ncredential = cc\n'
+      '[hosts.box]\naddress = "box.example.com"\n[hosts.box.policy]\nexec = deny\n'
+      'env_import = "ask"\n'
+      '[hosts.box.workspaces.app]\nroot = "/srv/app"\nread = { default = "allow", plan = "deny" }\n'
+      '[accounts.g]\nkind = "github"\n[accounts.g.policy]\nnetwork = { default = "cc" }\n')
+def _(f):
+    assert f.ok, f.report_lines()
+    assert f.policy == {"write": False, "credential": True}, "the modeless word: bypass denies"
+    assert f.policy_modes["write"].word("bypass") == "deny"
+    b = f.hosts["box"]
+    assert b.policy == {"exec": False, "env_import": "ask"} and "env_import" not in b.policy_modes
+    ws = b.workspaces["app"]
+    assert ws.policy == {"read": True} and ws.policy_modes["read"].word("plan") == "deny"
+    assert f.accounts["g"].policy_modes["network"].word("auto") == "cc"
+
+
+@case("one_word_policy_keys_refuse_tables_and_cc",
+      '[hosts.a]\naddress = "a.example.com"\n[hosts.a.policy]\nprovision = { default = "ask" }\n'
+      '[hosts.b]\naddress = "b.example.com"\n[hosts.b.policy]\nforward_agent = "cc"\n'
+      '[policy]\nexec = { auto = "deny" }\n')
+def _(f):
+    assert set(f.disabled) == {"a", "b"} and "one word" in f.disabled["a"]
+    assert f.policy == {"exec": False} and f.policy_modes["exec"].word("default") == "deny", \
+        "a bad [policy] value is deny until it's fixed"
+
+
+@case("network_table", '[network]\ncommands = { default = "ask", auto = "cc", bypass = "allow" }\n'
+      'extra = ["dig", "ping", "dig"]\ndrop = ["openssl-tls"]\n')
+def _(f):
+    n = f.network
+    assert f.ok and n.written and not n.invalid
+    assert n.commands.word("auto") == "cc" and n.commands.word("bypass") == "allow"
+    assert n.commands.word("plan") == "ask" and n.extra == ["dig", "ping"] and n.drop == ["openssl-tls"]
+
+
+@case("network_default_asks_and_bare_allow_approves_but_in_plan", "[network]\ncommands = allow\n")
+def _(f):
+    assert f.network.commands.word("default") == "allow" and f.network.commands.word("plan") == "cc"
+    assert F.parse_text("", Path("/x")).network.commands.map() == {m: "ask" for m in F.modes.KEYS}
+
+
+@case("network_mistakes_mark_it_invalid",
+      '[network]\ncommands = "sometimes"\nextra = ["ok", "no spaces"]\nverbose = true\n')
+def _(f):
+    n = f.network
+    assert n.invalid and n.extra == ["ok"]
+    assert n.commands.map() == {m: "ask" for m in F.modes.KEYS}, "the default until fixed"
+    assert sum("network:" in m for m in errs(f)) == 3, errs(f)
+
+
+@case("shell_warn_is_gone", '[shell]\nmanaged = "warn"\n')
+def _(f):
+    assert f.shell.managed == "on" and f.shell.managed_invalid
+    assert any('"warn" is gone' in m for m in errs(f)), errs(f)
+
+
+@case("azure_sign_in_scope_and_catalog_tenant",
+      '[accounts.az]\nkind = "azure"\ntenant = "t.example.com"\nsign_in = "browser"\n'
+      'client_id = "11111111-2222-3333-4444-555555555555"\n'
+      'scope = "https://management.azure.com/.default offline_access"\n'
+      '[accounts.noclient]\nkind = "azure"\ntenant = "t.example.com"\nsign_in = "browser"\n'
+      '[accounts.sp]\nkind = "azure"\ntenant = "t.example.com"\nscope = "x.y/.default"\n'
+      '[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n'
+      'tenant = "11111111-2222-3333-4444-555555555555"\n'
+      '[accounts.bad]\nkind = "azure"\ntenant = "t.example.com"\nsign_in = "device-code"\n'
+      '[accounts.badcat]\nkind = "ml-catalog"\nhost = "c.example.com"\ntenant = "not a tenant"\n')
+def _(f):
+    az, sp, cat = f.accounts["az"], f.accounts["sp"], f.accounts["cat"]
+    assert az.sign_in == "browser" and az.scope == "https://management.azure.com/.default", \
+        "offline_access is the gateway's to add"
+    assert sp.sign_in == "" and any("scope is used only" in m for m in warns(f, "sp"))
+    assert cat.tenant == "11111111-2222-3333-4444-555555555555"
+    assert F.parse_text('[accounts.c]\nkind = "ml-catalog"\nhost = "c.example.com"\n',
+                        Path("/x")).accounts["c"].tenant == "", "the default is the reader's"
+    assert set(f.disabled) == {"bad", "badcat", "noclient"}, "a browser sign-in needs its client_id"
 
 
 @case("remote_host_sudo_still_defaults_true", '[hosts.box]\naddress = "u@box.example.com"\n')
@@ -452,14 +579,11 @@ def _(f):
     assert len(errs(f)) == 2 and "a" in f.accounts and "b" in f.accounts
 
 
-@case("settings_others", '[settings]\nothers = "mine"\n')
+@case("settings_table_removed", '[settings]\nothers = "mine"\n')
 def _(f):
-    assert f.ok and f.settings.others == "mine"
-
-
-@case("settings_bad_others_defaults_refuse", '[settings]\nothers = "everything"\nfoo = 1\n')
-def _(f):
-    assert f.settings.others == "refuse" and f.errors and f.warnings
+    # PLAN-0.11 §0.2: [settings] is gone; a written one is a warning, never read
+    assert f.ok and not f.errors and not hasattr(f, "settings")
+    assert any("[settings] was removed in gateway 0.11" in w.render() for w in f.warnings)
 
 
 @case("entry_not_a_table", '[hosts]\nbox = "box.example.com"\n')
@@ -527,11 +651,6 @@ def _(f):
     assert "box" in f.disabled and f.is_disabled("box", "accounts") and not f.is_disabled("box", "hosts")
 
 
-@case("invalid_others_flagged", '[settings]\nothers = "all"\n')
-def _(f):
-    assert f.settings.others == "refuse" and f.settings.others_invalid
-
-
 def _make(cid, text, check):
     def t():
         check(parse(text))
@@ -587,6 +706,22 @@ also = [
   "u@box2.example.com",
 ]
 '''
+
+
+def test_writer_puts_a_per_mode_value_back_as_written():
+    """manage.py's MODE=WORD edits write a ModeValue (PLAN-0.11 §2.9)."""
+    with H.gateway_env() as env:
+        env.write_form(BASE)
+        mv = F.modes.parse({"default": "ask", "auto": True, "bypassPermissions": "cc"})
+        F.set_key("hosts.box", "sudo", mv)
+        text = env.form_path.read_text()
+        assert 'sudo = {default = "ask", auto = true, bypassPermissions = "cc"}   # careful' in text
+        h = env.form().hosts["box"]
+        assert h.modes["sudo"] == mv and h.sudo == "ask"
+        F.set_key("hosts.box", "sudo", F.modes.parse("cc"))
+        assert env.form().hosts["box"].modes["sudo"] == F.modes.bare("cc")
+        F.append_table("hosts.box.policy", {"write": F.modes.parse({"default": "allow", "plan": "deny"}, "policy")})
+        assert env.form().hosts["box"].policy_modes["write"].word("plan") == "deny"
 
 
 def test_writer_set_key_replaces_one_line_and_keeps_comments():

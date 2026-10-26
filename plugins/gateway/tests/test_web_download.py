@@ -273,8 +273,7 @@ def test_plain_local_path_rules_under_a_symlinked_temp_root():
         real.mkdir()
         link = env.root / "link-base"
         link.symlink_to(real)
-        with testing.override(root=link / "r", machine_id="TEST-MACHINE-0001",
-                              extra={"claude_ancestor": ""}):
+        with testing.override(root=link / "r", machine_id="TEST-MACHINE-0001"):
             home = paths.user_home()
             assert str(home).startswith(str(link)) and os.path.realpath(home) != str(home)
             tmpd = link / "r" / "tmp-root"

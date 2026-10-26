@@ -12,7 +12,7 @@ from pathlib import Path
 
 import harness as H
 import harness_sudo as HS
-from gateway import envfile, githelper, paths
+from gateway import consent, envfile, githelper, paths
 from gateway import form as F
 
 SHELLS = [s for s in ("/bin/sh", "/bin/dash", "/bin/bash", "/opt/local/bin/bash", "/bin/zsh",
@@ -36,19 +36,27 @@ def _source_twice(shell: str, envf: Path, pre: dict[str, str]) -> dict[str, str]
 
 def test_env_text_content():
     with H.gateway_env():
-        t = envfile.env_text("refuse")
+        t = envfile.env_text()
         b = paths.bin_dir()
         assert f"GW_BIN='{b}'\n" in t
-        assert f"GIT_SSH_COMMAND='{b}/ssh'; RSYNC_RSH='{b}/ssh'; export GIT_SSH_COMMAND RSYNC_RSH" in t
-        assert f"GIT_CONFIG_VALUE_$_n='{paths.git_config_path()}'" in t
+        assert "RSYNC_RSH" not in t, "rsync reaches the ssh stand-in through PATH"
+        # PLAN-0.11 §6: no git include and no GIT_SSH_COMMAND in Claude's shell
+        # (the gated git gets them in its own child; any other git is the user's)
+        for word in ("GIT_SSH_COMMAND", "GIT_CONFIG", "GW_GITCFG_SET", str(paths.git_config_path())):
+            assert word not in t, word
         lines = t.rstrip().splitlines()
         # everything after GW_BIN= is inside one `if [ -d "$GW_BIN" ]` (env.sh is
         # sourced by other launchers too: a no-op once the stand-ins are gone)
         k = lines.index(f"GW_BIN='{b}'")
         assert lines[k + 1] == 'if [ -d "$GW_BIN" ]; then' and lines[-1] == "fi", lines
         assert all(line.startswith("  ") for line in lines[k + 2:-1]), lines
-        assert lines[-2].startswith("  unset SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS")
-        assert "unset SSH_AUTH_SOCK" not in envfile.env_text("mine")
+        # PLAN-0.11 §1.8: in Claude Code's shell, its own credentials go (names
+        # only) and the present stand-ins' aliases and functions; the user's
+        # agent and token variables stay
+        assert "  if [ -n \"${CLAUDECODE-}\" ]; then" in lines
+        assert "    unset " + " ".join(envfile.CLAUDE_CRED_NAMES) in lines
+        assert "SSH_AUTH_SOCK" not in t and "GH_TOKEN" not in t
+        assert "    for _gw_n in " + " ".join(envfile.STANDIN_NAMES) + "; do" in lines
         # nothing in it assumes Claude's Bash, and it is sourced (no return/exit)
         code = "\n".join(line for line in lines if not line.startswith("#"))
         for word in ("CLAUDE_PID", "return", "exit", "trap"):
@@ -60,26 +68,70 @@ def test_env_file_idempotent_under_every_shell():
     with H.gateway_env() as env:
         paths.bin_dir().mkdir(parents=True, exist_ok=True)   # the stand-ins are there
         envf = env.root / "envfile.sh"
-        envfile.write_env_file(envf, envfile.env_text("refuse"))
-        envfile.write_env_file(envf, envfile.env_text("refuse"))
-        assert envf.read_text() == envfile.env_text("refuse"), "truncate, never append"
+        envfile.write_env_file(envf, envfile.env_text())
+        envfile.write_env_file(envf, envfile.env_text())
+        assert envf.read_text() == envfile.env_text(), "truncate, never append"
         b = str(paths.bin_dir())
         for sh in SHELLS:
             got = _source_twice(sh, envf, {"SSH_AUTH_SOCK": "/tmp/agent", "GH_TOKEN": "tok"})
             assert got["PATH"].split(":").count(b) == 1 and got["PATH"].startswith(b + ":"), (sh, got)
-            assert got["COUNT"] == "1" and got["K0"] == "include.path", (sh, got)
-            assert got["V0"] == str(paths.git_config_path()) and got["NKEYS"] == "1", (sh, got)
-            assert got["GSC"] == b + "/ssh" and got["RSH"] == b + "/ssh"
-            assert got["SOCK"] == "unset" and got["GH"] == "unset", (sh, got)
-            # an existing GIT_CONFIG_COUNT is respected
+            assert got["COUNT"] == "" and got["NKEYS"] == "0", "no git include (PLAN-0.11 §6)"
+            assert got["GSC"] == "" and got["RSH"] == "", "the user's own git and ssh"
+            assert got["SOCK"] == "/tmp/agent" and got["GH"] == "tok", "the user's own stay"
+            # the user's own GIT_CONFIG_COUNT is left alone
             got = _source_twice(sh, envf, {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "a.b",
                                            "GIT_CONFIG_VALUE_0": "1", "GIT_CONFIG_KEY_1": "c.d",
                                            "GIT_CONFIG_VALUE_1": "2"})
-            assert got["COUNT"] == "3" and got["K2"] == "include.path" and got["K1"] == "c.d", (sh, got)
-        envfile.write_env_file(envf, envfile.env_text("mine"))
+            assert got["COUNT"] == "2" and got["K2"] == "" and got["K1"] == "c.d", (sh, got)
+        (paths.bin_dir() / "ssh").write_text("#!/bin/sh\n")
         for sh in SHELLS:
             got = _source_twice(sh, envf, {"SSH_AUTH_SOCK": "/tmp/agent"})
-            assert got["SOCK"] == "/tmp/agent", "others = mine keeps the user's agent"
+            assert got["GSC"] == "", "with the ssh stand-in too: the gated git sets its own ssh"
+
+
+def test_in_claude_codes_shell_the_env_file_takes_back_stand_in_names_and_its_credentials():
+    """PLAN-0.11 §1.8: with CLAUDECODE set (Claude Code's own shell: mods off,
+    or managed "off"), the env file unsets Claude Code's own credential
+    variables (names only) and removes the aliases and functions named after
+    a present stand-in, sourced twice under set -eu in every shell; a name
+    with no stand-in keeps the user's own, and outside Claude Code (a
+    terminal, a checkpoint job) nothing is taken."""
+    with H.gateway_env() as env:
+        b = paths.bin_dir()
+        b.mkdir(parents=True, exist_ok=True)
+        (b / "ssh").write_text("#!/bin/sh\necho standin-ssh\n")
+        os.chmod(b / "ssh", 0o755)
+        envf = env.root / "envfile.sh"
+        envfile.write_env_file(envf, envfile.env_text())
+        script = "\n".join([
+            "set -eu",
+            "ssh() { echo user-fn-ssh; }",
+            "scp() { echo user-scp; }",
+            "alias ssh='echo user-alias-ssh'",
+            f". '{envf}'",
+            f". '{envf}'",
+            'echo "A=$(alias ssh 2>/dev/null || echo none)"',
+            'echo "V=$(command -v ssh)"',
+            "ssh",
+            "scp",
+            'echo "T=${CLAUDE_CODE_OAUTH_TOKEN-unset} K=${ANTHROPIC_API_KEY-unset} '
+            'S=${SSH_AUTH_SOCK-unset} G=${GH_TOKEN-unset}"'])
+        creds = {"CLAUDE_CODE_OAUTH_TOKEN": "tok", "ANTHROPIC_API_KEY": "sk",
+                 "SSH_AUTH_SOCK": "/tmp/agent", "GH_TOKEN": "gho"}
+        for sh in SHELLS:
+            for claudecode in ("1", ""):
+                r = subprocess.run([sh, "-c", script], capture_output=True, text=True, timeout=20,
+                                   env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
+                                        "CLAUDECODE": claudecode, **creds})
+                assert r.returncode == 0 and r.stderr == "", (sh, claudecode, r)
+                out = r.stdout.splitlines()
+                if claudecode:
+                    assert out == ["A=none", f"V={b / 'ssh'}", "standin-ssh", "user-scp",
+                                   "T=unset K=unset S=/tmp/agent G=gho"], (sh, out)
+                else:
+                    assert out[0] != "A=none" and out[1] != f"V={b / 'ssh'}", (sh, out)
+                    assert out[2] in ("user-fn-ssh", "user-alias-ssh") and out[3] == "user-scp", (sh, out)
+                    assert out[4] == "T=tok K=sk S=/tmp/agent G=gho", (sh, out)
 
 
 def test_env_file_with_empty_path_and_set_u():
@@ -101,7 +153,7 @@ def test_env_file_does_nothing_once_the_stand_in_folder_is_gone():
     every shell, sourced twice, under set -eu."""
     with H.gateway_env() as env:
         envf = env.root / "envfile.sh"
-        envfile.write_env_file(envf, envfile.env_text("refuse"))
+        envfile.write_env_file(envf, envfile.env_text())
         assert not paths.bin_dir().exists()
         pre = {"SSH_AUTH_SOCK": "/tmp/agent", "GH_TOKEN": "tok", "GIT_CONFIG_COUNT": "1",
                "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "1"}
@@ -122,7 +174,7 @@ def test_env_file_does_nothing_once_the_stand_in_folder_is_gone():
         for sh in SHELLS:
             got = _source_twice(sh, envf, pre)
             assert got["PATH"].startswith(str(paths.bin_dir()) + ":"), (sh, got)
-            assert got["SOCK"] == "unset" and got["K1"] == "include.path", (sh, got)
+            assert got["SOCK"] == "/tmp/agent" and got["K1"] == "" and got["K0"] == "a.b", (sh, got)
 
 
 def test_a_checkpoint_job_sourcing_env_sh_finds_the_stand_ins():
@@ -130,19 +182,20 @@ def test_a_checkpoint_job_sourcing_env_sh_finds_the_stand_ins():
     ENVFILE STATUSFILE` (checkpoint's current wrapper, pinned in
     harness_sudo.CHECKPOINT_WRAPPER) with the MCP server's environment (no
     CLAUDE_PID, no CLAUDE_ENV_FILE); the wrapper sources env.sh first, so the
-    job gets the stand-ins first on PATH, the gateway's ssh for git and rsync,
-    and no user agent or tokens."""
+    job gets the stand-ins first on PATH (git's too: the gated git sets its
+    own ssh, PLAN-0.11 §6); the user's own agent and token variables stay
+    (PLAN-0.11: theirs)."""
     with H.gateway_env() as env:
         envfile.write_stubs(envfile.stand_ins())
-        p = envfile.write_env_sh(envfile.env_text("refuse"))
-        cmd = ('command -v ssh; command -v sudo; '
-               'echo "GSC=$GIT_SSH_COMMAND SOCK=${SSH_AUTH_SOCK-unset} GH=${GH_TOKEN-unset}"')
+        p = envfile.write_env_sh(envfile.env_text())
+        cmd = ('command -v ssh; command -v sudo; command -v git; '
+               'echo "GSC=${GIT_SSH_COMMAND-} SOCK=${SSH_AUTH_SOCK-unset} GH=${GH_TOKEN-unset}"')
         r = HS.checkpoint_job(env, cmd, envfile=p,
                               extra_env={"SSH_AUTH_SOCK": "/tmp/agent", "GH_TOKEN": "tok"})
         b = paths.bin_dir()
         assert r.returncode == 0 and r.stderr == "gateway_env: applied\n", r
-        assert r.stdout.splitlines() == [str(b / "ssh"), str(b / "sudo"),
-                                         f"GSC={b / 'ssh'} SOCK=unset GH=unset"], r.stdout
+        assert r.stdout.splitlines() == [str(b / "ssh"), str(b / "sudo"), str(b / "git"),
+                                         "GSC= SOCK=/tmp/agent GH=tok"], r.stdout
 
 
 def _ck_wrapper(sh: str, env, cmd: str, envf, pre: dict[str, str]
@@ -164,36 +217,36 @@ def test_checkpoint_jobs_apply_env_sh_silently():
     """checkpoint's wrapper (pinned: harness_sudo.CHECKPOINT_WRAPPER) sources
     env.sh in a subshell first and applies it only if that printed nothing on
     stderr; otherwise the job records "failed" and runs without the
-    stand-ins. So env.sh must source silently: "applied" and no stderr for
-    others = refuse and mine, with and without $DATA/bin (after an
+    stand-ins. So env.sh must source silently: "applied" and no stderr, in
+    Claude Code's shell and outside it, with and without $DATA/bin (after an
     uninstall), under /bin/sh and dash."""
     shells = ["/bin/sh"] + [d for d in ("/bin/dash", "/usr/bin/dash") if os.path.exists(d)][:1]
     assert len(shells) == 2 or not os.path.exists("/bin/dash"), shells
     cmd = 'command -v ssh; echo "SOCK=${SSH_AUTH_SOCK-unset}"'
     with H.gateway_env() as env:
         b = paths.bin_dir()
-        for others in ("refuse", "mine"):
-            p = envfile.write_env_sh(envfile.env_text(others))
+        for claudecode in ("1", ""):
+            p = envfile.write_env_sh(envfile.env_text())
             for with_bin in (True, False):
                 if with_bin:
                     envfile.write_stubs(envfile.stand_ins())
                 else:
                     shutil.rmtree(b)
                 for sh in shells:
-                    where = (others, with_bin, sh)
-                    r, rc, status = _ck_wrapper(sh, env, cmd, p, {"SSH_AUTH_SOCK": "/tmp/agent"})
+                    where = (claudecode, with_bin, sh)
+                    r, rc, status = _ck_wrapper(sh, env, cmd, p, {"SSH_AUTH_SOCK": "/tmp/agent",
+                                                                  "CLAUDECODE": claudecode})
                     assert r.returncode == 0 and rc == "0", (where, r)
                     assert status == "applied" and r.stderr == "", (where, status, r.stderr)
                     out = r.stdout.splitlines()
                     if with_bin:
-                        sock = "SOCK=/tmp/agent" if others == "mine" else "SOCK=unset"
-                        assert out == [str(b / "ssh"), sock], (where, out)
+                        assert out == [str(b / "ssh"), "SOCK=/tmp/agent"], (where, out)
                     else:                      # a no-op: the system's ssh, the user's agent
                         assert str(b) not in r.stdout and out[-1] == "SOCK=/tmp/agent", (where, out)
         # what the wrapper does with an env file that writes to stderr: "failed",
         # its text in the job's log, and the job runs without it
         noisy = env.root / "noisy.sh"
-        noisy.write_text(envfile.env_text("refuse") + "echo 'a note' >&2\n")
+        noisy.write_text(envfile.env_text() + "echo 'a note' >&2\n")
         envfile.write_stubs(envfile.stand_ins())
         for sh in shells:
             r, rc, status = _ck_wrapper(sh, env, cmd, noisy, {})
@@ -223,18 +276,23 @@ def test_stub_runs_still_setting_up_when_env_missing():
 
 
 def test_stand_ins_conditional():
-    with H.gateway_env(system_git=True):
-        base = set(envfile.stand_ins())
-        assert base == {"sudo", "ssh", "scp", "sftp", "gh", "hf", "databricks", "crane", "pijul",
-                        "asiml", "gate", "git-credential-gateway", "gate-askpass"}
-        f = F.parse_text('[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n[accounts.az]\nkind = "azure"\n'
-                         'tenant = "t.example.com"\nenv = "AZ_TOKEN"\n')
-        s = envfile.stand_ins(f)
-        assert "dvc" in s and "az" in s
-        assert "az" not in envfile.stand_ins(F.parse_text('[accounts.az]\nkind = "azure"\ntenant = "t.example.com"\n'))
-    with H.gateway_env(system_git=False):
-        s = envfile.stand_ins()
-        assert "git" in s and str(paths.env_bin() / "git") in s["git"]
+    """stand_ins(): the full base set without effective rights (the cold
+    window's), else the helpers and what standins_for names; git is a
+    stand-in like the others (PLAN-0.11 §6.1), whether the system has a git
+    or not: no stub runs the env's git directly."""
+    for system_git in (True, False):
+        with H.gateway_env(system_git=system_git):
+            base = set(envfile.stand_ins())
+            assert base == {"sudo", "ssh", "scp", "sftp", "git", "gh", "hf", "databricks", "crane",
+                            "pijul", "asiml", "az", "dvc", "gate", "git-credential-gateway",
+                            "gate-askpass"}
+            assert str(paths.env_bin() / "git") not in envfile.stand_ins()["git"]
+            f = F.parse_text('[accounts.cat]\nkind = "ml-catalog"\nhost = "catalog.example.com"\n')
+            s = envfile.stand_ins(f, consent.compute(f, {}))
+            assert set(s) == {"asiml", "dvc", "gate", "git-credential-gateway", "gate-askpass"}
+            f = F.parse_text("")
+            assert set(envfile.stand_ins(f, consent.compute(f, {}))) == \
+                {"gate", "git-credential-gateway", "gate-askpass"}
 
 
 def test_write_stubs_replaces_files_and_removes_stale_names():
@@ -244,7 +302,7 @@ def test_write_stubs_replaces_files_and_removes_stale_names():
         envfile.write_stubs({"a": "#!/bin/sh\necho one\n"})
         ino = os.stat(paths.bin_dir()).st_ino
         envfile.write_stubs({"b": "#!/bin/sh\necho two\n"})
-        assert sorted(p.name for p in paths.bin_dir().iterdir()) == ["b"]
+        assert sorted(p.name for p in paths.bin_dir().iterdir()) == [envfile.STANDIN_MARKER, "b"]
         assert os.stat(paths.bin_dir()).st_ino == ino, "the folder itself is never swapped"
         assert not list(d.glob("bin.new.*")) and not list(d.glob("bin.old.*"))
         assert oct(os.stat(paths.bin_dir() / "b").st_mode & 0o777) == "0o755"
@@ -280,6 +338,7 @@ def test_stubs_never_missing_while_rewritten():
 def test_launch_sh_stubs_never_missing_while_rewritten():
     import threading
     with H.gateway_env() as env:
+        env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')    # the full base set
         envfile.write_stubs(envfile.stand_ins())
         target = paths.bin_dir() / "ssh"
         misses = 0
@@ -312,35 +371,34 @@ def test_launcher_and_env_sh():
         assert e.read_text() == envfile.env_text() and oct(e.stat().st_mode & 0o777) == "0o600"
 
 
-def test_git_config_resets_credential_helpers_under_refuse():
+def test_git_config_holds_only_the_url_scoped_helpers():
+    """PLAN-0.11: no global credential.helper reset any more (the user's
+    own helpers serve every remote nothing configures); githelper's sections
+    clear the helpers for their own URLs only. No text: no file."""
     with H.gateway_env():
         f = F.parse_text("")
-        # others = "refuse": the global reset is always written, even with no
-        # githelper text, so git never falls back to the user's keychain helper.
-        p = envfile.write_git_config(f, {})
-        assert p and p.read_text() == "[credential]\n\thelper =\n" == envfile.GIT_RESET
-        assert envfile.write_git_config(f, {}, "mine") is None and not paths.git_config_path().exists(), \
-            "others = mine: no reset, and a stale include file is removed"
+        paths.git_dir().mkdir(parents=True, exist_ok=True)
+        paths.git_config_path().write_text("[credential]\n\thelper =\n")     # an older include
+        assert envfile.write_git_config(f, {}) is None and not paths.git_config_path().exists()
         orig_inc, orig_id = githelper.include_config, githelper.identity_files
         helper = '[credential "https://github.com"]\n\thelper =\n\thelper = !x\n'
         githelper.include_config = lambda form, meta: helper
         githelper.identity_files = lambda form: {"identity-x": "[user]\n\tname = X\n", "../evil": "x"}
         try:
             p = envfile.write_git_config(f, {})
-            assert p.read_text() == envfile.GIT_RESET + helper, "the reset comes first"
-            assert envfile.write_git_config(f, {}, "mine").read_text() == helper
+            assert p.read_text() == helper
             assert (paths.git_dir() / "identity-x").exists() and not (paths.data_dir() / "evil").exists()
         finally:
             githelper.include_config, githelper.identity_files = orig_inc, orig_id
 
 
-def test_session_sync_writes_the_reset_and_git_sees_it():
+def test_a_user_helper_answers_for_hosts_nothing_configures():
     import shutil as _sh
     git = _sh.which("git", path="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
     with H.gateway_env() as env:
         f = F.parse_text("")
         envfile.sync(f, None, {}, None)
-        assert paths.git_config_path().read_text() == envfile.GIT_RESET
+        assert not paths.git_config_path().exists()
         if git:
             home = env.root / "githome"
             home.mkdir()
@@ -350,7 +408,7 @@ def test_session_sync_writes_the_reset_and_git_sees_it():
                                env={"HOME": str(home), "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
                                     "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "include.path",
                                     "GIT_CONFIG_VALUE_0": str(paths.git_config_path())})
-            assert r.stdout.splitlines()[-1:] == [""], ("the empty reset is the last helper value", r.stdout)
+            assert r.stdout.splitlines() == ["osxkeychain"], r.stdout
 
 
 def test_stub_through_test_entry_runs_gate_status():
@@ -380,17 +438,38 @@ def test_launch_degraded_session_matches_python():
         out = json.loads(r.stdout)
         assert out["systemMessage"].startswith("gateway: ")
         assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
-        assert envf.read_text() == envfile.env_text("refuse"), "sh and Python write the same env file"
+        assert envf.read_text() == envfile.env_text(), "sh and Python write the same env file"
         # round 3: the first session has the terminal launcher too (no-screen
         # messages name it), byte-identical to Python's, mode 0700
         assert paths.launcher_path().read_text() == envfile.launcher_text() \
             == envfile.launcher_text("building")
         assert (paths.launcher_path().stat().st_mode & 0o777) == 0o700
-        want = envfile.stand_ins()
-        got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()}
+        # nothing configured: gate and its helpers, no stand-in (PLAN-0.11 §1.2)
+        want = {n: t for n, t in envfile.stand_ins().items() if n not in envfile.STANDIN_NAMES}
+        got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()
+               if p.name != envfile.STANDIN_MARKER}
         assert got == want, sorted(set(got) ^ set(want)) or [n for n in got if got[n] != want[n]]
-        assert paths.git_config_path().read_text() == envfile.git_config_text("refuse"), \
-            "sh writes the same credential reset"
+        assert (paths.bin_dir() / envfile.STANDIN_MARKER).read_text() == envfile.MARKER_TEXT
+        assert not paths.git_config_path().exists()
+        # something may be configured (a [hosts. or [accounts. header, or the
+        # configured list): the full base set, byte-identical; no git include
+        # (only the gated git reads it, and the cold git stub runs none)
+        for how in ("form", "list"):
+            shutil.rmtree(paths.bin_dir())
+            if how == "form":
+                env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
+            else:
+                paths.form_path().unlink()
+                paths.ensure_private()
+                paths.configured_path().write_text("{}")
+            r = H.run_launch(env, "hook-session", "--test", payload={"session_id": "s1"},
+                             extra_env={"CLAUDE_ENV_FILE": str(envf),
+                                        "PATH": f"{fake.parent}:/usr/bin:/bin"})
+            want = envfile.stand_ins()
+            got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()
+                   if p.name != envfile.STANDIN_MARKER}
+            assert got == want, (how, sorted(set(got) ^ set(want)))
+            assert not paths.git_config_path().exists(), how
 
 
 FIXED_PIXI_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/home/linuxbrew/.linuxbrew/bin")
@@ -434,7 +513,7 @@ def test_launch_degraded_says_pixi_missing():
         stub = H.run_stub(env, "gate", "status")
         assert stub.returncode == 75 and "pixi isn't installed" in stub.stderr, stub.stderr
         assert "try again in a minute" not in stub.stderr
-        assert "exec /usr/bin/sudo" in (paths.bin_dir() / "sudo").read_text()
+        assert not (paths.bin_dir() / "sudo").exists(), "nothing configured: no stand-in"
         r = H.run_launch(env, "hook-subagent", plugin_root=root, extra_env=e)
         assert "pixi isn't installed" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
         r = H.run_launch(env, "gate", "status", plugin_root=root, extra_env=e)
@@ -534,6 +613,7 @@ def test_launch_degraded_file_guard_denies_transcripts():
 
 def test_launch_degraded_session_reports_a_failed_build():
     with H.gateway_env() as env:
+        env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
         envd = paths.env_dir()
         envd.mkdir(parents=True)
         (envd / "install.log").write_text("error: network unreachable\n")
@@ -588,7 +668,7 @@ def test_launch_with_built_env_runs_python_session():
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert ctx.startswith("Gateway (plugin)") and "box" in ctx
         assert out["hookSpecificOutput"]["watchPaths"] == [str(paths.form_path())]
-        assert envf.read_text() == envfile.env_text("refuse")
+        assert envf.read_text() == envfile.env_text()
         assert (paths.env_dir() / ".used").exists()
 
 
@@ -741,14 +821,16 @@ def test_launch_runs_on_an_older_env_while_an_update_builds():
         py = old / ".pixi" / "envs" / "default" / "bin" / "python3"
         py.parent.mkdir(parents=True)
         os.symlink(H.PY, py)
+        # on the lock's Python minor (another minor is never used: test_packaging)
+        os.symlink(H.PY, py.parent / f"python{envfile.lock_python_minor()}")
         (old / ".ready").write_text("")
         assert not paths.env_ready()
         env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
         r = H.run_launch(env, "hook-bash", "--test",
                          payload={"tool_name": "Bash", "tool_input": {"command": "curl http://x"}})
-        assert r.returncode == 0 and '"deny"' in r.stdout, (r.stdout, r.stderr)
-        assert "reconnect gw in /mcp" in json.loads(r.stdout)["hookSpecificOutput"][
-            "permissionDecisionReason"]
+        assert r.returncode == 0 and '"ask"' in r.stdout, (r.stdout, r.stderr)
+        assert "curl is a network command" in json.loads(r.stdout)["hookSpecificOutput"][
+            "permissionDecisionReason"], "Python judged it (the cold guard's text differs)"
         assert (old / ".used").exists(), "an env in use isn't cleaned up"
         t0 = time.time()
         r = H.run_launch(env, "mcp", "--test", timeout=20)
@@ -793,7 +875,7 @@ def test_a_failed_command_keeps_its_exit_code_in_claudes_shell():
     record works as without the gateway."""
     with H.gateway_env() as env:
         envf = env.root / "envfile.sh"
-        text = envfile.env_text("refuse")
+        text = envfile.env_text()
         assert "trap " not in text and "EXIT" not in text, text
         envfile.write_env_file(envf, text)
         sub = env.root / "sub"
@@ -857,31 +939,35 @@ def _temps(*dirs: Path) -> list[str]:
 def test_launch_writes_the_safe_env_before_python_runs_session_start():
     """The first Python SessionStart on a new env took 5-13 s (once past
     Claude Code's 20 s limit): a session whose hook is cancelled or killed
-    before Python writes anything must still run Claude's commands through
-    the stand-ins, without the user's agent and tokens. launch.sh writes the
-    env file, and the stand-ins and the git reset when missing, before it
-    starts Python; the next session (Python) writes everything for the form."""
+    before Python writes anything must still run a configured target's
+    commands through the stand-ins. launch.sh writes the env file, and (while
+    something may be configured) the full base set of stand-ins when one is
+    missing, before it starts Python (no git include: only the gated git
+    reads it); the next session (Python) writes what the configured set
+    needs."""
     with H.gateway_env() as env:
         _killed_python(env)
+        env.write_form('[accounts.gh]\nkind = "github"\n')     # something may be configured
         envf = env.root / "session-env" / "sid" / "sessionstart-hook-0.sh"
         assert not paths.bin_dir().exists() and not paths.git_config_path().exists()
         r = H.run_launch(env, "hook-session", "--test", payload={"session_id": "s1"},
                          extra_env={"CLAUDE_ENV_FILE": str(envf)})
         assert r.returncode != 0 and r.stdout == "", (r.returncode, r.stdout, r.stderr)
-        assert envf.read_text() == envfile.env_text("refuse")
+        assert envf.read_text() == envfile.env_text()
         want = envfile.stand_ins()
-        got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()}
+        got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()
+               if p.name != envfile.STANDIN_MARKER}
         assert got == want, sorted(set(got) ^ set(want)) or [n for n in got if got[n] != want[n]]
         assert all(os.access(paths.bin_dir() / n, os.X_OK) for n in got)
-        assert paths.git_config_path().read_text() == envfile.git_config_text("refuse")
-        assert not _temps(envf.parent, paths.bin_dir(), paths.git_config_path().parent)
+        assert not paths.git_config_path().exists()
+        assert not _temps(envf.parent, paths.bin_dir())
         # a resumed session reuses its env file (replaced whole); a missing
         # stand-in is written again
         envf.write_text("# an older session's text\n")
         (paths.bin_dir() / "scp").unlink()
         r = H.run_launch(env, "hook-session", "--test", payload={"session_id": "s1"},
                          extra_env={"CLAUDE_ENV_FILE": str(envf)})
-        assert envf.read_text() == envfile.env_text("refuse")
+        assert envf.read_text() == envfile.env_text()
         assert (paths.bin_dir() / "scp").read_text() == want["scp"], "a missing stand-in is back"
         # the next session (Python runs) writes everything for the form
         paths.env_python().unlink()
@@ -892,8 +978,8 @@ def test_launch_writes_the_safe_env_before_python_runs_session_start():
                          extra_env={"CLAUDE_ENV_FILE": str(envf2)})
         assert r.returncode == 0, r.stderr
         assert "box" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-        assert envf2.read_text() == envfile.env_text("refuse")
-        assert paths.env_sh_path().read_text() == envfile.env_text("refuse")
+        assert envf2.read_text() == envfile.env_text()
+        assert paths.env_sh_path().read_text() == envfile.env_text()
         assert paths.launcher_path().read_text() == envfile.launcher_text()
 
 
@@ -935,7 +1021,7 @@ def test_the_env_file_is_never_left_cut_short():
                                                   else real_open(f, m, *a, **k))
         try:
             try:
-                envfile.write_env_file(envf, envfile.env_text("refuse"))
+                envfile.write_env_file(envf, envfile.env_text())
             except Killed:
                 pass
         finally:
@@ -945,21 +1031,87 @@ def test_the_env_file_is_never_left_cut_short():
         assert seen == {envf.name: "OLD\n"}, seen
         assert [p.name for p in envf.parent.iterdir() if p.name.endswith(".tmp")], \
             "the cut write left only its temp file"
-        envfile.write_env_file(envf, envfile.env_text("refuse"))
-        assert envf.read_text() == envfile.env_text("refuse")
+        envfile.write_env_file(envf, envfile.env_text())
+        assert envf.read_text() == envfile.env_text()
         # a killed writer's temp file goes once it is an hour old
         stale, fresh = (envf.parent / f".{envf.name}.{n}.tmp" for n in (99998, 99999))
         for p in (stale, fresh):
             p.write_text("# cut")
         os.utime(stale, (time.time() - 7200, time.time() - 7200))
-        envfile.write_env_file(envf, envfile.env_text("refuse"))
+        envfile.write_env_file(envf, envfile.env_text())
         assert not stale.exists() and fresh.exists()
 
 
 def test_launch_sh_base_stand_ins_match_python():
     text = (H.PLUGIN / "hooks" / "launch.sh").read_text()
-    line = next(ln for ln in text.splitlines() if ln.startswith("STUB_NAMES="))
-    assert line.split("=", 1)[1].strip('"').split() == [n for n, _ in envfile.BASE_STANDINS]
+    def words(var: str) -> list[str]:
+        line = next(ln for ln in text.splitlines() if ln.startswith(var + "="))
+        return line.split("=", 1)[1].strip('"').split()
+    assert words("STUB_STANDINS") == list(envfile.STANDIN_NAMES)
+    assert words("STUB_STANDINS") + words("STUB_HELPERS") == [n for n, _ in envfile.BASE_STANDINS]
+    marker = next(ln for ln in text.splitlines() if ln.startswith("MARKER_TEXT="))
+    assert marker.split("=", 1)[1].strip('"') + chr(10) == envfile.MARKER_TEXT
+
+
+# Every shape of gateway.toml whose hosts or accounts table form.parse_text
+# reads (PLAN-0.11 §1.2's cold rule must see each one), and shapes with none.
+COLD_CONFIGURED = (
+    '[hosts.box]\naddress = "u@box.example.com"\n',
+    '[ hosts . box ]\naddress = "u@box.example.com"\n',
+    '["hosts".box]\naddress = "u@box.example.com"\n',
+    "['hosts'.\"box\"]\naddress = \"u@box.example.com\"\n",
+    '[hosts]\nbox = { address = "u@box.example.com" }\n',
+    'hosts.box.address = "u@box.example.com"\n',
+    '"hosts".box.address = "u@box.example.com"\n',
+    'hosts = { box = { address = "u@box.example.com" } }\n',
+    '[accounts.gh]\nkind = "github"\nlogin = "octo"\n',
+    '[accounts]\ngh = { kind = "github", login = "octo" }\n',
+    'accounts.gh.kind = "github"\naccounts.gh.login = "octo"\n',
+    '[hosts.localhost]\nsudo = "ask"\n',
+)
+COLD_UNCONFIGURED = (
+    "", "# [hosts.box]\n# address = \"u@box.example.com\"\n", '[shell]\nmanaged = "on"\n',
+    '[network]\ncommands = "ask"\n', 'hostsfile = "x"\n',
+)
+
+
+def _maybe_configured(env, text: str | None) -> bool:
+    """launch.sh's maybe_configured, run alone (its function text, with the
+    home given) on a gateway.toml holding `text` (None: no file)."""
+    src = (H.PLUGIN / "hooks" / "launch.sh").read_text()
+    start = src.index("maybe_configured() {")
+    body = src[start:src.index("\n}\n", start) + 3]
+    home = env.root / "cold-home"
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir()
+    if text is not None:
+        (home / "gateway.toml").write_text(text)
+    r = subprocess.run(["/bin/sh", "-c", 'GWH=$1; gw_home() { printf %s "$GWH"; }\n'
+                        f'{body}\nmaybe_configured', "sh", str(home)],
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode in (0, 1), r.stderr
+    return r.returncode == 0
+
+
+def test_the_cold_rule_sees_every_shape_of_a_hosts_or_accounts_table():
+    """Review should-fix 4: before Python runs, launch.sh writes the full set
+    of stand-ins only when something may be configured; every form shape
+    the parser reads as a host or an account counts (a bare [hosts] table
+    with inline tables, a dotted key, a quoted key, an inline table at the
+    root), so `ssh box` never runs the user's own ssh in the cold window."""
+    with H.gateway_env() as env:
+        for text in COLD_CONFIGURED:
+            f = F.parse_text(text, Path("gateway.toml"))
+            assert f.syntax_error is None, (text, f.syntax_error)
+            assert (set(f.hosts) - {"localhost"}) or f.accounts or f.disabled_accounts or \
+                f.hosts["localhost"].sudo_configured, text
+            assert _maybe_configured(env, text), text
+        for text in COLD_UNCONFIGURED:
+            f = F.parse_text(text, Path("gateway.toml"))
+            assert not (set(f.hosts) - {"localhost"}) and not f.accounts, text
+            assert not f.hosts["localhost"].sudo_configured, text
+            assert not _maybe_configured(env, text), text
+        assert not _maybe_configured(env, None)
 
 
 def test_ensure_env_warms_a_new_env_once():

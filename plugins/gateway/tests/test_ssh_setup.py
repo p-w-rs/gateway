@@ -270,11 +270,13 @@ def test_ssh_setup_close_masters() -> None:
         assert len(s.masters()) == 1
         assert ssh.close_masters("box") == 1
         assert not s.masters() and not (s.run_dir / "cm-box.list").exists()
-        # narrowing the address closes masters too (consent.ratchet -> close_masters)
+        # narrowing the right closes masters too (consent.ratchet -> close_masters);
+        # an address's `when` no longer narrows (PLAN-0.11 §1.1: a widening)
         assert s.run("ssh", "box", "true").returncode == 0
-        s.write_form(f'[hosts.box]\naddress = "{t.addr()}"\nwhen = "127.0.0.0/8"\n')
-        assert s.run("ssh", "box", "true").returncode == 0     # this run ratchets first
-        assert t.accepted() == 3
+        assert len(s.masters()) == 1
+        s.write_form(f'[hosts.box]\naddress = "{t.addr()}"\nssh = false\n')
+        assert s.run("ssh", "box", "true").returncode != 0     # this run ratchets first
+        assert not s.masters() and t.accepted() == 2
 
 
 def _lines(p: "os.PathLike[str]") -> list[str]:
@@ -498,7 +500,25 @@ def test_ssh_setup_helpers_honour_the_ssh_right() -> None:
                 assert ssh.test_login("box")[0] is True
             finally:
                 popup._MODE = old
+            # a command Claude typed: only with the approval hook's record of
+            # that very gate command (should-fix 1: a sourced file's `gate
+            # rotate box` has none)
+            from gateway import asks, hooks_bash
             ancestry.typed_by_claude = lambda: (True, "")
+            s.set(asked="real")
+            asks.begin("gate", ["rotate", "box"])
+            ok, msg = ssh.test_login("box")
+            assert not ok and 'ssh on box is set to "ask"' in msg, msg
+            out = hooks_bash.main({"tool_name": "Bash", "tool_input": {"command": "gate rotate box"},
+                                   "permission_mode": "default", "cwd": os.getcwd()})
+            assert out["hookSpecificOutput"]["permissionDecision"] == "ask", out
+            asks.begin("gate", ["rotate", "box"])
+            assert ssh.test_login("box")[0] is True
+            assert ssh.test_login("box")[0] is True, "one gate command: the record held for it"
+            asks.begin("gate", ["rotate", "box"])              # the next gate command
+            assert not ssh.test_login("box")[0], "used once"
+            s.set(asked=True)
+            asks.begin("gate", ["check", "box"])
             assert ssh.test_login("box")[0] is True
             s.write_form(f'[hosts.box]\naddress = "{t.addr()}"\nssh = false\n')
             refused("false", "ssh is off for box")

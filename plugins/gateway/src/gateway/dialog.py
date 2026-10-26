@@ -318,6 +318,8 @@ class Dialog:
             rem = s.remember
             if out.startswith("\x00forget\x00"):       # a test's "don't remember"
                 out, rem = out[len("\x00forget\x00"):], False
+            elif out.startswith("\x00remember\x00"):   # a test's tick of the box
+                out, rem = out[len("\x00remember\x00"):], True
         return Result(OK, out, remember=rem)
 
 

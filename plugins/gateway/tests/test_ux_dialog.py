@@ -1,6 +1,7 @@
 """dialog.py (PLAN-v4 phase 3): native dialogs only. No OS dialog backend is
 left (osascript, zenity, kdialog), and nothing in the plugin starts one, a
-browser or a terminal; the backend is the gateway daemon's native dialog
+browser (but the browser sign-in's, PLAN-0.11 §7) or a terminal; the backend
+is the gateway daemon's native dialog
 (test_dialogs.py drives it end to end), the test fake, or none under a test
 override; the fake's protocol and outcomes; the session record ssh.py reads."""
 from __future__ import annotations
@@ -20,9 +21,29 @@ def _script(path: Path, body: str) -> str:
     return str(path)
 
 
+def _span(path: Path, func: str) -> range:
+    """The line numbers of a top-level function in path."""
+    lines = path.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines, 1) if ln.startswith(f"def {func}("))
+    end = next((i for i, ln in enumerate(lines, 1) if i > start and ln.startswith(("def ", "class "))),
+               len(lines) + 1)
+    return range(start, end)
+
+
 def test_no_os_dialog_browser_or_terminal_opener_is_left_in_the_code():
     """Nothing the plugin runs names an OS dialog program, a URL opener or a
-    terminal emulator (brief sections 3 and 11.1)."""
+    terminal emulator (brief sections 3 and 11.1). The one exception is the
+    browser sign-in's system browser (PLAN-0.11 §7.2), opened by gated after
+    the person's Open, and named only in daemon/oauth.py's browser_command.
+    The approval hook names osascript only to refuse its administrator
+    privileges (PLAN-0.11 §9.5: hooks_bash's elevation finders and
+    _other_elevation) or a script it can't read (_hides), never runs it."""
+    oauth_py = H.PLUGIN / "src" / "gateway" / "daemon" / "oauth.py"
+    allowed = {f"src/gateway/daemon/oauth.py:{n}" for n in _span(oauth_py, "browser_command")}
+    hb = H.PLUGIN / "src" / "gateway" / "hooks_bash.py"
+    judged = {f"src/gateway/hooks_bash.py:{n}"
+              for f in ("_text_elevator", "_elevation_tool", "_other_elevation", "_hides")
+              for n in _span(hb, f)}
     banned = re.compile(r"""["'/](osascript|zenity|kdialog|xdg-open|gnome-terminal|x-terminal-emulator|xterm)["' ]"""
                         r"""|["']/usr/bin/open["']|webbrowser|display dialog|choose from list"""
                         # an argv naming one: ["open", url], ['xdg-open', ...], ("konsole", ...)
@@ -44,7 +65,9 @@ def test_no_os_dialog_browser_or_terminal_opener_is_left_in_the_code():
             for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
                 if banned.search(line) and not line.lstrip().startswith(("#", "//", "*")):
                     hits.append(f"{p.relative_to(H.PLUGIN)}:{n}")
-    assert not hits, hits
+    excepted = [h for h in hits if h in allowed]
+    assert [h for h in hits if h not in allowed and h not in judged] == [], hits
+    assert 1 <= len(excepted) <= 2, excepted       # /usr/bin/open and xdg-open, nothing else
 
 
 def test_backend_choice():

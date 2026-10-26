@@ -15,7 +15,7 @@ const statusJson = (): string => JSON.stringify({
   state: 'ready', root: '/plugin', data: `${CONFIG}/plugins/data/gate-inline`,
   env: `${CONFIG}/plugins/data/gate-inline/envs/0123456789ab`, lock: '0123456789ab', warm: true, older: '',
   build_running: false, install_log: false, pixi: `${HOME}/.pixi/bin/pixi`, pixi_version: 'pixi 0.81.0',
-  home: `${HOME}/.config/gateway`, form: true, vault: true, vault_v2: false,
+  home: `${HOME}/.config/gateway`, form: true, vault: true, managed: true,
 }) + '\n'
 
 const daemonJson = (): string => JSON.stringify({

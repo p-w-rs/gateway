@@ -18,24 +18,64 @@ the rights and on the consent ratchet; it never gives more than the rights.
 
 | action | covers | base on a remote host | base on this machine | where it is decided |
 |---|---|---|---|---|
-| `read` | reading files on the host: `host_inspect`, scp/rsync/sftp downloads, `git-upload-pack` | `ssh` | allow | ssh stand-in (`ssh_args.ssh_actions`), gated (`/agent/remote/inspect`), `managed.inspect` |
-| `exec` | running commands: `ssh HOST CMD`, terminals, jobs | `ssh` | allow | ssh stand-in, gated (`Supervisor._bind`), approval hook |
+| `read` | reading files on the host: `host_inspect`, scp/rsync/sftp downloads, `git-upload-pack` | `ssh` | cc | ssh stand-in (`ssh_args.ssh_actions`), gated (`/agent/remote/inspect`), `managed.inspect` |
+| `exec` | running commands: `ssh HOST CMD`, terminals, jobs | `ssh` | cc | ssh stand-in, gated (`Supervisor._bind`), approval hook |
 | `write` | uploads to the host (scp/rsync/sftp, `git-receive-pack`); with an account: pushes and non-GET http | `ssh` | (not a local action) | ssh stand-in, `web.http`, account selection |
-| `network` | `ssh -L/-D/-N` tunnels; the http and download tools | `ssh` | allow | ssh stand-in, `web` |
+| `network` | `ssh -L/-D/-N` tunnels; the http and download tools | `ssh` | cc | ssh stand-in, `web` |
 | `elevation` | sudo | stricter of `sudo` and exec | localhost `sudo` | sudo stand-in, remote sudo (`ssh._host`), approval hook (also names the target) |
-| `credential` | the gateway handing a stored credential to a command | `ssh` | allow | `accounts.select`, `web.credential`, ssh endpoints |
-| `env_import` | `[hosts.X.shell]` / `[shell]` imports into the managed shell | `ssh` | allow | `managed.imports_allowed`, `RemoteHost.imports` |
+| `credential` | the gateway handing a stored credential to a command | `ssh` | cc | `accounts.select`, `web.credential`, ssh endpoints |
+| `env_import` | `[hosts.X.shell]` / `[shell]` imports into the managed shell | `ssh` | cc | `managed.imports_allowed`, `RemoteHost.imports` |
 | `provision` | staging the managed runtime on the host | `ssh` | (n/a) | `remote.ensure_runtime` (a new or changed runtime only) |
 | `forward_agent`, `forward_x11`, `forward_remote`, `forward_stdio` | `ssh -A`, `-X/-Y`, `-R`, `-W` (and their `-o` forms) | **deny** unless the host's own policy says `"allow"` | (n/a) | ssh stand-in (`parse_ssh(forwards=True)`, `_policy_gate`) |
 
 On this machine `read`, `exec`, `network`, `credential` and `env_import`
-start at allow: Claude Code's own permission modes govern Claude's local
-commands, and the gateway doesn't add a competing mode. Policy stays a
-gateway concept: it never writes Claude Code's permission rules or modes,
-and Claude Code's mode never changes a gateway decision (an `allow` in
-bypass mode is still refused by a gateway `deny`).
+start at cc (since 0.11.0; "allow" before): Claude Code's own permission
+modes govern Claude's local commands. Policy stays a gateway concept: it
+never writes Claude Code's permission rules, and a gateway `deny` holds in
+every mode it names (an `allow` in bypass mode is still refused by it).
 
 An account's `credential`, `write` and `network` start at its `use`.
+
+## Per mode (PLAN-0.11 §2)
+
+The rights and the restrictions `read`, `exec`, `write`, `network`,
+`elevation` and `credential` take a word or a per-mode table
+(`modes.ModeValue`): words deny < ask < cc < allow, modes `default` (also
+`manual`), `plan`, `acceptEdits`, `auto`, `bypass` (also
+`bypassPermissions`), `dontAsk`; a table must name `default`. A bare policy
+`"allow"` restricts nothing in any mode; a table's `"allow"` is the user's
+explicit allow for that mode (`ModeValue.explicit`), which ranks above a
+plain one (gaining it is a widening) and approves only this computer's
+`network` for the http and download tools (`hooks_mcp`, lead decision 19.1);
+plan never approves. `env_import`, `provision` and the grants take one word.
+The legacy attributes (`Host.ssh`, `Policy` words, ...) hold the modeless
+resolution, so a reader that doesn't know the mode gets the strict value.
+
+`policy.decide(..., mode=)`: the hook passes the payload's mode; the
+stand-ins, web.py and gated pass the session's recorded mode
+(`modes.current_for`: only for a command Claude typed, or the MCP server
+below that session, under the current epoch) or `None`, the **modeless
+rule**: the strictest word over every mode but plan, allow capped at cc (a
+bare `true` stays cc; `{ default = "ask", auto = true }` is ask, a refusal
+for a caller Claude didn't type). Jobs, terminals, scripts, gated's
+`_bind`/`ensure_runtime`/inspection and `managed.imports_allowed` are
+modeless. `Decision` carries `value`, `mode`, `mode_label` and
+`explicit_allow`. CONTRACT-v1's rights words come from the modeless value
+(cc and allow map to allow; `lifecycle.contract_rights`).
+
+`[policy]` binds the configured hosts and accounts plus this computer's
+elevation and network commands; its `read`, `exec`, `write` and
+`credential` don't reach a host or account the configured set doesn't name
+(the user's own). The first 0.11 session names a global deny that no longer
+reaches everything (`hooks_session.posture_notice`).
+
+`gate host set NAME ssh|sudo MODE=WORD...`, `gate account set NAME use
+MODE=WORD...`, `gate policy set all|HOST|ACCOUNT ACTION MODE=WORD...` and
+`gate network commands
+MODE=WORD...` write a table (`form.set_key`, `form.toml_value`), also from
+the panes' edit line (`manage.ts` `modeTokens`), and the panes draw a table
+in words ("Manual: ask · Auto: allow · Plan: deny", `modeText`), never as an
+object.
 
 ## Form syntax
 
@@ -110,8 +150,9 @@ how to get it asked.
 
 ## Consent
 
-Policy keys are consented like rights (`consent.policy_compare`): per key,
-an absent restriction ranks as allow (2) and an absent grant as deny (0).
+Policy keys are consented like rights (`consent.policy_compare`), mode by
+mode: an absent restriction ranks as allow (no restriction), a table's
+explicit allow above a plain one, and an absent grant as deny.
 Raising a key, adding a workspace, moving one (a new root or local
 folder), removing a restriction or adding a grant is a **widening**: it
 waits in `pending` until the person approves it in the gateway's consent
@@ -174,15 +215,16 @@ isn't followed (the host resolves it, not the gateway).
 
 Agent, X11, remote (`-R`) and stdio (`-W`) forwarding are refused unless the
 host's own `[hosts.X.policy]` says `forward_KIND = "allow"` (approved like
-any widening), and never for an account endpoint or a host outside the form.
+any widening), and never for an account endpoint (a host the configured set
+doesn't name is the user's own ssh, outside the gateway).
 Stated prerequisites, checked or said in the refusal:
 
 - agent: the forwarded agent is the call's own private agent with only the
   gateway's key for that host (never your own agent); the connection skips
   the shared master so the forward belongs to the call;
-- X11: an X server here (`DISPLAY`, which the managed shell passes only as
-  an approved `[shell] import_env`; XQuartz on macOS) and `X11Forwarding yes`
-  in the host's sshd;
+- X11: an X server here (`DISPLAY`, which the managed shell keeps from
+  the user's environment since 0.11.0; XQuartz on macOS) and
+  `X11Forwarding yes` in the host's sshd;
 - remote: the forwarded port binds only to the host's loopback (`-R` with a
   bind address that isn't loopback is refused, like `-L`/`-D` here);
 - stdio: `-W HOST:PORT` only.
@@ -194,14 +236,18 @@ gated's `/ui/manage` (UI plane: hosts with identity, reachability, auth,
 runtime and their rights, workspaces, accounts with their adapter states,
 pending changes; never a value). The hosts pane has an edit field taking one
 of `host add NAME USER@HOST[:PORT] [KEY=VALUE...]`, `host set NAME KEY
-VALUE`, `workspace add HOST NAME ROOT [LOCAL]`, `workspace remove HOST
-NAME`, `policy set all|HOST|ACCOUNT ACTION allow|ask|deny`
-(`manage.ts editArgv`: these shapes only, names checked, an argv, never a
-shell string); the pane runs it as `launch.sh gate ...`, then `gate check
-ENTRY`, whose consent dialog shows any widening. The accounts pane has Check
-(`gate accounts --check NAME --json`) and Enter credential (`gate login
-NAME`: the credential dialog's private field). Credentials are never typed
-into the panes.
+VALUE`, `account set NAME use WORD|MODE=WORD...`, `workspace add HOST NAME
+ROOT [LOCAL]`, `workspace remove HOST NAME`, `policy set all|HOST|ACCOUNT
+ACTION allow|ask|deny|cc|MODE=WORD...`, `network commands
+VALUE|MODE=WORD...`, `network extra|drop add|remove NAME` (`host set NAME
+ssh|sudo` also takes `MODE=WORD...`; `manage.ts editArgv`: these shapes
+only, names checked, an argv, never a shell string); the pane runs it as
+`launch.sh gate ...`, then `gate check ENTRY`, whose consent dialog shows
+any widening. The accounts pane has the same edit field (its hint names
+`account set NAME use ...` and an account's `policy set`), Check (`gate
+accounts --check NAME --json`) and Enter credential (`gate login NAME`: the
+credential dialog's private field). Credentials are never typed into the
+panes.
 
 `manage.py` writes through the form writer only (`form.append_table`,
 `form.set_key`; the form is never re-serialized); `workspace remove` takes

@@ -2,9 +2,115 @@
 
 Public API and behaviour of the modules the `accounts` group owns:
 `scrub.py`, `githelper.py`, `clis.py`, `asiml.py`, `entra.py`, `logins.py`.
-Contract: [SPEC-v3.md](../SPEC-v3.md) §9.4, §9.5, §9.6, §9.7, §11, §14.
-Python 3.12 stdlib only. Every credential use writes an audit line
-(`audit.use`); every refusal `audit.refusal`. Messages start with `gateway:`.
+Contract: [SPEC-v3.md](../SPEC-v3.md) §9.4, §9.5, §9.6, §9.7, §11, §14, with
+[PLAN-0.11.md](../PLAN-0.11.md) §1.4, §6 and §7 where they differ. Stdlib
+only, on the lock's Python. Every credential use writes an audit line
+(`audit.use`, with its mode); every refusal `audit.refusal`, with the mode
+the stand-in decided in (the recorded mode, or "modeless"). Messages start
+with `gateway:`.
+
+## 0.11.0: destinations, the git stand-in, browser sign-in
+
+**Account CLIs decide by destination** (`clis.destination(tool, argv, cwd,
+eff)`, PLAN-0.11 §1.4). Each stand-in resolves the destination the way the
+tool would: gh from `-R`/`--repo`, `GH_REPO`, `GH_HOST`, `--hostname`, else
+the cwd repository's remote (through `gitroute`), else github.com (an
+account's `api.` host counts as its own); hf from `HF_ENDPOINT` and the repo
+id's owner; databricks from `DATABRICKS_HOST` or the project's
+`databricks.yml`; crane from the registry; pijul from its remote; az from
+the subscription and tenant. A covered destination (`accounts.destinations`
+and the account's owners: its `login`, `owners`, a `default` account, or the
+only account of its kind for that host while it lists no `owners`:
+`accounts.owner_covered`, gitroute's rule; an account that lists owners
+covers only those and its login, so a personal repository never goes
+through a work account's key) takes the gated
+path below. A destination that can be told and isn't covered passes
+through to the user's own tool (`envfile.pass_through`), the user's
+`GH_TOKEN` and the like reaching it. One that can't be told (`gh api
+/user`, `gh auth status`, `hf whoami`) takes the gated path while an
+account of that kind exists for the host (account selection as usual:
+`GATE_ACCOUNT`, owners, the default, the only one; refused when two fit),
+never the user's own token. A tool run by its path
+is refused by the hook while an account of its kind exists (lead decision
+19.10), and so is `huggingface-cli` (hf's older name, with no stand-in) by
+any name while a huggingface account exists, pointing at `hf`. `asiml.dvc_main` sends only `dvc pull|push` inside an asiml
+workspace to asiml; every other dvc command passes through.
+
+**The git stand-in** (`githelper.git_main`, PLAN-0.11 §6; present while a
+host other than localhost or a github or huggingface account is
+configured). `gitroute.resolve(argv, cwd)` reads the effective config as the
+user's git would (the bundled git's `config -z --list --show-scope`, config
+reads only; `-C`, `--git-dir`, `--work-tree`, `GIT_DIR`, `-c` and
+`--config-env` honoured; aliases resolved, a `!` alias in a handled
+repository refused), collects every effective URL (each remote's `url`s and
+`pushurl`, after `insteadOf`/`pushInsteadOf`, operand URLs, `pushRemote`,
+`pushDefault`, submodules, `lfs.url`) and decides: **gated** in a repository
+where any effective URL is configured (a configured host by name, `gw-NAME`,
+address or `also`; or a URL an account covers, its `host` included, so GHES
+counts), and for any command whose operand URL is configured (`clone`
+reads no repository config); everything else **passes through**, untouched.
+`git config --global|--system|--file` passes through. The gated git: the
+env's git with `gated_env` (an allowlist, `GATED_KEEP`), at command-line
+scope first the user's own `user.name` and `user.email`
+(`user_identity`: `git --git-dir=<Route.repo> config --get-regexp
+'^user\.(name|email)$'` run by the user's git, `envfile.user_tool`, else
+the env's, with the user's environment, in the repository the command works
+on as gitroute resolved it (its `-C`, `--git-dir`, `--work-tree`: `git -C
+other commit` typed in another repository reads `other`'s), so a
+repository's own setting and an includeIf identity count as they do for the
+user; only for a command that may write a commit, a tag or a note: not for
+`NO_IDENTITY`'s status, diff, log, fetch and the like; a read reached again
+from that read, a wrapper `git` on PATH, reads nothing: `GW_GIT_IDENTITY`),
+then
+the include file (an account's `name`/`email` there wins) and
+`core.sshCommand` (the ssh stand-in), all as `GIT_CONFIG_KEY_n`/`VALUE_n`
+in the child's environment (never on a command line),
+`GIT_CONFIG_GLOBAL=$DATA/git/global` (0444, init defaults the user's older
+git and IDE can read, git-lfs's filters, `user.useConfigOnly = true` so git
+refuses to commit rather than guess `you@hostname`) and
+`GIT_CONFIG_NOSYSTEM=1`; it
+refuses guarded `-c`/`--config-env` pairs (`GUARDED_C`) and guarded
+`git config` writes (`GUARDED`). Local commands (status, log, commit) still
+run there while the vault is locked, the entry is disabled or the form is
+missing; anything that contacts a configured remote is refused with the
+entry's refusal (lead decision 19.9). Remote commands read the vault and the
+recorded mode and judge each configured entry (`git_decisions`: a host's ssh
+right and read/write restrictions, an account's use, credential and write).
+The hook judges `push|fetch|pull|clone|ls-remote`, `remote update` and
+`submodule update` up front (`hooks_bash._git_judge`) and writes a record
+for each stage it asks about (`asks.record`); the stand-in passes an "ask"
+on only with a matching record (`asks.take`: same Claude Code, folder,
+tool, words and entries, at most 15 minutes old, used once), else "run `git
+push ...` as its own command". The mark `GW_GATED_GIT` tells the ssh stand-in and the
+helper the gated git started which mode and entries applied
+(`gated_parent`, believed only for the gated git's own process tree). One
+pass-through audit line per remote command, never for `git status`. The
+stand-in's pass-through costs about one Python start plus one `git config`
+(budget 80 ms on macOS arm64; `test_git_standin`).
+
+**Browser sign-in** (PLAN-0.11 §7; gated's side is
+[daemon.md](daemon.md#browser-sign-in)). An azure account with `sign_in =
+"browser"` (a public client's `client_id` required; `scope` shapes only the
+authorization request, `offline_access` added) and every ml-catalog account
+(authority `entra.authority()` with its own `tenant`, default
+"organizations"; the client id from the bound catalog's `/api/config`,
+pinned at sign-in; the scope fixed, `api://{clientId}/access_as_user`) sign
+in through gated: `gate check`/`gate login` take a sign-in lease
+(`entra.signin_start`), gated asks in its confirm dialog, opens the browser
+after Open, and stores the tokens in the vault; `gate` waits up to its
+budget (`signin_wait`) and exits 75 when the dialog is still open. Refresh
+is unchanged (`entra.access_token` mints from the stored refresh token and
+persists the rotated one). `accounts.entra_fits` is the one rule for whether
+a stored Entra credential fits the account: a browser sign-in for its
+tenant, client and scope (a catalog's: its tenant, pinned), or a service
+principal's secret or certificate for its tenant and client.
+`entra._entra_record` refuses one that doesn't fit the approved account
+(lead decision 19.5), so after an approved change of `tenant`,
+`client_id`, `sign_in` or `scope` the old credential and its cached tokens
+(cleared by `consent.approve`) aren't used until a new sign-in. A browser
+sign-in's refresh token isn't exported (lead decision 19.12): the import
+brings the account's settings, and it needs a new sign-in (`gate login
+NAME`).
 
 ## scrub.py (SPEC 11)
 
@@ -62,8 +168,9 @@ Python 3.12 stdlib only. Every credential use writes an audit line
   the ssh forms to https for **token-only** hosts (every account on the host has
   a token and no ssh key, from `vault_meta`); and `[includeIf
   "hasconfig:remote.*.url:…"]` identity includes for each owner of an account
-  that carries a commit `name`/`email`. **Never** emits the global
-  `[credential] helper =` reset (envfile does). Loopback hosts use `http`.
+  that carries a commit `name`/`email`. Each credential section clears the
+  helpers before it for its own URL only; there is no global reset (the
+  gated git reads no user or system config anyway). Loopback hosts use `http`.
 - `identity_files(form) -> {name: content}`: `[user]` include files
   (`identity-<account>`), values quoted/escaped.
 - `credential_main(argv) -> int`: `git-credential-gateway get|store|erase`.
@@ -98,7 +205,7 @@ Python 3.12 stdlib only. Every credential use writes an audit line
 ### Verified: `includeIf hasconfig` works from an env-provided include
 `/opt/local/bin/git` 2.55 and `/usr/bin/git` 2.54 (Apple Git-157) both honour
 `includeIf "hasconfig:remote.*.url:…"` when the including file is supplied
-through `GIT_CONFIG_COUNT`/`include.path` (the env-file mechanism), choosing the
+through `GIT_CONFIG_COUNT`/`include.path` (the gated git's mechanism), choosing the
 per-owner identity for https and ssh remotes under the owner and the global
 identity otherwise. **No fallback is needed.**
 
@@ -113,6 +220,22 @@ identity otherwise. **No fallback is needed.**
   an allowlist + forced endpoint variables + the credential in a temp config
   dir, runs the real binary from the pixi env by absolute path, streams output
   through the scrubber, audits.
+  - An account whose `use` (or credential policy) is "ask" in the session's
+    mode (lead decision 19.14): `_select` chooses as if Claude Code had asked
+    about every such account, and the chosen one is used only for a command
+    Claude typed (`ancestry.typed_by_claude`) with the approval hook's
+    record of it (`asks.standin`, `_unasked`); else "run `gh ...` as its own
+    command", the job or pane wording. The hook asks about the command
+    (`ask_accounts`: the account the stand-in will choose, `chosen`, with
+    the stage's GATE_ACCOUNT, when that one is "ask"; every "ask" account of
+    the tool's kinds for a GATE_ACCOUNT the hook can't spell out) and records
+    it; `chosen` shares the stand-ins' own choice (`_gh_pick`, `_hf_target`,
+    `_db_ws`, `_crane_target`, `_pijul_target`, `_az_account`) with no
+    record taken and no bound check. pre_bash.sh forwards a plain account
+    CLI while its stand-in exists and `$DATA/ask-clis` names it
+    (`consent.ask_clis`: an account of its kinds is "ask" in some mode).
+    `az` (a program's token, never a typed command) refuses an account
+    whose use is off or "ask".
   - gh → `GH_TOKEN`/`GH_ENTERPRISE_TOKEN`, `GH_HOST`, temp `GH_CONFIG_DIR`,
     prompts/browser off. Refuses `auth token|login|logout|refresh|setup-git|
     git-credential` wherever the word appears after `auth` (cobra finds the
@@ -170,7 +293,13 @@ identity otherwise. **No fallback is needed.**
 - `with_main(argv) -> int`: `gate with NAME -- CMD`. Only accounts with an
   approved `env`; var per kind (api-key→the key, huggingface→`HF_TOKEN`,
   github→`GH_TOKEN`); azure is refused (use `az`/http). Environment otherwise
-  inherited; output scrubbed; direct check applies.
+  inherited; output scrubbed; direct check applies. `_with_refused`: the
+  account's use in the session's mode off or waiting refuses, so does a
+  credential policy that refuses (`policy.decide`); either at "ask" hands
+  the key over only to a command Claude typed with the approval hook's
+  record of `gate with NAME -- CMD` (tool `gate`; the hook's
+  `_with_asks` asks and records it), else the script, job or pane
+  wording. Refusals are audited.
 - Owner helpers: `gh_owner`, `hf_owner`, `crane_owner`, plus
   `accounts.owner_from_*`. `resolve_tool(name, feature=None)` resolves a binary
   from the pixi env (never PATH); optional feature envs are installed on first
@@ -221,12 +350,15 @@ identity otherwise. **No fallback is needed.**
   registries are refused (crane does the exchange). Raises EntraError.
 - `acr_token(host, account)`: ARM-token → `/oauth2/exchange` → ACR refresh
   token, cached in cache.age (`acr:<host>`), for crane.
-- Sign-ins: `login_browser` / `login_device` (PKCE and device code) were
-  removed in PLAN-v4 phase 3 (no browser, web page or code to type
-  elsewhere). An existing refresh token keeps working; a service principal
-  (`client_secret` with the account's own `client_id` and `tenant`) mints
-  tokens with the client-credentials grant (`access_token` uses it when
-  there is no refresh token; `gate_setup.sp_token` checks a new one).
+- Sign-ins: the device-code sign-in stays removed (PLAN-v4 phase 3). A
+  service principal (`client_secret` or a certificate with the account's own
+  `client_id` and `tenant`) mints tokens with the client-credentials grant
+  (`gate_setup.sp_token` checks a new one). A refresh token is used only for
+  an account approved for browser sign-in and only when its stored record
+  says `kind: "browser"` and fits (`accounts.entra_fits`); an older
+  gateway's refresh token is never used. The browser sign-in itself is
+  gated's (`daemon/oauth.py`; above): `signin_start`/`signin_wait` here are
+  its client side.
   Authority from `testing.override(entra_authority=...)` in tests;
   production always login.microsoftonline.com (never an env var).
 - `urlopen(req, timeout=30)`, `opener()`, `tls_context()`, `is_redirect(e)`:
@@ -315,16 +447,13 @@ allow.
   the user is here.
 
 ## Known residual limits (the "determined program" class, README "Security and privacy")
-- The helper's parent check (like ancestry) compares the **basename** of the
-  parent's executable path. A program that copies a binary to a file named
-  `git-remote-https` (or `git-lfs`) and runs the helper from it passes. Only
-  a deliberate attack does this; pinning the parent to the system git's
-  exec-path would close it but would need a trust anchor Claude's PATH can't
-  influence.
-- The helper does not refuse custom CA settings (`GIT_SSL_CAINFO`,
-  `http.sslCAInfo`) or `http.curloptResolve`; with a local interceptor these
-  are equivalent to `sslVerify=false`. SPEC 9.4 doesn't list them, and
-  refusing would break users whose own git config trusts a corporate CA.
+- The helper's parent check is by executable path (since 0.11.0: the env's
+  own `libexec/git-core/git-remote-http(s)`, or the env's git below the
+  env's git-lfs, below the gated git), and it refuses proxy and CA settings
+  for the URL (`http.proxy`, `sslCAInfo`, `sslCAPath`, `sslBackend`,
+  `sslVerify`, a remote's own proxy, proxy and CA variables). `/git/config`
+  (the include) can still be written by Claude's commands like the rest of
+  the data folder.
 - **Tokens in a running tool's environment** (round 3): gh (`GH_TOKEN` /
   `GH_ENTERPRISE_TOKEN`), databricks (`DATABRICKS_TOKEN`), dvc under asiml
   (`AZURE_STORAGE_SAS_TOKEN`) and `gate with` (its variable) hold the

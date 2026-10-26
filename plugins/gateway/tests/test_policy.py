@@ -81,17 +81,21 @@ def test_a_bad_policy_key_or_value_fails_closed():
 def test_raising_or_removing_a_restriction_and_granting_forwarding_wait_for_the_ok():
     base = HOST + '[hosts.box.policy]\nexec = "deny"\n'
     e = run(base, HOST + '[hosts.box.policy]\nexec = "allow"\n')
-    assert any('policy exec "deny" -> "allow"' in c.what for c in e.pending_for("box"))
+    raised = ("policy exec: in Plan mode Claude Code decides; elsewhere no restriction (was: refused "
+              "in every mode)")
+    assert any(raised == c.what for c in e.pending_for("box")), e.pending
     assert e.hosts["box"].policy == {"exec": False}           # the approved value applies
     e = run(base, HOST)                                       # the table removed
-    assert any('policy exec "deny" -> unrestricted' in c.what for c in e.pending_for("box"))
+    assert any(raised == c.what for c in e.pending_for("box")), e.pending   # (absent: none)
     assert policy.decide(e, "exec", host="box").word is False
     e = run(HOST, HOST + '[hosts.box.policy]\nforward_agent = "allow"\n')
-    assert any("forward_agent off -> \"allow\"" in c.what for c in e.pending_for("box"))
+    assert any("policy forward_agent: in Plan mode Claude Code decides; elsewhere it is on (was: "
+               "off in every mode)" in c.what for c in e.pending_for("box")), e.pending
     assert policy.decide(e, "forward_agent", host="box").word is False
     # global restrictions belong to "settings"
     e = run('[policy]\nwrite = "deny"\n', '[policy]\nwrite = "ask"\n')
-    assert any(c.entry == "settings" and 'write "deny" -> "ask"' in c.what for c in e.pending)
+    assert any(c.entry == "settings" and c.what == "policy write: in every mode you are asked (was: "
+               "refused in every mode)" for c in e.pending), e.pending
     assert e.policy == {"write": False}
     # an account's
     gh = '[accounts.gh]\nkind = "github"\n'
@@ -280,7 +284,8 @@ def test_a_read_grant_never_implies_exec_write_elevation_or_credentials():
          'provision = "deny"\n'
          '[accounts.gh]\nkind = "github"\n[accounts.gh.policy]\ncredential = "deny"\n')
     e = run(f, f)
-    r = policy.rights(e, "box")
+    from gateway.daemon import lifecycle
+    r = lifecycle.contract_rights(e, host="box")
     assert r["read"] == "allow"
     assert r["exec"] == r["write"] == r["elevation"] == r["provision"] == "deny", r
     assert all(r[g] == "deny" for g in F.POLICY_GRANT)
@@ -706,28 +711,43 @@ def test_the_hook_decides_transfers_as_the_stand_in_will():
         assert _dec(out) == "deny" and "sftp can open any file on box" in _why(out), out
 
 
-def test_the_hook_refuses_credential_tools_reached_around_the_stand_ins_in_managed_mode():
+def test_the_hook_refuses_credential_tools_reached_around_the_stand_ins():
+    """PLAN-0.11 §1.7: a route around a stand-in is refused when it reaches a
+    configured target, in every mode, managed shell on or off; one that
+    reaches nothing configured is the user's own."""
+    around = ("/usr/bin/ssh box uptime", "/usr/bin/scp f box:/tmp/f", "env -i ssh box uptime",
+              "command -p ssh box uptime", "PATH=/usr/bin:/bin ssh box uptime",
+              "rsync -e /usr/bin/ssh -a d box:/tmp/d", "timeout 5 /usr/bin/ssh box true")
+    # nothing configured reached: this computer's sudo isn't configured, no
+    # github account, no repository with a configured remote in /tmp
+    theirs = ("/usr/bin/sudo -n true", "/opt/homebrew/bin/gh repo list",
+              "GIT_SSH_COMMAND=/usr/bin/ssh git fetch", "git -c core.sshCommand=/usr/bin/ssh fetch")
     with H.gateway_env() as env:
         env.write_form(HOST)
         consent.approve_all(env.form())
-        for c in ("/usr/bin/ssh box uptime", "/usr/bin/scp f box:/tmp/f", "/usr/bin/sudo -n true",
-                  "env -i ssh box uptime", "command -p ssh box uptime",
-                  "PATH=/usr/bin:/bin ssh box uptime", "GIT_SSH_COMMAND=/usr/bin/ssh git fetch",
-                  "rsync -e /usr/bin/ssh -a d box:/tmp/d", "git -c core.sshCommand=/usr/bin/ssh fetch",
-                  "/opt/homebrew/bin/gh repo list", "timeout 5 /usr/bin/ssh box true"):
+        for c in around:
             for mode in ("auto", "default"):
                 out = _hook(c, mode)
                 assert _dec(out) == "deny" and "around the gateway" in _why(out), (c, mode, out)
+        for c in theirs:
+            for mode in ("auto", "default"):
+                assert _dec(_hook(c, mode)) is None, (c, mode)
         # routed or harmless: git and rsync by path use the gateway's ssh; reading the binary is no route
         for c in ("/usr/bin/git fetch", "cat /usr/bin/ssh", "ssh box uptime", "rsync -a d box:/tmp/d"):
             assert _dec(_hook(c)) != "deny", c
-        # managed mode off: not this rule's business
+        # this computer's sudo configured: sudo by its path goes around it
+        env.write_form(HOST + '[hosts.localhost]\nsudo = true\n')
+        consent.approve_all(env.form())
+        out = _hook("/usr/bin/sudo -n true")
+        assert _dec(out) == "deny" and "around the gateway" in _why(out), out
+        # managed mode off: the same (the route checks hold in every mode)
         env.write_form(HOST + '[shell]\nmanaged = "off"\n')
         consent.approve_all(env.form())
-        assert _dec(_hook("/usr/bin/ssh box uptime")) is None
+        assert _dec(_hook("/usr/bin/ssh box uptime")) == "deny"
+        assert _dec(_hook("/usr/bin/sudo -n true")) is None
 
 
-def test_the_hook_refuses_routes_it_cant_follow_in_managed_mode():
+def test_the_hook_refuses_routes_it_cant_follow():
     # typed commands whose credential tool the parser can't resolve: a shell string,
     # eval/exec, a function, a variable as the program, find -exec, PATH or a
     # transport variable changed earlier in the same command, combined options
@@ -735,7 +755,7 @@ def test_the_hook_refuses_routes_it_cant_follow_in_managed_mode():
         "sh -c '/usr/bin/ssh box uptime'", "bash -lc \"/usr/bin/ssh box uptime\"",
         "nohup bash -c '/usr/bin/ssh box true'", "echo '/usr/bin/ssh box id' | sh",
         "eval '/usr/bin/ssh box uptime'", "exec /usr/bin/ssh box uptime",
-        "ssh(){ /usr/bin/ssh \"$@\"; }; ssh box uptime", "function ssh { command -p ssh \"$@\"; }",
+        "ssh(){ /usr/bin/ssh \"$@\"; }; ssh box uptime",
         "s=/usr/bin/ssh; $s box uptime", "x=/usr/bin; \"$x/ssh\" box uptime",
         "for t in ssh; do $t box uptime; done", "$(which -a ssh | tail -1) box uptime",
         "\"$SSH_BIN\" box uptime", "$X box uptime",
@@ -745,13 +765,19 @@ def test_the_hook_refuses_routes_it_cant_follow_in_managed_mode():
         "find . -maxdepth 0 -execdir sh -c '/usr/bin/ssh box true' \\;",
         "export PATH=/usr/bin:/bin; ssh box uptime", "export PATH=/usr/bin:/bin && sudo -n id",
         "PATH=/usr/bin:/bin; ssh box uptime", "unset PATH; ssh box uptime",
-        "hash -p /usr/bin/ssh ssh; ssh box uptime", "declare -x PATH=/usr/bin; gh repo list",
-        "export GIT_SSH_COMMAND=/usr/bin/ssh; git fetch", "export RSYNC_RSH=/usr/bin/ssh; rsync -a d box:/x",
-        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand; git fetch",
-        "env -- PATH=/usr/bin ssh box uptime", "env GIT_CONFIG_PARAMETERS=x git fetch",
-        "git -ccore.sshCommand=/usr/bin/ssh fetch", "git config core.sshCommand /usr/bin/ssh",
-        "git config --global ssh.variant ssh", "rsync -ae /usr/bin/ssh d box:/tmp/d",
+        "hash -p /usr/bin/ssh ssh; ssh box uptime", "export RSYNC_RSH=/usr/bin/ssh; rsync -a d box:/x",
+        "env -- PATH=/usr/bin ssh box uptime", "rsync -ae /usr/bin/ssh d box:/tmp/d",
         "rsync -aze/usr/bin/ssh d box:/tmp/d", "rsync -avze '/usr/bin/ssh -v' d box:/tmp/d",
+    ]
+    # the same shapes reaching nothing configured (PLAN-0.11 §1.7: no github
+    # account, no repository with a configured remote in /tmp, nothing "ask"
+    # and no configured name in a function's text): the user's own
+    theirs = [
+        "function ssh { command -p ssh \"$@\"; }", "declare -x PATH=/usr/bin; gh repo list",
+        "export GIT_SSH_COMMAND=/usr/bin/ssh; git fetch",
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand; git fetch",
+        "env GIT_CONFIG_PARAMETERS=x git fetch", "git -ccore.sshCommand=/usr/bin/ssh fetch",
+        "git config core.sshCommand /usr/bin/ssh", "git config --global ssh.variant ssh",
     ]
     harmless = [
         "ssh box uptime", "export PATH=\"$PATH:/opt/tools/bin\"; make", "bash -c 'echo hi'",
@@ -769,17 +795,23 @@ def test_the_hook_refuses_routes_it_cant_follow_in_managed_mode():
         for c in routes:
             for mode in ("auto", "default", "bypassPermissions"):
                 out = _hook(c, mode)
-                assert _dec(out) == "deny" and "around the gateway" in _why(out), (c, mode, out)
+                assert _dec(out) == "deny" and ("around the gateway" in _why(out) or
+                                                "hides the program or host" in _why(out)), \
+                    (c, mode, out)
+        for c in theirs:
+            for mode in ("auto", "default"):
+                assert _dec(_hook(c, mode)) is None, (c, mode, _why(_hook(c, mode)))
         for c in harmless:
             assert _dec(_hook(c)) != "deny", (c, _why(_hook(c)))
         # env's assignments after -- are still assignments: the program after them is judged
+        # (curl: a network command, asked about: PLAN-0.11 §3)
         out = _hook("env -- A=1 curl https://example.com")
-        assert _dec(out) == "deny" and "curl" in _why(out), out
-        # managed mode off: the person chose their own shell
+        assert _dec(out) == "ask" and "curl is a network command" in _why(out), out
+        # managed mode off: the same (PLAN-0.11 §1.7: in every mode)
         env.write_form(HOST + 'sudo = true\n[hosts.localhost]\nsudo = true\n[shell]\nmanaged = "off"\n')
         consent.approve_all(env.form())
         for c in routes:
-            assert _dec(_hook(c)) != "deny" or "around the gateway" not in _why(_hook(c)), c
+            assert _dec(_hook(c)) == "deny", c
 
 
 def test_the_target_of_sudo_is_named_before_it_runs():
@@ -858,7 +890,7 @@ def test_this_machines_inspection_and_imports_follow_its_policy():
                        '[hosts.localhost.policy]\nenv_import = "deny"\nread = "deny"\n')
         eff = consent.compute(env.form(), vault.load())
         assert "/opt/local/bin" not in [d for d, _o in managed.path_plan(eff)]
-        assert managed.env_plan(eff) == [] and "env=\n" in managed.conf_text(eff)
+        assert managed.env_plan(eff) == [] and "imports=\n" in managed.conf_text(eff)
         r = managed.inspect(None, str(env.root))
         assert r["ok"] is False and '[hosts.localhost.policy] read = "deny"' in r["error"], r
 

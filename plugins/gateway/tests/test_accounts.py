@@ -195,7 +195,7 @@ def test_select_owner_matched_by_a_live_and_a_pending_account_is_ambiguous():
 
 def test_select_respects_effective_rights_and_bound():
     f = F.parse_text('[accounts.gh]\nkind = "github"\npackages = true\n', Path("/x"))
-    data = {"approved": {"rights": {"settings": {"others": "refuse"}, "hosts": {},
+    data = {"approved": {"rights": {"settings": {"others": "refuse", "shell": {"managed": "on", "import_path": [], "import_env": []}}, "hosts": {},
                                     "accounts": {"gh": {"kind": "github", "use": True,
                                                         "destinations": ["github.com", "api.github.com"]}}}},
             "accounts": {"gh": {"kind": "github", "bound": {"hosts": ["github.com", "api.github.com"]}}}}

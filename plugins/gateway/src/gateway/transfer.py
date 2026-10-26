@@ -1,6 +1,6 @@
 """Export, import, copy-to and pubkey (SPEC 16).
 
-Export (format 3, PLAN-v4 phase 7; formats 1 and 2 are still read):
+Export (format 3, PLAN-v4 phase 7, the only one read):
 `{gateway_export: 3, schema: 3, created, form: <text>, vault: <the picked
 entries' records>, from: {machine_id, name, hostname, user, ssh_host_keys},
 items: [...], digest}`, encrypted with an age passphrase (age's scrypt
@@ -8,8 +8,10 @@ recipient; age reads passphrases only from a terminal, so it runs under a
 private pty; the plaintext goes through a FIFO in a 0700 temp dir, never a
 regular file). The selection is per item (`export_items`): each host, its
 secrets (keys, sudo passwords), each account, its credentials, the shared
-settings ([settings], [shell], [policy], [vault]) and this machine's sudo password
-(unticked by default), as a checklist in the native dialog; the passphrase is
+settings ([shell], [policy], [network], [vault]), this machine's settings
+([hosts.localhost]: sudo, scripts, policy, workspaces; never an address) and
+its sudo password (both unticked by default), as a checklist in the native
+dialog; the passphrase is
 typed twice in its private field (at least 12 characters). The digest is a
 sha256 over the rest, checked on import beside age's own authentication; the
 file never holds a process id, socket, terminal or job id, task reference or
@@ -18,8 +20,8 @@ file, never inside a git work tree, a cloud-synced folder or the gateway home
 (default ~/Downloads/gateway-YYYYMMDD.age). The form text in the file is
 generated from the validated entries that were ticked.
 
-Import (format 1 through migrate.map_export_v1, 2 or 3; a newer format is
-refused with "made by a newer gateway"): decrypt (a passphrase dialog: a
+Import (format 3; a newer format is refused with "made by a newer gateway",
+an older one as unsupported): decrypt (a passphrase dialog: a
 wrong passphrase asks again, a damaged or altered file stops with "the file
 was changed or damaged"; or this machine's own key for a file encrypted to
 it), check the schema and the digest, validate everything as strictly as the
@@ -30,14 +32,30 @@ password moves to localhost; the source machine's localhost becomes a host
 named after it with address user@hostname and ssh = false), resolve each
 conflicting item in its own dialog (keep this machine's, replace with the
 file's, add the file's under a new name; for a host key, keep or take the
-pin), show one consent dialog (default Cancel), then apply it staged
+pin; for the file's settings for this machine, keep or replace this
+machine's own [hosts.localhost]), show one consent dialog (default Cancel)
+listing every change an approval would make, each line naming its entry
+(each entry's consent lines, the settings' too, and what a new entry brings
+beyond them, one key per line: its policy and forwarding grants, a host's
+imports and workspaces; settings changes that already waited for the OK in
+this machine's own form under a heading of their own, never as the file's),
+every line whole (a long one goes on in continuation lines; a list longer
+than one dialog in parts the person goes through before anything is
+imported: `confirm_pages`), then apply it staged
 (`apply_import`): the new form text and merged vault are built and checked
 in memory, both are backed up to ~/.config/gateway/private/backups/import-*, the
 vault is written, then the form (each atomically), and any failure restores
-both. Then exactly the shown changes are approved and the imported
-credentials are checked through their adapters (`verify_imported`): a
-refresh token from another machine that doesn't check out is marked as
-needing a fresh sign-in.
+both. Then exactly the shown changes are approved (each entry's and the
+settings', in that one dialog: nothing is left waiting for a second one
+unless the form changed while it was open, which the result says; a peer
+import, which shows this machine no dialog, leaves the settings waiting when
+this machine's own already had changes waiting) and the imported
+credentials are checked through their adapters (`verify_imported`). A
+browser sign-in's refresh token is never exported (PLAN-0.11 §19.12: it is
+the other machine's session state, which could never be used here, and a
+file holding one is refused): the account's settings come over, and the
+result names it as needing a new sign-in (`gate login NAME` in a Claude
+Code session).
 
 copy-to HOST: only to a form host whose host key was pinned before this
 session; the user ticks the groups and types the host name in the dialog; the
@@ -86,7 +104,7 @@ from . import audit, consent, hooks_session, paths, popup, testing, vault
 from . import form as formmod
 
 FORMAT = 3                        # PLAN-v4 phase 7: per-item selection, settings, a digest
-FORMATS = (1, 2, 3)
+FORMATS = (3,)
 MAX_CONFLICT_DIALOGS = 12           # more conflicting items than that: the rest keep this machine's
 MAX_FILE = 5_000_000
 AGE_TIMEOUT = 120
@@ -98,6 +116,10 @@ SYNC_NAMES = ("dropbox", "onedrive", "google drive", "googledrive", "icloud driv
               "creative cloud files", "seafile", "tresorit")
 SHELLS = ("sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "tcsh", "csh", "env")
 RECIPIENT_RE = re.compile(r"age1[0-9a-z]{58}")
+# what a file's account sign-in may hold: a service principal's secret or
+# certificate and what it is for; never a browser sign-in's refresh token
+# (PLAN-0.11 §19.12)
+ENTRA_FIELDS = ("client_secret", "client_certificate", "client_id", "tenant_id", "refreshed", "kind")
 
 
 class TransferError(Exception):
@@ -362,15 +384,20 @@ def _doc(text: str) -> dict[str, Any]:
         return {}
 
 
+# An entry's sub-tables; any other table-valued key is a per-mode value
+# (PLAN-0.11 §2: ssh = { default = "ask", auto = true }), written inline.
+SUBTABLES = ("policy", "shell", "workspaces")
+
+
 def entry_tables(sect: str, name: str, t: dict[str, Any]) -> list[tuple[str, list[tuple[str, Any]]]]:
     """An entry's tables as the form writes them (PLAN-v4 phase 7): its own
-    keys, then each sub-table on its own ([hosts.NAME.policy],
-    [hosts.NAME.shell], [hosts.NAME.workspaces.WS]), so a later edit can
-    change one key line."""
-    own = [(k, v) for k, v in t.items() if not isinstance(v, dict)]
+    keys (a per-mode value as its inline table), then each sub-table on its
+    own ([hosts.NAME.policy], [hosts.NAME.shell], [hosts.NAME.workspaces.WS]),
+    so a later edit can change one key line."""
+    own = [(k, v) for k, v in t.items() if not (isinstance(v, dict) and k in SUBTABLES)]
     out: list[tuple[str, list[tuple[str, Any]]]] = [(f"{sect}.{name}", own)]
     for k, v in t.items():
-        if not isinstance(v, dict):
+        if not isinstance(v, dict) or k not in SUBTABLES:
             continue
         if k == "workspaces":
             for wn, wt in v.items():
@@ -391,13 +418,33 @@ def _tables_text(tables: list[tuple[str, list[tuple[str, Any]]]]) -> list[str]:
     return out
 
 
-SETTINGS_TABLES = ("settings", "shell", "policy", "vault")
+# The shared settings tables an export carries as one item (PLAN-0.11 §9.3).
+SETTINGS_TABLES = ("shell", "policy", "network", "vault")
+SETTINGS_LABEL = "Settings ([shell], [policy], [network], [vault])"
+# This machine's settings (PLAN-0.11 §9.3): [hosts.localhost]'s sudo,
+# scripts, policy and workspaces, never an address. Their own item, unticked
+# by default; on import a keep/replace choice for that machine's own
+# [hosts.localhost] (separate from the source machine becoming a named host).
+LOCALHOST_KEYS = ("sudo", "scripts", "policy", "workspaces")
+LOCALHOST_ITEM = "localhost-settings"
+LOCALHOST_LABEL = "This machine's settings ([hosts.localhost]: sudo, scripts, policy, workspaces)"
+
+
+def localhost_table(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """[hosts.localhost] as an export carries it (LOCALHOST_KEYS only), or
+    None when the form says nothing about this machine."""
+    t = (raw.get("hosts") or {}).get("localhost")
+    if not isinstance(t, dict):
+        return None
+    out = {k: t[k] for k in LOCALHOST_KEYS if k in t}
+    return out or None
 
 
 def entries_text(raw: dict[str, Any], hosts: list[str], accts: list[str],
-                 comment: str | None = None, settings: bool = False) -> str:
-    """TOML tables for the given entries (and the settings tables), from
-    their parsed (validated) tables."""
+                 comment: str | None = None, settings: bool = False,
+                 localhost: bool = False) -> str:
+    """TOML tables for the given entries (and the settings tables, and this
+    machine's settings), from their parsed (validated) tables."""
     out: list[str] = []
     if comment:
         out.append(f"# {comment}")
@@ -406,6 +453,9 @@ def entries_text(raw: dict[str, Any], hosts: list[str], accts: list[str],
             v = raw.get(t)
             if isinstance(v, dict) and v:
                 out += _tables_text([(t, list(v.items()))])
+    lt = localhost_table(raw) if localhost else None
+    if lt:
+        out += _tables_text(entry_tables("hosts", "localhost", lt))
     for sect, names in (("hosts", hosts), ("accounts", accts)):
         for n in names:
             t = (raw.get(sect) or {}).get(n)
@@ -418,7 +468,7 @@ def entries_text(raw: dict[str, Any], hosts: list[str], accts: list[str],
 @dataclass
 class ExportItem:
     key: str              # "host:NAME", "host-secrets:NAME", "account:NAME", "account-secrets:NAME",
-                          # "settings", "localhost-sudo"
+                          # "settings", "localhost-settings", "localhost-sudo"
     label: str            # what the selection pane shows (fixed words and validated names)
     checked: bool = True
 
@@ -434,20 +484,31 @@ def _secret_words(kind: str, rec: dict[str, Any]) -> list[str]:
         words.append("client certificate")
     elif e.get("client_secret"):
         words.append("client secret")
-    elif e.get("refresh_token"):
-        words.append("refresh token (session state: needs a fresh sign-in after import)")
+    # (a browser sign-in's refresh token is never exported: PLAN-0.11 §19.12)
     return words
+
+
+def _exported_entra(e: Any) -> dict[str, Any] | None:
+    """An account's sign-in as a file carries it: a service principal's
+    secret or certificate with what it is for, never a browser sign-in's
+    refresh token (PLAN-0.11 §19.12: the other machine's session state; the
+    account needs a new sign-in there); None when nothing is left."""
+    if not isinstance(e, dict) or not (e.get("client_secret") or e.get("client_certificate")):
+        return None
+    return {k: v for k, v in e.items() if k in ENTRA_FIELDS}
 
 
 def export_items(form: formmod.Form, data: dict[str, Any]) -> list[ExportItem]:
     """What the selection pane offers, one item each (PLAN-v4 phase 7): every
     host and account entry, its secrets (SSH keys and sudo passwords, a
     token, a client secret or certificate) as their own item, the settings
-    tables, and this machine's sudo password (unticked)."""
+    tables, this machine's settings and its sudo password (both unticked)."""
     items: list[ExportItem] = []
     raw = _doc(form.used_text)
     if any(isinstance(raw.get(t), dict) and raw.get(t) for t in SETTINGS_TABLES):
-        items.append(ExportItem("settings", "Settings ([settings], [shell], [policy], [vault])"))
+        items.append(ExportItem("settings", SETTINGS_LABEL))
+    if localhost_table(raw):
+        items.append(ExportItem(LOCALHOST_ITEM, LOCALHOST_LABEL, checked=False))
     for n, h in form.hosts.items():
         if not h.explicit or h.is_local:
             continue
@@ -503,8 +564,6 @@ def export_content(form: formmod.Form, data: dict[str, Any], picked: set[str]) -
     hosts = [n for n, h in form.hosts.items() if h.explicit and not h.is_local and f"host:{n}" in keys]
     accts = [n for n in form.accounts if f"account:{n}" in keys]
     v = vault.export_view(data)
-    for k in ("machine", "migrated", "imported", "cache"):
-        v.pop(k, None)
     vh: dict[str, Any] = {}
     for n in hosts:
         r = dict((v.get("hosts") or {}).get(n) or {})
@@ -523,6 +582,9 @@ def export_content(form: formmod.Form, data: dict[str, Any], picked: set[str]) -
             for k in consent.CREDENTIAL_FIELDS:
                 if k != "host_keys":
                     r.pop(k, None)
+        e = _exported_entra(r.pop("entra", None))
+        if e is not None:
+            r["entra"] = e
         va[n] = r
     v["accounts"] = va
     if "localhost-sudo" not in keys:
@@ -530,7 +592,8 @@ def export_content(form: formmod.Form, data: dict[str, Any], picked: set[str]) -
     keep = set(hosts) | set(accts)
     v["aliases"] = {a: t for a, t in (v.get("aliases") or {}).items() if t in keep}
     c = {"gateway_export": FORMAT, "schema": FORMAT, "created": vault.now(),
-         "form": entries_text(raw, hosts, accts, "exported by gateway", settings="settings" in keys),
+         "form": entries_text(raw, hosts, accts, "exported by gateway", settings="settings" in keys,
+                              localhost=LOCALHOST_ITEM in keys),
          "vault": v, "from": source_info(data), "items": sorted(keys)}
     c["digest"] = _digest(c)
     return c
@@ -608,8 +671,9 @@ def _ssh_key(rec: Any, what: str) -> dict[str, Any]:
 
 
 def validate_vault(v: Any, form: formmod.Form) -> dict[str, Any]:
-    """The file's vault part, checked field by field (unknown fields refused)."""
-    _keys(v, "vault", ("version", "localhost", "hosts", "accounts", "aliases", "events_seen"))
+    """The file's vault part, checked field by field (unknown fields refused:
+    only what an export writes, vault.EXPORT_KEYS)."""
+    _keys(v, "vault", vault.EXPORT_KEYS)
     if v.get("version") not in (None, 3):
         raise TransferError("gateway: the file is from another gateway version; nothing was imported")
     out: dict[str, Any] = {"version": 3, "localhost": {"sudo": {}}, "hosts": {}, "accounts": {},
@@ -655,10 +719,10 @@ def validate_vault(v: Any, form: formmod.Form) -> dict[str, Any]:
             k = _ssh_key(rec["ssh_key"], f"account {n} ssh key")
             r["ssh_key"] = {"private": k["private"], "public": k["public"], "fingerprint": k["fingerprint"]}
         if rec.get("entra") is not None:
-            e = _keys(rec["entra"], f"account {n} sign-in",
-                      ("refresh_token", "client_secret", "client_certificate", "client_id",
-                       "tenant_id", "refreshed", "scope", "kind"))
-            if e.get("client_certificate") and not e.get("refresh_token"):
+            # a service principal's secret or certificate only: a browser
+            # sign-in's refresh token is never in a file (PLAN-0.11 §19.12)
+            e = _keys(rec["entra"], f"account {n} sign-in", ENTRA_FIELDS)
+            if e.get("client_certificate"):
                 from . import adapters
                 pem = _s(e.get("client_certificate"), f"account {n} certificate", 16384,
                          optional=False)
@@ -668,20 +732,14 @@ def validate_vault(v: Any, form: formmod.Form) -> dict[str, Any]:
                     raise TransferError(f"gateway: the file's account {n} certificate isn't valid; "
                                         "nothing was imported") from None
                 r["entra"] = {"client_certificate": pem, "kind": "service-principal"}
-            elif e.get("client_secret") and not e.get("refresh_token"):
+            else:
                 r["entra"] = {"client_secret": _s(e.get("client_secret"),
                                                   f"account {n} client secret", optional=False),
                               "kind": "service-principal"}
-            else:
-                r["entra"] = {"refresh_token": _s(e.get("refresh_token"), f"account {n} sign-in",
-                                                  optional=False)}
             r["entra"] |= {"client_id": _s(e.get("client_id"), f"account {n} client", 64, formmod.GUID_RE),
                           "tenant_id": _s(e.get("tenant_id"), f"account {n} tenant", 100,
                                           re.compile(r"[A-Za-z0-9.-]{1,100}")),
                           "refreshed": _s(e.get("refreshed"), f"account {n}", 40)}
-            if e.get("scope"):
-                r["entra"]["scope"] = _s(e.get("scope"), f"account {n} scope", 200,
-                                         re.compile(r"[A-Za-z0-9:/._~-]{1,200}"))
         if rec.get("host_keys") is not None:
             r["host_keys"] = _host_keys(rec.get("host_keys"), f"account {n} host keys")
         if rec.get("bound") is not None:
@@ -722,7 +780,6 @@ class Incoming:
     source: dict[str, Any]
     source_sudo: dict[str, Any] = field(default_factory=dict)   # the source machine's own sudo
     created: str = ""
-    report: str = ""
 
 
 def _source(v: Any, fallback_host: str = "") -> dict[str, Any]:
@@ -749,41 +806,27 @@ def parse_incoming(obj: Any) -> Incoming:
     if not isinstance(obj, dict):
         raise TransferError("gateway: this isn't a gateway export; nothing was imported")
     fmt = obj.get("gateway_export")
-    if fmt == 1:
-        from . import migrate
-        try:
-            m = migrate.map_export_v1(obj, local_user=paths.local_user())
-        except migrate.MigrationError as e:
-            raise TransferError(f"gateway: the 0.6 export couldn't be read ({formmod.strip_unsafe(str(e))[:120]}); "
-                                "nothing was imported") from None
-        form = formmod.parse_text(m.form_text)
-        if form.syntax_error is not None:
-            raise TransferError("gateway: the 0.6 export didn't convert cleanly; nothing was imported")
-        v = m.vault
-        vv = validate_vault({k: v.get(k) for k in ("localhost", "hosts", "accounts", "aliases")
-                             if v.get(k) is not None}, form)
-        src = _source({}, str(obj.get("from_host") or ""))
-        sudo = _sudo_map((m.source_localhost or {}).get("sudo") or {}, "source sudo")
-        return Incoming(1, form, _doc(m.form_text), vv, src, sudo, str(obj.get("created", ""))[:40],
-                        m.report)
-    if isinstance(fmt, int) and not isinstance(fmt, bool) and fmt > FORMAT:
+    is_int = isinstance(fmt, int) and not isinstance(fmt, bool)
+    if is_int and fmt > FORMAT:
         raise TransferError(f"gateway: the file is from a newer gateway (export format {fmt}; this "
-                            f"gateway reads up to {FORMAT}); update the gateway plugin, then import "
+                            f"gateway reads {FORMAT}); update the gateway plugin, then import "
                             "it; nothing was imported")
+    if is_int and 0 < fmt < FORMAT:
+        raise TransferError(f"gateway: the file is from an older gateway (export format {fmt}, "
+                            f"which this gateway doesn't read; it reads {FORMAT}); nothing was "
+                            "imported. Gateway 0.10.0 imports it, and its own export can be "
+                            "imported here")
     if fmt not in FORMATS:
         raise TransferError("gateway: this isn't a gateway export; nothing was imported")
-    if fmt == 2:
-        _keys(obj, "export", ("gateway_export", "created", "form", "vault", "from"))
-    else:
-        _keys(obj, "export", ("gateway_export", "schema", "created", "form", "vault", "from",
-                              "items", "digest"))
-        if obj.get("schema") != fmt:
-            raise TransferError("gateway: the file's schema version doesn't match its format; "
-                                "nothing was imported")
-        dg = obj.get("digest")
-        if not isinstance(dg, str) or not re.fullmatch(r"[0-9a-f]{64}", dg) or dg != _digest(obj):
-            raise TransferError("gateway: the file's contents don't match their checksum (it was "
-                                "changed or damaged after it was written); nothing was imported")
+    _keys(obj, "export", ("gateway_export", "schema", "created", "form", "vault", "from",
+                          "items", "digest"))
+    if obj.get("schema") != fmt:
+        raise TransferError("gateway: the file's schema version doesn't match its format; "
+                            "nothing was imported")
+    dg = obj.get("digest")
+    if not isinstance(dg, str) or not re.fullmatch(r"[0-9a-f]{64}", dg) or dg != _digest(obj):
+        raise TransferError("gateway: the file's contents don't match their checksum (it was "
+                            "changed or damaged after it was written); nothing was imported")
     text = _s(obj.get("form"), "form", 1_000_000, optional=False)
     form = formmod.parse_text(text)
     if form.syntax_error is not None:
@@ -811,11 +854,14 @@ class Conflict:
     """An item of the file that meets one of this machine's (PLAN-v4 phase
     7): what differs, and the choices the person gets for it."""
     name: str
-    section: str                       # hosts | accounts | settings
+    section: str                       # hosts | accounts | settings | localhost (this machine's)
     diffs: list[str]
     options: list[tuple[str, str]]     # (choice, label)
 
     def question(self) -> str:
+        if self.section == "localhost":
+            return ("The file's settings for this machine ([hosts.localhost]) differ from yours: "
+                    + "; ".join(self.diffs)[:400] + ". What should the import do with them?")
         what = "the settings" if self.section == "settings" else f"{self.section[:-1]} {self.name}"
         return (f"The file's {what} differs from yours: " + "; ".join(self.diffs)[:400]
                 + ". What should the import do with it?")
@@ -842,6 +888,15 @@ class ImportPlan:
     tables: list[tuple[str, list[tuple[str, Any]], str]] = field(default_factory=list)
     vault_add: dict[str, Any] = field(default_factory=dict)
     changes: dict[str, list[str]] = field(default_factory=dict)   # consent lines per entry
+    # what an added or replaced entry brings beyond its consent lines (a new
+    # host's are its address and rights only): its policy, forwarding grants,
+    # [hosts.NAME.shell] imports and workspaces; the settings' imports
+    details: dict[str, list[str]] = field(default_factory=dict)
+    # settings changes that were already waiting for the user's OK in this
+    # machine's own form before the import (Claude may have written them):
+    # never shown as the file's; approved with the file's settings only where
+    # the dialog lists them under their own heading (never by a peer import)
+    waiting_settings: list[str] = field(default_factory=list)
 
     def lines(self, inc: Incoming, label: str) -> list[str]:
         out = [f"Import {label}" + (f" (from {inc.source['name']}" + (f", {inc.created[:10]}" if inc.created else "") + ")"
@@ -851,18 +906,34 @@ class ImportPlan:
         elif self.this_host:
             out.append(f"This machine is {self.this_host} in the file (found by {self.how}): it isn't "
                        "added as a host" + ("; its sudo password becomes this machine's" if self.localhost_sudo else "") + ".")
+
+        def entry_lines(n: str) -> None:
+            # each line names its entry: a long list stays readable in parts
+            shown = {"localhost": "this machine", "settings": "settings"}.get(n, n)
+            for c in self.changes.get(n, []) + self.details.get(n, []):
+                out.append(f"  - {shown}: {c}")
         added = self.add_hosts + self.add_accounts
         if added:
             out.append("Adds: " + ", ".join(added) + ".")
-        for n in added + self.replace + list(self.renames.values()):
-            for c in self.changes.get(n, []):
-                out.append(f"  - {n}: {c}" if n not in added else "  - " + c)
+            for n in added:
+                entry_lines(n)
         if self.replace:
-            out.append("Replaces yours with the file's: " + ", ".join(self.replace) + ".")
+            out.append("Replaces yours with the file's: "
+                       + ", ".join(_replaced_name(n) for n in self.replace) + ".")
+            for n in self.replace:
+                entry_lines(n)
         if self.renames:
             out.append("Adds under new names: " + ", ".join(f"{a} as {b}" for a, b in self.renames.items()) + ".")
+            for n in self.renames.values():
+                entry_lines(n)
         if self.settings_add:
             out.append("Adds settings: " + ", ".join(f"[{t}]" for t in self.settings_add) + ".")
+            if "settings" not in self.replace:      # else listed once, with the replace
+                entry_lines("settings")
+        if self.waiting_settings and self.changes.get("settings"):
+            out.append("Also approves changes already waiting for your OK in this machine's own "
+                       "settings (made here before the import, not from the file):")
+            out += [f"  - settings: {c}" for c in self.waiting_settings]
         if self.source_host:
             out.append(f"{self.source_host} is the machine the file came from (ssh stays off until you turn it on).")
         if self.fill:
@@ -882,6 +953,126 @@ class ImportPlan:
     def nothing(self) -> bool:
         return not (self.add_hosts or self.add_accounts or self.fill or self.localhost_sudo or
                     self.replace or self.renames or self.settings_add or self.take_pins)
+
+
+def _replaced_name(n: str) -> str:
+    return {"settings": "the settings",
+            "localhost": "this machine's settings ([hosts.localhost])"}.get(n, n)
+
+
+def _word(v: Any) -> str:
+    """A value as gateway.toml spells it (a per-mode table inline)."""
+    try:
+        return formmod.toml_value(v)
+    except formmod.FormWriteError:
+        return "?"
+
+
+def entry_details(sect: str, t: dict[str, Any]) -> list[str]:
+    """What an entry's tables bring beyond its consent lines (a new host's
+    say only its address and rights), one line each, so a long per-mode value
+    never pushes another off the dialog: each policy key (a forwarding grant
+    named as such), a host's [hosts.NAME.shell] imports, each workspace and
+    each of its keys."""
+    out: list[str] = []
+    pol = t.get("policy")
+    if isinstance(pol, dict) and pol:
+        for k, v in pol.items():
+            grant = k in formmod.POLICY_GRANT
+            out.append(f"policy {k} = {_word(v)}" + (" (a forwarding grant)" if grant else ""))
+    sh = t.get("shell")
+    if sect == "hosts" and isinstance(sh, dict) and sh:
+        for k in ("import_env", "import_path"):
+            v = sh.get(k)
+            if isinstance(v, list) and v:
+                out.append("imports on the host: " + ("environment " if k == "import_env" else "PATH ")
+                           + ", ".join(str(x) for x in v))
+    ws = t.get("workspaces")
+    if sect == "hosts" and isinstance(ws, dict):
+        for wn, w in ws.items():
+            if not isinstance(w, dict):
+                continue
+            line = f"workspace {wn}: {w.get('root', '?')}"
+            if w.get("local"):
+                line += f" (here {w['local']})"
+            out.append(line)
+            out += [f"workspace {wn} {k} = {_word(w[k])}" for k in formmod.WORKSPACE_POLICY_KEYS
+                    if k in w]
+    return out
+
+
+def settings_details(raw: dict[str, Any], tables: list[str]) -> list[str]:
+    """The settings an import brings that the consent lines say less about:
+    the [shell] imports, a PATH import that isn't a folder on this machine
+    named as such (reqcheck 35)."""
+    out: list[str] = []
+    sh = raw.get("shell") if "shell" in tables else None
+    if isinstance(sh, dict):
+        for p in sh.get("import_path") or []:
+            if isinstance(p, str):
+                where = p.replace("~", str(paths.user_home()), 1) if p.startswith("~") else p
+                if not os.path.isdir(where):
+                    out.append(f"PATH import {p} isn't a folder on this machine")
+    return out
+
+
+MAX_CONFIRM_PAGES = 10     # an import's confirm in parts; more is refused (export fewer items)
+_CONT = "      "           # a long line's continuation
+
+
+def fit_lines(lines: list[str], width: int) -> list[str]:
+    """Each line no longer than `width` (popup.confirm cuts there): a longer
+    one goes on in indented continuation lines, broken after a comma or a
+    semicolon, else at a space, so nothing an approval adds is cut off."""
+    out: list[str] = []
+    for ln in lines:
+        cur = ln
+        while len(cur) > width:
+            low = len(_CONT) + 10
+            cut = max(cur.rfind(", ", 0, width), cur.rfind("; ", 0, width))
+            if cut > low:
+                piece, rest = cur[:cut + 1], cur[cut + 2:]
+            else:
+                sp = cur.rfind(" ", low, width)
+                piece, rest = (cur[:sp], cur[sp + 1:]) if sp > low else (cur[:width], cur[width:])
+            out.append(piece)
+            cur = _CONT + rest
+        out.append(cur)
+    return out
+
+
+def confirm_pages(lines: list[str], width: int, max_rows: int) -> list[list[str]]:
+    """The import confirm as dialogs of lines of at most `width` characters
+    (gated's and popup's limits) that take at most `max_rows` rows of the
+    pane (popup.pane_rows): one, as before, when it fits; else parts
+    (popup.dialog_parts: "Part i of n" in the heading and again in the
+    question beside the buttons, a long line kept with its continuation
+    lines where they fit) that the user goes through one by one before
+    anything is imported. Every line an approval adds is shown whole: a
+    longer list is refused (TransferError), never cut short."""
+    body = fit_lines(lines, width)
+    one = body + ["", "Import this? Cancel changes nothing."]
+    if sum(popup.pane_rows(ln) for ln in one) <= max_rows:
+        return [one]
+    groups: list[list[str]] = []
+    for ln in body:                          # a line with its continuation lines
+        if groups and ln.startswith(_CONT):
+            groups[-1].append(ln)
+        else:
+            groups.append([ln])
+
+    def tail(i: int, n: int) -> list[str]:
+        return ["", f"Part {i} of {n}. " + (
+            f"Import all of this (parts 1 to {n})? Cancel changes nothing." if i == n else
+            f"Go on to part {i + 1} of {n}? Nothing is imported before the last part; "
+            "Cancel changes nothing.")]
+    pages = popup.dialog_parts(groups, lambda i, n: [f"Part {i} of {n}:"], tail,
+                               MAX_CONFIRM_PAGES, rows=max_rows)
+    if pages is None:
+        raise TransferError(f"gateway: this import would change more than {MAX_CONFIRM_PAGES} "
+                            "gateway dialogs can list, so nothing was imported; export fewer items "
+                            "at a time and import each file in turn")
+    return pages
 
 
 def find_this_machine(inc: Incoming, local_data: dict[str, Any]) -> tuple[str | None, str]:
@@ -931,13 +1122,14 @@ def _host_diffs(fh: formmod.Host, lh: formmod.Host, src: dict[str, Any],
     if (fh.via or "") != (lh.via or ""):
         diffs.append(f"via {fh.via or 'direct'} (yours {lh.via or 'direct'})")
     for k in ("ssh", "sudo"):
-        if getattr(fh, k) != getattr(lh, k):
-            diffs.append(f"{k} {consent.word(getattr(fh, k))} (yours {consent.word(getattr(lh, k))})")
+        fv, lv = fh.mode_value(k), lh.mode_value(k)      # per mode (PLAN-0.11 §2)
+        if fv != lv:
+            diffs.append(f"{k} {consent.word(fv)} (yours {consent.word(lv)})")
     for wn, w in fh.workspaces.items():
         lw = lh.workspaces.get(wn)
         if lw is not None and (lw.root != w.root or lw.local != w.local):
             diffs.append(f"workspace {wn} root {w.root} (yours {lw.root})")
-    if (fh.policy or {}) != (lh.policy or {}):
+    if (fh.policy or {}) != (lh.policy or {}) or fh.policy_modes != lh.policy_modes:
         diffs.append("policy differs")
     pins = set(src.get("host_keys") or [])
     lpins = set(lrec.get("host_keys") or [])
@@ -964,6 +1156,8 @@ def plan_import(inc: Incoming, local_form: formmod.Form, local_data: dict[str, A
     def add_tables(sect: str, name: str, t: dict[str, Any], note: str = src_note) -> None:
         for i, (table, items) in enumerate(entry_tables(sect, name, t)):
             p.tables.append((table, items, note if i == 0 else ""))
+        if entry_details(sect, t):
+            p.details[name] = entry_details(sect, t)
 
     # this machine in the file -> localhost
     if this_host:
@@ -998,8 +1192,32 @@ def plan_import(inc: Incoming, local_form: formmod.Form, local_data: dict[str, A
                                         [(KEEP, "Keep my settings"),
                                          (REPLACE, "Use the file's settings")]))
             p.keep.append("settings")
-    for t in p.settings_add + ([x.strip("[]") for x in sdiff] if "settings" in p.replace else []):
+    s_tables = p.settings_add + ([x.strip("[]") for x in sdiff] if "settings" in p.replace else [])
+    for t in s_tables:
         p.tables.append((t, list((inc.raw.get(t) or {}).items()), src_note))
+    if settings_details(inc.raw, s_tables):
+        p.details["settings"] = settings_details(inc.raw, s_tables)
+    # this machine's settings (PLAN-0.11 §9.3): the file's [hosts.localhost]
+    # for this machine's own, when the person picks it over theirs (a
+    # replace that drops this machine's sudo is a widening: the consent lines)
+    f_lt = localhost_table(inc.raw)
+    l_lt = localhost_table(local_raw) or {}
+    if f_lt is not None and f_lt != l_lt:
+        if choices.get("localhost") == REPLACE:
+            p.replace.append("localhost")
+            add_tables("hosts", "localhost", f_lt,
+                       src_note + " (this machine's settings, replacing yours)")
+        else:
+            d = []
+            for k in LOCALHOST_KEYS:
+                if f_lt.get(k) != l_lt.get(k):
+                    d.append(f"{k} {_word(f_lt[k]) if k in f_lt else 'not set'} (yours "
+                             f"{_word(l_lt[k]) if k in l_lt else 'not set'})"
+                             if k in ("sudo", "scripts") else f"{k} differs")
+            p.conflicts.append(Conflict("localhost", "localhost", d,
+                                        [(KEEP, "Keep this machine's settings"),
+                                         (REPLACE, "Use the file's settings for this machine")]))
+            p.keep.append("localhost")
     for n, h in inc.form.hosts.items():
         if not h.explicit or n == this_host:
             continue
@@ -1167,14 +1385,24 @@ def plan_import(inc: Incoming, local_form: formmod.Form, local_data: dict[str, A
             vadd["aliases"][al] = tgt
     p.vault_add = vadd
     # consent lines for what the form gains: as it will read after the merge
+    # (the settings' too: approved by the same dialog, PLAN-0.11 §9.3)
     if p.tables:
         new_text = stage_form_text(local_form.text, p)
         merged = formmod.parse_text(new_text)
         eff = consent.compute(merged, local_data)
-        for n in p.add_hosts + p.add_accounts + p.replace + list(p.renames.values()):
+        names = p.add_hosts + p.add_accounts + p.replace + list(p.renames.values())
+        if p.settings_add and "settings" not in names:
+            names.append("settings")
+        for n in names:
             p.changes[n] = [c.what for c in eff.pending_for(n)]
             if n != "settings" and n not in merged.hosts and n not in merged.accounts:
                 raise TransferError(f"gateway: {n} from the file wouldn't be valid here; nothing was imported")
+        if "settings" in p.changes:
+            # the settings are approved as a whole: what already waited in
+            # this machine's own form before the merge isn't the file's
+            mine = {c.what for c in consent.compute(local_form, local_data).pending_for("settings")}
+            p.waiting_settings = [w for w in p.changes["settings"] if w in mine]
+            p.changes["settings"] = [w for w in p.changes["settings"] if w not in mine]
     return p
 
 
@@ -1411,17 +1639,31 @@ def apply_import(inc: Incoming, p: ImportPlan, label: str, *, peer: bool) -> str
                             f"(restored from the backup in {paths.describe(bk)})") from None
     formmod.clear_cache()
     form = formmod.load(use_cache=False)
-    approved = []
-    for n in written + (["settings"] if "settings" in p.replace or p.settings_add else []):
+    # exactly the changes the dialog showed, each entry's and the settings'
+    # (PLAN-0.11 §9.3); one that changed meanwhile (the form edited while the
+    # dialog was open) is approved by nothing and said to wait
+    approved, waiting = [], []
+    # The settings are approved as a whole, so only for changes of the
+    # file's, and with changes that already waited in this machine's own
+    # settings only where the dialog listed them as such (a peer import shows
+    # this machine no dialog: then the settings keep waiting, and it says so).
+    settings = ("settings" in p.replace or bool(p.settings_add)) and bool(p.changes.get("settings"))
+    mine_wait = settings and peer and bool(p.waiting_settings)
+    for n in written + (["settings"] if settings and not mine_wait else []):
+        shown = p.changes.get(n, []) + (p.waiting_settings if n == "settings" else [])
         try:
-            consent.approve(n, p.changes.get(n, []) and [f"{n}: {c}" for c in p.changes[n]], form=form,
-                            keep_credentials=True)
+            consent.approve(n, [f"{n}: {c}" for c in shown], form=form, keep_credentials=True)
             approved.append(n)
-        except consent.ConsentChanged:
-            pass
-        except KeyError:
-            pass
+        except (consent.ConsentChanged, KeyError):
+            waiting.append(n)
     checks = verify_imported(written + list(p.fill))
+    signins = needs_signin(form, written)
+    # the vault passphrase offer (PLAN-0.11 §8) once the import's secrets are
+    # stored and the vault's lock is released (in the import's dialog helper:
+    # when its job ends); gated offers only while one is due. (A peer import
+    # runs under sshd, where no session draws a dialog.)
+    if not peer:
+        popup.offer_passphrase()
     audit.log("import", source=inc.source["name"], peer=peer, added=written, filled=list(p.fill),
               kept=p.keep, hostkey_diff=p.hostkey_diff, replaced=p.replace, renamed=p.renames,
               backup=str(bk))
@@ -1429,8 +1671,10 @@ def apply_import(inc: Incoming, p: ImportPlan, label: str, *, peer: bool) -> str
     adds = [n for n in written if n not in p.replace]
     if adds:
         bits.append("added " + ", ".join(adds))
+    if p.settings_add:
+        bits.append("added the settings " + ", ".join(f"[{t}]" for t in p.settings_add))
     if p.replace:
-        bits.append("replaced " + ", ".join(p.replace))
+        bits.append("replaced " + ", ".join(_replaced_name(n) for n in p.replace))
     if p.fill:
         bits.append("filled in " + ", ".join(p.fill))
     if p.localhost_sudo:
@@ -1443,17 +1687,39 @@ def apply_import(inc: Incoming, p: ImportPlan, label: str, *, peer: bool) -> str
         bits.append(f"{p.source_host} has ssh = false until you turn it on")
     if checks:
         bits.append("checked: " + ", ".join(checks))
-    if len([n for n in approved if n != "settings"]) != len(written):
-        bits.append("some additions wait for your OK (gate check NAME)")
-    bits.append(f"backup of the form and vault before it: {paths.describe(bk)}")
+    if signins:
+        bits.append(SIGNIN_AFTER.format(names=", ".join(signins),
+                                        cmds=", ".join(f"gate login {n}" for n in signins)))
+    if mine_wait:
+        bits.append("the settings wait for the user's OK, since this machine's own settings already "
+                    "had changes waiting that no dialog here showed (run gate check settings while "
+                    "the user is here)")
+    if waiting:
+        bits.append("changed while the dialog was open, so waiting for the user's OK: "
+                    + ", ".join(_replaced_name(n) for n in waiting) + " (run gate check NAME for "
+                    "each, " + ", ".join(waiting) + ", while the user is here)")
+    bits.append(f"backup of the form and vault before it: {paths.describe(bk)}"
+                + ("" if peer else " (gate forget --backups deletes such copies)"))
     return "; ".join(bits)
+
+
+SIGNIN_AFTER = ("needs a new sign-in on this machine (a browser sign-in never travels in a file): "
+                "{names}; run {cmds} in a Claude Code session while the user is here")
+
+
+def needs_signin(form: formmod.Form, names: list[str]) -> list[str]:
+    """The imported accounts that sign in through the browser: each needs
+    `gate login NAME` in a session, since a file never carries a sign-in
+    (PLAN-0.11 §19.12) and a written entry keeps no credential of this
+    machine's (_merge_vault)."""
+    return [n for n in names
+            if (a := form.accounts.get(n)) is not None and acctmod.browser_sign_in(a)]
 
 
 def verify_imported(names: list[str]) -> list[str]:
     """Each imported account with a credential checked through its adapter
-    where practical (PLAN-v4 phase 7); a refresh token (session state from
-    another machine) that doesn't check out is marked as needing a fresh
-    sign-in. Under a test override only when the test asks (no network)."""
+    where practical (PLAN-v4 phase 7). Under a test override only when the
+    test asks (no network)."""
     from . import adapters
     if testing.active() is not None and not testing.get("verify_imports"):
         return []
@@ -1472,9 +1738,6 @@ def verify_imported(names: list[str]) -> list[str]:
             c = adapters.check(a, rec, vault.load())
         except Exception:  # noqa: BLE001
             c = adapters.Check("unknown", "the check failed")
-        if (rec.get("entra") or {}).get("refresh_token") and c.state != "connected":
-            c = adapters.Check("reauthentication_required", "needs a fresh sign-in on this "
-                               "machine (session state from another machine)", c.meta, vault.now())
         c.checked_at = c.checked_at or vault.now()
         try:
             adapters.record(n, a.kind, c)
@@ -1489,12 +1752,21 @@ def verify_imported(names: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# An import into a vault that can't be read (PLAN-0.11 §19.14): a locked one
+# is unlocked first; one whose passphrase is lost starts over (its files kept
+# in private/backups), and the export is imported into the new one.
+VAULT_UNREADABLE = ("gateway: the vault can't be read, so nothing was done. Locked: "
+                    "/gate-unlock unlocks it. Its passphrase lost: gate passphrase --start-over "
+                    "(after the user's OK in the gateway's dialog the old vault moves into "
+                    "private/backups), then import the last export.")
+
+
 def _load() -> tuple[formmod.Form, consent.Effective, dict[str, Any]]:
     msgs: list[str] = []
     form, eff, data = hooks_session.prepare(msgs, write=False)
     if data is None:
         if vault.exists():
-            raise TransferError("gateway: the vault can't be read; nothing was done")
+            raise TransferError(VAULT_UNREADABLE)
         data = vault.empty()
     return form, eff, data
 
@@ -1515,6 +1787,14 @@ def _groups_options(form: formmod.Form, data: dict[str, Any]) -> tuple[list[str]
         opts.append(o)
         key[o] = GROUP_ACCOUNTS
         checked.append(o)
+    raw = _doc(form.used_text)
+    if any(isinstance(raw.get(t), dict) and raw.get(t) for t in SETTINGS_TABLES):
+        opts.append(SETTINGS_LABEL)
+        key[SETTINGS_LABEL] = "settings"
+        checked.append(SETTINGS_LABEL)
+    if localhost_table(raw):
+        opts.append(LOCALHOST_LABEL)
+        key[LOCALHOST_LABEL] = LOCALHOST_ITEM           # unticked, as in the item list
     if (data.get("localhost") or {}).get("sudo"):
         o = "This machine's sudo password"
         opts.append(o)
@@ -1622,9 +1902,12 @@ def export_cmd(path: str | None) -> int:
                 f"gateway: exported {nh} host{'s' if nh != 1 else ''} and {na} "
                 f"account{'s' if na != 1 else ''}"
                 + (" with the settings" if "settings" in items else "")
+                + (", this machine's settings" if LOCALHOST_ITEM in items else "")
                 + (" and this machine's sudo password" if "localhost-sudo" in items else "")
-                + f" to {paths.describe(dest)} (passphrase-protected, mode 0600). Import it on the "
-                  f"other machine with ~/.config/gateway/gate import FILE")
+                + f" to {paths.describe(dest)} (passphrase-protected, mode 0600). To import it, "
+                  "copy the file to the other machine and ask Claude in a Claude Code session "
+                  "there to run gate import FILE: the gateway's dialog opens in that session "
+                  "(never in a plain terminal, where no dialog can open)")
         except _Stop as s:
             return s.outcome, s.msg
         except TransferError as e:
@@ -1872,10 +2155,17 @@ def import_cmd(path: str, from_peer: bool = False) -> int:
             if plan.nothing():
                 return popup.Outcome.OK, "gateway: the file holds nothing new for this machine; nothing changed"
             lines = plan.lines(inc, Path(path).name if formmod.safe(Path(path).name) else "the file")
-            oc = popup.confirm(LABEL, lines + ["", "Import this? Cancel changes nothing."],
-                               title="import", ok_label="Import", what="import confirmation")
-            if oc != popup.Outcome.OK:
-                raise _Stop(oc, popup.message(oc, LABEL, "import"))
+            from .daemon.dialogs import MAX_LINE, MAX_LINES
+            # every change the approval makes must be on screen, whole: in
+            # parts when one dialog can't hold it, never a list cut short
+            pages = confirm_pages(lines, min(popup.CONFIRM_LINE, MAX_LINE), MAX_LINES)
+            for i, page in enumerate(pages, 1):
+                last = i == len(pages)
+                oc = popup.confirm(LABEL, page, title="import" if len(pages) == 1 else
+                                   f"import, part {i} of {len(pages)}",
+                                   ok_label="Import" if last else "Next", what="import confirmation")
+                if oc != popup.Outcome.OK:
+                    raise _Stop(oc, popup.message(oc, LABEL, "import"))
             return popup.Outcome.OK, apply_import(inc, plan, label, peer=False)
         except _Stop as s:
             return s.outcome, s.msg
@@ -1941,19 +2231,10 @@ def _ts(s: str | None) -> float | None:
     return None
 
 
-def pinned_since(data: dict[str, Any], rec: dict[str, Any]) -> float | None:
-    """When a host's keys were pinned: hosts[N].pinned_at, else (v2 pins
-    carried over by the migration) the migration's time; None if unknown."""
-    t = _ts(rec.get("pinned_at"))
-    if t is None:
-        t = _ts((data.get("migrated") or {}).get("at"))
-    return t
-
-
-def pinned_too_recently(name: str, data: dict[str, Any], rec: dict[str, Any]) -> str | None:
+def pinned_too_recently(name: str, rec: dict[str, Any]) -> str | None:
     """Why copy-to must not go to `name` yet (SPEC 16: only to a host pinned
-    before this session), or None."""
-    pinned = pinned_since(data, rec)
+    before this session; when is hosts[N].pinned_at), or None."""
+    pinned = _ts(rec.get("pinned_at"))
     if pinned is None:
         return (f"gateway: when {name}'s host key was pinned isn't known; copy-to only goes to a "
                 f"host pinned before this session. Ask the user to run gate forget {name} host-keys "
@@ -2003,7 +2284,7 @@ def copy_to(host: str) -> int:
         if not rec.get("host_keys"):
             raise TransferError(f"gateway: {name}'s host key isn't pinned yet; run gate check {name} "
                                 "first (and copy in a later session)")
-        why = pinned_too_recently(name, data, rec)
+        why = pinned_too_recently(name, rec)
         if why:
             raise TransferError(why)
         rc, out, _e = remote(name, f"test -x {REMOTE_GATE} && echo gateway-present")

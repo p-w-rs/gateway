@@ -1,18 +1,29 @@
 """The e2e scenarios: one short `claude -p` session each, then assertions on
 its stream-json, debug log, the fixtures' records and the audit log.
 
-    context  SessionStart context; the env file in foreground, background and
-             subagent Bash; SubagentStart context
+    context  SessionStart context (no checkpoint job lines while checkpoint
+             isn't live: "ckoff"); the env file in foreground, background and
+             subagent Bash (the stand-ins first, the user's own variables
+             kept, Claude Code's credential variables gone); SubagentStart
     ssh      ssh / remote sudo / scp / rsync / a jump host / local sudo -n true,
              all approved by the gateway's hook (no classifier) in auto mode
-    git      clone and push over http to the local git server, the account
-             picked by owner, the commit identity from the include
-    web      curl denied; the http tool called directly (alwaysLoad) with an
-             api-key account; a server echoing the key gets *** back
-    refuse   sudo = false refused, ssh = "ask" denied in -p, unknown host refused,
-             `gate secret` denied (round 5: the user's command)
-    default  default permission mode: the allowed ssh is not auto-approved,
-             denies still apply
+    git      clone and push over http to the local git server through the git
+             stand-in, the account picked by owner, the commit identity from
+             the include (at command scope: nothing in the clone's config); a
+             repository and a remote nothing configures go to the user's own
+             git (a recording fake)
+    web      curl asked about (the network class; nobody can answer in -p);
+             the http tool called directly (alwaysLoad) with an api-key
+             account; a server echoing the key gets *** back
+    refuse   sudo = false refused, ssh = "ask" denied in -p, a git push to the
+             "ask" host asked about up front, an unknown host passed to the
+             user's own ssh (a recording fake)
+    default  Claude Code's default permission mode (manual): the allowed ssh is
+             not auto-approved, curl is still asked about
+    modes    one session per --permission-mode choice `claude --help` lists: a
+             probe plugin records the hook payloads' permission_mode string,
+             which must be one the gateway knows (PLAN-0.11 §2.1), and the
+             gateway's hook approves a bare ssh = true only in auto and bypass
     leak     a command's output masked; a failed command keeps its exit code
              (no EXIT trap: rolled back) and cwd tracking; a failure with a token
              shape gets the PostToolUseFailure warning; Monitor runs as typed,
@@ -28,10 +39,12 @@ its stream-json, debug log, the fixtures' records and the audit log.
     jobs     optional (a checkpoint checkout next to the gateway repo, else
              skipped): checkpoint's job_start with the gateway: the env probe
              in a job, an ssh job, a remote-sudo job and an argv job work;
-             curl, an "ask" right and the private folder are denied for
-             job_start; an "ask" right hidden in a script gets the job
-             wording from the stand-in; job_tail's output is masked; a step
-             Claude Code's classifier denies is "not reached (classifier)"
+             curl (nobody can be asked in a job), an "ask" right and the
+             private folder are denied for job_start; an "ask" right hidden
+             in a script gets the job wording from the stand-in; job_tail's
+             output is masked; checkpoint is live afterwards (gated saw it:
+             the next session's context has the job lines); a step Claude
+             Code's classifier denies is "not reached (classifier)"
 """
 from __future__ import annotations
 
@@ -46,10 +59,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import acceptance_lib as L
 from e2elib import (CLASSIFIER_SKIP, Checks, Session, dispatch_info, first_line, scan,
                     secret_forms)
 
 LONG = 210        # run_e2e.LONG_TIMEOUT: the notice scenarios wait 45 s for the notice
+MODE_TIMEOUT = 60  # one --permission-mode probe session
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -79,11 +94,63 @@ def _probe(path: Path) -> dict[str, str]:
         return {}
 
 
+def probe_want(data: Path, job: bool = False) -> dict[str, str]:
+    """What the env probe (run_e2e.PROBE) must print in Claude's Bash
+    (PLAN-0.11 §1.6, §1.8, §6): the stand-ins present for the configured
+    hosts and accounts first on PATH; no git include, GIT_SSH_COMMAND or
+    RSYNC_RSH; the user's own SSH_AUTH_SOCK and GITHUB_TOKEN kept (§1.10);
+    Claude Code's own credential variable removed. A job's environment comes
+    through checkpoint and gated, so only the gateway's part is checked
+    there."""
+    b = data / "bin"
+    want = {"path_first": str(b), "ssh": str(b / "ssh"), "sudo": str(b / "sudo"),
+            "git": str(b / "git"), "git_include": "", "git_ssh_command": "", "rsync_rsh": ""}
+    if not job:
+        want.update(ssh_auth_sock="set", github_token="set", claude_pid="set", client_key_pass="")
+    return want
+
+
 def _call(C: Checks, g: str, s: Session, needle: str, tool: str = "Bash") -> Any:
     c = s.find(needle, tool)
     if c is None:
         C.add(g, f"`{needle}` was run", None, "the model never made this call")
     return c
+
+
+_DECISION = re.compile(r'"permissionDecision"\s*:\s*"(allow|ask|deny)"')
+
+
+def hook_decisions(c: Any) -> list[str]:
+    """The permission decisions PreToolUse hooks answered for this call
+    (stream hook events), in order: allow, ask or deny."""
+    return [m.group(1) for o in (c.hook_outputs if c is not None else []) for m in _DECISION.finditer(o)]
+
+
+def _audit_since(e: Any, n: int) -> list[dict[str, Any]]:
+    return e.audit()[n:]
+
+
+def curl_requests(e: Any) -> list[dict[str, Any]]:
+    """The requests the local API got from curl (its User-Agent)."""
+    out = []
+    for r in e.api.rec.requests:
+        ua = {k.lower(): v for k, v in (r.get("headers") or {}).items()}.get("user-agent", "")
+        if "curl" in str(ua).lower():
+            out.append(r)
+    return out
+
+
+def check_net_asked(C: Checks, g: str, c: Any, e: Any) -> None:
+    """curl in Claude's Bash (PLAN-0.11 §3): the network class asks by
+    default, so the hook answers ask, naming [network] commands; in -p nobody
+    can answer it, so Claude Code denies the call, and nothing reaches the
+    local API."""
+    C.add(g, "curl: the gateway's hook asks (the network class, [network] commands' default "
+             "\"ask\"), and in -p nobody can answer: a permission denial",
+          c.denied and "ask" in hook_decisions(c) and any(L.NET_ASK in o for o in c.hook_outputs),
+          {"denied": c.denied, "decisions": hook_decisions(c),
+           "hook": first_line(" ".join(c.hook_outputs), 300)})
+    C.add(g, "curl: nothing reached the local API", not curl_requests(e), len(curl_requests(e)))
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +160,9 @@ def _call(C: Checks, g: str, s: Session, needle: str, tool: str = "Bash") -> Any
 
 def context(e: Any, C: Checks) -> None:
     g = "context"
+    # §9.4: checkpoint counts as live only when gated saw it in the last day
+    # (<run>/checkpoint-seen); no checkpoint in this session or before it
+    seen_before = (e.run / "checkpoint-seen").exists()
     s = e.session(g, "Steps:\n"
                   "1. Run: sh probe.sh fg\n"
                   "2. Run this command with the Bash tool's run_in_background option set to true: "
@@ -101,11 +171,7 @@ def context(e: Any, C: Checks) -> None:
                   "prompt: \"Run the shell command `sh probe.sh sub` with the Bash tool exactly as "
                   "written, then reply with its output.\" Wait for it to finish.\n"
                   "4. Run: cat out-bg.txt")
-    data = e.root / "data"
-    want = {"path_first": str(data / "bin"), "ssh": str(data / "bin" / "ssh"),
-            "sudo": str(data / "bin" / "sudo"), "git_include": str(data / "git" / "config"),
-            "git_ssh_command": str(data / "bin" / "ssh"), "rsync_rsh": str(data / "bin" / "ssh"),
-            "ssh_auth_sock": "", "github_token": "", "claude_pid": "set"}
+    want = probe_want(e.root / "data")
     ctx = s.hook_text("SessionStart")
     names = ["e2ehost", "e2enosudo", "e2ejump", "e2ebehind", "e2eask", "e2e-personal", "e2e-work",
              "e2eapi"]
@@ -114,11 +180,17 @@ def context(e: Any, C: Checks) -> None:
           {"missing": [n for n in names if n not in ctx], "ctx": first_line(ctx, 400)})
     C.add(g, "SessionStart tells the user it is the e2e test vault",
           "e2e test mode" in ctx and str(e.root) in ctx, first_line(ctx, 300))
-    for tag, what in (("fg", "foreground"), ("bg", "background"), ("sub", "subagent")):
+    what = "ckoff: no live checkpoint, so the context has no checkpoint job lines (§9.4)"
+    if seen_before:
+        C.add(g, what, None, "gated saw checkpoint earlier in this run (a jobs scenario ran first)")
+    else:
+        C.add(g, what, L.JOBS_MARK not in ctx and bool(ctx), first_line(ctx, 300))
+    for tag, where in (("fg", "foreground"), ("bg", "background"), ("sub", "subagent")):
         got = _probe(e.work / f"out-{tag}.txt")
         diff = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
-        C.add(g, f"env file applied in {what} Bash (stand-ins first on PATH, git include, "
-                 "GIT_SSH_COMMAND/RSYNC_RSH, SSH_AUTH_SOCK and GITHUB_TOKEN unset)",
+        C.add(g, f"env file applied in {where} Bash (the stand-ins first on PATH, no git include, "
+                 "GIT_SSH_COMMAND or RSYNC_RSH; the user's SSH_AUTH_SOCK and GITHUB_TOKEN kept, "
+                 "Claude Code's credential variable gone)",
               bool(got) and not diff, diff or got or "no probe output (the step didn't run)")
     sub = s.hook_text("SubagentStart")
     C.add(g, "SubagentStart gives the subagent the same context",
@@ -180,13 +252,16 @@ def ssh(e: Any, C: Checks) -> None:
 def git(e: Any, C: Checks) -> None:
     g = "git"
     h = e.gitsrv.host
+    n_audit = len(e.audit())
     s = e.session(g, "Steps:\n"
                   f"1. Run: git clone http://{h}/e2eorg/work.git\n"
                   f"2. Run: git clone http://{h}/e2euser/proj.git\n"
                   "3. Run: echo e2e > work/f.txt && git -C work add f.txt && git -C work -c "
                   "commit.gpgsign=false commit -qm e2e && git -C work push -q origin "
                   "HEAD:refs/heads/main\n"
-                  "4. Run: git -C work log -1 --format=%ae")
+                  "4. Run: git -C work log -1 --format=%ae\n"
+                  "5. Run: git status --short\n"
+                  f"6. Run: git ls-remote {UNCONFIGURED_REMOTE}")
     C.add(g, "both clones exist", (e.work / "work" / ".git").is_dir()
           and (e.work / "proj" / ".git").is_dir(),
           [first_line(c.result, 200) for c in s.calls if c.name == "Bash"][:2])
@@ -211,7 +286,52 @@ def git(e: Any, C: Checks) -> None:
     C.add(g, "audit log has the git credential uses",
           {a.get("account") for a in uses} >= {"e2e-work", "e2e-personal"},
           sorted({str(a.get("account")) for a in uses}))
-    C.add(g, "no permission denials", not s.denials, s.denials)
+    try:
+        cfg = (e.work / "work" / ".git" / "config").read_text()
+    except OSError:
+        cfg = None
+    C.add(g, "the gateway's settings stayed at command scope in the gated git (the clone's own "
+             "config names no gateway helper or include)",
+          cfg is not None and "gateway" not in cfg and "credential" not in cfg,
+          first_line(cfg or "no clone", 300))
+    # PLAN-0.11 §6.4: a repository and a remote nothing configures run the
+    # user's own git (the e2e user_tools knob: a recording fake), untouched
+    runs = L.user_tool_runs(e.user_tools, "git")
+    ran: dict[str, bool] = {}
+    for needle, argv, what in (
+            ("git status --short", ["status", "--short"],
+             "outside any configured repository: `git status` runs the user's own git (the "
+             "fake), with the full argv"),
+            ("git ls-remote", ["ls-remote", UNCONFIGURED_REMOTE],
+             "a remote nothing configures: `git ls-remote` runs the user's own git (the fake)")):
+        c = _call(C, g, s, needle)
+        if c is None:
+            continue
+        if c.denied:
+            C.add(g, what, None, "denied before it ran (Claude Code's permission step): "
+                  + first_line(c.result, 200))
+            continue
+        ran[argv[0]] = True
+        C.add(g, what, L.FAKE_RAN.format(tool="git") in c.result
+              and any(r.get("argv") == argv and r.get("cwd") == str(e.work) for r in runs),
+              {"result": first_line(c.result, 200), "fake": [r.get("argv") for r in runs][-4:]})
+    new = _audit_since(e, n_audit)
+    passed = [a for a in new if a.get("event") == "passthrough" and a.get("tool") == "git"]
+    what = ("the pass-through audit: one line for the remote command, none for `git status`, "
+            "never an argv (§1.3)")
+    if ran:
+        C.add(g, what, len(passed) == (1 if ran.get("ls-remote") else 0)
+              and not any("argv" in a or "args" in a for a in passed),
+              [{k: a.get(k) for k in ("tool", "target")} for a in passed])
+    else:
+        C.add(g, what, None, "neither pass-through step ran")
+    gated = [d for d in s.denials if "git status" not in json.dumps(d) and "ls-remote" not in json.dumps(d)]
+    C.add(g, "no permission denials for the configured repositories", not gated, gated)
+
+
+# a remote no gateway.toml entry covers (an .invalid host: nothing is
+# contacted; the user's own git here is a recording fake)
+UNCONFIGURED_REMOTE = "https://example.invalid/octocat/hello.git"
 
 
 def web(e: Any, C: Checks) -> None:
@@ -225,8 +345,7 @@ def web(e: Any, C: Checks) -> None:
                   "\"e2eapi\".")
     c = _call(C, g, s, "curl -s")
     if c is not None:
-        C.add(g, "curl is denied with the gateway's message",
-              c.denied and "gateway: use the http tool" in c.result, first_line(c.result, 300))
+        check_net_asked(C, g, c, e)
     tools = s.init.get("tools") or []
     C.add(g, "the http tool is loaded at start (alwaysLoad)",
           "mcp__plugin_gate_gw__http" in tools, [t for t in tools if "gw" in t])
@@ -259,11 +378,12 @@ def web(e: Any, C: Checks) -> None:
 
 def refuse(e: Any, C: Checks) -> None:
     g = "refuse"
+    n_audit = len(e.audit())
     s = e.session(g, "Steps:\n"
                   "1. Run: ssh e2enosudo sudo whoami\n"
                   "2. Run: ssh e2eask echo e2e-ask\n"
-                  "3. Run: ssh nosuchhost.invalid echo e2e-unknown\n"
-                  "4. Run: gate secret e2ehost")
+                  f"3. Run: {ASK_PUSH}\n"
+                  "4. Run: ssh nosuchhost.invalid echo e2e-unknown")
     c = _call(C, g, s, "ssh e2enosudo")
     if c is not None:
         C.add(g, "sudo = false: refused with the gateway's message",
@@ -274,6 +394,16 @@ def refuse(e: Any, C: Checks) -> None:
         C.add(g, "ssh = \"ask\": a permission denial in -p (nobody can answer)",
               c.denied and "e2e-ask" not in c.result.replace("echo e2e-ask", ""),
               first_line(c.result, 300))
+    c = _call(C, g, s, "git -C pushprobe push")
+    if c is not None:
+        # PLAN-0.11 §6.5 (requirement 24): the hook asks before a push to an
+        # "ask" host runs, so it can't fail after an OK; -p can't answer
+        C.add(g, "a git push to the \"ask\" host is asked about up front (the hook's ask names "
+                 "e2eask); in -p a permission denial, so it never ran",
+              c.denied and hook_decisions(c)[-1:] == ["ask"]
+              and any("ssh on e2eask" in o for o in c.hook_outputs),
+              {"denied": c.denied, "decisions": hook_decisions(c),
+               "hook": first_line(" ".join(c.hook_outputs), 300)})
     c = _call(C, g, s, "ssh nosuchhost.invalid")
     if c is not None:
         # control for the ssh scenario's "approved by the gateway hook" check:
@@ -284,46 +414,130 @@ def refuse(e: Any, C: Checks) -> None:
                  "own permission step, which the hook check tells apart",
               ok is False and info.get("found") and not info.get("hook_approved")
               and bool(info.get("permission_step")), detail)
+        what = ("unknown host: the ssh stand-in passes it to the user's own ssh (the recording "
+                "fake) with the full argv and the recursion guard (PLAN-0.11 §1.3)")
         if c.denied:
-            C.add(g, "unknown host: refused with the 'not in gateway.toml' message", None,
-                  "the classifier denied the command before the stand-in ran: "
+            C.add(g, what, None, "the classifier denied the command before the stand-in ran: "
                   + first_line(c.result, 200))
         else:
-            C.add(g, "unknown host: refused with the 'not in gateway.toml' message",
-                  "isn't in gateway.toml" in c.result and "e2e-unknown" not in
-                  c.result.replace("echo e2e-unknown", ""), first_line(c.result, 300))
-    c = _call(C, g, s, "gate secret")
-    if c is not None:
-        C.add(g, "round 5: `gate secret` is denied by the hook (it is the user's command)",
-              c.denied and "gateway: gate secret is for the user" in c.result,
-              first_line(c.result, 300))
+            runs = [r for r in L.user_tool_runs(e.user_tools, "ssh")
+                    if r.get("argv") == ["nosuchhost.invalid", "echo", "e2e-unknown"]]
+            C.add(g, what, L.FAKE_RAN.format(tool="ssh") in c.result and len(runs) == 1
+                  and str((runs[0].get("env") or {}).get("GW_PASSTHRU", "")).startswith("ssh:1:"),
+                  {"result": first_line(c.result, 300), "runs": runs[-2:]})
     C.add(g, "nothing reached the e2enosudo sshd", e.sshds["nosudo"].commands() == [],
           e.sshds["nosudo"].commands())
-    refs = [a for a in e.audit() if a.get("event") == "refusal"]
+    new = _audit_since(e, n_audit)
+    refs = [a for a in new if a.get("event") == "refusal"]
     C.add(g, "the refusals are in the audit log (for `gate why`)",
-          any(a.get("target") == "e2enosudo" for a in refs)
-          and any(a.get("target") == "nosuchhost.invalid" or "nosuchhost" in str(a.get("reason"))
-                  for a in refs),
+          any(a.get("target") == "e2enosudo" for a in refs),
           [{k: a.get(k) for k in ("tool", "target")} for a in refs][-6:])
+    if s.find("ssh nosuchhost.invalid") is not None and not s.find("ssh nosuchhost.invalid").denied:
+        passed = [a for a in new if a.get("event") == "passthrough" and a.get("tool") == "ssh"]
+        C.add(g, "the pass-through is audited (tool and host, never the argv)",
+              len(passed) == 1 and passed[0].get("target") in ("nosuchhost.invalid", "-")
+              and "e2e-unknown" not in json.dumps(passed[0]),
+              [{k: a.get(k) for k in ("tool", "target")} for a in passed])
+
+
+# a push to the "ask" host from a repository nothing configures (the
+# fixtures make pushprobe with one commit): its URL names e2eask
+ASK_PUSH = "git -C pushprobe push e2eask:e2e/repo.git HEAD:refs/heads/main"
 
 
 def default(e: Any, C: Checks) -> None:
     g = "default"
     base = e.api.url("")
+    mode = L.manual_mode(e.claude_modes())     # "manual" on the latest Claude Code
     s = e.session(g, "Steps:\n"
                   "1. Run: ssh e2ehost echo e2e-default\n"
-                  f"2. Run: curl -s {base}/data", mode="default")
-    C.add(g, "the session ran in the default permission mode",
-          s.init.get("permissionMode") == "default", s.init.get("permissionMode"))
+                  f"2. Run: curl -s {base}/data", mode=mode)
+    C.add(g, f"the session ran in Claude Code's default permission mode (--permission-mode {mode})",
+          s.init.get("permissionMode") in ("default", "manual"), s.init.get("permissionMode"))
     c = _call(C, g, s, "ssh e2ehost echo e2e-default")
     if c is not None:
-        C.add(g, "the allowed ssh is NOT auto-approved (permission denied in -p)",
-              c.denied and not any("e2e-default" in x for x in e.sshds["target"].commands()),
-              first_line(c.result, 300))
+        C.add(g, "the allowed ssh is NOT approved by the gateway (a bare true is Claude Code's call "
+                 "there: permission denied in -p)",
+              c.denied and "allow" not in hook_decisions(c)
+              and not any("e2e-default" in x for x in e.sshds["target"].commands()),
+              {"result": first_line(c.result, 300), "decisions": hook_decisions(c)})
     c = _call(C, g, s, "curl -s")
     if c is not None:
-        C.add(g, "curl is still denied with the gateway's message",
-              c.denied and "gateway: use the http tool" in c.result, first_line(c.result, 300))
+        check_net_asked(C, g, c, e)
+
+
+def mode_records(text: str, sid: str) -> dict[str, list[str]]:
+    """The probe plugin's records for one session (lines EVENT<TAB>SESSION
+    <TAB>MODE, run_e2e.MODEPROBE_REC): each event's permission_mode strings,
+    in order ("" where a payload had none)."""
+    out: dict[str, list[str]] = {}
+    for ln in (text or "").splitlines():
+        parts = ln.split("\t")
+        if len(parts) != 3 or parts[1] != sid:
+            continue
+        out.setdefault(parts[0], []).append("" if parts[2] == "-" else parts[2])
+    return out
+
+
+def mode_verdict(choice: str, payloads: list[str]) -> tuple[bool | None, str]:
+    """Is every recorded payload string one the gateway knows, for the key
+    its --permission-mode choice means (PLAN-0.11 §2.1's table)? None when
+    nothing was recorded."""
+    from gateway import modes
+    if not payloads:
+        return None, "no payload recorded"
+    want = L.mode_key(choice)
+    if want is None:
+        return False, f"--permission-mode {choice} isn't in the gateway's table (§2.1): add it"
+    got = [modes.from_payload(p) for p in payloads]
+    bad = sorted({p for p, (k, known) in zip(payloads, got) if not known or k != want})
+    if bad:
+        return False, f"payload {bad} for --permission-mode {choice} (the gateway reads {want!r} only " \
+                      f"from {sorted(p for p, k in modes.PAYLOADS.items() if k == want)})"
+    return True, f"payload {sorted(set(payloads))} -> {want}"
+
+
+def modes_probe(e: Any, C: Checks) -> None:
+    """PLAN-0.11 §2.1 and §14: one short session per --permission-mode
+    choice `claude --help` lists, with a probe plugin (run_e2e: its hooks
+    record each payload's permission_mode string, nothing else) beside the
+    gateway. The strings must be ones modes.from_payload knows, mapping to
+    the key the choice means; the gateway's hook approves `ssh e2ehost`
+    (a bare ssh = true) only where that key is auto or bypass."""
+    g = "modes"
+    choices = e.claude_modes()
+    if not C.add(g, "`claude --help` lists the --permission-mode choices", bool(choices), choices):
+        return
+    note = []
+    for choice in choices:
+        name = f"modes-{choice}"
+        s = e.session(name, "Steps:\n"
+                      f"1. Run: ssh e2ehost echo e2e-mode-{choice}", mode=choice,
+                      timeout=MODE_TIMEOUT, plugins=[e.modeprobe])
+        recs = mode_records(e.modeprobe_log.read_text() if e.modeprobe_log.exists() else "", s.sid)
+        ok, detail = mode_verdict(choice, recs.get("PreToolUse", []))
+        C.add(g, f"{choice}: the Bash hook's payload names a mode the gateway knows", ok, detail)
+        sst = recs.get("SessionStart", [])
+        if sst and any(sst):
+            ok, detail = mode_verdict(choice, [x for x in sst if x])
+            C.add(g, f"{choice}: SessionStart's payload names it too (lead decision 3)", ok, detail)
+        else:
+            C.add(g, f"{choice}: SessionStart's payload names it too (lead decision 3)", None,
+                  "SessionStart carried no permission_mode" if sst else "no SessionStart record")
+        c = s.find(f"ssh e2ehost echo e2e-mode-{choice}")
+        what = f"{choice}: the gateway approves the bare ssh = true only in auto and bypass"
+        key = L.mode_key(choice)
+        if c is None or key is None:
+            C.add(g, what, None, "the model never ran the ssh step" if c is None else "unknown mode")
+        else:
+            approved = "allow" in hook_decisions(c)
+            C.add(g, what, approved == (key in L.BARE_TRUE_ALLOWS),
+                  {"decisions": hook_decisions(c), "denied": c.denied})
+        note.append(f"{choice}={sorted(set(recs.get('PreToolUse', [])))}")
+        C.add(name, f"session finished in time ({s.seconds:.0f} s, limit {s.limit:.0f} s)",
+              not s.timed_out and s.result.get("subtype") is not None,
+              {"rc": s.rc, "cost": s.result.get("total_cost_usd")})
+    C.add(g, "the payload strings seen (for §2.1's table)", None, "; ".join(note))
 
 
 def leak(e: Any, C: Checks) -> None:
@@ -569,8 +783,9 @@ their two Claude Code plugins, gateway and checkpoint, together.
 - The task: run the listed steps as checkpoint jobs (job_start) to test how the
   gateway treats jobs: its stand-ins (ssh with the stored test key, remote sudo
   through its askpass) and its refusals. Some steps are meant to be refused by
-  the gateway (curl, the "ask" host e2eask, the gateway's private folder); the
-  suite checks those refusals afterwards.
+  the gateway (curl, which it would ask about but nobody can be asked in a
+  job; the "ask" host e2eask; the gateway's private folder); the suite checks
+  those refusals afterwards.
 """
 NOT_REACHED_CLASSIFIER = CLASSIFIER_SKIP      # how Checks counts them
 
@@ -694,14 +909,17 @@ def jobs(e: Any, C: Checks) -> None:
     ck_home, env_sh = Path(ckenv["CHECKPOINT_HOME"]), Path(ckenv["CHECKPOINT_GATEWAY_ENV"])
     from gateway import paths
     with paths.e2e_context():
-        same = (paths.checkpoint_state_dir() == ck_home and paths.env_sh_path() == env_sh)
+        # checkpoint's state folder in the e2e home (${XDG_STATE_HOME:-~/.local/state}/checkpoint)
+        same = (paths.user_home() / ".local" / "state" / "checkpoint" == ck_home
+                and paths.env_sh_path() == env_sh)
     real_env_sh = str(R.real_home() / ".config" / "gateway" / "env.sh")
     if not C.add(g, "CHECKPOINT_HOME and CHECKPOINT_GATEWAY_ENV are the gateway's e2e state "
                     "folder and env.sh (inside the e2e root, never the real ones)",
                  same and str(env_sh) != real_env_sh, ckenv):
         return
-    ck_home.mkdir(parents=True, exist_ok=True)   # the gateway's context mentions jobs then
+    ck_home.mkdir(parents=True, exist_ok=True)   # checkpoint's own state folder
     os.chmod(ck_home, 0o700)
+    t_start = time.time()
     pixi = shutil.which("pixi") or str(R.real_home() / ".pixi" / "bin" / "pixi")
     r = subprocess.run([pixi, "install", "--locked", "--manifest-path", str(e.ck / "pixi.toml")],
                        capture_output=True, text=True, timeout=900,
@@ -762,15 +980,24 @@ def jobs(e: Any, C: Checks) -> None:
             return
         plist = [x.get("name") for x in (s.init.get("plugins") or [])]
         C.add(g, "both plugins loaded (gate, check)", "gate" in plist and "check" in plist, plist)
-        # SessionStart gives the context; when Claude Code cancels it (its 20 s
-        # limit) the first prompt's hook does (no context record: prompt.sh)
+        # §9.4: checkpoint is live once gated served it a CONTRACT-v1 route
+        # (<run>/checkpoint-seen); the session that checkpoint first reaches
+        # may lack the job lines (its SessionStart came first), the next has them
+        seen = e.run / "checkpoint-seen"
+        from gateway import hooks_session, paths
+        with paths.e2e_context():
+            live, howto = hooks_session.checkpoint_live(), hooks_session._howto(None)
+        C.add(g, "checkpoint is live after the session: gated recorded its CONTRACT-v1 calls "
+                 "(<run>/checkpoint-seen), so the next session's context has the job lines",
+              seen.exists() and seen.stat().st_mtime >= t_start - 5 and live
+              and any(L.JOBS_MARK in x for x in howto),
+              {"seen": seen.exists(), "live": live})
         ss, ups = s.hook_text("SessionStart"), s.hook_text("UserPromptSubmit")
         took = _hook_ms(s, "launch.sh hook-session]")
-        C.add(g, "the gateway's context mentions checkpoint jobs (its state folder exists)",
-              "checkpoint jobs (job_start)" in ss + ups,
-              {"from": "SessionStart" if "checkpoint jobs (job_start)" in ss else
-               "the first prompt's hook" if "checkpoint jobs (job_start)" in ups else "neither",
-               "hook-session": took, "ctx": first_line(ss, 160)})
+        C.add(g, "this session's context (informational: checkpoint may reach gated after "
+                 "SessionStart)", None,
+              {"job lines": L.JOBS_MARK in ss + ups, "hook-session": took,
+               "ctx": first_line(ss, 160)})
         ran = ["envprobe", "jobssh", "jobsudo", "argvssh", "hiddenask", "leak"]
         _ck_wait(ck_home, ran, 60)
         data = e.root / "data"
@@ -779,8 +1006,8 @@ def jobs(e: Any, C: Checks) -> None:
         c, rec = _job_call(s, "envprobe"), _ck_job(ck_home, "envprobe")
         jf = _ck_files(rec)
         what = "envprobe: job_start not denied, the job ran with the gateway env applied"
-        what2 = ("envprobe: the job runs in the gateway env (stand-ins first on PATH, git "
-                 "include, GIT_SSH_COMMAND/RSYNC_RSH, SSH_AUTH_SOCK and GITHUB_TOKEN unset)")
+        what2 = ("envprobe: the job runs in the gateway env (the stand-ins first on PATH; no git "
+                 "include, GIT_SSH_COMMAND or RSYNC_RSH)")
         if _reached(C, g, "job_start envprobe", c, what, what2):
             C.add(g, what,
                   not c.denied and rec is not None
@@ -791,12 +1018,7 @@ def jobs(e: Any, C: Checks) -> None:
                    "rec": {k: (rec or {}).get(k) for k in ("gateway_env", "gateway_env_file")},
                    "files": {k: first_line(v, 120) for k, v in jf.items()}})
             got = _probe(e.work / "out-job.txt")
-            want = {"path_first": str(data / "bin"), "ssh": str(data / "bin" / "ssh"),
-                    "sudo": str(data / "bin" / "sudo"),
-                    "git_include": str(data / "git" / "config"),
-                    "git_ssh_command": str(data / "bin" / "ssh"),
-                    "rsync_rsh": str(data / "bin" / "ssh"), "ssh_auth_sock": "",
-                    "github_token": ""}
+            want = probe_want(data, job=True)
             diff = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
             C.add(g, what2, bool(got) and not diff,
                   diff or got or first_line(jf.get("output.log", ""), 200))
@@ -848,7 +1070,7 @@ def jobs(e: Any, C: Checks) -> None:
             C.add(g, what, None, "no ssh job ran: " + json.dumps(
                 {n: denied_by_classifier.get(n) for n in ("jobssh", "jobsudo", "argvssh")}))
         # -- denied for job_start: the gateway's hook, before any classifier ------
-        for name, needle in (("curljob", "gateway: use the http tool"),
+        for name, needle in (("curljob", L.NET_JOB),
                              ("askjob", 'a job can\'t use the "ask" right for ssh on e2eask'),
                              ("privjob", "gateway:")):
             c, rec = _job_call(s, name), _ck_job(ck_home, name)
@@ -912,8 +1134,8 @@ def jobs(e: Any, C: Checks) -> None:
 
 
 SCENARIOS = {"context": context, "ssh": ssh, "git": git, "web": web, "refuse": refuse,
-             "default": default, "leak": leak, "notice": notice, "midturn": midturn,
-             "jobs": jobs}
+             "default": default, "modes": modes_probe, "leak": leak, "notice": notice,
+             "midturn": midturn, "jobs": jobs}
 
 
 def run_all(e: Any, C: Checks, only: list[str]) -> None:
@@ -945,6 +1167,7 @@ def final_checks(e: Any, C: Checks) -> None:
         "e2eapi key": secret_forms(e.api_key),
         "e2ehost sudo password": secret_forms(e.remote_pw),
         "planted GITHUB_TOKEN": secret_forms(e.planted_gh),
+        "planted CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": secret_forms(e.planted_ck),
     }
     for host, priv in e.host_keys.items():
         forms[f"{host} ssh private key"] = secret_forms(priv)

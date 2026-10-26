@@ -15,18 +15,18 @@ It imports nothing from either plugin or from the gateway's other test helpers
 (gwe2e.py runs the installed gateway's own `launch.sh` and `gateway.paths` in
 child processes, as a pre-flight).
 
-Requirements: Python 3.12 with `pyte` (nothing else outside the stdlib), the
-`claude` CLI on PATH (checked against 2.1.301; mods need 2.1.287 terminal),
-and `git` on PATH (Claude Code clones git marketplaces with it; the git
+Requirements: the newest Python (`--spec python`) with `pyte` (nothing else
+outside the stdlib), the `claude` CLI on PATH (checked against 2.1.301; mods
+need 2.1.287 terminal), and `git` on PATH (Claude Code clones git marketplaces with it; the git
 server runs `git http-backend`). macOS and Linux (pty, termios).
 
 ## Self-test
 
 ```bash
-pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py            # from the plugin folder
-pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py --tmp DIR --keep --only a,c
-pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py --gateway ../gateway  # from checkpoint
-pixi exec --spec python=3.12 --spec pyte python tests/tui/selftest.py --only t   # the record-only proxy (opt-in)
+pixi exec --spec python --spec pyte python tests/tui/selftest.py            # from the plugin folder
+pixi exec --spec python --spec pyte python tests/tui/selftest.py --tmp DIR --keep --only a,c
+pixi exec --spec python --spec pyte python tests/tui/selftest.py --gateway ../gateway  # from checkpoint
+pixi exec --spec python --spec pyte python tests/tui/selftest.py --only t   # the record-only proxy (opt-in)
 ```
 
 It proves, on this machine, in about 35 seconds (166 checks, 2026-10-20; `--tmp` must be a

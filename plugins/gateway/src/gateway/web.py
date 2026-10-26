@@ -57,7 +57,17 @@ that open folder (openat with O_EXCL|O_NOFOLLOW) and the folder is checked to
 still be at its path afterwards. A folder swapped for a symlink while the
 request runs can't redirect the file into ~/.ssh or ~/Library/LaunchAgents.
 
-Every credential use writes an audit line; every refusal is audited.
+Per mode (PLAN-0.11 §2.4, §2.10): the network policy (this computer's, and
+with an account the account's too), the account's `use` and its credential
+and write policy are read in the session's mode the hooks recorded in gated
+(modes.current_for("mcp")), or the modeless rule without a record. The
+network policy refuses only on deny: an "ask" passes, since the approval
+hook (hooks_mcp) had Claude Code ask about the call up front. The account's
+`use` and its credential and write policy still refuse an "ask" (nothing
+asks about the credential's use). [network] commands is never read here.
+
+Every credential use writes an audit line (with the mode it was decided
+in); every refusal is audited (with it too, once the mode was read).
 """
 from __future__ import annotations
 
@@ -138,6 +148,7 @@ class Cred:
     query: tuple[str, str] | None = None
     literals: list[str] = field(default_factory=list)
     placement: str = ""
+    mode: str = "modeless"          # the mode its use was decided in (for the audit line)
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +326,11 @@ def _drop_query(url: str, key: str | None, literals: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def entra_token(account: str, scope: str) -> str:
-    """An Entra access token (group 'accounts' owns entra.py; tests replace this)."""
+def entra_token(account: str, scope: str, mode: str = "modeless") -> str:
+    """An Entra access token (group 'accounts' owns entra.py; tests replace
+    this); `mode` names the tool's mode in the mint's audit line."""
     from . import entra
-    return entra.access_token(account, scope)
+    return entra.access_token(account, scope, mode=mode)
 
 
 def azure_scope(a: formmod.Account, host: str, scope_arg: str | None) -> str:
@@ -385,24 +397,56 @@ def _load_state() -> tuple[formmod.Form, Any, dict[str, Any]]:
     return form, consent.compute(form, data), data
 
 
-def _network_ok(what: str) -> None:
-    """A request without a credential: this machine's network policy
-    ([hosts.localhost.policy] network, [policy] network; PLAN-v4 phase 7)."""
+_UNSET: Any = object()
+
+
+def _mode() -> str | None:
+    """The session's mode for the gw MCP server (PLAN-0.11 §2.4): the one the
+    hooks recorded in gated, or None (the modeless rule: no record, gated
+    unreachable, any other caller)."""
+    from . import modes
+    return modes.current_for("mcp")
+
+
+def _network_ok(what: str, mode: Any = _UNSET, account: str | None = None,
+                state: tuple | None = None) -> None:
+    """Every request, with or without a credential: this machine's network
+    policy ([hosts.localhost.policy] network, [policy] network; PLAN-v4
+    phase 7), and with `account` (the credential's, already handed over by
+    credential()) that account's too ([accounts.NAME.policy] network, [policy]
+    network), in the session's recorded mode, or the modeless rule without
+    one (PLAN-0.11 §2.10). Only deny refuses: "ask" passes, since every MCP
+    call is Claude's own and the approval hook (hooks_mcp) had Claude Code
+    ask about it up front (invariant 6's trust); cc and allow pass.
+    [network] commands is the Bash hook's, never read here (§3.6)."""
     from . import consent, policy
-    try:
-        _form, eff, _data = _load_state()
-    except Refused:
-        # a locked or unreadable vault: the form's own restrictions still apply
-        eff = consent.compute(formmod.load(), None)
-    d = policy.decide(eff, "network")
-    if d.word is not True:
-        raise Refused(d.message(f"{what}'s requests"))
+    if mode is _UNSET:
+        mode = _mode()
+    if state is not None:
+        eff = state[1]
+    else:
+        try:
+            _form, eff, _data = _load_state()
+        except Refused:
+            # a locked or unreadable vault: the form's own restrictions still apply
+            eff = consent.compute(formmod.load(), None)
+    ds = [policy.decide(eff, "network", mode=mode)]
+    if account is not None:
+        ds.append(policy.decide(eff, "network", account=account, mode=mode))
+    for d in ds:
+        if d.value == "deny":
+            raise Refused(d.message(f"{what}'s requests"))
 
 
 def credential(name: str, url: str, *, auth: str | None = None, scope: str | None = None,
-               state: tuple | None = None) -> Cred:
-    """The credential for account `name` at `url`, or Refused."""
+               state: tuple | None = None, mode: Any = _UNSET) -> Cred:
+    """The credential for account `name` at `url`, or Refused. The account's
+    `use` and its credential policy are read in the session's recorded mode
+    (or the modeless rule without one: PLAN-0.11 §2.4); only cc and allow
+    hand the credential over (an "ask" can't be asked for a tool call)."""
     from . import consent
+    if mode is _UNSET:
+        mode = _mode()
     form, eff, data = state or _load_state()
     if not isinstance(name, str) or not name:
         raise Refused("gateway: account must be an account name from gateway.toml")
@@ -424,15 +468,32 @@ def credential(name: str, url: str, *, auth: str | None = None, scope: str | Non
     if ea is None or ea.new:
         raise Refused(f"gateway: {name} waits for the user's OK; run `gate check {name}` while "
                       "they're here", fix)
-    if not ea.use:
-        raise Refused(f"gateway: {name} is off (use = false in gateway.toml)")
+    use = eff.word(name, "use", mode)
+    if use not in ("cc", "allow"):
+        from . import modes
+        how = (f"in {modes.DISPLAY[mode]} mode" if mode is not None else
+               "(the session's mode isn't recorded, so the strictest of its modes applies)")
+        written = a.mode_value()
+        if modes.RANK[written.word(mode)] > modes.RANK[use]:
+            # gateway.toml says more than the user approved: the approved word applies
+            raise Refused(f"gateway: {name}'s use {how} waits for the user's OK (gateway.toml says "
+                          f"use = {consent.word(written)}); run `gate check {name}` while "
+                          "they're here", fix)
+        raise Refused(f"gateway: {name} is off {how} (gateway.toml says use = "
+                      f"{consent.word(written)})"
+                      if use == "deny" else
+                      f"gateway: {name} is \"ask\" {how} (gateway.toml says use = "
+                      f"{consent.word(written)}), and a tool call can't be asked about; ask the "
+                      "user to change it")
     # the policy's credential restriction (PLAN-v4 phase 7); "ask" can't be
-    # asked for a tool call, so only "allow" hands the credential over
+    # asked for a tool call, so only cc and allow hand the credential over
     from . import policy
-    d = policy.decide(eff, "credential", account=name)
+    d = policy.decide(eff, "credential", account=name, mode=mode)
     if d.word is not True:
         raise Refused(d.message(f"using {name}'s credential"))
-    if not ea.may_send_to(host) or not consent.bound_ok(data, name, host):
+    # (the destinations alone: `use` was read in the mode above, while
+    # EffectiveAccount.use holds the modeless word)
+    if not acctmod.covers(ea.destinations, host) or not consent.bound_ok(data, name, host):
         if acctmod.covers(a.destinations(), host):
             raise Refused(f"gateway: sending {name}'s credential to {host} waits for the user's OK "
                           f"(a change in gateway.toml); run `gate check {name}` while they're here",
@@ -442,7 +503,7 @@ def credential(name: str, url: str, *, auth: str | None = None, scope: str | Non
                       "them. To add it, change gateway.toml (only if the user asks), then run "
                       f"`gate check {name}`")
     rec = (data.get("accounts") or {}).get(name) or {}
-    c = Cred(account=name)
+    c = Cred(account=name, mode=mode or "modeless")
     tok = rec.get("token") or {}
     if a.kind in ("api-key", "github", "huggingface", "registry"):
         value = tok.get("value")
@@ -476,7 +537,7 @@ def credential(name: str, url: str, *, auth: str | None = None, scope: str | Non
         raise Refused(f"gateway: {name} isn't signed in; run `gate check {name}` while the user "
                       "is here", fix)
     try:
-        token = entra_token(name, sc)
+        token = entra_token(name, sc, mode=c.mode)
     except Exception as e:  # noqa: BLE001
         msg = getattr(e, "args", [""])[0] if type(e).__name__ == "EntraError" else ""
         msg = formmod.strip_unsafe(str(msg))[:160] if msg else type(e).__name__
@@ -1025,8 +1086,11 @@ def _textual(ctype: str) -> bool:
     return any(t in c for t in TEXTUAL)
 
 
-def _refuse(tool: str, target: str | None, e: Refused) -> dict[str, Any]:
-    audit.refusal(tool, target, e.message, e.fix)
+def _refuse(tool: str, target: str | None, e: Refused, mode: Any = _UNSET) -> dict[str, Any]:
+    """Audit a refusal (with the mode the call was decided in, once it was
+    read: the mode key, or "modeless"; PLAN-0.11 §2.4) and answer it."""
+    audit.refusal(tool, target, e.message, e.fix,
+                  mode=None if mode is _UNSET else (mode or "modeless"))
     return {"ok": False, "error": e.message}
 
 
@@ -1041,6 +1105,7 @@ def _int(v: Any, default: float, lo: float, hi: float, what: str) -> float:
 def http(args: dict) -> dict:
     """The http tool (SPEC 14)."""
     target = None
+    mode: Any = _UNSET
     try:
         if not isinstance(args, dict):
             raise Refused("gateway: the http tool takes an object of arguments")
@@ -1080,24 +1145,27 @@ def http(args: dict) -> dict:
         cap = MAX_SAVE if save_to else MAX_INLINE
         max_bytes = int(_int(args.get("max_bytes"), MAX_INLINE, 1, cap, "max_bytes"))
         cred = None
+        mode = _mode()
         if args.get("account") is not None:
             if args.get("auth") is not None and not isinstance(args.get("auth"), str):
                 raise Refused("gateway: auth must be a string")
             st = _load_state()
             cred = credential(args.get("account"), url, auth=args.get("auth"), scope=args.get("scope"),
-                              state=st)
+                              state=st, mode=mode)
             if cred.headers and any(k.lower() in {x.lower() for x in cred.headers} for k in clean_h):
                 raise Refused("gateway: don't set the credential's own header; the gateway adds it")
             if method not in ("GET", "HEAD", "OPTIONS"):
-                # a write with the account's credential (PLAN-v4 phase 7)
+                # a write with the account's credential (PLAN-v4 phase 7), in the mode
                 from . import policy
-                d = policy.decide(st[1], "write", account=cred.account)
+                d = policy.decide(st[1], "write", account=cred.account, mode=mode)
                 if d.word is not True:
                     raise Refused(d.message(f"a {method} with {cred.account}'s credential"))
+            # the network policy holds with a credential too (this machine's, the account's)
+            _network_ok("the http tool", mode, account=cred.account, state=st)
         elif args.get("auth") is not None:
             raise Refused("gateway: auth only applies with account=")
         else:
-            _network_ok("the http tool")
+            _network_ok("the http tool", mode)
         dest = Dest(check_destination(save_to, url)) if save_to else None
         try:
             return _http_send(url, method, clean_h, body, cred, timeout, max_bytes, dest, target)
@@ -1105,7 +1173,7 @@ def http(args: dict) -> dict:
             if dest is not None:
                 dest.close()
     except Refused as e:
-        return _refuse("http", target, e)
+        return _refuse("http", target, e, mode)
 
 
 def _http_send(url: str, method: str, clean_h: dict[str, str], body: bytes | None, cred: Cred | None,
@@ -1113,7 +1181,7 @@ def _http_send(url: str, method: str, clean_h: dict[str, str], body: bytes | Non
     literals = cred.literals if cred else []
     if cred is not None:
         audit.use("http", target, cred.account, [method, _show_url(url)], secrets=literals,
-                  placement=cred.placement)
+                  placement=cred.placement, mode=cred.mode)
     watch = Watchdog(timeout)
     try:
         sent = _send(url, method, clean_h, body, cred, timeout, watch)
@@ -1177,6 +1245,7 @@ def download(args: dict, cwd: str | None = None) -> dict:
     """The download tool (SPEC 14)."""
     target = None
     dest: Dest | None = None
+    mode: Any = _UNSET
     try:
         if not isinstance(args, dict):
             raise Refused("gateway: the download tool takes an object of arguments")
@@ -1184,14 +1253,18 @@ def download(args: dict, cwd: str | None = None) -> dict:
         _split(url)
         target = host_of(url)
         final = check_destination(args.get("save_to"), url, cwd)
-        cred = credential(args["account"], url) if args.get("account") is not None else None
-        if cred is None:
-            _network_ok("the download tool")
+        mode = _mode()
+        cred, st = None, None
+        if args.get("account") is not None:
+            st = _load_state()
+            cred = credential(args["account"], url, state=st, mode=mode)
+        # the network policy holds with a credential too (this machine's, the account's)
+        _network_ok("the download tool", mode, account=cred.account if cred else None, state=st)
         dest = Dest(final)          # the folder is held open from here on
         literals = cred.literals if cred else []
         if cred is not None:
             audit.use("download", target, cred.account, ["GET", _show_url(url)], secrets=literals,
-                      placement=cred.placement)
+                      placement=cred.placement, mode=cred.mode)
         limit = int(testing.get("download_max", MAX_SAVE))
         timeout = float(testing.get("download_timeout", 600))
         watch = Watchdog(timeout)
@@ -1219,7 +1292,7 @@ def download(args: dict, cwd: str | None = None) -> dict:
             result["credential"] = sent.dropped
         return result
     except Refused as e:
-        return _refuse("download", target, e)
+        return _refuse("download", target, e, mode)
     finally:
         if dest is not None:
             dest.close()

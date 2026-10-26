@@ -70,7 +70,10 @@ def test_every_referenced_file_is_in_the_plugin():
     # Claude Code runs the prefix as a program (git keeps the mode; managed.py copies it
     # into the data folder when an install dropped it)
     assert os.access(H.PLUGIN / "hooks" / "gate-sh", os.X_OK), "hooks/gate-sh must be executable"
-    optional = {"e2e-root"}      # the e2e suite's marker, written into scratch copies only
+    # the e2e suite's marker, written into scratch copies only; the checkout's own
+    # pixi env (git-ignored, never shipped), which launch.sh names only to skip it
+    # (user_tool's pass-through), absent from a fresh clone and the mutation copies
+    optional = {"e2e-root", ".pixi"}
     missing = sorted(r for r in refs - optional if not (H.PLUGIN / r).exists())
     assert not (H.PLUGIN / "e2e-root").exists(), "the checkout must never carry the e2e marker"
     assert not missing, f"referenced but not in the plugin folder: {missing}"
@@ -212,3 +215,60 @@ def test_release_check_note_for_this_checkout():
     elif code == 2:
         print("    note: release check can't tell here: " + out.strip()[:200])
     assert code in (0, 1, 2), out
+
+
+# ---------------------------------------------------------------------------
+# No backward compatibility (PLAN-0.11 section 4): the conversion from 0.6,
+# the install marks, old export formats and old Claude Code installs are gone
+# ---------------------------------------------------------------------------
+
+GONE_FILES = ("src/gateway/migrate.py", "src/gateway/vault_v2.py", "tests/test_migrate.py",
+              "tests/fixtures/v2_vault.py")
+# exact tokens nothing shipped may contain any more (the plain words they are
+# made of stay usable)
+GONE_TOKENS = ("older_install", "BASELINE_KEY", "LOCALHOST_SUDO_OLDER", "STARTER_OLDER",
+               "apply_install_defaults", "sudo_default", "map_export_v1", "is_claude_node",
+               "claude_ancestor", "imported_rights", "from_v2_form_path", "v2_lock_path",
+               "vault_v2", "migrate.", "import migrate", "gate migrate", "migrated.unshown",
+               "migrating", "MODS_MIN_", '"nopasswd", "ask"', "cli.js",
+               # WS-1 (PLAN-0.11 §1): [settings] others, the managed refusal, the
+               # curated managed environment, the system-git lookup
+               'others = "', "SETTINGS_KEYS", "MANAGED_DENY", "GW_MANAGED_CHECK",
+               "PLATFORM_NAMES", "CLAUDE_NAMES", "_form_host_behind", "def system_git",
+               "runtime_dir()")
+
+
+def _shipped_text():
+    for top, dirs, names in os.walk(H.PLUGIN):
+        rel_top = Path(top).relative_to(H.PLUGIN)
+        dirs[:] = sorted(d for d in dirs if d not in {".pixi", "logs", "quarantine", "__pycache__",
+                                                      "types", ".git", "tests"})
+        for name in sorted(names):
+            p = Path(top) / name
+            if p.is_symlink() or (rel_top / name).as_posix() == "tsconfig.json" or \
+                    re.search(r"\.test\.tsx?$", name):        # the mod's tests
+                continue
+            try:
+                yield (rel_top / name).as_posix(), p.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+
+
+def test_no_backward_compatibility_is_left_in_the_shipped_plugin():
+    """migrate.py, vault_v2.py and their tests are gone, and nothing shipped
+    (code, hooks, the mod, skills, commands) names what they or the other
+    compatibility paths were made of. The 0.6 detector (vault.v06_waiting)
+    and the file guard's protection of store.age and key.txt stay."""
+    for rel in GONE_FILES:
+        assert not (H.PLUGIN / rel).exists(), rel
+    hits, seen = [], 0
+    for rel, text in _shipped_text():
+        seen += 1
+        for tok in GONE_TOKENS:
+            for n, line in enumerate(text.splitlines(), 1):
+                if tok in line:
+                    hits.append(f"{rel}:{n}: {tok}")
+    assert seen > 50, seen
+    assert not hits, "\n".join(hits[:40])
+    from gateway import transfer, vault
+    assert transfer.FORMATS == (3,) and callable(vault.v06_waiting)

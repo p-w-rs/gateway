@@ -302,8 +302,8 @@ def test_azure_end_to_end_with_a_minted_token():
     minted = []
     tok = "eyJhbGciOiJub25lIn0.eyJhdWQiOiJ4In0.sig-azure-access"
 
-    def fake(name, scope):
-        minted.append((name, scope))
+    def fake(name, scope, mode="?"):
+        minted.append((name, scope, mode))
         return tok
     with H.gateway_env() as env, U.servers(_routes()) as (a,):
         U.setup(env, AZFORM)
@@ -311,12 +311,13 @@ def test_azure_end_to_end_with_a_minted_token():
             vault.account_record(d, "az", "azure")["entra"] = {"refresh_token": "rt-123456789",
                                                                "client_id": formmod.AZURE_CLI_CLIENT_ID,
                                                                "tenant_id": "t"}
-        with U.patch(web, "entra_token", fake):
+        with U.patch(web, "entra_token", fake), U.patch(web, "_mode", lambda: "auto"):
             r = web.http({"url": a.url("/echo"), "account": "az"})
             assert not r["ok"] and "scope=" in r["error"]
             r = web.http({"url": a.url("/echo"), "account": "az", "scope": "https://x.example.com/.default"})
         assert r["ok"], r
-        assert minted == [("az", "https://x.example.com/.default")]
+        # the mint names the tool's mode in its audit line (verify013)
+        assert minted == [("az", "https://x.example.com/.default", "auto")], minted
         assert a.rec.last()["headers"]["Authorization"] == f"Bearer {tok}"
         assert tok not in json.dumps(r)
 
@@ -330,7 +331,7 @@ def test_ml_catalog_uses_the_pinned_scope():
             rec = vault.account_record(d, "cat", "ml-catalog")
             rec["entra"] = {"refresh_token": "rt-abcdefghi", "client_id": formmod.AZURE_CLI_CLIENT_ID,
                             "tenant_id": "t"}
-        with U.patch(web, "entra_token", lambda n, s: seen.append(s) or "catalog-access-token-1"):
+        with U.patch(web, "entra_token", lambda n, s, mode="": seen.append(s) or "catalog-access-token-1"):
             r = web.http({"url": a.url("/echo"), "account": "cat"})
             assert not r["ok"] and "gate login cat" in r["error"], "no pinned scope: sign in again"
             with vault.edit() as d:

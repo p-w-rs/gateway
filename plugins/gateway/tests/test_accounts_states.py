@@ -192,11 +192,18 @@ def test_azure_states_for_a_secret_a_certificate_and_a_refresh_token():
             with vault.edit() as d:
                 d["accounts"]["az"]["entra"] = {**base, "client_certificate": mixed}
             assert _check("az").state == "revoked"
-            # a refresh token stored before: rotated and saved by the check
+            # a refresh token an older gateway stored: never used (PLAN-0.11 §7)
             with vault.edit() as d:
                 d["accounts"]["az"]["entra"] = {**base, "refresh_token": "RT-OLD-0123456789"}
                 d["accounts"]["az"]["entra"].pop("kind")
-            assert _check("az").state == "connected"
+            n = len(srv.calls)
+            assert _check("az").state != "connected" and len(srv.calls) == n
+            # the browser sign-in's refresh token: rotated and saved by the check
+            _setup(env, AZ + 'sign_in = "browser"\n', "az", "azure",
+                   entra={**base, "kind": "browser", "refresh_token": "RT-SSO-0123456789",
+                          "scope": "https://management.azure.com/.default offline_access"})
+            c = _check("az")
+            assert c.state == "connected" and c.meta["credential"] == "browser sign-in", c
             assert vault.load()["accounts"]["az"]["entra"]["refresh_token"].startswith("ROT-REFRESH-")
         finally:
             srv.close()
@@ -271,7 +278,7 @@ def test_no_adapter_needs_a_cookie_or_session_store():
     assert set(adapters.CHECKED_KINDS) == {"github", "huggingface", "azure"}
     for kind in adapters.CHECKED_KINDS:
         assert not any("cookie" in m.lower() for m in adapters.METHODS[kind])
-    assert "unavailable" in adapters.METHODS["ml-catalog"][0]
+    assert adapters.METHODS["ml-catalog"] == ("browser sign-in (authorization code with PKCE)",)
     _ = (F, testing)
 
 

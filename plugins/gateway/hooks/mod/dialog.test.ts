@@ -5,7 +5,7 @@
 // what the Client sealed and check that nothing else carries the value.
 import { expect, mock, test } from 'claude-code/testing'
 import { b64encode, keyPairForTest, openForTest, plaintext, seal } from './seal.ts'
-import { FULLSCREEN_HINT, GUARD_CLOSED_TEXT, GUARD_DROP_TEXT, GUARD_MAIN_TEXT, GUARD_NODISPLAY_TEXT, GUARD_TEXT, MAIN_KEYS, MAIN_SCREEN, NO_DISPLAY_MAIN, NO_DISPLAY_PASTE, NOT_RECEIVED, PASTE_NOTE, UNAVAILABLE_SURFACE, guardEdit, guardPasses, guardSubmitPasses, parseNext, parsePost, queueLine, resultText } from './dialog.ts'
+import { FULLSCREEN_HINT, GUARD_CLOSED_TEXT, GUARD_DROP_TEXT, GUARD_MAIN_TEXT, GUARD_NODISPLAY_TEXT, GUARD_TEXT, MAIN_KEYS, MAIN_SCREEN, NO_DISPLAY_MAIN, NO_DISPLAY_PASTE, NOT_RECEIVED, OFFER_LINES, OFFER_OPTIONS, OFFER_TITLE, OFFER_WHAT, PASTE_NOTE, SIGNIN_ENV, SIGNIN_NOTE, SIGNIN_UNREADABLE, SIGNIN_WHAT, UNAVAILABLE_SURFACE, guardEdit, guardPasses, guardSubmitPasses, parseNext, parsePost, queueLine, resultText } from './dialog.ts'
 import { printable } from './field.tsx'
 
 const HOME = '/Users/tester'
@@ -18,7 +18,7 @@ const statusJson = (): string => JSON.stringify({
   state: 'ready', root: '/plugin', data: `${CONFIG}/plugins/data/gate-inline`,
   env: `${CONFIG}/plugins/data/gate-inline/envs/0123456789ab`, lock: '0123456789ab', warm: true, older: '',
   build_running: false, install_log: false, pixi: `${HOME}/.pixi/bin/pixi`, pixi_version: 'pixi 0.81.0',
-  home: `${HOME}/.config/gateway`, form: true, vault: true, vault_v2: false,
+  home: `${HOME}/.config/gateway`, form: true, vault: true, managed: true,
 }) + '\n'
 
 const daemonJson = (extra: Record<string, unknown> = {}): string => JSON.stringify({
@@ -382,7 +382,7 @@ test("on the terminal's main screen (no fullscreen: no clicks) the field isn't d
   const ui = await $.ui.mount({ plugin: 'gate', surface: 'terminal', component: 'Pane', requestId: 'gate-dialog',
                                 props: PANE_PROPS, viewport: MAIN_VIEWPORT })
   const t = JSON.stringify(await ui.drawn())
-  expect(t).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(t).toContain('/tui fullscreen')
   expect(t).not.toContain('field.tsx')
   expect(await ui.find({ key: 'paste' })).not.toBe(undefined)
   // the reflex at a password prompt: typing it into the prompt box. Held back
@@ -393,7 +393,14 @@ test("on the terminal's main screen (no fullscreen: no clicks) the field isn't d
   expect(burst.text).toBe('')
   expect(w.statuses).toContain(GUARD_MAIN_TEXT)
   expect(GUARD_MAIN_TEXT).toContain('Paste from clipboard')
-  expect(GUARD_MAIN_TEXT).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(GUARD_MAIN_TEXT).toContain('/tui fullscreen')
+  // Claude Code's own command (it restarts and resumes the session), never a
+  // quit-and-restart with an environment variable
+  for (const x of [GUARD_MAIN_TEXT, FULLSCREEN_HINT, MAIN_SCREEN]) {
+    expect(x).toContain('restarts and resumes')
+    expect(x).not.toContain('NO_FLICKER=1')
+    expect(x).not.toContain('quit Claude Code')
+  }
   // GW-UX-6: the pane says plainly that this terminal can't type into the
   // field, that Paste leaves the value on the clipboard, and how to get the
   // fullscreen view; one keyboard route everywhere
@@ -425,7 +432,7 @@ test('on Linux without a display the main screen says neither typing nor Paste w
   const t = JSON.stringify(await ui.drawn())
   expect(t).toContain('Neither typing nor Paste can work in this terminal')
   expect(t).toContain('no DISPLAY or WAYLAND_DISPLAY')
-  expect(t).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(t).toContain('/tui fullscreen')
   expect(t).toContain("this machine's desktop")
   expect(t).not.toContain("This terminal can't type into the gateway's field")     // MAIN_SCREEN's Paste advice
   expect(NO_DISPLAY_MAIN).toContain("Don't type it into the prompt")
@@ -645,6 +652,112 @@ test('on mobile a secret dialog draws no field and says credential entry is unav
   expect(t).toContain(UNAVAILABLE_SURFACE)
   expect(t).not.toContain('field.tsx')
   expect(await ui.find({ key: 'paste' })).toBe(undefined)
+})
+
+// PLAN-0.11 §7.1: the browser sign-in's confirm dialog (gated's own, its fields only)
+const SIGNIN = { account: 'work-azure', kind: 'azure', tenant: 'contoso.onmicrosoft.com', client: '11111111-1111-1111-1111-111111111111', scope: 'https://management.azure.com/.default offline_access', host: '', previous_client: '' }
+
+function signinDialog(extra: Dialog = {}): Dialog {
+  return {
+    ...secretDialog(new Uint8Array(32)), kind: 'confirm', pub: '', fields: 0, paste: false,
+    title: 'gated title, never shown', entry: 'work-azure', what: SIGNIN_WHAT,
+    lines: ['gated words, never shown'], ok_label: 'OK', cancel_label: 'No', default_cancel: false,
+    signin: SIGNIN, ...extra,
+  }
+}
+
+test('a browser sign-in is drawn from the fixed template: the account, tenant, client and scope, with Open and Cancel', () => {
+  const d = parseNext(JSON.stringify(view(signinDialog())))!.dialog!
+  expect(d.signin).toEqual(SIGNIN)
+  expect(d.title).toBe('Sign in to work-azure in your browser')
+  expect(d.lines).toEqual([
+    'Claude asks to sign in to Azure as you (account work-azure), in your web browser.',
+    'Tenant: contoso.onmicrosoft.com', 'Client id: 11111111-1111-1111-1111-111111111111',
+    'Scope: https://management.azure.com/.default offline_access', SIGNIN_NOTE])
+  expect([d.ok_label, d.cancel_label, d.default_cancel]).toEqual(['Open', 'Cancel', true])
+  // a catalog: its host, the client id it gave, and a change from the one pinned before
+  const cat = { ...SIGNIN, account: 'models', kind: 'ml-catalog', tenant: 'organizations', host: 'catalog.example.com', previous_client: '22222222-2222-2222-2222-222222222222', scope: 'api://11111111-1111-1111-1111-111111111111/access_as_user offline_access' }
+  const c = parseNext(JSON.stringify(view(signinDialog({ signin: cat, entry: 'models' }))))!.dialog!
+  expect(c.lines[0]).toBe('Claude asks to sign in to the model catalog catalog.example.com as you (account models), in your web browser.')
+  expect(c.lines).toContain('Client id (from the catalog): 11111111-1111-1111-1111-111111111111')
+  expect(c.lines).toContain("The catalog's client id changed since the last sign-in (it was 22222222-2222-2222-2222-222222222222).")
+  // a field that isn't valid: nothing of it is shown, and the pane says to cancel
+  for (const bad of [{ ...SIGNIN, tenant: 'evil tenant' }, { ...SIGNIN, client: 'not-a-guid' }, { ...SIGNIN, scope: 'a‮b' },
+    { ...SIGNIN, kind: 'github' }, { ...SIGNIN, host: 'x.example.com' }, { ...cat, host: '' }, 'text']) {
+    const b = parseNext(JSON.stringify(view(signinDialog({ signin: bad }))))!.dialog!
+    expect(b.signin).toBe(null)
+    expect(b.lines).toEqual([SIGNIN_UNREADABLE])
+    expect(b.default_cancel).toBe(true)
+  }
+  // only a confirm carries a sign-in; any other dialog keeps its own words
+  const other = parseNext(JSON.stringify(view({ ...secretDialog(new Uint8Array(32)) })))!.dialog!
+  expect(other.signin).toBe(null)
+  expect(resultText({ id: ID, entry: 'work-azure', what: SIGNIN_WHAT, outcome: 'ok', note: '' })).toBe('browser sign-in for work-azure: opened in your browser')
+  expect(resultText({ id: ID, entry: 'work-azure', what: SIGNIN_WHAT, outcome: 'cancelled', note: '' })).toBe('browser sign-in for work-azure: cancelled')
+})
+
+test('the sign-in pane focuses Cancel first, and Open sends only the display, desktop and ssh variables', async ($: any, on: any) => {
+  const w = world(on, [view(signinDialog())], daemonJson(), undefined, true,
+                  { env: { WAYLAND_DISPLAY: 'wayland-0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/501/bus', XDG_CURRENT_DESKTOP: 'ubuntu:GNOME', SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22', ANTHROPIC_API_KEY: 'sk-not-real-0123456789abcdef' } })
+  await start($)
+  const ui = await mount($)
+  const t = JSON.stringify(await ui.drawn())
+  expect(t).toContain('Sign in to work-azure in your browser')
+  expect(t).toContain('Scope: https://management.azure.com/.default offline_access')
+  expect(t).not.toContain('gated words, never shown')
+  expect(await ui.find({ key: FIELD })).toBe(undefined)
+  expect((await ui.find({ key: 'ok' }))?.text).toBe('Open')
+  const cancel = await ui.find({ key: 'cancel' })
+  expect(cancel?.text).toBe('Cancel')
+  expect(JSON.stringify(cancel)).toContain('autoFocus')
+  await ui.press({ key: 'ok' })
+  expect(w.fetches.filter((f) => f.url.endsWith('/ui/dialog/answer')).map((f) => f.body)).toEqual([
+    { id: ID, button: 'ok', env: { DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/501/bus', XDG_CURRENT_DESKTOP: 'ubuntu:GNOME', SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22' } }])
+  expect(SIGNIN_ENV).not.toContain('ANTHROPIC_API_KEY')
+})
+
+// PLAN-0.11 §8: the vault passphrase offer (gated's own choice, its marker only)
+function offerDialog(extra: Dialog = {}): Dialog {
+  return {
+    ...secretDialog(new Uint8Array(32)), kind: 'choice', pub: '', fields: 0, paste: false,
+    title: 'gated title, never shown', entry: 'vault', what: OFFER_WHAT,
+    lines: ['gated words, never shown'], options: ['Set passphrase', 'Not now'], ok_label: 'Continue',
+    cancel_label: 'No', default_cancel: true, offer: 'passphrase', ...extra,
+  }
+}
+
+test('the passphrase offer is drawn from the fixed template: Set passphrase, Not now and Cancel', () => {
+  const d = parseNext(JSON.stringify(view(offerDialog())))!.dialog!
+  expect(d.title).toBe(OFFER_TITLE)
+  expect(d.title).toBe('Protect the vault with a passphrase?')
+  expect(d.lines).toEqual([...OFFER_LINES])
+  expect(d.lines[0]).toBe('Without one, any program running as you can read the stored secrets.')
+  expect(d.options).toEqual(['Set passphrase', 'Not now'])
+  expect([d.cancel_label, d.default_cancel]).toEqual(['Cancel', false])
+  // gated's own options can't change what the pane offers
+  const odd = parseNext(JSON.stringify(view(offerDialog({ options: ['Something else'] }))))!.dialog!
+  expect(odd.options).toEqual([...OFFER_OPTIONS])
+  // only a choice carries the offer; another kind keeps its own words
+  const conf = parseNext(JSON.stringify(view(offerDialog({ kind: 'confirm' }))))!.dialog!
+  expect(conf.lines).toEqual(['gated words, never shown'])
+  expect(resultText({ id: ID, entry: 'vault', what: OFFER_WHAT, outcome: 'ok', note: 'set it in the dialog that opened' })).toBe('vault passphrase: set it in the dialog that opened')
+  expect(resultText({ id: ID, entry: 'vault', what: OFFER_WHAT, outcome: 'cancelled', note: '' })).toBe('the vault passphrase offer: cancelled')
+})
+
+test('the passphrase offer pane sends the option picked, and Cancel only cancels', async ($: any, on: any) => {
+  const w = world(on, [view(offerDialog())])
+  await start($)
+  const ui = await mount($)
+  const t = JSON.stringify(await ui.drawn())
+  expect(t).toContain('Protect the vault with a passphrase?')
+  expect(t).not.toContain('gated words, never shown')
+  expect(await ui.find({ key: FIELD })).toBe(undefined)
+  expect((await ui.find({ key: 'opt0' }))?.text).toBe('Set passphrase')
+  expect((await ui.find({ key: 'opt1' }))?.text).toBe('Not now')
+  expect((await ui.find({ key: 'cancel' }))?.text).toBe('Cancel')
+  await ui.press({ key: 'opt1' })
+  expect(w.fetches.filter((f) => f.url.endsWith('/ui/dialog/answer')).map((f) => f.body)).toEqual([
+    { id: ID, button: 'ok', choice: 'Not now' }])
 })
 
 test('the queue is shown by identity', () => {

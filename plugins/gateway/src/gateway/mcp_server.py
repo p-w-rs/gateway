@@ -40,7 +40,8 @@ INSTRUCTIONS = (
     "decides whether it asks, as for any tool); with "
     "account=NAME the gateway adds that account's key or token, only for the account's own "
     "sites. download: save a file into the project (never overwrites, never executable). "
-    "curl and wget are refused in Bash; use these instead. host_inspect: what this machine "
+    "Prefer these to curl and wget in Bash (network commands there are asked about unless "
+    "gateway.toml's [network] says otherwise). host_inspect: what this machine "
     "offers the managed shell (login PATH folders, toolchains, project toolchain files), read "
     "without running anything. Terminals (terminal_*): real PTYs the user can watch and take "
     "over (/gate-terminal); read the screen, then send input quoting the seq you read (a stale "
@@ -251,7 +252,7 @@ TERM_ROUTES = {name: route for name, route, _schema, _desc in TERM_TOOLS}
 
 TOOLS: list[dict[str, Any]] = [
     {"name": "http",
-     "description": "HTTP request through the gateway (instead of curl/wget). With account=NAME "
+     "description": "HTTP request through the gateway (rather than curl/wget). With account=NAME "
                     "the gateway adds that account's credential for its own sites. The response "
                     "comes back scrubbed of secrets; binary bodies as base64 or save_to.",
      "inputSchema": HTTP_SCHEMA, "_meta": dict(ALWAYS)},
@@ -276,18 +277,12 @@ TOOL_NAMES = tuple(t["name"] for t in TOOLS)
 
 
 def terminal_env() -> dict[str, str]:
-    """What a new terminal or job may take from this server's environment
-    (Claude Code's): the platform's variables and the managed shell's approved
-    imports (its conf's env= and mine= names). gated checks them again."""
+    """What a new terminal or job takes from this server's environment
+    (Claude Code's, the user's): every variable but the managed shell's
+    removals (managed.dropped; PLAN-0.11 §1.6). gated checks them again."""
     import os
-    from .daemon import terminals
-    conf = terminals.read_conf()
-    names = set(conf.get("env", "").split()) | set(conf.get("mine", "").split())
-    out = {}
-    for k, v in os.environ.items():
-        if k in terminals.PLATFORM_PASS or k.startswith("LC_") or k in names:
-            out[k] = v
-    return out
+    from . import managed
+    return {k: v for k, v in os.environ.items() if not managed.dropped(k)}
 
 
 def call_terminal(name: str, args: dict[str, Any]) -> dict[str, Any]:

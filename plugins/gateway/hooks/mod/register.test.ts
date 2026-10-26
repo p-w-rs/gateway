@@ -2,6 +2,7 @@
 // The test's hooks stand beneath the plugin, so they answer what a session's
 // engine would: launch.sh (process.run / process.spawn), the clock, the env.
 import { expect, mock, test } from 'claude-code/testing'
+import { CLAUDE_TESTED, PIXI_TESTED } from './lib.ts'
 
 const HOME = '/Users/tester'
 const CONFIG = `${HOME}/.claude`
@@ -14,8 +15,8 @@ function statusJson(state: string, extra: Record<string, unknown> = {}): string 
     state, root: '/plugin', data: `${CONFIG}/plugins/data/gate-inline`,
     env: `${CONFIG}/plugins/data/gate-inline/envs/0123456789ab`, lock: '0123456789ab', warm: true, older: '',
     build_running: state === 'building', install_log: false, pixi: `${HOME}/.pixi/bin/pixi`,
-    pixi_version: 'pixi 0.81.0', home: `${HOME}/.config/gateway`, form: true, vault: true,
-    vault_v2: false, ...extra,
+    pixi_version: `pixi ${PIXI_TESTED}`, home: `${HOME}/.config/gateway`, form: true, vault: true,
+    managed: true, ...extra,
   }) + '\n'
 }
 
@@ -32,7 +33,8 @@ function daemonJson(extra: Record<string, unknown> = {}): string {
 // one repeats), `launch.sh gated ...` from `gated` (the last one repeats);
 // every run, spawn and fetch is recorded.
 function world(on: any, answers: string[], gated: string[] = [daemonJson({ parent_pid: 4242 })],
-               files: Record<string, string> = {}, startEnv: Record<string, string> = {}) {
+               files: Record<string, string> = {}, startEnv: Record<string, string> = {},
+               registers: { status: number; text: string }[] = []) {
   const runs: Run[] = []
   const spawns: Run[] = []
   const fetches: { url: string; init: any }[] = []
@@ -60,6 +62,9 @@ function world(on: any, answers: string[], gated: string[] = [daemonJson({ paren
     // the dialog loop's long poll at gated: no change while the test runs
     if (String(e.url).includes('/ui/dialog/next')) return new Promise(() => {})
     fetches.push(e)
+    // /ui/register answers from `registers` first (then 200)
+    const a = String(e.url).endsWith('/ui/register') ? registers.shift() : undefined
+    if (a !== undefined) return { value: { status: a.status, ok: a.status < 400, headers: {}, text: a.text } }
     return { value: { status: 200, ok: true, headers: {}, text: '{"ok": true}' } }
   })
   on('process.spawn', async function* (_$: any, e: any) {
@@ -111,11 +116,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(last.init?.env?.CLAUDE_PLUGIN_DATA).toBe(`${CONFIG}/plugins/data/gate-inline`)
     const lines = text.split('\n')
     expect(lines[0]).toBe('gateway plugin 0.7.0 (gate@inline), diagnostics')
-    expect(lines).toContain('Claude Code: 2.1.301 (mods need 2.1.287 in the terminal, 2.1.286 in the desktop app)')
+    expect(lines).toContain(`Tested with pixi ${PIXI_TESTED} and Claude Code ${CLAUDE_TESTED} (only the latest is supported)`)
+    expect(lines).toContain(`Claude Code: 2.1.301, older than the tested ${CLAUDE_TESTED}: warning: update Claude Code (claude update): only the latest is supported`)
     expect(lines).toContain(`Surfaces: ${surface}`)
     expect(lines).toContain('Mods: on (this report comes from the gateway mod)')
     expect(lines).toContain('Data folder: ~/.claude/plugins/data/gate-inline (loaded from a folder, --plugin-dir)')
-    expect(lines).toContain('pixi: ~/.pixi/bin/pixi, 0.81.0, inside the tested range 0.68.0-0.82.0')
+    expect(lines).toContain(`pixi: ~/.pixi/bin/pixi, ${PIXI_TESTED}, the tested version`)
     expect(lines).toContain('Environment: ready (warmed) at ~/.claude/plugins/data/gate-inline/envs/0123456789ab')
     expect(lines.find((l) => l.startsWith('Managed shell: on; this session: active (CLAUDE_CODE_SHELL_PREFIX = '))).toMatch(/\/hooks\/gate-sh; Claude Code starts it from the managed bash\)$/)
     expect(lines).toContain('Vault: present; form (gateway.toml): present (checked by existence only; the vault is never read)')
@@ -135,7 +141,7 @@ test('/gate-doctor says whether a secret can be typed here: the main screen (and
   expect(line).toContain("this terminal shows Claude Code's main screen (inside tmux), so a secret can't be typed")
   expect(line).toContain('Paste from clipboard (/gate-dialog, then Tab and Enter)')
   expect(line).toContain('clear it yourself')
-  expect(line).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(line).toContain('/tui fullscreen')
   const full: string = (await $.command.run({ command: 'gate-doctor', args: '', origin: { kind: 'composer' },
                                               presentation: { isFullscreen: true, columns: 140 } })).text
   expect(full).toContain("Secrets here: the fullscreen view, so the gateway dialog's field takes a click, then keys")
@@ -149,29 +155,27 @@ test('/gate-doctor on Linux without a display says neither typing nor Paste work
   const line = ((await doctor($)).text as string).split('\n').find((l) => l.startsWith('Secrets here: '))!
   expect(line).toContain('neither typing nor Paste can work in this terminal')
   expect(line).toContain('no DISPLAY or WAYLAND_DISPLAY')
-  expect(line).toContain('CLAUDE_CODE_NO_FLICKER=1')
+  expect(line).toContain('/tui fullscreen')
   expect(line).toContain("this machine's desktop")
   expect(line).not.toContain('press Paste')
 })
 
-test('/gate-doctor warns about a pixi newer than the tested range and names a failed setup', async ($: any, on: any) => {
-  world(on, [statusJson('failed', { pixi_version: 'pixi 0.95.1', warm: false, vault: false, form: false })])
+test('/gate-doctor notes a pixi newer than the tested one and names a failed setup', async ($: any, on: any) => {
+  world(on, [statusJson('failed', { pixi_version: 'pixi 9.95.1', warm: false, vault: false, form: false })])
   on('session.surfaces', () => ({ value: [] }))
   const text: string = (await doctor($)).text
-  expect(text).toContain('0.95.1 is newer than the tested range 0.68.0-0.82.0 (a warning only')
+  expect(text).toContain(`pixi: ~/.pixi/bin/pixi, 9.95.1, newer than the tested ${PIXI_TESTED} (info: it should work`)
   expect(text).toContain('Environment: setup failed or was interrupted; log: ~/.claude/plugins/data/gate-inline/envs/0123456789ab/install.log')
   expect(text).toContain('Vault: not set up yet; form (gateway.toml): not written yet')
   expect(text).toContain('Surfaces: none (-p or SDK)')
 })
 
-test('/gate-doctor reports an unmigrated 0.6 vault instead of "not set up yet"', async ($: any, on: any) => {
-  // store.age but no private/vault.age: the cold Bash guard counts it as "a
-  // vault exists", so the doctor must not contradict it by saying there is none.
+test('/gate-doctor says nothing of a gateway 0.6 vault (SessionStart names it)', async ($: any, on: any) => {
   world(on, [statusJson('building', { vault: false, vault_v2: true })])
   on('session.surfaces', () => ({ value: ['terminal'] }))
   const text: string = (await doctor($)).text
-  expect(text).toContain('Vault: a 0.6 vault (store.age), converted once setup finishes')
-  expect(text).not.toContain('Vault: not set up yet')
+  expect(text).toContain('Vault: not set up yet')
+  expect(text).not.toContain('store.age')
 })
 
 test('a missing env: provisions by argv and shows setting up, then a ready toast, then nothing', async ($: any, on: any) => {
@@ -278,7 +282,8 @@ test('launch.sh not answering never breaks the session', async ($: any, on: any)
   expect(text).toContain("Environment: unknown (hooks/launch.sh status didn't answer)")
 })
 
-test('a build that never finishes: after 20 minutes the line says so and polling stops', async ($: any, on: any) => {
+// a 20-minute span of 3 s polls: past the kit's 5 s default on a slow machine
+test('a build that never finishes: after 20 minutes the line says so and polling stops', { timeoutMs: 20_000 }, async ($: any, on: any) => {
   const w = world(on, [statusJson('building')])
   await start($)
   await w.clock.advance(20 * 60 * 1000 + 2000)
@@ -288,7 +293,8 @@ test('a build that never finishes: after 20 minutes the line says so and polling
   expect(w.runs.length).toBe(runs)
 })
 
-test('a failed setup that fails again keeps its line, also after polling stops', async ($: any, on: any) => {
+// a 20-minute span of 3 s polls: past the kit's 5 s default on a slow machine
+test('a failed setup that fails again keeps its line, also after polling stops', { timeoutMs: 20_000 }, async ($: any, on: any) => {
   const w = world(on, [statusJson('failed')])
   await start($)
   expect(w.spawns).toHaveLength(1)                 // one retry, at session start
@@ -330,6 +336,38 @@ test('no claude_pid is claimed when launch.sh could not name its parent as Claud
   const body = JSON.parse(fetchArgs(w.fetches[0]).init.body)
   expect('claude_pid' in body).toBe(false)
   expect(body.session_id).toBe('sess-1')
+})
+
+// gated refuses a registration once it has decided to stop (its idle exit
+// began): the session isn't registered there, so the mod starts a new one
+// (`gated start` waits for the old one to go) and registers with that
+const STOPPING = { status: 503, text: JSON.stringify({ ok: false, error: 'stopping', message: 'gateway: the gateway daemon is stopping (idle), so this session wasn\'t registered with it; start a new one (gated start) and register again' }) }
+const SOCKET2 = '/tmp/gw-501/gated-new.sock'
+
+test('a registration refused because gated is stopping goes to a new gated', async ($: any, on: any) => {
+  const w = world(on, [statusJson('ready')], [daemonJson({ parent_pid: 4242 }), daemonJson({ parent_pid: 4242, pid: 778, socket: SOCKET2 })],
+                  {}, {}, [STOPPING])
+  await start($)
+  expect(gatedRuns(w).map((r) => r.argv.slice(2))).toEqual([['gated', 'start'], ['gated', 'start']])
+  const regs = w.fetches.map(fetchArgs).filter((f) => f.url === 'http://gated/ui/register')
+  expect(regs.map((f) => f.init.socketPath)).toEqual([SOCKET, SOCKET2])
+  expect(JSON.parse(regs[1]!.init.body)).toEqual(JSON.parse(regs[0]!.init.body))
+})
+
+test('a gated that keeps refusing as stopping is asked at most three times; other refusals once', async ($: any, on: any) => {
+  const w = world(on, [statusJson('ready')], undefined, {}, {}, [STOPPING, STOPPING, STOPPING, STOPPING, STOPPING])
+  await start($)
+  expect(gatedRuns(w)).toHaveLength(3)
+  expect(w.fetches.filter((f) => fetchArgs(f).url === 'http://gated/ui/register')).toHaveLength(3)
+})
+
+test('a registration refused for another reason is not sent again', async ($: any, on: any) => {
+  const w = world(on, [statusJson('ready')], undefined, {}, {},
+                  [{ status: 403, text: '{"ok": false, "error": "pid", "message": "gateway: registration refused"}' },
+                   { status: 503, text: '{"ok": false, "error": "draining"}' }])
+  await start($)
+  expect(gatedRuns(w)).toHaveLength(1)
+  expect(w.fetches.filter((f) => fetchArgs(f).url === 'http://gated/ui/register')).toHaveLength(1)
 })
 
 test('-p registers too (no surface), without a status line', async ($: any, on: any) => {
@@ -387,9 +425,8 @@ function managedState(extra: Record<string, unknown> = {}): string {
     version: 1, mode: 'on', form_mode: 'on', form_mode_invalid: false,
     bash: `${ENVD}/.pixi/envs/default/bin/bash`, bash_version: '5.2.37', ready: true,
     path: [{ dir: `${DATA}/bin`, origin: "the gateway's stand-ins" },
-           { dir: `${DATA}/managed/bin`, origin: "the gateway's runtime tools (bash, pixi)" },
-           { dir: '/opt/homebrew/bin', origin: 'gateway.toml [shell] import_path, line 4; Homebrew' },
-           { dir: '/usr/bin', origin: 'system' }],
+           { dir: '$PATH', origin: "your own PATH (Claude Code's shell snapshot, else its own PATH)" },
+           { dir: '/opt/homebrew/bin', origin: 'gateway.toml [shell] import_path, line 4; Homebrew' }],
     env: [{ name: 'JAVA_HOME', origin: 'gateway.toml [shell] import_env, line 5' }],
     pending: [], vault_readable: true, ...extra,
   })
@@ -457,7 +494,7 @@ test('an approved managed = "off": no prefix, and /gate-doctor says why', async 
   expect(text).toContain('Managed shell: off; this session: inactive: gateway.toml [shell] managed = "off" (approved)')
 })
 
-test('"warn" sets the prefix like "on"', async ($: any, on: any) => {
+test('"warn" (gone, PLAN-0.11 §1.6) in the state counts as "on": the prefix is set', async ($: any, on: any) => {
   const w = world(on, [statusJson('ready')], undefined, { [STATE]: managedState({ mode: 'warn', form_mode: 'warn' }) })
   await start($)
   expect(w.env.CLAUDE_CODE_SHELL_PREFIX).toBe(`${rootOf(w)}/hooks/gate-sh`)
@@ -486,18 +523,18 @@ test('/gate-doctor: the managed PATH and imports with their origins, and what wa
   const lines: string[] = (await doctor($)).text.split('\n')
   expect(lines).toContain('  gateway.toml says "warn"; that waits for the user\'s OK (gate check settings)')
   expect(lines).toContain('  bash: ~/.claude/plugins/data/gate-inline/envs/0123456789ab/.pixi/envs/default/bin/bash (5.2.37)')
-  expect(lines.find((l) => l.startsWith('  PATH: '))).toBe("  PATH: ~/.claude/plugins/data/gate-inline/bin (the gateway's stand-ins); ~/.claude/plugins/data/gate-inline/managed/bin (the gateway's runtime tools (bash, pixi)); /opt/homebrew/bin (gateway.toml [shell] import_path, line 4; Homebrew); /usr/bin (system); then other plugins' bin/ folders")
-  expect(lines).toContain('  Environment: platform variables, SHELL, Claude Code\'s own; imported: JAVA_HOME (gateway.toml [shell] import_env, line 5)')
+  expect(lines.find((l) => l.startsWith('  PATH: '))).toBe("  PATH: ~/.claude/plugins/data/gate-inline/bin (the gateway's stand-ins); $PATH (your own PATH (Claude Code's shell snapshot, else its own PATH)); /opt/homebrew/bin (gateway.toml [shell] import_path, line 4; Homebrew) (other plugins' bin/ folders come before the imports)")
+  expect(lines).toContain('  Environment: yours (Claude Code\'s), minus Claude Code\'s own credential variables, the shell startup variables and the gateway\'s GW_* names; SHELL is the managed bash; [shell] import_env: JAVA_HOME (gateway.toml [shell] import_env, line 5)')
   expect(lines).toContain('  waiting for the user\'s OK: settings: managed shell "on" -> "warn" (...)')
   expect(w.runs.length).toBeGreaterThan(0)
 })
 
-test('a session whose prefix was taken away later: /gate-doctor says the classic hook reports it', async ($: any, on: any) => {
+test('a session whose prefix was taken away later: /gate-doctor says commands run in your own shell', async ($: any, on: any) => {
   const w = world(on, [statusJson('ready')])
   on('session.surfaces', () => ({ value: ['terminal'] }))
   await start($)
   w.env.CLAUDE_CODE_SHELL_PREFIX = '/somewhere/else'
-  expect((await doctor($)).text).toContain('Managed shell: on; this session: inactive: another CLAUDE_CODE_SHELL_PREFIX is set (/somewhere/else); the classic Bash hook reports it')
+  expect((await doctor($)).text).toContain('Managed shell: on; this session: inactive: another CLAUDE_CODE_SHELL_PREFIX is set (/somewhere/else); Claude\'s commands run in your own shell (the classic Bash hook still judges them)')
 })
 
 test('a gate-sh copy in the data folder (the plugin lost its exec bit) is the prefix; any other path is not', async ($: any, on: any) => {

@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Mutation checks for WS-8, the integration fixes after wave 3 (PLAN-0.11
+§19): one list of credential variables to mask (envfile.MASK_ENV_NAMES,
+which post.sh writes out and import_env never takes); the account CLIs,
+slogin and sudoedit run by their path reaching the Bash hook (pre_bash.sh),
+and a bare slogin refused toward a configured host; `gate with NAME -- CMD`
+unwrapped for the route checks, the hidden-command rule and the other
+elevation tools; a consent dialog longer than one dialog shown whole, in
+parts, nothing approved before the last (decision 19.11), each part sized
+by the rows a docked pane shows (a wide character two columns), its
+question naming the part, and each limit held exactly; the vault
+passphrase offer after each first store, through the real flows; a browser
+sign-in's refresh token never exported (decision 19.12). (su's -s shell
+after its -c string is mutations_policy.py's, now aimed at the posture
+table.) Same format and runner as tests/mutation_check.py: each mutation
+removes or weakens one property; the named test must then FAIL.
+
+    pixi run --locked python tests/mutations_integration.py [-k SUBSTR] [--copy DIR]
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mutation_check  # noqa: E402
+
+S = "src/gateway/"
+TU = "test_ux_hooks::"
+
+MUTATIONS = [
+    # --- one list of credential variables (item 1) -------------------------------------
+    ("envfile's list drifts from post.sh's", S + "envfile.py",
+     '    "DOCKER_PASSWORD", "AZURE_DEVOPS_EXT_PAT",\n',
+     '    "DOCKER_PASSWORD",\n',
+     TU + "test_post_sh_lists_are_pythons"),
+    ("post.sh's loop drops a listed name", "hooks/post.sh",
+     "      DOCKER_PASSWORD AZURE_DEVOPS_EXT_PAT \\\n",
+     "      DOCKER_PASSWORD \\\n",
+     TU + "test_post_sh_lists_are_pythons"),
+    ("hooks_post masks with a shorter list of its own", S + "hooks_post.py",
+     "    from .envfile import MASK_ENV_NAMES\n",
+     '    MASK_ENV_NAMES = ("GH_TOKEN", "ANTHROPIC_API_KEY")\n',
+     TU + "test_one_list_of_credential_variables_is_masked_and_never_imported"),
+    ("post.sh starts Python for fewer names than the posture leaves in Claude's shell", "hooks/post.sh",
+     "      OPENAI_API_KEY GITLAB_TOKEN GL_TOKEN CI_JOB_TOKEN NPM_TOKEN NODE_AUTH_TOKEN \\\n",
+     "      OPENAI_API_KEY GITLAB_TOKEN GL_TOKEN NPM_TOKEN NODE_AUTH_TOKEN \\\n",
+     TU + "test_post_sh_sends_a_credential_variables_value_to_python_without_a_vault"),
+    ("import_env takes a name the masker hides", S + "form.py",
+     "    return name.upper() in ENV_UNSET or name.upper() in MASK_ENV_NAMES\n",
+     "    return name.upper() in ENV_UNSET\n",
+     TU + "test_one_list_of_credential_variables_is_masked_and_never_imported"),
+    # --- account CLIs, sudoedit and slogin reach the hook (item 3) ---------------------
+    ("pre_bash.sh doesn't forward gh run by its path", "hooks/pre_bash.sh",
+     "'/(gh|hf|databricks|crane|pijul|dvc)([^A-Za-z0-9_.-]|$)'",
+     "'/(hf|databricks|crane|pijul|dvc)([^A-Za-z0-9_.-]|$)'",
+     "test_hookbash_prefilter::test_account_clis_by_path_reach_python_but_their_plain_names_dont"),
+    ("pre_bash.sh forwards a plain gh too (or every name glued to a slash)", "hooks/pre_bash.sh",
+     "'/(gh|hf|databricks|crane|pijul|dvc)([^A-Za-z0-9_.-]|$)'",
+     "'(gh|hf|databricks|crane|pijul|dvc)'",
+     "test_hookbash_prefilter::test_account_clis_by_path_reach_python_but_their_plain_names_dont"),
+    ("pre_bash.sh's quick case skips dvc", "hooks/pre_bash.sh",
+     "  */[Pp][Ii][Jj][Uu][Ll]*|*/[Dd][Vv][Cc]*)\n",
+     "  */[Pp][Ii][Jj][Uu][Ll]*)\n",
+     "test_packaging::test_every_route_tool_run_by_its_path_reaches_the_bash_hook"),
+    ("pre_bash.sh doesn't forward slogin", "hooks/pre_bash.sh",
+     "|pkexec|runuser|osascript|slogin|sudoedit|huggingface-cli)([^A-Za-z0-9_]|\\$)|",
+     "|pkexec|runuser|osascript|sudoedit|huggingface-cli)([^A-Za-z0-9_]|\\$)|",
+     "test_packaging::test_every_route_tool_run_by_its_path_reaches_the_bash_hook"),
+    ("a bare slogin to a configured host passes", S + "hooks_bash.py",
+     "            if base == \"slogin\":\n                return _route_deny(argv[0], base, tgt, SLOGIN_WHY)\n",
+     "",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("a bare slogin in text the parser can't follow passes", S + "hooks_bash.py",
+     "                return _route_deny(\"slogin\", \"slogin\", tgt, SLOGIN_WHY)\n",
+     "                pass\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # --- gate with NAME -- CMD for the route checks, hidden commands, elevation (item 4) --
+    ("the route checks don't look into gate with", S + "hooks_bash.py",
+     "    # `gate with NAME -- CMD`: CMD is judged as a stage of its own (WS-8)\n"
+     "    for k, st in _with_inners(stages):\n",
+     "    for k, st in enumerate(stages):\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("the elevation check doesn't look into gate with", S + "hooks_bash.py",
+     "    for _k, st in _with_inners(stages):         # CMD of `gate with NAME -- CMD` too (WS-8)\n",
+     "    for st in stages:\n",
+     "test_hookbash_table::test_posture_other_elevation_tools"),
+    ("a wrapper chain doesn't look through gate with", S + "hooks_bash.py",
+     "            # `gate with NAME -- CMD` runs CMD (WS-8)\n            if \"--\" not in words[i + 2:]:\n"
+     "                return None\n",
+     "            # `gate with NAME -- CMD` runs CMD (WS-8)\n            if True:\n"
+     "                return None\n",
+     "test_hookbash_table::test_posture_other_elevation_tools"),
+    ("the text scan doesn't look through gate with", S + "hooks_bash.py",
+     "            # `gate with NAME -- CMD` runs CMD as its program (WS-8)\n            if \"--\" not in argv[2:]:\n",
+     "            # `gate with NAME -- CMD` runs CMD as its program (WS-8)\n            if True:\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("the hidden-command text scan doesn't start a command after gate with", S + "hooks_bash.py",
+     r'|\s*(?:\S*/)?(?i:gate)\s+with\s+[^\s;&|]+\s+--(?=\s))*")',
+     r')*")',
+     "test_hookbash_table::test_posture_a_hidden_command_gets_no_decision"),
+    ("a variable program after gate with in text isn't seen", S + "hooks_bash.py",
+     r'=[^\s;&|]*\s+)*)|(?i:gate)\s+with\s+[^\s;&|]+\s+--\s+)*"',
+     r'=[^\s;&|]*\s+)*))*"',
+     "test_hookbash_table::test_posture_a_hidden_command_gets_no_decision"),
+    ("gate with's account counts as an ssh target in text", S + "hooks_bash.py",
+     "    text = _TEXT_WITH_NAME.sub(r\"\\1\", text)\n",
+     "",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # --- a consent dialog longer than one dialog comes in parts (item 5) ---------------
+    ("a long consent dialog is one dialog, its tail cut by gated", S + "popup.py",
+     "    if sum(pane_rows(ln) for ln in text.split(\"\\n\")) <= DIALOG_LINES:\n",
+     "    if True:\n",
+     "test_ux_popup::test_a_consent_dialog_longer_than_one_dialog_comes_in_parts"),
+    ("a part's lines take the room of its heading and question too", S + "popup.py",
+     "    room = rows - tall(head(max_parts, max_parts)) - tall(tail(max_parts, max_parts))\n",
+     "    room = rows\n",
+     "test_ux_popup::test_a_consent_dialog_longer_than_one_dialog_comes_in_parts"),
+    ("more than CONSENT_PARTS parts open dialogs anyway", S + "popup.py",
+     "    if n > max_parts:\n        return None\n",
+     "    if False:\n        return None\n",
+     "test_ux_popup::test_a_consent_dialog_longer_than_one_dialog_comes_in_parts"),
+    # --- a part fits the pane's rows, and its question names it (mac-tui D) -----------
+    ("a part is sized by its lines, not the rows the pane shows", S + "popup.py",
+     "    return rows\n",
+     "    return 1\n",
+     "test_ux_popup::test_a_dialog_part_is_sized_by_the_rows_the_pane_shows"),
+    ("the pane is taken as wider than a docked one", S + "popup.py",
+     "PANE_COLUMNS = 72\n",
+     "PANE_COLUMNS = 150\n",
+     "test_portability::test_an_import_confirm_is_sized_by_the_rows_the_pane_shows"),
+    ("a consent that fits gated's lines is one dialog however many rows it takes", S + "popup.py",
+     "    if sum(pane_rows(ln) for ln in text.split(\"\\n\")) <= DIALOG_LINES:\n",
+     "    if text.count(\"\\n\") + 1 <= DIALOG_LINES:\n",
+     "test_ux_popup::test_a_dialog_part_is_sized_by_the_rows_the_pane_shows"),
+    ("a consent part's question doesn't say which part it is", S + "popup.py",
+     "        return [\"\", f\"Part {i} of {n}. \" + (\n",
+     "        return [\"\", \"\" + (\n",
+     "test_ux_popup::test_a_dialog_part_is_sized_by_the_rows_the_pane_shows"),
+    ("a long line and its continuation lines are split across parts where they fit", S + "popup.py",
+     "        if cur and used + tall(g) > room:\n",
+     "        if False:\n",
+     "test_portability::test_an_import_confirm_is_sized_by_the_rows_the_pane_shows"),
+    # --- WS-11b review: each limit exactly, wide characters, no blank part start ------
+    ("one part more than CONSENT_PARTS is shown", S + "popup.py",
+     "    if n > max_parts:\n",
+     "    if n > max_parts + 1:\n",
+     "test_ux_popup::test_a_dialog_in_parts_sits_exactly_on_its_limits"),
+    ("one part more than CONSENT_PARTS is shown, through gate check", S + "popup.py",
+     "    if n > max_parts:\n",
+     "    if n > max_parts + 1:\n",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+    ("exactly CONSENT_PARTS parts are refused", S + "popup.py",
+     "    if n > max_parts:\n",
+     "    if n >= max_parts:\n",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+    ("a consent one row longer than a dialog is one dialog (gated drops its question)",
+     S + "popup.py",
+     "    if sum(pane_rows(ln) for ln in text.split(\"\\n\")) <= DIALOG_LINES:\n",
+     "    if sum(pane_rows(ln) for ln in text.split(\"\\n\")) <= DIALOG_LINES + 1:\n",
+     "test_ux_popup::test_a_dialog_in_parts_sits_exactly_on_its_limits"),
+    ("a part starts with a blank line", S + "popup.py",
+     "            if cur or ln.strip():\n",
+     "            if True:\n",
+     "test_ux_popup::test_a_dialog_in_parts_sits_exactly_on_its_limits"),
+    ("a wide character counts as one column", S + "popup.py",
+     "    return sum(2 if unicodedata.east_asian_width(ch) in \"WF\" else 1 for ch in text)\n",
+     "    return len(text)\n",
+     "test_ux_popup::test_a_dialog_part_counts_wide_characters_as_two_columns"),
+    ("a space after a full row starts no row", S + "popup.py",
+     "            if used >= width:\n                rows, used = rows + 1, 0\n",
+     "",
+     "test_ux_popup::test_a_dialog_part_counts_wide_characters_as_two_columns"),
+    ("the consent is approved after its first part", S + "popup.py",
+     "            if oc != Outcome.OK:\n                return oc, None\n        if on_ok is not None:\n",
+     "            if oc != Outcome.OK:\n                return oc, None\n            break\n"
+     "        if on_ok is not None:\n",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+    ("a Decline on a later part still approves", S + "popup.py",
+     "            if oc != Outcome.OK:\n                return oc, None\n        if on_ok is not None:\n",
+     "            if oc != Outcome.OK and i == 1:\n                return oc, None\n"
+     "        if on_ok is not None:\n",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+    # --- the passphrase offer after each first store, through the real flows (item 2) --
+    ("an import makes no offer", S + "transfer.py",
+     "    if not peer:\n        popup.offer_passphrase()\n",
+     "    if False:\n        popup.offer_passphrase()\n",
+     "test_offer::test_an_import_that_stores_secrets_offers_once_its_job_has_ended"),
+    ("gated's own sign-in store makes no offer once gate check stopped waiting", "src/gateway/daemon/oauth.py",
+     "        self._offer(si)\n        return 200, PAGE_OK\n",
+     "        return 200, PAGE_OK\n",
+     "test_offer::test_gateds_own_sign_in_store_offers_also_after_gate_check_stopped_waiting"),
+    ("gate check's new SSH key makes no offer", S + "gate_setup.py",
+     "        popup.offer_passphrase()             # PLAN-0.11 §8 (the vault's lock is released)\n",
+     "        pass\n",
+     "test_offer::test_gate_check_offers_after_its_job_stores_a_key_or_a_token"),
+    ("gate check's account token makes no offer", S + "gate_setup.py",
+     "    popup.offer_passphrase()                 # PLAN-0.11 §8 (the vault's lock is released)\n",
+     "",
+     "test_offer::test_gate_check_offers_after_its_job_stores_a_key_or_a_token"),
+    ("the remote sudo dialog keeps a remembered password nowhere", S + "ssh.py",
+     "                     verify=_sudo_verify(name, user), store=_sudo_store(name, user),\n"
+     "                     detail={\"user\": user}, load=_sudo_load(name, user),\n",
+     "                     verify=_sudo_verify(name, user), store=None,\n"
+     "                     detail={\"user\": user}, load=_sudo_load(name, user),\n",
+     "test_offer::test_a_remote_sudo_password_is_offered_only_when_remembered"),
+    ("an unticked sudo password is stored (and offered)", S + "popup.py",
+     "                keep = r.remember if r.remember is not None else (remember is not False)\n",
+     "                keep = True\n",
+     "test_offer::test_the_sudo_dialog_offers_only_once_a_password_is_remembered"),
+    # --- a browser sign-in's refresh token never exported (item 7, decision 19.12) ------
+    ("an export carries a browser sign-in's record", S + "transfer.py",
+     '    if not isinstance(e, dict) or not (e.get("client_secret") or e.get("client_certificate")):\n',
+     "    if not isinstance(e, dict):\n",
+     "test_accounts_entra::test_a_browser_sign_ins_refresh_token_is_never_exported"),
+    ("an export carries a refresh token stored beside a service principal's secret", S + "transfer.py",
+     "    return {k: v for k, v in e.items() if k in ENTRA_FIELDS}\n",
+     "    return e\n",
+     "test_accounts_entra::test_a_browser_sign_ins_refresh_token_is_never_exported"),
+    ("the export offers a browser sign-in as a secret to tick", S + "transfer.py",
+     "    # (a browser sign-in's refresh token is never exported: PLAN-0.11 §19.12)\n    return words\n",
+     '    if e.get("refresh_token") and not words:\n        words.append("refresh token")\n    return words\n',
+     "test_portability::test_a_round_trip_carries_everything_0_11_configures"),
+    ("an import takes a file's refresh token or scope", S + "transfer.py",
+     'ENTRA_FIELDS = ("client_secret", "client_certificate", "client_id", "tenant_id", "refreshed", "kind")\n',
+     'ENTRA_FIELDS = ("client_secret", "client_certificate", "client_id", "tenant_id", "refreshed", "kind",\n'
+     '                "refresh_token", "scope")\n',
+     "test_accounts_entra::test_a_browser_sign_ins_refresh_token_is_never_exported"),
+    ("the import doesn't name the account that needs a new sign-in", S + "transfer.py",
+     "    if signins:\n        bits.append(SIGNIN_AFTER",
+     "    if False:\n        bits.append(SIGNIN_AFTER",
+     "test_portability::test_imported_credentials_are_checked_and_a_browser_sign_in_needs_a_new_one"),
+    ("needs_signin names no browser sign-in", S + "transfer.py",
+     "            if (a := form.accounts.get(n)) is not None and acctmod.browser_sign_in(a)]\n",
+     "            if (a := form.accounts.get(n)) is not None and False]\n",
+     "test_portability::test_a_round_trip_carries_everything_0_11_configures"),
+    # --- the WS-8 review's fixes -------------------------------------------------------
+    # must-fix 1: an account CLI by its name where names find the system's tool
+    ("pre_bash.sh doesn't forward an account CLI after env -i, command -p or PATH=", "hooks/pre_bash.sh",
+     "  *PATH*|*[Cc][Oo][Mm][Mm][Aa][Nn][Dd]\\ *|*[Cc][Oo][Mm][Mm][Aa][Nn][Dd],*|*[Ee][Nn][Vv]\\ *|\\\n"
+     "  *[Ee][Nn][Vv],*)\n",
+     "  _no_route_forms_)\n",
+     "test_hookbash_prefilter::test_every_posture_deny_row_reaches_python"),
+    ("pre_bash.sh misses env's lone -", "hooks/pre_bash.sh",
+     "(-[A-Za-z0-9]*[iuPS]|-([[:space:],]|$)|--ignore-environment",
+     "(-[A-Za-z0-9]*[iuPS]|--ignore-environment",
+     "test_hookbash_prefilter::test_account_clis_by_name_where_names_find_the_systems_tool"),
+    ("pre_bash.sh's route forms miss a PATH change", "hooks/pre_bash.sh",
+     "grep -Eiq '(^|[^A-Za-z0-9_])PATH([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_-])command",
+     "grep -Eiq '(^|[^A-Za-z0-9_-])command",
+     "test_hookbash_prefilter::test_every_posture_deny_row_reaches_python"),
+    ("env's lone - isn't looked through", S + "hooks_bash.py",
+     "            if w == \"env\" and (_ASSIGN.match(a) or a == \"-\"):\n",
+     "            if w == \"env\" and _ASSIGN.match(a):\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("env's lone - keeps the PATH", S + "hooks_bash.py",
+     "        if a in (\"-\", \"--ignore-environment\"):\n",
+     "        if a in (\"--ignore-environment\",):\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("env -uPATH keeps the PATH", S + "hooks_bash.py",
+     "            if c == \"u\" and (body[k + 1:] or nxt) == \"PATH\":\n",
+     "            if c == \"u\" and nxt == \"PATH\":\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("macOS env -P keeps the PATH", S + "hooks_bash.py",
+     "            if c in \"iP\":\n",
+     "            if c in \"i\":\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("env's lone - in text the parser can't follow keeps the PATH", S + "hooks_bash.py",
+     "[iuSP]|-(?=\\s)|--ignore-environment|\"",
+     "[iuSP]|--ignore-environment|\"",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # must-fix 2: gate with nested however deep
+    ("only four levels of gate with are unwrapped", S + "hooks_bash.py",
+     "        while cur is not None:\n            out.append((k, cur))\n",
+     "        for _ in range(4):\n            if cur is None:\n                break\n"
+     "            out.append((k, cur))\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # must-fix 3: only an entry's name after gate with is the account's
+    ("any word before -- after gate with is taken for the account", S + "hooks_bash.py",
+     r'((?i:gate)\s+with\s+)[a-z][a-z0-9-]{0,31}(?=\s+--(?:\s|$))")',
+     r'((?i:gate)\s+with\s+)\S+(?=\s+--(?:\s|$))")',
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # should-fix 2: gate with starts a hidden command only at a command's start
+    ("gate with in the middle of a command starts a hidden one", S + "hooks_bash.py",
+     r'*?\s+-[A-Za-z]*c\s)"' + "\n",
+     r'*?\s+-[A-Za-z]*c\s|(?<![\w./-])gate\s+with\s+\S+\s+--\s)"' + "\n",
+     "test_hookbash_table::test_posture_a_hidden_command_gets_no_decision"),
+    # should-fix 4: a glob or brace expansion as the program, watch's command
+    ("a brace expansion as the program isn't hidden", S + "hooks_bash.py",
+     "    return at >= 0 and words[at:] == argv and bool(glb[at])\n",
+     "    return False\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("watch's command isn't scanned", S + "hooks_bash.py",
+     "                           \"catchsegv\", \"proot\", \"fakeroot\", \"watch\"})",
+     "                           \"catchsegv\", \"proot\", \"fakeroot\"})",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    # should-fixes 1 and 6: the refusals' wording
+    ("slogin's refusal names a slogin stand-in", S + "hooks_bash.py",
+     '    stand = "ssh" if base in _NO_STANDIN_SSH else "sudo" if base in _ELEVATORS else base\n',
+     '    stand = "ssh" if base == "rsync" else "sudo" if base in _ELEVATORS else base\n',
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("the by-path refusal doesn't say the stand-in passes other destinations on", S + "hooks_bash.py",
+     "           f\"user's own {stand}\" if base in _ACCOUNT_TOOLS else \"it supplies the key\")\n",
+     "           f\"user's own {stand}\" if False else \"it supplies the key\")\n",
+     "test_hookbash_table::test_posture_unconfigured_targets_get_no_decision"),
+    ("gate check drops the too-many-parts reason", S + "gate_setup.py",
+     "popup._LAST_REASON if oc == popup.Outcome.FAILED else \"\"))",
+     "\"\"))",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+    ("a consent refused with no dialog says the user's OK wasn't used", S + "popup.py",
+     "        if reason and what == \"consent\":\n",
+     "        if reason and what == \"never\":\n",
+     "test_ux_gate_setup::test_gate_checks_consent_longer_than_one_dialog_comes_in_parts"),
+]
+
+
+def main(argv: list[str]) -> int:
+    mutation_check.MUTATIONS = MUTATIONS
+    return mutation_check.main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

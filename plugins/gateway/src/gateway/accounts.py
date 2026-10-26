@@ -7,8 +7,9 @@ Selection (used by every stand-in, the git helper and the http tool):
    set when the vault is given); owners never restrict an explicit choice.
 2. Otherwise the target owner picks: accounts of that kind for that host with
    `use = true` whose login or owners include it; else the one marked
-   `default = true`; else, if exactly one account of that kind+host exists,
-   that one.
+   `default = true`; else, if exactly one account of that kind+host exists
+   and it lists no `owners` (or no owner is named), that one: an account
+   that lists `owners` covers only those and its login (owner_covered).
 3. Exactly one -> use it. Several -> "both X and Y fit; set GATE_ACCOUNT=Y".
    None -> run without a credential: "no account for host/owner".
 """
@@ -18,7 +19,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Container, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from . import form as formmod
@@ -62,6 +63,55 @@ def destinations(a: formmod.Account) -> list[str]:
     elif k == "api-key":
         out += a.sites
     return list(dict.fromkeys(out))
+
+
+# ---------------------------------------------------------------------------
+# Entra credentials (azure, ml-catalog): which one fits the account
+# ---------------------------------------------------------------------------
+
+ARM_SCOPE = "https://management.azure.com/.default"
+
+
+def browser_sign_in(a: Any) -> bool:
+    """Does the account sign in through the browser (PLAN-0.11 §7)? An
+    ml-catalog account always, an azure one with sign_in = "browser"."""
+    return a.kind == "ml-catalog" or (a.kind == "azure" and a.sign_in == "browser")
+
+
+def request_scope(a: Any) -> str:
+    """The browser sign-in's request scope for an azure account (PLAN-0.11
+    §7.4): its `scope` (ARM's .default when unset), with offline_access added
+    (a refresh token). It shapes only the authorization request: each later
+    token's audience is chosen by host (entra.scope_for_host)."""
+    toks = [t for t in (getattr(a, "scope", "") or ARM_SCOPE).split() if t != "offline_access"]
+    return " ".join(dict.fromkeys(toks + ["offline_access"]))
+
+
+def entra_stored(info: Mapping[str, Any]) -> bool:
+    """Is any Entra credential stored (vault.entra_info: no value)?"""
+    return bool(info.get("refresh") or info.get("secret"))
+
+
+def entra_fits(a: Any, info: Mapping[str, Any]) -> bool:
+    """Is the stored Entra credential (vault.entra_info) one the account's
+    settings `a` use: a browser sign-in made for its tenant, client and
+    scope (a catalog's: its tenant, with the API scope pinned), or a service
+    principal's secret or certificate for its tenant and client? Anything
+    else (an older gateway's refresh token, a sign-in for settings that
+    changed since) needs a new sign-in. The status lines and gate check
+    decide with this one rule."""
+    if a.kind not in ("azure", "ml-catalog"):
+        return False
+    if browser_sign_in(a):
+        if not info.get("refresh") or info.get("kind") != "browser":
+            return False
+        if a.kind == "ml-catalog":
+            return (info.get("tenant_id") == (a.tenant or formmod.CATALOG_TENANT)
+                    and bool(info.get("pinned")))
+        return (info.get("tenant_id") == a.tenant and info.get("client_id") == a.client_id
+                and info.get("scope") == request_scope(a))
+    return (bool(info.get("secret")) and info.get("tenant_id") == a.tenant
+            and info.get("client_id") == a.client_id)
 
 
 def destination_matches(pattern: str, host: str) -> bool:
@@ -142,6 +192,22 @@ def owner_from_path(path: str, kind: str = "github") -> str | None:
     return owner if _OWNER.fullmatch(owner) else None
 
 
+def owner_covered(owner: str | None, names: Iterable[str], *, default: bool, any_owner: bool,
+                  only: bool) -> bool:
+    """Does an account route for `owner` (the one rule gitroute, the account
+    CLIs' destination, the hook and select share): an owner the destination
+    doesn't name (any account's), its login or one of its `owners`, the
+    default account; and the only account of its kind for that host only
+    when it lists no `owners` (any_owner): one that lists them covers only
+    those and its own login, so another owner's repository is the user's
+    own, never sent with a work account's key."""
+    if not owner:
+        return True
+    if owner.lower() in (n.lower() for n in names if n) or default:
+        return True
+    return only and any_owner
+
+
 def owner_from_url(url: str, kind: str = "github") -> tuple[str, str | None] | None:
     """(host, owner) from https://host/owner/repo, ssh://git@host[:port]/owner/repo
     or the scp form git@host:owner/repo. None if it isn't a URL."""
@@ -211,13 +277,15 @@ def resolve_name(name: str, aliases: Mapping[str, str] | None = None,
 
 def _select(kind: str | Iterable[str], host: str, owner: str | None, form: formmod.Form, *,
            effective: Any, vault: Mapping[str, Any] | None = None,
-           env: Mapping[str, str] | None = None) -> Selection:
+           env: Mapping[str, str] | None = None, mode: str | None = None,
+           asked: Container[str] = ()) -> Selection:
     """The account to use for (kind, destination host, owner). `kind` may be a
-    tuple of kinds. `effective` (consent.compute(form, vault_data)) is
+    tuple of kinds. `effective` (consent.compute(form, vault_data, mode)) is
     required: only approved destinations, approved `use` and bound credentials
-    count (never the raw form). `vault` (the vault dict) adds aliases and the
-    `bound` check for GATE_ACCOUNT; an account without a vault record has an
-    empty bound set."""
+    count (never the raw form); a `use` of "ask" in `mode` counts for an
+    account in `asked` (the approval hook asked about the command: the gated
+    git's). `vault` (the vault dict) adds aliases and the `bound` check for
+    GATE_ACCOUNT; an account without a vault record has an empty bound set."""
     kinds = (kind,) if isinstance(kind, str) else tuple(kind)
     env = os.environ if env is None else env
     aliases = (vault or {}).get("aliases") or {}
@@ -227,9 +295,22 @@ def _select(kind: str | Iterable[str], host: str, owner: str | None, form: formm
         ea = effective.accounts.get(a.name)
         return list(ea.destinations) if ea is not None else []
 
+    def use_word(a: formmod.Account) -> str:
+        try:
+            return str(effective.word(a.name, "use", mode))
+        except (AttributeError, KeyError):
+            return "deny"
+
     def usable(a: formmod.Account) -> bool:
         ea = effective.accounts.get(a.name)
-        return bool(ea is not None and ea.use)
+        if ea is None:
+            return False
+        return bool(ea.use) or (a.name in asked and use_word(a) == "ask")
+
+    def ask_note(a: formmod.Account) -> str:
+        return ("has use = \"ask\": only a git or account-CLI command that Claude runs as its "
+                "own command (not inside a script, a hook or sh -c), which Claude Code asks you "
+                "about first, may use it")
 
     explicit = (env.get("GATE_ACCOUNT") or "").strip()
     if explicit:
@@ -244,6 +325,8 @@ def _select(kind: str | Iterable[str], host: str, owner: str | None, form: formm
             return Selection(error=f"gateway: GATE_ACCOUNT={a.name} is a {a.kind} account; "
                                    f"this needs {' or '.join(kinds)}")
         if not usable(a):
+            if use_word(a) == "ask":
+                return Selection(error=f"gateway: {a.name} {ask_note(a)}")
             return Selection(error=f"gateway: {a.name} has use = false (or is waiting for the "
                                    f"user's OK); see gate status {a.name}")
         if not covers(dests(a), host):
@@ -267,6 +350,8 @@ def _select(kind: str | Iterable[str], host: str, owner: str | None, form: formm
 
     def why(a: formmod.Account) -> str:
         ea = effective.accounts.get(a.name)
+        if ea is not None and not ea.new and use_word(a) == "ask":
+            return ask_note(a)
         if not a.use or (ea is not None and not ea.use and not ea.new and not ea.pending):
             return (f"has use = false (gateway.toml); ask the user if it should be used, or "
                     f"pick another account with GATE_ACCOUNT=NAME")
@@ -304,7 +389,11 @@ def _select(kind: str | Iterable[str], host: str, owner: str | None, form: formm
                                    f"but {why(held[0])}")
     # SPEC 9.6: "if exactly one account of that kind+host exists" (in the
     # form, approved or not): a pending second account isn't "no other".
-    if not cands and len(in_form) == 1 and live:
+    # It covers an owner it doesn't list only when it lists no owners at
+    # all (owner_covered; gitroute and the hook say the same).
+    if not cands and len(in_form) == 1 and live and owner_covered(
+            owner, in_form[0].owner_names(), default=False, any_owner=not in_form[0].owners,
+            only=True):
         cands = live
         reason = "only"
     names = [a.name for a in cands]
@@ -355,23 +444,26 @@ def no_git_account(host: str) -> str:
     if kind:
         return f"gateway: no account for {shown}; ask the user to add one (gateway.toml, kind {kind})"
     return (f"gateway: no account for {shown}. The gateway has accounts for GitHub (also GitHub "
-            "Enterprise: kind github with host), Hugging Face and Pijul; for another git server, "
-            "use https for a public repository, or ask the user whether to set others = \"mine\" "
-            "in [settings] (servers not in the form then use their own ssh and git setup)")
+            "Enterprise: kind github with host), Hugging Face and Pijul; another git server, "
+            "left out of gateway.toml, is reached with the user's own ssh and git")
 
 
 def select(kind: str | tuple[str, ...], host: str, owner: str | None, form: formmod.Form,
            *, effective: Any, vault: dict[str, Any] | None = None,
-           env: Any = None) -> "Selection":
+           env: Any = None, mode: str | None = None, asked: Container[str] = ()) -> "Selection":
     """_select (above), then the chosen account's credential policy
     (PLAN-v4 phase 7: [accounts.NAME.policy] credential and [policy]
-    credential): only "allow" hands its credential to the git helper, the
-    CLI stand-ins and git over ssh; the refusal names the rule."""
-    sel = _select(kind, host, owner, form, effective=effective, vault=vault, env=env)
+    credential) in `mode` (None: the modeless rule): only "allow" hands its
+    credential to the git helper, the CLI stand-ins and git over ssh, and
+    "ask" too for an account in `asked` (the gated git's command, which the
+    approval hook asked about: githelper.gated_parent; its `use` too); the
+    refusal names the rule."""
+    sel = _select(kind, host, owner, form, effective=effective, vault=vault, env=env, mode=mode,
+                  asked=asked)
     if sel.account is not None and sel.error is None:
         from . import policy
-        d = policy.decide(effective, "credential", account=sel.account.name)
-        if d.word is not True:
+        d = policy.decide(effective, "credential", account=sel.account.name, mode=mode)
+        if d.word is not True and not (sel.account.name in asked and d.word == "ask"):
             return Selection(candidates=list(sel.candidates or []),
                              error=d.message(f"using {sel.account.name}'s credential"))
     return sel

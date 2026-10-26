@@ -3,7 +3,9 @@
 # Gateway v4 plan (authoritative from 2026-10-19)
 
 This plan implements the upgrade brief for the gateway (`gate@gateway`) and its side of the
-integration with checkpoint (`check@checkpoint`). It supersedes SPEC-v3 where they conflict;
+integration with checkpoint (`check@checkpoint`). [PLAN-0.11.md](PLAN-0.11.md) supersedes
+it where they differ (plugin 0.11.0: ungated unless configured, per-mode values, the network
+class, the git stand-in, browser sign-in, no managed refusal). It supersedes SPEC-v3 where they conflict;
 SPEC-v3 stays the reference for everything this plan keeps (form, vault format, consent,
 stand-ins, ssh, sudo, scrubbing, transfer). Checkpoint's half is the
 PLAN-v4.md in the checkpoint repository. The contract between them is [CONTRACT-v1.md](../CONTRACT-v1.md).

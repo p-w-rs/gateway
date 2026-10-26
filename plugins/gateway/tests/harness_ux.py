@@ -43,9 +43,6 @@ def _entry() -> int:
     cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     cfg.setdefault("dialog", "none")
     cfg.setdefault("machine_id", "TEST-MACHINE-0001")
-    # as in harness.gateway_env: no Claude Code ancestor unless a test asks
-    # for the real walk ({"extra": {"claude_ancestor": null}})
-    cfg["extra"] = {"claude_ancestor": "", **(cfg.get("extra") or {})}
     with testing.override(root, **cfg):
         return run.dispatch(sys.argv[3] if len(sys.argv) > 3 else "", sys.argv[4:])
 
@@ -212,7 +209,8 @@ def run_sh(env: H.GatewayEnv, script: str, payload: Any, *, test: bool = True,
            extra_env: dict[str, str] | None = None, timeout: float = 60) -> subprocess.CompletedProcess[str]:
     """sh hooks/SCRIPT [--test] with the payload on stdin. A ready (fake) env
     makes the script exec run.py, so --test is then required."""
-    if H.any_env_ready() and not test and script != "mcp_perm.sh":
+    # (mcp_perm.sh too: it hands http and download to Python, PLAN-0.11 §2.10)
+    if H.any_env_ready() and not test:
         raise H.GuardTripped("TEST GUARD: a hook script with a ready env needs --test")
     e = env.subprocess_env({"CLAUDE_PLUGIN_DATA": str(env.data), **(extra_env or {})})
     args = ["/bin/sh", str(SH_SCRIPTS / script)] + (["--test"] if test else [])

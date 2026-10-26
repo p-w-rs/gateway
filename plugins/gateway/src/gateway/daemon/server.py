@@ -19,19 +19,40 @@ and /agent/job/* for the gw MCP server's tools (planes.check_term),
 Dialog routes (daemon/dialogs.py): /ui/dialog/* on the UI plane (the mod),
 /agent/dialog/lease on the agent plane, /lease/* for any gateway entry point
 holding a lease token (popup.py's detached helper).
+
+The session's permission mode (PLAN-0.11 §2.4): POST /agent/session/mode
+from a gateway hook records it with the epoch marker's epoch, GET from a
+stand-in or the gw MCP server reads it under the epoch it names
+(planes.check_mode; modes.py is the client). The browser sign-in
+(PLAN-0.11 §7, daemon/oauth.py): POST /agent/signin/start and POST
+/agent/signin/wait (the lease token in the body, never in the URL) for the
+gate command (planes.check_signin).
+
+Every route names its plane; a plane the dispatcher doesn't know is refused
+(a typo never means "no check").
+
+A registration (/ui/register, /agent/register) takes the daemon's idle lock:
+once the daemon has decided to stop (idle, a stop request, a signal) it is
+refused with 503 "stopping", never answered 200 by a daemon about to exit.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import socketserver
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from .. import ancestry, paths, vault
+from .. import ancestry, modes, paths, vault
 from . import FEATURES, broker, dialogs, peers, planes, terminals
+
+# Planes whose route does its own check (or, for /health and the test routes,
+# none beyond the uid): every other plane is checked in Handler._dispatch.
+SELF_CHECKED = ("health", "ui-register", "agent-register", "test")
 
 MAX_REQUEST = 8 * 1024 * 1024
 EVENTS_WAIT_MAX = 25.0
@@ -50,11 +71,12 @@ def _err(status: int, code: str, message: str, **extra: Any) -> Reply:
 LOCKED_INTERACTIVE = ("gateway: the gateway vault is locked (it has a passphrase), so nothing "
                       "was sent. The gateway's unlock dialog is open in Claude Code (the user "
                       "can also type /gate-unlock); tell the user once, then retry after they "
-                      "unlock it.")
+                      "unlock it. Only if the user lost the passphrase: gate passphrase "
+                      "--start-over.")
 LOCKED_HEADLESS = ("gateway: the gateway vault is locked (it has a passphrase) and this session "
                    "has no screen to unlock it on, so nothing was sent. Tell the user to unlock "
                    "it from an interactive Claude Code session (/gate-doctor shows the vault's "
-                   "state), then retry.")
+                   "state; a lost passphrase: gate passphrase --start-over there), then retry.")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -147,10 +169,20 @@ class Handler(BaseHTTPRequestHandler):
                 ctx.session, ctx.entry = planes.check_agent(d.registry, self.peer)
             elif plane == "contract":
                 ctx.session = planes.check_contract(d.registry, self.peer)
+                _checkpoint_seen()
             elif plane == "agent-term":
                 ctx.session, ctx.entry = planes.check_term(d.registry, self.peer)
             elif plane in ("local", "lease"):
                 ctx.entry = planes.check_local(self.peer)
+            elif plane == "mode-record":
+                ctx.session, ctx.entry = planes.check_mode(d.registry, self.peer, record=True)
+            elif plane == "mode-read":
+                ctx.session, ctx.entry = planes.check_mode(d.registry, self.peer, record=False)
+            elif plane == "signin":
+                ctx.session, ctx.entry = planes.check_signin(d.registry, self.peer)
+            elif plane not in SELF_CHECKED:
+                d.log(f"error on {method} {url.path}: unknown plane")
+                raise _err(500, "internal", "gateway: the gateway daemon has no check for this route")
             body = fn(ctx)
             status = 200
         except dialogs.DialogError as e:
@@ -181,6 +213,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         self._dispatch("POST")
+
+
+# PLAN-0.11 §9.4 (lead decision 7): a checkpoint client reached a CONTRACT-v1
+# route, so checkpoint is live: <run>/checkpoint-seen's time says when
+# (hooks_session adds checkpoint's job lines to Claude's context while it is
+# younger than a day). Touched at most once a minute (events are polled).
+CHECKPOINT_SEEN_EVERY = 60.0
+_SEEN: dict[str, float] = {}
+
+
+def _checkpoint_seen() -> None:
+    now = time.time()
+    if now - _SEEN.get("at", 0.0) < CHECKPOINT_SEEN_EVERY:
+        return
+    _SEEN["at"] = now
+    try:
+        p = paths.checkpoint_seen_path()
+        with open(p, "a", encoding="ascii"):
+            pass
+        os.utime(p, None)
+    except (OSError, paths.PathError):
+        pass
 
 
 class Ctx:
@@ -240,8 +294,28 @@ def r_health(ctx: Ctx) -> dict[str, Any]:
     return ctx.daemon.health()
 
 
+STOPPING = ("gateway: the gateway daemon is stopping ({why}), so this session wasn't registered "
+            "with it; start a new one (gated start) and register again")
+
+
+@contextlib.contextmanager
+def _registering(ctx: Ctx) -> Iterator[None]:
+    """A registration, one at a time with the idle decision (Daemon._idle_stop):
+    answered 200 only while the daemon isn't stopping, so a session it accepts
+    is one it serves; after the decision to stop, 503 "stopping" (the client
+    starts a new daemon: lifecycle.ensure_running waits for this one)."""
+    d = ctx.daemon
+    with d.idle_lock:
+        if d.stopping.is_set():
+            raise _err(503, "stopping", STOPPING.format(why=d.stop_reason or "exit"))
+        if d.register_gap:
+            time.sleep(d.register_gap)        # a test knob: the race window held open
+        yield
+
+
 def r_ui_register(ctx: Ctx) -> dict[str, Any]:
-    s = planes.register_ui(ctx.daemon.registry, ctx.peer, ctx.body)
+    with _registering(ctx):
+        s = planes.register_ui(ctx.daemon.registry, ctx.peer, ctx.body)
     ctx.daemon.events.emit("session.registered", session=s.session_id or None, via="ui", ui=True)
     return {"ok": True, "registered": s.public(), **ctx.daemon.health()}
 
@@ -264,7 +338,8 @@ def r_lock(ctx: Ctx) -> dict[str, Any]:
 
 
 def r_agent_register(ctx: Ctx) -> dict[str, Any]:
-    s = planes.register_agent(ctx.daemon.registry, ctx.peer, ctx.body)
+    with _registering(ctx):
+        s = planes.register_agent(ctx.daemon.registry, ctx.peer, ctx.body)
     ctx.daemon.events.emit("session.registered", session=s.session_id or None, via="hook",
                            ui=s.ui)
     return {"ok": True, "registered": s.public()}
@@ -292,7 +367,7 @@ def r_vault_write(ctx: Ctx) -> dict[str, Any]:
     with ctx.daemon.vault_mutex:
         current = b.read() if paths.vault_path().exists() else vault.empty()
         merged = broker.merge(new, current, scope, b.key, entry_ok)
-        b.write(merged, migrating=bool(ctx.body.get("migrating")))
+        b.write(merged)
     return {"ok": True}
 
 
@@ -496,6 +571,33 @@ def r_resume(ctx: Ctx) -> dict[str, Any]:
 # -- jobs on the contract (CONTRACT-v1 "Calls") ----------------------------------------
 
 
+# CONTRACT-v1 feature job_env: a job's environment from the consumer (names
+# to string values, typically its session's whole environment). gated gives
+# the job what a pane keeps of it (terminals.env_kept: shell names, values
+# of at most ENV_VALUE_MAX, minus the managed shell's removals and what the
+# pane sets itself; the rest skipped, as for a gateway job_start's Claude
+# Code environment), the stand-ins first on its PATH (env_plan). Refused
+# whole (nothing starts) only when it isn't an object of strings, or when
+# what the job would keep exceeds JOB_ENV_TOTAL bytes (a job's every exec
+# would fail on an environment that large). A remote job keeps the host's
+# managed environment.
+JOB_ENV_TOTAL = 256 * 1024
+JOB_ENV_BAD = ("gateway: env is an object of variable names to string values, and what a job keeps "
+               "of it is at most {t} KiB; nothing started")
+
+
+def _job_env(v: Any) -> dict[str, str] | None:
+    if v is None:
+        return None
+    bad = _err(400, "bad_env", JOB_ENV_BAD.format(t=JOB_ENV_TOTAL // 1024))
+    if not isinstance(v, dict) or not all(isinstance(val, str) for val in v.values()):
+        raise bad
+    kept = terminals.env_kept(v)
+    if sum(len(k) + len(val.encode("utf-8")) + 2 for k, val in kept.items()) > JOB_ENV_TOTAL:
+        raise bad
+    return dict(v)
+
+
 def r_v1_job_start(ctx: Ctx) -> dict[str, Any]:
     b = ctx.body
     s = ctx.session
@@ -504,12 +606,13 @@ def r_v1_job_start(ctx: Ctx) -> dict[str, Any]:
         raise _err(403, "session", "gateway: that session isn't the caller's Claude Code session")
     if b.get("idempotency_key") in (None, ""):
         raise _err(400, "bad_request", "gateway: a job needs an idempotency_key (CONTRACT-v1)")
+    env = _job_env(b.get("env"))
     sup = ctx.daemon.terminals
     p, new = sup.start_job(s, agent=terminals._clean(b.get("agent"), 80), argv=b.get("argv"),
                            command=b.get("command"), cwd=b.get("cwd"), host=b.get("host"),
                            workspace=b.get("workspace") or "", task_ref=b.get("task_ref") or "",
                            on_pause=b.get("on_pause"), idempotency_key=b.get("idempotency_key"),
-                           via="contract")
+                           env=env, via="contract")
     return {"ok": True, "job": p.id, "op": terminals.ulid("o"), "state": p.state, "new": new}
 
 
@@ -777,6 +880,26 @@ def r_ui_unlock(ctx: Ctx) -> dict[str, Any]:
     return ctx.daemon.vault_dialog(ctx.session)
 
 
+def r_vault_offer(ctx: Ctx) -> dict[str, Any]:
+    """The vault passphrase offer after a store (PLAN-0.11 §8, daemon/offer.py),
+    from a gateway program below its session."""
+    return ctx.daemon.offers.offer(ctx.session)
+
+
+def r_vault_passphrase(ctx: Ctx) -> dict[str, Any]:
+    """`gate passphrase [--remove|--start-over]` (PLAN-0.11 §19.14): {action}
+    "passphrase", "remove" or "start-over"; gated opens its own dialog in the
+    caller's session (lifecycle.Daemon.vault_passphrase), or says why not."""
+    return ctx.daemon.vault_passphrase(ctx.session, ctx.body.get("action"))
+
+
+def r_lease_vault_offer(ctx: Ctx) -> dict[str, Any]:
+    """The same from popup's detached helper, whose dialog lease names its
+    session (it runs outside the session's process tree)."""
+    return ctx.daemon.offers.offer(ctx.daemon.dialogs.lease_session(ctx.body.get("lease"),
+                                                                     ctx.peer.pid))
+
+
 def r_dialog_lease(ctx: Ctx) -> dict[str, Any]:
     assert ctx.entry is not None
     return ctx.daemon.dialogs.lease(ctx.session, ctx.peer.pid, ctx.entry.mode)
@@ -811,6 +934,55 @@ def r_lease_release(ctx: Ctx) -> dict[str, Any]:
     return ctx.daemon.dialogs.release(ctx.body.get("lease"), ctx.peer.pid)
 
 
+# -- the session's permission mode (PLAN-0.11 §2.4) ------------------------------
+
+
+def r_session_mode_set(ctx: Ctx) -> dict[str, Any]:
+    """A gateway hook records its session's permission mode: the payload's
+    permission_mode, normalized (empty, missing or unknown is "default")."""
+    assert ctx.session is not None
+    mode = modes.normalize(ctx.body.get("mode"))
+    epoch = ctx.body.get("epoch")
+    epoch = epoch if isinstance(epoch, str) and modes.EPOCH_RE.fullmatch(epoch) else None
+    ctx.daemon.registry.set_mode(ctx.session, mode, epoch)
+    return {"ok": True, "mode": mode}
+
+
+def r_session_mode_get(ctx: Ctx) -> dict[str, Any]:
+    """The mode recorded for the caller's own session under the epoch the
+    caller names (?epoch=, the marker's: modes.current_for), or None (none
+    recorded for this process since gated started, or one posted under
+    another epoch: the caller uses the modeless rule)."""
+    assert ctx.session is not None
+    return {"ok": True, "mode": ctx.daemon.registry.mode_under(ctx.session, ctx.query.get("epoch"))}
+
+
+# -- the browser sign-in (PLAN-0.11 §7, daemon/oauth.py) -------------------------
+
+
+def r_signin_start(ctx: Ctx) -> dict[str, Any]:
+    """{account}: the sign-in lease, like the dialog lease: only for a session
+    that can draw the gateway's confirm dialog; gated then asks the person
+    (Open / Cancel) and runs the sign-in itself."""
+    from . import oauth
+    ok, why = ctx.daemon.dialogs.available(ctx.session)
+    if not ok:
+        return {"ok": True, "available": False, "reason": why, "message": dialogs.UNAVAILABLE[why]}
+    try:
+        return ctx.daemon.signins.start(ctx.session, ctx.body.get("account"))
+    except oauth.SignInError as e:
+        raise _err(e.status, e.code, e.message) from None
+
+
+def r_signin_wait(ctx: Ctx) -> dict[str, Any]:
+    """{lease, wait}: the sign-in's state, then its fixed outcome."""
+    from . import oauth
+    try:
+        return ctx.daemon.signins.wait(ctx.body.get("lease"), ctx.body.get("wait"))
+    except oauth.SignInError as e:
+        raise _err(e.status, e.code, e.message) from None
+
+
 def r_test_passphrase(ctx: Ctx) -> dict[str, Any]:
     ctx.daemon.broker.set_passphrase(ctx.body.get("passphrase"))
     return {"ok": True, "vault": ctx.daemon.broker.state()}
@@ -838,6 +1010,9 @@ ROUTES: dict[tuple[str, str], tuple[str, Callable[[Ctx], dict[str, Any]]]] = {
     ("POST", "/lease/dialog/retry"): ("lease", r_lease_retry),
     ("POST", "/lease/dialog/close"): ("lease", r_lease_close),
     ("POST", "/lease/release"): ("lease", r_lease_release),
+    ("POST", "/lease/vault/offer"): ("lease", r_lease_vault_offer),
+    ("POST", "/agent/vault/offer"): ("agent", r_vault_offer),
+    ("POST", "/agent/vault/passphrase"): ("agent", r_vault_passphrase),
     ("POST", "/agent/register"): ("agent-register", r_agent_register),
     ("POST", "/agent/vault/status"): ("agent", r_vault_status),
     ("POST", "/agent/vault/read"): ("agent", r_vault_read),
@@ -882,6 +1057,10 @@ ROUTES: dict[tuple[str, str], tuple[str, Callable[[Ctx], dict[str, Any]]]] = {
     ("POST", "/ui/term/close"): ("ui", r_ui_term_close),
     ("POST", "/ui/term/agent"): ("ui", r_ui_term_agent),
     ("GET", "/ui/manage"): ("ui", r_ui_manage),
+    ("POST", "/agent/session/mode"): ("mode-record", r_session_mode_set),
+    ("GET", "/agent/session/mode"): ("mode-read", r_session_mode_get),
+    ("POST", "/agent/signin/start"): ("signin", r_signin_start),
+    ("POST", "/agent/signin/wait"): ("signin", r_signin_wait),
 }
 TEST_ROUTES = {
     ("POST", "/test/vault/passphrase"): ("test", r_test_passphrase),

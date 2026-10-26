@@ -119,6 +119,15 @@ after this check passed.
   locks the vault after `lock_after` without use, prunes dead sessions, and
   exits after `IDLE_EXIT` (30 min) with no live session, terminal or job
   (live panes keep it running; the supervisor has its own 0.25 s tick).
+  The idle decision and a registration take turns (`Daemon.idle_lock`): a
+  session registered since the prune counts, and once it decided to stop
+  (idle or any other reason) a registration is refused with 503
+  `stopping`, so a 200 always means a daemon that serves the session.
+  `/health` then says `stopping`; `ensure_running` waits for that daemon's
+  pid and its instance lock and starts a new one (or uses the lock's
+  holder once it answers and isn't stopping: a gated still starting), and a
+  refused `/agent/register` (the client's `call`) or `/ui/register` (the
+  mod, up to three times) goes to it.
   Leaving because its socket was removed, it also stops its tmux server,
   whose socket went with the run dir (`Supervisor.abandon`). It also exits
   when the plugin folder its code runs from is going away and it holds no
@@ -129,10 +138,12 @@ after this check passed.
   orphaned by Claude Code (`.orphaned_at`, which 2.1.301's `claude plugin
   uninstall` and an update write into the version folder they leave for a
   later sweep) once no live session is registered (a session still running
-  that version keeps it). So an uninstalled gateway stops advertising the
-  contract at the next tick, not 30 min later (acceptance 2026-10-21; a
-  disabled plugin can't be seen from the daemon: a session without the
-  gateway isn't registered, and its calls are refused).
+  that version keeps it; decided under `idle_lock` like the idle exit, so a
+  session registered since the prune counts). So an uninstalled gateway
+  stops advertising the contract at the next tick, not 30 min later
+  (acceptance 2026-10-21; a disabled plugin can't be seen from the daemon:
+  a session without the gateway isn't registered, and its calls are
+  refused).
 - **Draining** (0.9.1; the GitHub install test found a plain uninstall with a
   job running left gated running forever, advertising the contract, its tmux
   server and watchdog running from deleted files: the env's tmux could no
@@ -203,7 +214,11 @@ Test knobs, `<root>/gated-test.json`, read only under a test override:
 `disk_max`, `log_max`, `busy` (stands in for live terminals and jobs),
 `clipboard`, `tmux` (a tmux the supervisor runs instead: a test's logging
 wrapper), `watch_tick` (the tmux watchdog's seconds between looks, 1-60;
-0.9.1), and since phase 6 `runtime_artifacts` (prebuilt fake runtime
+0.9.1), `stop_linger`, `idle_gap`, `idle_hold` and `register_gap` (how
+long a stopping daemon still answers, a pause before the idle or
+orphaned-plugin decision, one inside the idle decision after it decided to
+stop and one inside a registration: the idle exit's race windows held
+open), and since phase 6 `runtime_artifacts` (prebuilt fake runtime
 artifacts: no pixi-pack, no network), `remote_corrupt_upload`,
 `remote_no_hash_tool`, `remote_df_avail_kb`, `remote_tick`, `remote_stale` (the
 host status's staleness window), `ssh` (an ssh wrapper that records its argv, or
@@ -219,7 +234,7 @@ then the uid must be the daemon's, before any route.
 |---|---|---|
 | health | `GET /health` | any process of this user |
 | ui | `/ui/register`, `/ui/unregister`, `/ui/vault/lock`, `/ui/vault/unlock`, `GET /ui/dialog/next`, `POST /ui/dialog/{submit,paste,answer,cancel}` | the Claude Code process itself: a registered UI session's pid |
-| agent | `/agent/register`, `/agent/vault/{status,read,write,cache-read,cache-write,open-own,lock}`, `/agent/dialog/lease` | a gateway entry point below a registered session |
+| agent | `/agent/register`, `/agent/vault/{status,read,write,cache-read,cache-write,open-own,lock,offer,passphrase}`, `/agent/dialog/lease` | a gateway entry point below a registered session |
 | lease | `/lease/dialog/{open,wait,retry,close}`, `/lease/release` | a gateway entry point (any session or none: the dialog helper is detached) holding a live lease token |
 | agent-term | `/agent/term/{open,read,send,resize,signal,close,list}`, `/agent/job/{start,status,tail,signal,list}`, `/agent/remote/runtime` | the gw MCP server (a `run.py mcp` entry point) below a registered session (`planes.check_term`; terminals.md, remote.md) |
 | ui (pane) | `GET /ui/term/{list,screen}`, `POST /ui/term/{keys,take,release,resize,signal,open,close,agent}` | the Claude Code process itself (the mod's terminal pane) |
@@ -270,10 +285,8 @@ desktop app has the private field). The executable is checked when a process reg
 be Claude Code's (`peers.is_claude`: `ancestry.is_claude_exe`, named
 `claude`, npm's native binary `.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`
 (the package's `bin` since 2.1.113), the native install's versions folder,
-the desktop app's copy; or `ancestry.is_claude_node`, node whose first
-argument, with no node option before it, is an absolute path resolving to an
-existing `.../node_modules/@anthropic-ai/claude-code/cli.js`: npm before
-2.1.113). `gated start|status` name how the Claude Code that ran them was
+the desktop app's copy; node running npm's `cli.js`, from before 2.1.113,
+is no longer recognized: 0.11.0, no backward compatibility). `gated start|status` name how the Claude Code that ran them was
 installed (`claude_install`, or `parent_exe` when it isn't recognized), and
 `/gate-doctor` shows it. Afterwards a session is
 valid while its pid lives with the start time it registered with (a reused
@@ -306,7 +319,9 @@ from another epoch (named, or past this epoch's end) starts over with
 `daemon.started`, `daemon.stopping`, `daemon.draining {reason, terminals,
 jobs, resumed}` (0.9.1; the plugin uninstalled while work runs; new within v1, which
 allows new kinds), `session.registered`, `session.ended`,
-`vault.wrapped`, `vault.unlocked`, `vault.locked`, `auth.waiting`,
+`vault.wrapped`, `vault.unlocked`, `vault.locked`, since 0.11
+`vault.unwrapped` (the passphrase removed) and `vault.started_over` (a
+locked vault moved aside), `auth.waiting`,
 `auth.supplied`, `pause.applied`, and since phase 5 `job.started`,
 `job.state`, `job.exited`, `job.output` (counts), `terminal.opened`,
 `terminal.owner`, `terminal.closed`, since phase 6 `host.state {host, name,
@@ -318,10 +333,22 @@ command); `pause.applied` gains `replayed` for a repeated `pause_id`.
 
 - `/v1/capabilities`: `{contract: 1, contract_id, gateway_version, features:
   ["hosts", "events", "pause", "jobs", "terminals", "remote", "workspaces",
-  "accounts", "pause_id"], epoch, limits}`.
+  "accounts", "pause_id", "job_env"], epoch, limits}`.
+- `POST /v1/jobs` with `env` (feature `job_env`, PLAN-0.11 §19.14):
+  the job's pane gets what `terminals.env_kept` keeps of it, like the gw
+  MCP server's `job_start` (the first `ENV_MAX` names
+  `[A-Za-z_][A-Za-z0-9_]{0,63}` with string values of at most
+  `ENV_VALUE_MAX` characters, valid UTF-8, no NUL, minus `PANE_SETS` and
+  the managed shell's removals; the rest is skipped: a session's
+  environment often holds an exported function or a long direnv value),
+  the stand-ins first on PATH, then its PATH (`env_plan`).
+  `server._job_env` refuses it whole (400 `bad_env`, nothing starts, no
+  value in the message) only when it isn't an object of strings or what
+  the job keeps is over 256 KiB in UTF-8 bytes (`JOB_ENV_TOTAL`).
 - `/v1/snapshot`: `{contract: 1, seq, epoch, hosts, workspaces, accounts,
   terminals, jobs}` (since phase 7: hosts carry `rights`, the effective
-  allow/ask/deny per action from `policy.rights`; `workspaces` are `{workspace:
+  allow/ask/deny per action from `lifecycle.contract_rights` (the modeless
+  rule, PLAN-0.11 §2.11); `workspaces` are `{workspace:
   w_..., name, host, host_name, root, local?}`; `accounts` are `{account, kind,
   state, checked_at?, rights}` from the adapters' last checks, docs/dev/modules/policy.md
   and accounts.md; a locked vault gives `state: "unknown"`. Snapshot reads use
@@ -362,6 +389,80 @@ suspended ...").
   `host_inspect` for a remote host): `RemoteHost.inspect`, read-only, decided
   by the host's `read` policy (remote.md).
 
+### Routes added in 0.11.0
+
+- `POST /agent/session/mode` and `GET /agent/session/mode` (PLAN-0.11 §2.4,
+  lead decision 3; `planes.Registry.set_mode`, `mode_under`): a Python hook
+  (`hook-*`, `hook-mcp`, `hook-mode`, below the registered session) posts the
+  payload's permission mode with the epoch of `$DATA/mode-epoch`; a stand-in
+  Claude typed (a `shim` entry point below that session) and the gw MCP
+  server read it back only under the same epoch (`modes.current_for`), so a
+  record posted before the marker was taken out and made again never
+  counts. Records live in memory, per session (pid and start time): a
+  restarted daemon or a reused pid has none until the next post, and then
+  the modeless rule applies. The last post wins (a subagent in another mode
+  changes it for the session). A guardrail: a process running as the user
+  could post a false one.
+- `POST /agent/signin/start` and `POST /agent/signin/wait` (the signin
+  plane: a gateway entry point below a session that can draw dialogs; the
+  wait's lease token in the body, gated keeps only its sha256): the browser
+  sign-in, below.
+- `POST /agent/vault/offer` (agent plane) and `POST /lease/vault/offer`
+  (lease plane, for popup's detached helper): the vault passphrase offer
+  (`daemon/offer.py`, PLAN-0.11 §8). After a stored secret, while the
+  vault's `passphrase_offer` is "pending" and no `key.wrapped` exists,
+  gated opens its own choice dialog (Set passphrase / Not now / Cancel) at
+  most once per session (in memory, so a restart can offer again): Set
+  passphrase opens the set-passphrase dialog, Not now records "declined"
+  for good (it waits at most 30 s for the vault lock), Cancel or a timeout
+  leaves it pending. It is offered only once the vault lock is released
+  (`set_passphrase` takes the flock), never under a fake dialog, and also
+  after gated's own sign-in store.
+- Every CONTRACT-v1 route touches `<run>/checkpoint-seen`
+  (`paths.checkpoint_seen_path`, lead decision 7): SessionStart adds the
+  checkpoint jobs line to Claude's context only while it is younger than 24
+  h (`hooks_session.checkpoint_live`).
+- CONTRACT-v1's `rights` words come from the modeless resolution
+  (`lifecycle.contract_rights`: cc and allow map to allow, ask to ask, deny
+  to deny); the contract text is unchanged.
+
+### Browser sign-in
+
+`daemon/oauth.py` (PLAN-0.11 §7): `gate check NAME` or `gate login NAME` for
+an azure account with `sign_in = "browser"`, or an ml-catalog account, takes
+a sign-in lease (one sign-in per user at a time; the same account from the
+same session joins it). gated reads the account itself (the form and the
+approved rights; an account waiting for the user's OK, an unbound catalog or
+a locked vault is refused) and opens its own confirm dialog (a fixed
+template in the mod) naming the account, tenant, client id (a catalog's host
+and a changed client id) and scope, with Open and Cancel. Nothing happens
+before Open. On Open: the display variables come with the mod's answer (no
+display on Linux, or a Mac in an ssh session, gives the fixed no-display
+text); a listener on 127.0.0.1, port 0 (the one TCP endpoint gated opens: a
+TCP peer has no uid, so `state` and the PKCE verifier bind the callback);
+`state` and a PKCE S256 pair; `<run>/signin-active` (the browser-automation
+tools are denied while it exists); the system browser by absolute path
+(`/usr/bin/open`, or xdg-open from fixed folders; never `$BROWSER` or a PATH
+lookup). The listener serves only `GET /cb` (headers capped, one deadline
+per connection, at most `MAX_CONNS` at once); a wrong state gets a fixed 400
+and it keeps waiting; an `error` gives a fixed outcome (its description is
+dropped); the first valid code is exchanged through `entra.urlopen`, the
+tokens go straight into the vault (`entra` record, kind "browser"; a catalog
+also pins its client and scope) and the access token into cache.age. The
+program that asked waits with `signin/wait` and gets a fixed outcome; the
+code, verifier and tokens never leave gated. The listener stops when the
+sign-in ends, before the waiters hear of it and before the marker goes
+(`Listener.stop`: the socket shut down, since on Linux `close()` alone
+doesn't wake the accept thread and the socket kept listening), then
+`Listener.close` waits for the accept thread and closes the socket; a
+connection accepted after the stop is closed unanswered. Its own timer stops
+it at its deadline too. Test knobs (only under a test
+override): `browser` (the program run instead of the system browser),
+`browser_platform`, `signin_timeout`, `entra_authority`. Never verified
+against Microsoft's real service: a catalog whose app registration doesn't
+allow a loopback redirect shows Microsoft's error, and `gate check` times
+out with a message naming that cause.
+
 ## The broker (broker.py, agepass.py)
 
 Key modes (`vault.key_mode()`): `none`, `unwrapped` (key.txt, every vault
@@ -392,8 +493,9 @@ made before this phase), `wrapped` (key.wrapped + key.recipient, no key.txt).
   it), key.txt is checked to be still the key that was wrapped, the key to
   open the vault, and key.recipient and key.wrapped are put in place and
   key.txt removed (each step fsynced). A failed check removes the temp file
-  and changes nothing. Refused while a 0.6 store waits for migration, or when
-  the key is already wrapped.
+  and changes nothing. Refused with `vault.V06_MESSAGE` beside a gateway 0.6
+  vault (`vault.v06_waiting`: before age runs, and again under the flock), or
+  when the key is already wrapped.
 - `unlock(pw)`: refuses a passphrase the wrap never accepts (over 512 bytes,
   control characters), unwraps key.wrapped (`BrokerError` "that passphrase
   doesn't unlock the vault"; scrypt outside the mutex), checks the identity
@@ -415,10 +517,34 @@ made before this phase), `wrapped` (key.wrapped + key.recipient, no key.txt).
   match, at least 12 characters) wraps an unwrapped vault (`set_passphrase`:
   wrap, verify by unwrapping, then key.txt goes), and the unlock dialog
   (`unlock`; "That didn't work" up to 3 times). `/ui/vault/unlock`
-  (`/gate-unlock`) opens whichever applies; a locked vault read from a
-  session that can draw dialogs opens the unlock dialog by itself (once per
-  session at a time). `/ui/vault/lock` (`/gate-lock`) locks at once. The
-  test routes stay for tests.
+  (`/gate-unlock`) opens whichever applies, and for an unlocked vault gated's
+  menu (a choice: Change passphrase, Remove passphrase; one per session); a
+  locked vault read from a session that can draw dialogs opens the unlock
+  dialog by itself (once per session at a time). `/ui/vault/lock`
+  (`/gate-lock`) locks at once. The test routes stay for tests.
+- Vault care from chat (PLAN-0.11 §19.14), each only after the person's
+  answer in gated's own dialog: `change_passphrase(pw)` (unlocked: the
+  identity wrapped with the new passphrase into a temp file, unwrapped
+  again and compared, then put over key.wrapped under the flock and the
+  mutex; the old key.wrapped is never kept), `remove_passphrase()`
+  (unlocked: the passphrase offer recorded as declined while the vault is
+  still encrypted to the same key, key.txt written whole, then key.wrapped
+  and key.recipient removed: a crash between leaves key.txt, which
+  `key_mode()` reads first; event `vault.unwrapped`) and `start_over()`
+  (wrapped and locked: a lost passphrase; `vault.move_aside` renames
+  vault.age, key.wrapped, key.recipient and cache.age, regular files only,
+  into a new 0700 `private/backups/startover-<time>-<hex>/`, nothing
+  deleted; the next store makes a new key and vault; event
+  `vault.started_over`). Each checks the vault's state again under the
+  mutex when the person answers, so a vault locked (remove) or unlocked
+  (start over) while the confirm waits is refused. The unlock dialog and
+  the locked messages (`LOCKED_INTERACTIVE`, `LOCKED_HEADLESS`,
+  SessionStart's `VAULT_LOCKED`) name `gate passphrase --start-over` for a
+  lost passphrase. `POST /agent/vault/passphrase
+  {action}` (agent plane; `gate passphrase [--remove|--start-over]`,
+  `client.vault_passphrase`) opens the dialog for "passphrase" (set, or
+  change when unlocked), "remove" (a confirm, Cancel the default) or
+  "start-over" (a confirm, only while locked), or says why not.
 
 Scoped data: `scope_for(mode)` names the secret classes a mode may see:
 
@@ -429,7 +555,7 @@ Scoped data: `scope_for(mode)` names the secret classes a mode may see:
 | `git-credential`, `mcp` | `tokens`, `signins`, `cache` |
 | `shim gh/hf/databricks/crane/pijul/az/asiml/dvc` | `tokens`, `signins`, `account_keys`, `cache` |
 | `gate`, `shim gate`, `hook-*` (they mask output) | all |
-| `hook-files`, `hook-daemon`, `askpass`, `gated`, anything else | none |
+| `hook-files`, `hook-daemon`, `hook-mcp`, `hook-mode`, `askpass`, `gated`, anything else (`shim git` too: it reads approvals, never a secret; the gated git's helper and ssh are their own modes) | none |
 
 `make_view` replaces every value the peer may not see with a sentinel
 `gw-redacted:<32 hex>` (HMAC-SHA256 with a per-daemon random key, so it says
@@ -439,9 +565,7 @@ nothing about the value); `vault.is_redacted` recognizes one and
 mode names) also gets sentinels for every entry without an effective
 `scripts = true` (consent, computed by the daemon). `merge` swaps sentinels
 back for their values and raises `Conflict` (409) when the written document
-adds, changes, moves or drops a value the writer couldn't see; the vault's
-baseline mark stays as the vault has it (a writer can neither drop nor add
-it: vault.older_install). The token
+adds, changes, moves or drops a value the writer couldn't see. The token
 cache: `cache_view`/`cache_merge` (no cache class: empty view, writes
 refused; withheld accounts kept as they are). The client (`client.vault_read`)
 asks the daemon on every read and keeps nothing between reads, so a lock (or
@@ -566,8 +690,12 @@ drawing side).
   recheck; a failed recheck closes the dialog as failed; such dialogs aren't
   persisted (the prompt is asked again if it still waits after a restart).
 - **The vault's dialogs** (`lifecycle.vault_dialog`): `passphrase` (two
-  fields) and `unlock` kinds, owned by gated itself (no lease): the answer
-  goes straight to the broker on a worker thread.
+  fields; its `what` says set or change) and `unlock` kinds, owned by
+  gated itself (no lease): the answer goes straight to the broker on a
+  worker thread. The unlocked vault's menu (a choice) and the remove and
+  start-over confirms are `open_owned` dialogs (owner "gated", one of each
+  per session: `Daemon._open_gated`) whose handlers run only on the
+  person's pick or OK.
 - **gated's own confirmations** (phase 6, remote.md): `open_owned(...,
   kind="confirm" | "info")`, owner "gated", never persisted: a remote host's
   changed host key or machine (default Cancel; the handler pins or stores on
@@ -601,13 +729,11 @@ nothing to lock).
   lives (`Registry.pane_session`, terminals.md), and gets nothing after.
 - A handed-over secret is a Python string in gated and in the helper for as
   long as they use it (it can't be wiped; the box's plaintext bytes are).
-- An npm-installed Claude Code is recognized (since GW-COMPAT-1): npm's
-  native binary by its path, an older node one by its argv (node and cli.js,
-  nothing before the script). Before that it couldn't register, and without
-  a registered session no gateway dialog can open (every dialog goes through
-  gated, wrapped vault or not). A Claude Code run some other way (a copy
-  renamed, node with options before cli.js, a bundler's own runtime) still
-  can't register: `/gate-doctor` says "not recognized" and names what asked.
+- An npm-installed Claude Code is recognized by npm's native binary
+  (`bin/claude.exe`, 2.1.113 and later). A Claude Code run some other way (a
+  copy renamed, node running an old `cli.js`, a bundler's own runtime) can't
+  register: without a registered session no gateway dialog can open, and
+  `/gate-doctor` says "not recognized" and names what asked.
 - One gated per user (one socket, `/tmp/gw-<uid>/gated.sock`) serves one
   plugin data folder: the one its python belongs to. A second Claude Code
   configuration (its own `CLAUDE_CONFIG_DIR`, so its own data folder) gets
@@ -642,7 +768,7 @@ nothing to lock).
   scratch config, fake API, 2.1.301 on macOS: the kernel's peer pid was the
   claude pid); the desktop app and `claude -p` (the hook route) weren't run
   live. Recognising Claude Code by executable: named `claude`, npm's
-  `bin/claude.exe` (or node running npm's cli.js, by argv), or under the
+  `bin/claude.exe`, or under the
   person's own `~/.local/share/claude/versions/` or the desktop app's
   folder, whatever home a test or e2e override gives the gateway (the live
   run found the native install's `versions/2.1.301` refused under the e2e

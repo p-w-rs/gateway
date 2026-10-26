@@ -1,5 +1,5 @@
 // The gateway mod's pure logic (no `$`): where the plugin's data folder is,
-// what `launch.sh status` says, the setup status line, the pixi verdict, the
+// what `launch.sh status` says, the setup status line, the version verdicts, the
 // capability matrix and the /gate-doctor report. register.tsx wires it to the
 // engine; lib.test.ts and register.test.ts test it under `claude plugin test`.
 //
@@ -8,20 +8,21 @@
 
 import { FULLSCREEN_HINT, MAIN_KEYS, NO_DISPLAY, NO_DISPLAY_TODO, PASTE_NOTE } from './dialog.ts'
 
-// pixi versions that install this plugin's lock (format v7) with the
-// launcher's own `pixi install --locked --manifest-path`, tested 2026-10-19 on
-// macOS arm64: 0.68.0, 0.69.0, 0.70.0, 0.81.0, 0.82.0 (0.61.0-0.67.0 refuse
-// the lock). pixi.toml's requires-pixi is the lower bound, with no upper
-// bound; a newer pixi only gets a warning here. tests/test_packaging.py
-// keeps these, pixi.toml and the docs in step.
-export const PIXI_TESTED_MIN = '0.68.0'
-export const PIXI_TESTED_MAX = '0.82.0'
-
-// Mods (hooks modules) load from these Claude Code versions on.
-export const MODS_MIN_TERMINAL = '2.1.287'
-export const MODS_MIN_DESKTOP = '2.1.286'
+// Latest only (PLAN-0.11 section 5): the one pixi and the one Claude Code this
+// release is tested with. PIXI_TESTED is the pixi that made pixi.lock, the
+// newest at the relock, and pixi.toml's requires-pixi is ">=" it
+// (tests/update_deps.py sets both; tests/test_packaging.py keeps them in
+// step). CLAUDE_TESTED is the Claude Code the live acceptance runs used. An
+// older version gets a warning (update: only the latest is supported), a
+// newer one an info line.
+export const PIXI_TESTED = '0.83.0'
+export const CLAUDE_TESTED = '2.1.310'
 
 export const DOCTOR_COMMAND = 'gate-doctor'
+
+// How pixi is updated: its own self-update, or the package manager that
+// installed it (pixi self-update refuses a Homebrew or MacPorts pixi).
+export const PIXI_UPDATE = 'pixi self-update, or your package manager for a Homebrew or MacPorts pixi'
 
 // Managed execution (PLAN-v4 phase 4; docs/dev/modules/managed.md): the prefix
 // Claude Code runs every shell command through, the folder Python writes the
@@ -30,7 +31,7 @@ export const DOCTOR_COMMAND = 'gate-doctor'
 export const GATE_SH = 'hooks/gate-sh'
 
 export type ManagedState = {
-  mode: 'on' | 'warn' | 'off'
+  mode: 'on' | 'off'
   formMode: string
   gateSh: string                  // the prefix to use: hooks/gate-sh, or the data folder's copy
   bash: string
@@ -43,7 +44,8 @@ export type ManagedState = {
   found: string[]                 // tool folders here the managed PATH lacks (managed.found_not_imported)
 }
 
-const MODES: readonly string[] = ['on', 'warn', 'off']
+// PLAN-0.11 §1.6: "warn" is gone (a written one is a mistake and counts as "on")
+const MODES: readonly string[] = ['on', 'off']
 
 export function parseManagedState(text: string | undefined): ManagedState | undefined {
   if (text === undefined || text.trim() === '') return undefined
@@ -84,12 +86,13 @@ export function parseManagedState(text: string | undefined): ManagedState | unde
 // that path, and only while it holds the plugin's gate-sh, copyOk); the
 // managed bash comes from launch.sh's status (the env it names), never from
 // state.json's `bash`. So a rewritten state.json can only take the prefix
-// away (the classic Bash hook then denies in managed mode).
+// away: Claude's commands then run in the user's own shell, still judged by
+// the classic Bash hook (PLAN-0.11 §1.8: no refusal, a notice once).
 export type ManagedPlan = {
   dir: string
   prefix: string | undefined
   shell: string | undefined
-  mode: 'on' | 'warn' | 'off'
+  mode: 'on' | 'off'
   inactive: string | undefined    // why there is no prefix, in words
 }
 
@@ -107,7 +110,7 @@ export function managedPlan(f: { root: string; data: string; state: ManagedState
   const copy = gateShPaths(f.root, f.data).copy
   const prefix = f.state?.gateSh === copy && f.copyOk === true ? copy : own
   if (prefix.includes(' -')) {
-    return { dir, prefix: undefined, shell: undefined, mode, inactive: 'the plugin\'s folder holds " -", which CLAUDE_CODE_SHELL_PREFIX can\'t carry (Claude Code splits the prefix there); the classic Bash hook reports it' }
+    return { dir, prefix: undefined, shell: undefined, mode, inactive: 'the plugin\'s folder holds " -", which CLAUDE_CODE_SHELL_PREFIX can\'t carry (Claude Code splits the prefix there); Claude\'s commands run in your own shell (the classic Bash hook still judges them)' }
   }
   return { dir, prefix, shell: bash, mode, inactive: undefined }
 }
@@ -134,8 +137,8 @@ export function managedLines(plan: ManagedPlan | undefined, state: ManagedState 
   }
   if (state.formMode !== '' && state.formMode !== state.mode) out.push(`  gateway.toml says "${state.formMode}"; that waits for the user's OK (gate check settings)`)
   out.push(`  bash: ${state.ready ? `${c(state.bash)} (${state.bashVersion})` : 'not ready yet (the gateway is still setting up)'}`)
-  out.push(`  PATH: ${state.path.map((p) => `${c(p.dir)} (${p.origin})`).join('; ')}; then other plugins' bin/ folders`)
-  out.push(`  Environment: platform variables, SHELL, Claude Code's own; imported: ${state.env.length > 0 ? state.env.map((e) => `${e.name} (${e.origin})`).join('; ') : 'nothing'}`)
+  out.push(`  PATH: ${state.path.map((p) => `${c(p.dir)} (${p.origin})`).join('; ')} (other plugins' bin/ folders come before the imports)`)
+  out.push(`  Environment: yours (Claude Code's), minus Claude Code's own credential variables, the shell startup variables and the gateway's GW_* names; SHELL is the managed bash${state.env.length > 0 ? `; [shell] import_env: ${state.env.map((e) => `${e.name} (${e.origin})`).join('; ')}` : ''}`)
   if (state.pending.length > 0) out.push(`  waiting for the user's OK: ${state.pending.join('; ')}`)
   if (state.found.length > 0) out.push(`  found here but not imported: ${state.found.map(c).join(', ')} (Claude can propose importing them: [shell] import_path, then your OK in the gateway's dialog)`)
   if (!state.vaultReadable) out.push('  the vault was locked when these were written: approved imports apply after /gate-unlock')
@@ -158,10 +161,14 @@ export type EnvStatus = {
   install_log: boolean
   pixi: string
   pixi_version: string
+  // the last build failed because pixi refused the manifest ("requires
+  // pixi"): the pixi it found and the requires-pixi it needs
+  pixi_too_old: boolean
+  pixi_found: string
+  pixi_needed: string
   home: string
   form: boolean
   vault: boolean
-  vault_v2: boolean
 }
 
 const STATES: readonly string[] = ['ready', 'building', 'failed', 'nopixi', 'missing']
@@ -183,11 +190,11 @@ export function parseStatus(stdout: string): EnvStatus | undefined {
   return {
     state: o.state as EnvState,
     root: s('root'), data: s('data'), env: s('env'), lock: s('lock'), warm: b('warm'),
-    // absent (a launch.sh before 0.9.1): counted as written, as it then was
-    managed: o.managed !== false,
+    managed: b('managed'),
     older: s('older'), build_running: b('build_running'), install_log: b('install_log'),
-    pixi: s('pixi'), pixi_version: s('pixi_version'), home: s('home'), form: b('form'),
-    vault: b('vault'), vault_v2: b('vault_v2'),
+    pixi: s('pixi'), pixi_version: s('pixi_version'),
+    pixi_too_old: b('pixi_too_old'), pixi_found: s('pixi_found'), pixi_needed: s('pixi_needed'),
+    home: s('home'), form: b('form'), vault: b('vault'),
   }
 }
 
@@ -234,24 +241,33 @@ export function parsePixiVersion(s: string): string | undefined {
   return m === null ? undefined : m[1]
 }
 
-export type PixiVerdict = { kind: 'tested' | 'newer' | 'older' | 'unknown'; text: string }
+// /gate-doctor's verdict on a version against the one tested (latest only,
+// PLAN-0.11 section 5): the tested one is fine, an older one is a warning
+// with the way to update, a newer one an info line.
+export type VersionVerdict = { kind: 'tested' | 'newer' | 'older' | 'unknown'; text: string }
 
-export function pixiVerdict(version: string | undefined): PixiVerdict {
-  const range = `${PIXI_TESTED_MIN}-${PIXI_TESTED_MAX}`
-  if (version === undefined) return { kind: 'unknown', text: `version unknown (tested range ${range})` }
-  if (compareVersions(version, PIXI_TESTED_MIN) < 0) {
-    return {
-      kind: 'older',
-      text: `${version} is older than ${PIXI_TESTED_MIN}, which this plugin needs (its lock is format v7); update pixi (pixi self-update)`,
-    }
-  }
-  if (compareVersions(version, PIXI_TESTED_MAX) > 0) {
-    return {
-      kind: 'newer',
-      text: `${version} is newer than the tested range ${range} (a warning only: it should work; if setup fails, say so)`,
-    }
-  }
-  return { kind: 'tested', text: `${version}, inside the tested range ${range}` }
+function versionVerdict(version: string | undefined, tested: string, update: string): VersionVerdict {
+  if (version === undefined) return { kind: 'unknown', text: `version unknown (tested with ${tested})` }
+  const c = compareVersions(version, tested)
+  if (c < 0) return { kind: 'older', text: `${version}, older than the tested ${tested}: warning: ${update}: only the latest is supported` }
+  if (c > 0) return { kind: 'newer', text: `${version}, newer than the tested ${tested} (info: it should work; if something fails, say so)` }
+  return { kind: 'tested', text: `${version}, the tested version` }
+}
+
+export function pixiVerdict(version: string | undefined): VersionVerdict {
+  return versionVerdict(version, PIXI_TESTED, `update pixi (${PIXI_UPDATE})`)
+}
+
+export function claudeVerdict(version: string | undefined): VersionVerdict {
+  return versionVerdict(version, CLAUDE_TESTED, 'update Claude Code (claude update)')
+}
+
+// What the doctor and the status line say when the last build failed
+// because pixi refused the manifest (launch.sh status: pixi_too_old).
+export function pixiTooOldText(st: EnvStatus): string {
+  const found = st.pixi_found !== '' ? `pixi ${st.pixi_found}` : 'this pixi'
+  const needed = st.pixi_needed !== '' ? ` (the gateway needs pixi ${st.pixi_needed})` : ''
+  return `${found} is too old${needed}; update pixi (${PIXI_UPDATE}), then start a new session`
 }
 
 export function formatElapsed(ms: number): string {
@@ -297,7 +313,7 @@ export function statusLine(st: EnvStatus | undefined, elapsedMs: number, managed
     case 'missing':
       return `setting up… ${formatElapsed(elapsedMs)}`
     case 'failed':
-      return `setup failed; /${DOCTOR_COMMAND} says why`
+      return st.pixi_too_old ? `pixi is too old: update it; /${DOCTOR_COMMAND} says how` : `setup failed; /${DOCTOR_COMMAND} says why`
     case 'nopixi':
       return `pixi isn't installed (https://pixi.sh); /${DOCTOR_COMMAND}`
   }
@@ -313,24 +329,24 @@ export type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile' | 'print' | '
 export type CapabilityRow = {
   feature: string
   cells: Record<Surface, Cell>
-  min: string
   withoutMods: boolean
 }
 
 export const CAPABILITIES: readonly CapabilityRow[] = [
-  { feature: 'Bash approval hook, file guard, output masking, paste guard (classic hooks)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, min: '2.1.299 (tested)', withoutMods: true },
-  { feature: 'Stand-ins on PATH (sudo, ssh, git, gh, ...) and the gw MCP tools (http, download)', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, min: '2.1.299 (tested)', withoutMods: true },
-  { feature: 'Cold-start guard while the env builds (sh, no Python)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, min: '2.1.301 (tested)', withoutMods: true },
-  { feature: '/gate:status and /gate:help (Markdown commands, a model turn)', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, min: '2.1.299 (tested)', withoutMods: true },
-  { feature: '/gate-doctor (immediate, no model turn)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, min: '2.1.287 terminal, 2.1.286 desktop', withoutMods: false },
-  { feature: 'Setup status line and provisioning at session start (mod)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'no', remote: 'untested' }, min: '2.1.287 terminal, 2.1.286 desktop', withoutMods: false },
-  { feature: 'Gateway daemon (gated): CONTRACT-v1 discovery, snapshot and events; the vault broker', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, min: '2.1.301 (tested)', withoutMods: true },
-  { feature: 'Native gateway dialogs: credential field with sealed delivery, consent, host key, vault passphrase; /gate-dialog, /gate-unlock, /gate-lock', cells: { terminal: 'yes', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, min: '2.1.301 (tested)', withoutMods: false },
-  { feature: 'Managed shell (CLAUDE_CODE_SHELL_PREFIX -> gate-sh): Bash, background, ! commands, subagents, skill injection', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, min: '2.1.301 (tested)', withoutMods: false },
-  { feature: 'Terminals and jobs (tmux supervisor in gated): gw terminal_* and job_* tools, CONTRACT-v1 job routes, password prompts through the dialog', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, min: '2.1.301 (tested)', withoutMods: true },
-  { feature: 'Remote terminals and jobs (the managed remote runtime over ssh): host on terminal_open, job_start and CONTRACT-v1 jobs, host_runtime, the host key and machine checks', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, min: '2.1.299 (the gw tools)', withoutMods: true },
-  { feature: 'Shared terminal pane and takeover (Client): /gate-terminal', cells: { terminal: 'yes', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, min: '2.1.301 (tested)', withoutMods: false },  { feature: 'Policy (allow, ask, deny per host, workspace, account and action), workspaces, forwarding grants, account states, export and import format 3', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, min: '2.1.299 (the hooks and stand-ins)', withoutMods: true },
-  { feature: 'Hosts and accounts panes (immediate): /gate-hosts, /gate-accounts', cells: { terminal: 'untested', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, min: '2.1.287 terminal, 2.1.286 desktop', withoutMods: false },
+  { feature: 'Bash approval hook, file guard, output masking, paste guard (classic hooks)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, withoutMods: true },
+  { feature: 'Stand-ins on PATH (sudo, ssh, git, gh, ...) and the gw MCP tools (http, download)', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, withoutMods: true },
+  { feature: 'Cold-start guard while the env builds (sh, no Python)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, withoutMods: true },
+  { feature: '/gate:status and /gate:help (Markdown commands, a model turn)', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, withoutMods: true },
+  { feature: '/gate-doctor (immediate, no model turn)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, withoutMods: false },
+  { feature: 'Setup status line and provisioning at session start (mod)', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'no', remote: 'untested' }, withoutMods: false },
+  { feature: 'Gateway daemon (gated): CONTRACT-v1 discovery, snapshot and events; the vault broker', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, withoutMods: true },
+  { feature: 'Native gateway dialogs: credential field with sealed delivery, consent, host key, vault passphrase; /gate-dialog, /gate-unlock, /gate-lock', cells: { terminal: 'yes', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, withoutMods: false },
+  { feature: 'Managed shell (CLAUDE_CODE_SHELL_PREFIX -> gate-sh): Bash, background, ! commands, subagents, skill injection', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'yes', remote: 'untested' }, withoutMods: false },
+  { feature: 'Terminals and jobs (tmux supervisor in gated): gw terminal_* and job_* tools, CONTRACT-v1 job routes, password prompts through the dialog', cells: { terminal: 'yes', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, withoutMods: true },
+  { feature: 'Remote terminals and jobs (the managed remote runtime over ssh): host on terminal_open, job_start and CONTRACT-v1 jobs, host_runtime, the host key and machine checks', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, withoutMods: true },
+  { feature: 'Shared terminal pane and takeover (Client): /gate-terminal', cells: { terminal: 'yes', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, withoutMods: false },
+  { feature: 'Policy (allow, ask, deny per host, workspace, account and action), workspaces, forwarding grants, account states, export and import format 3', cells: { terminal: 'untested', desktop: 'untested', vscode: 'untested', mobile: 'untested', print: 'untested', remote: 'untested' }, withoutMods: true },
+  { feature: 'Hosts and accounts panes (immediate): /gate-hosts, /gate-accounts', cells: { terminal: 'untested', desktop: 'untested', vscode: 'no', mobile: 'no', print: 'no', remote: 'no' }, withoutMods: false },
 ]
 
 const SURFACE_NAMES: Record<Surface, string> = {
@@ -406,6 +422,21 @@ export function parseDaemon(stdout: string): DaemonHealth | undefined {
     skew: s('skew'), terminals: n('terminals'), jobs: n('jobs'),
     claudeInstall: s('claude_install'), parentExe: s('parent_exe'),
     error: s('error'), message: s('message'), otherConfig: s('other_config'), platform: s('platform'),
+  }
+}
+
+// gated's answer to /ui/register: refused because it is stopping (its idle
+// exit began: 503 "stopping")? Then the session isn't registered, and
+// `gated start` (which waits for the old daemon to go) makes a new one to
+// register with. A 200 is a session gated serves.
+export const REGISTER_TRIES = 3
+export function registerStopping(status: number, text: string): boolean {
+  if (status !== 503) return false
+  try {
+    const v: unknown = JSON.parse(text)
+    return typeof v === 'object' && v !== null && (v as Record<string, unknown>).error === 'stopping'
+  } catch {
+    return false
   }
 }
 
@@ -503,6 +534,7 @@ function envLine(st: EnvStatus, home: string): string {
     case 'building':
       return `being set up (a build is running) at ${env}${st.older ? `; meanwhile the hooks run on ${clean(st.older, home)}` : ''}`
     case 'failed':
+      if (st.pixi_too_old) return `can't be set up: ${pixiTooOldText(st)}`
       return `setup failed or was interrupted; log: ${env}/install.log (retried at the next session start)`
     case 'nopixi':
       return "can't be set up: pixi isn't installed (https://pixi.sh), then start a new session"
@@ -511,8 +543,8 @@ function envLine(st: EnvStatus, home: string): string {
   }
 }
 
-// The /gate-doctor report: versions, surfaces, mods, pixi and its tested
-// range, the env, managed mode, vault presence (existence only), the gateway
+// The /gate-doctor report: versions (Claude Code and pixi against the tested
+// ones), surfaces, mods, the env, managed mode, vault presence (existence only), the gateway
 // daemon's state (its /health), and the capability matrix rows for this
 // session's surfaces. No secret can be in it:
 // it is built from versions, paths and yes/no facts only.
@@ -523,7 +555,8 @@ export function doctorText(f: DoctorFacts): string {
   const lines: string[] = []
   // Claude Code shows the output after the plugin's name ("gate: gateway plugin 0.7.0 ...")
   lines.push(`gateway plugin ${f.pluginVersion ?? '(version unknown)'} (${f.located.provenance}), diagnostics`)
-  lines.push(`Claude Code: ${f.claude?.version ?? 'unknown'} (mods need ${MODS_MIN_TERMINAL} in the terminal, ${MODS_MIN_DESKTOP} in the desktop app)`)
+  lines.push(`Tested with pixi ${PIXI_TESTED} and Claude Code ${CLAUDE_TESTED} (only the latest is supported)`)
+  lines.push(`Claude Code: ${claudeVerdict(f.claude?.version || undefined).text}`)
   lines.push(`Surfaces: ${f.surfaces.length > 0 ? f.surfaces.join(', ') : 'none (-p or SDK)'}`)
   lines.push('Mods: on (this report comes from the gateway mod)')
   // launch.sh's answer is what the hooks use; the mod's own reading of the
@@ -541,11 +574,7 @@ export function doctorText(f: DoctorFacts): string {
   const sec = secretLine(f.surfaces, f.fullscreen, f.tmux === true, f.noDisplay === true)
   if (sec !== undefined) lines.push(sec)
   if (st !== undefined) {
-    const vault = st.vault
-      ? 'present'
-      : st.vault_v2
-        ? 'a 0.6 vault (store.age), converted once setup finishes'
-        : 'not set up yet'
+    const vault = st.vault ? 'present' : 'not set up yet'
     lines.push(`Vault: ${vault}; form (gateway.toml): ${st.form ? 'present' : 'not written yet'} (checked by existence only; the vault is never read)`)
   }
   lines.push(clean(daemonLine(f.daemon), userHome))

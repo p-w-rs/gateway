@@ -57,11 +57,17 @@ def test_an_approved_ask_edited_to_true_is_still_asked_about():
         assert any("box" == c.entry for c in eff.pending)
         for mode in ("auto", "default"):
             for cmd in ("ssh box id", "sudo apt update", "ssh box 'sudo id'", "ssh box sudo id",
-                        "env bash -c 'ssh box id'", 'ssh box "$(cat cmd.txt)"',
-                        "for h in box; do ssh $h id; done", "gate check box"):
+                        "env bash -c 'ssh box id'", "gate check box"):
                 d, why = _decide(cmd, mode)
                 assert d == "ask", (mode, cmd, d, why)
                 assert '"ask"' in why
+            # words the hook can't spell out get no record: the stand-in would
+            # refuse after the prompt (lead decision 19.14), so refused here
+            d, why = _decide('ssh box "$(cat cmd.txt)"', mode)
+            assert d == "deny" and 'is set to "ask"' in why and "spell out" in why, (mode, d, why)
+            # a target in a variable hides the host (PLAN-0.11 §1.7): refused
+            d, why = _decide("for h in box; do ssh $h id; done", mode)
+            assert d == "deny" and "hides the program or host" in why, (mode, d, why)
             # scp / sftp / rsync start ssh themselves: the stand-in would refuse
             for cmd in ("scp ./f box:/srv/f", "rsync -a ./x box:/srv/x", "sftp box:/srv/f",
                         "rsync -a --rsync-path='sudo rsync' ./x box:/srv/x"):

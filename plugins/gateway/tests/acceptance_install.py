@@ -4,14 +4,17 @@ first-use provisioning, interrupted setup, warm start, later updates after a
 restart, uninstall, arbitrary working directories and paths with spaces and
 non-ASCII letters.
 
-    pixi exec --spec python=3.12 --spec pyte python tests/acceptance_install.py \\
-        --tmp DIR [--keep] [--checkpoint DIR] [--only prereq,cold,warm,update,uninstall,spaced]
+    pixi exec --spec python --spec pyte python tests/acceptance_install.py \\
+        --tmp DIR [--keep] [--checkpoint DIR] \\
+        [--only prereq,cold,notice,warm,update,uninstall,spaced,firstbash]
 
 Prerequisites as a user has them: a scratch bin folder with only `claude`
 and `pixi` (a recording wrapper around the real pixi: every call is logged;
-in "fail" mode it refuses every call), `git` from `pixi global install git`
+in "fail" mode it refuses every call; in "old" mode it answers like a pixi
+older than the manifest's requires-pixi), `git` from `pixi global install git`
 into a scratch PIXI_HOME (the documented route; its bin folder is on PATH as
-pixi's installer puts it), and the OS folders (/usr/bin:/bin:/usr/sbin:/sbin).
+pixi's installer puts it), the user's own sudo (a recording fake: the real
+one never runs) and the OS folders (/usr/bin:/bin:/usr/sbin:/sbin).
 Recording shims named python3, python, node, npm, npx and uv come first on
 PATH: a plugin that ran an undeclared interpreter by name is logged. A cold,
 scratch pixi cache (nothing downloaded before), so the first session really
@@ -26,19 +29,32 @@ Messages API.
 
   prereq    the git route: `pixi global install git` (scratch PIXI_HOME) gives
             the only git on the session PATH besides the OS's; the plugins'
-            marketplaces are added and installed with it
+            marketplaces are added and installed with it; and, in a config of
+            its own, a pixi older than requires-pixi: the gateway can't set
+            itself up, records the versions and says "pixi self-update"; a
+            curl there is asked about (the cold window's network class,
+            launch.sh's guard while no env can run Python; declined)
   cold      session 1 in a project folder with a space and a non-ASCII letter:
             both plugins start provisioning by themselves and say so (the
             gateway on its status line, checkpoint in the prompt footer;
-            sampled); mid-build, every pixi install, its builder
-            and claude are SIGKILLed (the interrupted setup); session 2 (a
-            restart) takes the stale build locks over, finishes, never runs two
-            builds of one env at once, and the plugins work: a Bash command
-            runs in the gateway's managed bash in that folder, checkpoint
-            journals the session with that folder
+            sampled); mid-build, every pixi
+            install, its builder and claude are SIGKILLed (the interrupted
+            setup); session 2 (a restart) takes the stale build locks over,
+            finishes, never runs two builds of one env at once, and the
+            plugins work: a Bash command runs in the gateway's managed bash in
+            that folder, checkpoint journals the session with that folder; the
+            fresh gateway.toml has no [hosts.localhost], no stand-in shadows
+            ssh, sudo or git (only the gateway's helpers in its bin folder),
+            and `sudo` is the user's own (the fake ran, no gateway decision;
+            PLAN-0.11 §1.5)
+  notice    a local sudo password in the vault while this computer's sudo
+            isn't configured: the first session says once that the stored
+            password stays unused (PLAN-0.11 §1.5); the next one doesn't
   warm      session 3 with pixi refusing every call and every non-loopback
             HTTP(S) request sent to a dead proxy (offline): ready at once, no
-            pixi call; startup measured against a session with no plugins
+            pixi call; startup measured against a session with no plugins;
+            checkpoint is live (gated recorded its calls in the earlier
+            sessions), so Claude's context has the checkpoint job lines
   update    new versions of both are published; after Claude Code exited,
             `claude plugin marketplace update` + `claude plugin update` run
             with the same PATH (no bootstrap environment, no pixi exec
@@ -55,6 +71,10 @@ Messages API.
             letter (its cache and data paths have them), first-use provisioning
             there, sessions from two other such folders: each recorded with its
             own folder
+  firstbash the gateway alone, a plain first session: a Bash command right
+            after the ready toast runs; "ckoff": without checkpoint (gated
+            never saw it) Claude's context has no checkpoint job lines
+            (PLAN-0.11 §9.4)
   vmdrain   (only on the disposable Linux VM, ACCEPTANCE_DISPOSABLE_VM=1, not in
             the default list) both plugins installed plainly into one config;
             a warm session starts a gateway job and opens a terminal and runs a
@@ -90,6 +110,7 @@ PLUGIN = HERE.parent
 REPO = PLUGIN.parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
+import acceptance_lib as L  # noqa: E402
 from tui import driver, install, safety  # noqa: E402
 
 RESULTS: list[dict] = []
@@ -97,6 +118,7 @@ NOTES: list[str] = []
 SUMMARY: dict = {}
 BUILD_TIMEOUT = 1800
 SHIMMED = ("python3", "python", "node", "npm", "npx", "uv")
+OLD_PIXI = "0.81.0"          # what the "old" pixi wrapper says it is
 
 
 def check(name: str, ok, detail: str = "") -> bool:
@@ -157,22 +179,36 @@ class Prereqs:
         self.shim_log = root / "shim-calls.log"
         self.fail_flag = root / "pixi-refuses"
         self.slow_flag = root / "pixi-slow"          # `pixi install` waits 6 s first (a slow network's start)
-        for d in (self.bin, self.shims, self.pixi_home, self.cache):
+        self.old_flag = root / "pixi-old"            # answers like a pixi older than requires-pixi
+        self.userbin = root / "user-bin"             # the user's own sudo: a recording fake
+        self.sudo_log = root / "user-sudo.log"
+        for d in (self.bin, self.shims, self.pixi_home, self.cache, self.userbin):
             d.mkdir(parents=True, exist_ok=True)
         self.pixi_log.write_text("")
         self.shim_log.write_text("")
+        self.sudo_log.write_text("")
         real_pixi = shutil.which("pixi")
         if not real_pixi:
             raise RuntimeError("pixi is not on PATH")
         self.real_pixi = os.path.realpath(real_pixi)
+        need = re.search(r'requires-pixi\s*=\s*"([^"]+)"', (PLUGIN / "pixi.toml").read_text())
+        self.needed = need.group(1) if need else ">=0.83.0"
         os.symlink(os.path.realpath(driver.find_claude()), self.bin / "claude")
         (self.bin / "pixi").write_text(
             "#!/bin/sh\n"
             f"printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"$$\" \"$*\" >> '{self.pixi_log}'\n"
             f"if [ -e '{self.fail_flag}' ]; then echo 'pixi (acceptance shim): refused' >&2; exit 1; fi\n"
+            f"if [ -e '{self.old_flag}' ]; then\n"
+            f"  case $1 in --version) echo 'pixi {OLD_PIXI}'; exit 0 ;; esac\n"
+            f"  echo \"Error:   x this project requires pixi '{self.needed}', but you have pixi {OLD_PIXI}\" >&2\n"
+            "  exit 1\nfi\n"
             f"if [ -e '{self.slow_flag}' ] && [ \"$1\" = install ]; then sleep 6; fi\n"
             f"exec '{self.real_pixi}' \"$@\"\n")
         os.chmod(self.bin / "pixi", 0o755)
+        (self.userbin / "sudo").write_text(
+            "#!/bin/sh\n# the user's own sudo, a recording fake: never the real one\n"
+            f"printf '%s\\n' \"$*\" >> '{self.sudo_log}'\necho 'fake user sudo ran'\nexit 0\n")
+        os.chmod(self.userbin / "sudo", 0o755)
         for name in SHIMMED:
             real = shutil.which(name, path="/usr/bin:/bin:/usr/sbin:/sbin") or ""
             body = (f"#!/bin/sh\nprintf '%s\\t%s\\n' '{name}' \"$*\" >> '{self.shim_log}'\n"
@@ -182,7 +218,7 @@ class Prereqs:
 
     @property
     def path(self) -> str:
-        return ":".join([str(self.shims), str(self.bin), str(self.pixi_home / "bin"),
+        return ":".join([str(self.shims), str(self.bin), str(self.userbin), str(self.pixi_home / "bin"),
                          "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
     def env(self) -> dict:
@@ -342,7 +378,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--tmp", default=tempfile.gettempdir())
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--checkpoint", default=str(REPO.parent / "checkpoint"))
-    ap.add_argument("--only", default="prereq,cold,warm,update,uninstall,spaced,firstbash")
+    ap.add_argument("--only", default="prereq,cold,notice,warm,update,uninstall,spaced,firstbash")
     a = ap.parse_args(argv)
     before = safety.real_settings_fingerprint()
     root = Path(tempfile.mkdtemp(prefix="acc-install-", dir=a.tmp))
@@ -421,6 +457,8 @@ def run(root: Path, ck_src: Path, only: set[str]) -> None:
     check("with the session PATH, `git` is pixi's (first on PATH before the OS folders)",
           r.stdout.splitlines()[:1] == [str(pre.pixi_home / "bin" / "git")], r.stdout + r.stderr)
     SUMMARY["git"] = r.stdout.strip().splitlines()[-1:] if r.stdout else []
+    if "prereq" in only:
+        part_oldpixi(root, pre)
     h = install.Hermetic(root / "h", extra_env=pre.env())
     h.__enter__()
     try:
@@ -439,8 +477,10 @@ def run(root: Path, ck_src: Path, only: set[str]) -> None:
         proj.mkdir(parents=True)
         if "cold" in only:
             part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj)
+        if "notice" in only:
+            part_notice(root, pre, cfg, gi, proj)
         if "warm" in only:
-            part_warm(root, pre, cfg, gdata, cdata, home, proj)
+            part_warm(root, pre, cfg, gdata, cdata, home, proj, gi)
         if "update" in only:
             part_update(root, pre, h, cfg, gi, p, ck_src, gdata, cdata, home, proj)
         if "uninstall" in only:
@@ -520,8 +560,11 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
     pre.slow_flag.unlink(missing_ok=True)
     # session 2: the restart takes over
     s2 = session(root, "s2-restart", cfg, proj, pre, replies=[
-        bash("pwd -P > pwd.txt; printf '%s|%s|%s' \"$BASH_VERSION\" \"${GW_MANAGED_DIR:+managed}\" \"$0\" > shell.txt",
-             "where am I"), "done"])
+        bash("pwd -P > pwd.txt; printf '%s|%s|%s' \"$BASH_VERSION\" \"${GW_MANAGED_DIR:+managed}\" \"$0\" > shell.txt; "
+             "for t in ssh sudo git; do command -v $t; done > which.txt; "
+             # (only the recording fake ever runs: the snapshot's PATH may put the system's first)
+             "case $(command -v sudo) in */user-bin/sudo) sudo -n true > own-sudo.txt 2>&1 ;; "
+             "*) echo \"not-the-fake $(command -v sudo)\" > own-sudo.txt ;; esac", "where am I"), "done"])
     samp = StatusSampler(s2, [gdata, cdata])
     t0 = time.time()
     try:
@@ -555,6 +598,7 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
         check("...in the gateway's managed bash (bash 5, GW_MANAGED_DIR set)",
               sh.startswith("5.") and "|managed|" in sh, sh)
         wait(s2, lambda: len(s2.api.main_requests()) >= n0 + 2, 60)
+        check_fresh_posture(gi, gdata, proj, pre)
     finally:
         samp.stop.set()
         s2.close()
@@ -566,7 +610,142 @@ def part_cold(root, pre, cfg, gi, p, gdata, cdata, home, proj) -> None:
           json.dumps([(r.get("data") or {}).get("cwd") for r in starts])[:400])
 
 
-def part_warm(root, pre, cfg, gdata, cdata, home, proj) -> None:
+def cold_network_step(s: driver.Session, proj: Path) -> None:
+    """PLAN-0.11 §3.4, §14: while no env can run Python, launch.sh's cold Bash
+    guard asks about a network command (it can't read [network] yet; the
+    class asks by default). The prompt is declined: curl never runs. Run in
+    the old-pixi session, where no env can ever build (the cold part's first
+    session would spend its slow start here, and its build could then finish
+    before the mid-build kill)."""
+    s.api.script([bash("curl -s http://127.0.0.1:9/ > cold-curl.txt 2>&1", "cold curl"), "cold curl answered"])
+    s.submit("fetch the page")
+    asked = wait(s, lambda: "Do you want to proceed?" in s.text(), 90, 0.3)
+    check("cold window: a network command is asked about (the cold guard's ask: running a network "
+          "command, PLAN-0.11 §3.4)", asked and L.shows(s.all_text(), L.COLD_NET), s.text()[-900:])
+    if asked:
+        s.pump(1.0)
+        s.send("\x1b")            # declined (Escape)
+        wait(s, lambda: "Do you want to proceed?" not in s.text(), 15, 0.3)
+    s.pump(2.0)
+    check("cold window: declined, curl never ran", not (proj / "cold-curl.txt").exists())
+
+
+def check_fresh_posture(gi, gdata: Path, proj: Path, pre: Prereqs) -> None:
+    """PLAN-0.11 §1.2, §1.5 on a fresh install: the starter gateway.toml writes no
+    [hosts.localhost]; nothing configured, so the gateway's bin folder holds
+    only its helpers (no stand-in shadows ssh, sudo or git); this computer's
+    sudo is the user's own (the recording fake ran; the gateway decided
+    nothing)."""
+    form = gi.gateway_home / "gateway.toml"
+    text = form.read_text() if form.exists() else ""
+    check("fresh install: gateway.toml has no [hosts.localhost] (the starter is comments only)",
+          "[hosts.localhost]" not in text and not re.search(r"^\s*\[", text, re.M), text[:300])
+    names = sorted(p.name for p in (gdata / "bin").iterdir()) if (gdata / "bin").is_dir() else []
+    standins = ("sudo", "ssh", "scp", "sftp", "git", "gh", "hf", "databricks", "crane", "pijul", "asiml", "az", "dvc")
+    check("fresh install: no stand-in in the gateway's bin folder (only its helpers), so nothing is shadowed",
+          not (set(names) & set(standins)), str(names))
+    which = (proj / "which.txt").read_text().split() if (proj / "which.txt").exists() else []
+    check("fresh install: ssh, sudo and git in Claude's shell are the user's own (none in the gateway's "
+          "bin folder)", len(which) == 3 and not any(str(gdata / "bin") in w for w in which), " ".join(which))
+    out = (proj / "own-sudo.txt").read_text() if (proj / "own-sudo.txt").exists() else ""
+    calls = [ln for ln in pre.sudo_log.read_text().splitlines() if ln.strip()]
+    if out.startswith("not-the-fake"):
+        note(f"fresh install: the snapshot's PATH puts {out.split()[-1]} before the session's fake sudo, "
+             "so the fake wasn't run (no stand-in either way)")
+    check("fresh install: `sudo` is the user's own: `sudo -n true` ran the fake untouched by the gateway "
+          "(or, where the snapshot's PATH puts the system's sudo first, that one: never a stand-in)",
+          ("fake user sudo ran" in out and calls[-1:] == ["-n true"])
+          or (out.startswith("not-the-fake") and str(gdata / "bin") not in out), f"{out!r} {calls[-3:]}")
+
+
+def part_oldpixi(root: Path, pre: Prereqs) -> None:
+    """PLAN-0.11 §5: a pixi older than the manifest's requires-pixi refuses it;
+    launch.sh records the versions ($ENVD/.pixi-too-old) and the gateway says
+    to run `pixi self-update`. In its own config, so the cold part's first
+    build stays the first. No env can build here, so the cold Bash guard
+    stays in place: the cold window's network ask is checked in this
+    session."""
+    print(f"prereq: a pixi older than requires-pixi ({OLD_PIXI} < {pre.needed})", flush=True)
+    pre.old_flag.write_text("old\n")
+    try:
+        with install.Hermetic(root / "ho", extra_env=pre.env()) as h:
+            gi = h.install_gateway_e2e(REPO)
+            (root / "op-proj").mkdir(exist_ok=True)
+            s = session(root, "op-s1", h.inst.config_dir, root / "op-proj", pre)
+            try:
+                s.start()
+                s.wait_ready(180)
+                rec = gi.root / "data" / "envs"
+                noted = wait(s, lambda: any(rec.glob("*/.pixi-too-old")), 120)
+                # this session's SessionStart ran before the build failed, so the
+                # status line says it (pointing at the doctor) and /gate-doctor says
+                # "pixi self-update" (PLAN-0.11 §5: gate-sh's notice, gate status, the doctor)
+                pointed = wait(s, lambda: L.PIXI_OLD_STATUS in L.flat(s.all_text()), 60)
+                s.submit("/gate-doctor")
+                said = pointed and wait(s, lambda: L.PIXI_SELF_UPDATE in L.flat(s.all_text()), 60)
+                vals = {}
+                for f in rec.glob("*/.pixi-too-old"):
+                    vals = dict(ln.split("=", 1) for ln in f.read_text().splitlines() if "=" in ln)
+                check("old pixi: launch.sh records the versions (found the old pixi, needed requires-pixi)",
+                      noted and vals.get("found") == OLD_PIXI and vals.get("needed") == pre.needed, json.dumps(vals))
+                check("old pixi: the gateway says how to fix it (its status line points at /gate-doctor, "
+                      "which says pixi self-update)", said, s.text()[-800:])
+                cold_network_step(s, root / "op-proj")
+            finally:
+                s.close()
+            stop_gated(h.root)
+    finally:
+        pre.old_flag.unlink(missing_ok=True)
+
+
+def seed(gi, code: str) -> subprocess.CompletedProcess[str]:
+    """Gateway Python against the scratch e2e root (its own src, a test override
+    naming that root): a test-only way to put something in its vault."""
+    py = next(iter(sorted(gi.root.glob("data/envs/*/.pixi/envs/default/bin/python3"))), None)
+    src = Path(gi.plugin.cache_path) / "src"
+    prog = ("import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1])\n"
+            "from gateway import testing, paths, vault\n"
+            "with testing.override(sys.argv[2], run=sys.argv[3]):\n" +
+            "\n".join("    " + ln for ln in code.splitlines()))
+    return subprocess.run([str(py), "-I", "-S", "-c", prog, str(src), str(gi.root), str(gi.run or gi.root / "run")],
+                          capture_output=True, text=True, timeout=60)
+
+
+def part_notice(root, pre, cfg, gi, proj) -> None:
+    """PLAN-0.11 §1.5: a local sudo password stored (as 0.10 did) while this
+    computer's sudo isn't configured: SessionStart says once that it stays
+    unused and how to remove it; the vault records that it was said."""
+    print("notice: the first 0.11 session's notice about a stored local sudo password", flush=True)
+    r = seed(gi, "if not vault.exists():\n    vault.ensure_key()\n    vault.save(vault.empty())\n"
+                 "with vault.edit() as d:\n    vault.set_sudo(d, 'localhost', paths.local_user(), 'acc-unused-pw-0001')\n"
+                 "print('seeded')")
+    if not check("notice: a local sudo password is in the scratch vault (seeded)", r.stdout.strip() == "seeded",
+                 (r.stdout + r.stderr)[-400:]):
+        return
+    seen = []
+    for name in ("s2b-notice", "s2c-notice"):
+        s = session(root, name, cfg, proj, pre)
+        # every session of this config shares its projects folder: only this session's own
+        # transcripts count (hook messages are recorded there)
+        before = s.transcripts()
+        try:
+            s.start()
+            s.wait_ready(180)
+            wait(s, lambda: L.shows(s.all_text(), L.POSTURE_SUDO), 20)
+            s.pump(2)
+            seen.append(L.shows(s.all_text(), L.POSTURE_SUDO)
+                        or any(L.shows(t.read_text(errors="replace"), L.POSTURE_SUDO)
+                               for t in L.new_files(s.transcripts(), before)))
+        finally:
+            s.close()
+    check("notice: the first session says the stored local sudo password stays unused (gate forget localhost "
+          "removes it)", seen[:1] == [True], str(seen))
+    check("notice: ...once: the next session doesn't say it again", seen[1:] == [False], str(seen))
+    note("notice: the vault keeps that local sudo password (unused) for the later parts, as a 0.10 "
+         "user's vault would")
+
+
+def part_warm(root, pre, cfg, gdata, cdata, home, proj, gi=None) -> None:
     print("warm: pixi refusing every call, non-loopback HTTP(S) to a dead proxy; startup measured", flush=True)
     base_cfg = root / "baseline-cfg"
     base_cfg.mkdir()
@@ -596,6 +775,13 @@ def part_warm(root, pre, cfg, gdata, cdata, home, proj) -> None:
                     s.submit("warm check")
                     ok = wait(s, lambda: (proj / "warm0.txt").exists(), 90)
                     check("warm start offline: a Bash command runs (the gateway's managed bash, no pixi)", ok)
+                    if gi is not None and gi.run is not None:
+                        body = json.dumps([m.get("body") for m in s.api.main_requests()[:1]])
+                        seen = (gi.run / "checkpoint-seen").exists()
+                        check("warm start: checkpoint is live (gated recorded its calls in the earlier sessions: "
+                              "<run>/checkpoint-seen), so Claude's context has the checkpoint job lines "
+                              "(PLAN-0.11 §9.4)", seen and L.JOBS_MARK in body,
+                              f"checkpoint-seen: {seen}; job lines in the context: {L.JOBS_MARK in body}")
                     gst = "\n".join(ln for ln in s.lines() if "gate:" in ln)
                     check("...and the gateway shows no setup or failure on its status line",
                           "setting up" not in gst and "failed" not in gst and "pixi isn't" not in gst, gst)
@@ -721,11 +907,15 @@ def part_uninstall(root, pre, h, cfg, gi, p, gdata, cdata, home, proj) -> None:
         s.close()
         pre.fail_flag.unlink(missing_ok=True)
     check("...a reinstall records at once on the kept runtime (no pixi call)", rec and not pre.pixi_calls(t_mark))
-    n_recs = len(journal(home))
+    # the closed session may still flush a segment a second later (mac-tui F): read the journal
+    # once it stopped changing, and afterwards ask only that none of those records went
+    before = L.settled(lambda: journal(home))
     r = h.inst.uninstall(pid, check=False)
     check("`claude plugin uninstall check@checkpoint` removes its data folder", r.ok and not cdata.exists(),
           str(r)[:400])
-    check("...while its journal (CHECKPOINT_HOME, outside the plugin) stays", n_recs > 0 and len(journal(home)) == n_recs)
+    after = journal(home)
+    check("...while its journal (CHECKPOINT_HOME, outside the plugin) stays", bool(before) and L.kept(before, after),
+          f"{len(before)} records before, {len(after)} after")
     gpid = gi.plugin.id
     form = gi.gateway_home / "gateway.toml"
     had_form = form.exists()
@@ -794,13 +984,14 @@ def part_spaced(root: Path, pre: Prereqs, ck_src: Path) -> None:
 
 def part_firstbash(root: Path, pre: Prereqs) -> None:
     """A plain first session (nothing interrupted): the gateway builds its env during it; the moment the
-    ready toast shows, Claude runs Bash, then again every 2 s until a command runs."""
+    ready toast shows, Claude runs Bash, then again every 2 s until a command runs. Then "ckoff": a second,
+    warm session (the full context; the first one started cold, with the not-ready context, which never
+    has the job lines) without checkpoint: no job lines."""
     print("firstbash: Bash right after the first session's setup says ready", flush=True)
     with install.Hermetic(root / "hf", extra_env=pre.env()) as h:
         gi = h.install_gateway_e2e(REPO)
         proj = root / "fb-proj"
         proj.mkdir()
-        gdata = gi.root / "data"
         s = session(root, "fb-s1", h.inst.config_dir, proj, pre)
         try:
             s.start()
@@ -826,6 +1017,23 @@ def part_firstbash(root: Path, pre: Prereqs) -> None:
                                     "first_error": first_err}
             check("firstbash: the first Bash command after the ready toast runs (no not-ready window)",
                   ran and tries == 1, json.dumps(SUMMARY["firstbash"]))
+        finally:
+            s.close()
+        # ckoff (PLAN-0.11 §9.4): a warm session gets the full context (SessionStart's Python);
+        # gated never served checkpoint, so it has no checkpoint job lines
+        s = session(root, "fb-s2", h.inst.config_dir, proj, pre)
+        try:
+            s.start()
+            s.wait_ready(180)
+            n0 = len(s.api.main_requests())
+            s.submit("hello")
+            wait(s, lambda: len(s.api.main_requests()) > n0, 60, 0.3)
+            body = json.dumps([m.get("body") for m in s.api.main_requests()[:1]])
+            seen = gi.run is not None and (gi.run / "checkpoint-seen").exists()
+            ok, why = L.ckoff(body)
+            check("ckoff: without checkpoint (gated never saw it) a warm session's full context has no checkpoint "
+                  "job lines (PLAN-0.11 §9.4)", bool(s.api.main_requests()) and not seen and ok,
+                  f"checkpoint-seen: {seen}; {why or 'the context is right'}")
         finally:
             s.close()
         stop_gated(h.root)

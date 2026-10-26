@@ -26,9 +26,16 @@ gateway's pixi env by absolute path (never PATH).
      "approved": {"form_sha256", "at", "rights": {...}},      (consent.py)
      "form_last_good": "<text>",
      "aliases": {"github:work": "github-work"},
-     "events": [{"n", "at", "what", "detail"}], "events_seen": N,
-     "migrated": {"from", "store_sha256", "at", "report", "shown"},
-     "baseline": 2}           (made by a gateway with "ask" as this computer's sudo default; below)
+     "passphrase_offer": "pending" | "declined",   (PLAN-0.11 §8; absent: nothing stored yet)
+     "notices": {"posture-0.11": "<when shown>"},   (one-time notices: shown once, never again)
+     "events": [{"n", "at", "what", "detail"}], "events_seen": N}
+
+The passphrase offer (PLAN-0.11 §8): save() sets `passphrase_offer` to
+"pending" once the vault holds a secret and the key has no passphrase (no
+key.wrapped); gated offers a passphrase after a store while it is "pending"
+(daemon/offer.py), and the person's "Not now" makes it "declined" for good.
+Neither field is a secret: the broker's merge keeps them as the writer sent
+them, and an export never carries them (EXPORT_KEYS).
 
 cache.age holds short-lived tokens (Entra access tokens, ACR refresh tokens)
 keyed by account and scope, with their expiry; it is safe to delete.
@@ -56,8 +63,8 @@ from . import paths, testing
 
 VERSION = 3
 MAX_EVENTS = 100
-EVENT_KINDS = ("widen", "narrow", "bind", "export", "copy", "import", "migrate", "reject",
-               "hostkey", "forget")
+EVENT_KINDS = ("widen", "narrow", "bind", "export", "copy", "import", "reject", "hostkey",
+               "forget")
 
 # Built-in SSH host keys (type + base64). GitHub's are its published keys
 # (fingerprints SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU ed25519,
@@ -123,43 +130,32 @@ def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-# The defaults a vault was made under (review round 3). A vault this gateway
-# makes says `"baseline": 2`: this computer's sudo is "ask" where the form
-# doesn't say. A vault without it was made by an older gateway (0.9.1 and
-# before), whose default was sudo = true, and that install keeps it
-# (older_install; consent's baseline and the form's localhost default). Every
-# writer keeps the mark as it is: empty() has it, _fill never adds it to an
-# older vault, save() writes what load() gave, the broker's merge keeps the
-# vault's own (a writer can neither add nor drop it), export leaves it out
-# (export_view: per machine), and a converted 0.6 vault has none (migrate).
-BASELINE_KEY = "baseline"
-BASELINE = 2
-
-
 def empty() -> dict[str, Any]:
-    """A new vault (a missing one loads as this): it carries the baseline mark."""
+    """A new vault (a missing one loads as this)."""
     return {"version": VERSION, "machine": {}, "localhost": {"sudo": {}}, "hosts": {},
             "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {},
-            "events": [], "events_seen": 0, "migrated": None, BASELINE_KEY: BASELINE}
-
-
-def older_install(data: dict[str, Any] | None) -> bool:
-    """Was this vault made by an older gateway: a vault document (version 3,
-    as load() returns it) without the baseline mark? Never for no vault
-    (None: a new install, or one that can't be read now), an empty() one, or
-    anything that isn't a vault document: those get the stricter new defaults."""
-    if not isinstance(data, dict) or data.get("version") != VERSION:
-        return False
-    mark = data.get(BASELINE_KEY)
-    return not (isinstance(mark, int) and not isinstance(mark, bool) and mark >= BASELINE)
+            "events": [], "events_seen": 0}
 
 
 def _fill(data: dict[str, Any]) -> dict[str, Any]:
     for k, v in empty().items():
-        if k != BASELINE_KEY:         # an older vault stays one (older_install)
-            data.setdefault(k, v)
+        data.setdefault(k, v)
     data["localhost"].setdefault("sudo", {})
     return data
+
+
+# A gateway 0.6 install (~/.config/gateway/store.age, and no private/vault.age
+# yet) is never converted here: gateway 0.10.0 converts it. Until then no
+# vault is created beside it (save() refuses with this message, and
+# SessionStart says it once), so the conversion still finds it untouched.
+# paths.v2_store_path and v2_key_path stay in the file guard either way.
+V06_MESSAGE = ("gateway: a gateway 0.6 vault is here; convert it with gateway 0.10.0 first "
+               "(see CHANGELOG 0.11.0)")
+
+
+def v06_waiting() -> bool:
+    """Is a gateway 0.6 vault (store.age) here with no vault of this gateway?"""
+    return paths.v2_store_path().exists() and not paths.vault_path().exists()
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +339,14 @@ def snapshot(kind: str = "rotate") -> Path | None:
 
 # What in private/backups holds an older copy of the vault (or of the 0.6
 # store), so a forgotten secret may survive there: rotate's copies (and any
-# other *.vault.age), an import's backup folders (their vault.age), the 0.6
-# conversion's store-v2-*.age. Globs for the person's own `rm -r`, by kind.
+# other *.vault.age), an import's backup folders (their vault.age), a
+# start-over's folder (the vault whose passphrase was lost), the 0.6
+# conversion's store-v2-*.age. By kind; `gate forget --backups` deletes
+# them after the person's OK in the gateway's dialog (delete_older_copies).
 OLDER_COPY_GLOBS = (("*.vault.age", lambda f: f.is_file() and f.name.endswith(".vault.age")),
                     ("import-*", lambda f: f.is_dir() and f.name.startswith("import-")
                      and (f / "vault.age").exists()),
+                    ("startover-*", lambda f: f.is_dir() and f.name.startswith("startover-")),
                     ("store-v2-*.age", lambda f: f.is_file() and f.name.startswith("store-v2-")
                      and f.name.endswith(".age")))
 
@@ -367,6 +366,61 @@ def older_copies() -> list[tuple[str, list[str]]]:
         if names:
             out.append((glob, names))
     return out
+
+
+def delete_older_copies(names: list[str]) -> list[str]:
+    """Delete those of `names` that are older copies now (older_copies, read
+    again here: a name that isn't one any more, a link or anything else in
+    private/backups stays). A file is unlinked, a folder (an import's backup,
+    a start-over's) removed whole. Returns the names deleted, in order."""
+    import shutil
+    now = {n for _g, ns in older_copies() for n in ns}
+    d = paths.backups_dir()
+    gone: list[str] = []
+    for n in names:
+        if n not in now or "/" in n or n in (".", ".."):
+            continue
+        p = d / n
+        try:
+            if p.is_symlink():
+                continue
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+        except OSError:
+            continue
+        gone.append(n)
+    with contextlib.suppress(OSError):
+        fsync_dir(d)
+    return gone
+
+
+# The files a start-over moves aside (a vault whose key's passphrase is
+# lost): the vault, the wrapped key and its recipient, the cache (encrypted
+# to the same key). Moved, never deleted.
+START_OVER_FILES = ("vault.age", "key.wrapped", "key.recipient", "cache.age")
+
+
+def move_aside(kind: str = "startover") -> Path:
+    """Move START_OVER_FILES (those present) into a new 0700 folder
+    private/backups/<kind>-<time>-<hex>/ by rename, and sync both folders.
+    The caller holds the vault's lock. Returns the folder."""
+    import secrets
+    priv = paths.private_dir()
+    d = paths.backups_dir()
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(d, 0o700)
+    dest = d / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    dest.mkdir(mode=0o700)
+    os.chmod(dest, 0o700)
+    for name in START_OVER_FILES:
+        src = priv / name
+        if src.is_file() and not src.is_symlink():
+            os.rename(src, dest / name)
+    fsync_dir(dest)
+    fsync_dir(priv)
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -393,30 +447,43 @@ def load() -> dict[str, Any]:
     return _fill(data)
 
 
-def save(data: dict[str, Any], *, migrating: bool = False) -> None:
-    """Encrypt and atomically replace the vault. While a v2 store.age waits
-    for migration, a new vault.age is never created (except by migration), so
-    a failed migration retries next time instead of being skipped."""
+def save(data: dict[str, Any]) -> None:
+    """Encrypt and atomically replace the vault. Never creates one beside a
+    gateway 0.6 vault (v06_waiting: V06_MESSAGE)."""
     p = paths.vault_path()
-    if not migrating and not p.exists() and paths.v2_store_path().exists():
-        raise VaultError("the 0.6 vault hasn't been migrated yet (run gate migrate)")
+    if v06_waiting():
+        raise VaultError(V06_MESSAGE)
     data["version"] = VERSION
     data["events"] = list(data.get("events") or [])[-MAX_EVENTS:]
+    note_offer(data)
     if brokered():
         from .daemon import client
-        client.vault_write(data, migrating=migrating)
+        client.vault_write(data)
         return
     _encrypt_to(p, json.dumps(data, sort_keys=True).encode("utf-8"))
 
 
 @contextlib.contextmanager
-def locked() -> Iterator[None]:
-    """Serialize read-modify-write cycles across processes (private/.lock)."""
+def locked(timeout: float | None = None) -> Iterator[None]:
+    """Serialize read-modify-write cycles across processes (private/.lock).
+    `timeout`: wait at most that long for it (VaultError after), for gated's
+    own small writes (daemon/offer.py), which must never wait forever."""
     paths.ensure_private()
     with open(paths.lock_path(), "a+") as f:
         with contextlib.suppress(OSError):
             os.chmod(paths.lock_path(), 0o600)
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            end = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= end:
+                        raise VaultError("the vault is busy (another program holds its lock)") from None
+                    time.sleep(0.05)
         try:
             yield
         finally:
@@ -529,6 +596,50 @@ def mark_events_seen(data: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The passphrase offer and one-time notices (PLAN-0.11 §8, §1.5)
+# ---------------------------------------------------------------------------
+
+OFFER_PENDING, OFFER_DECLINED = "pending", "declined"
+OFFER_STATES = (OFFER_PENDING, OFFER_DECLINED)
+# The first 0.11 session's notice about this computer's sudo (PLAN-0.11
+# §1.5): shown once, recorded here so it never repeats.
+POSTURE_NOTICE = "posture-0.11"
+
+
+def offer_state(data: dict[str, Any] | None) -> str | None:
+    """"pending" (a passphrase is due to be offered), "declined" (the person
+    said Not now: never offered again unasked) or None (nothing stored yet)."""
+    v = (data or {}).get("passphrase_offer")
+    return v if v in OFFER_STATES else None
+
+
+def note_offer(data: dict[str, Any]) -> None:
+    """A vault being saved with a secret in it while the key has no
+    passphrase (no key.wrapped): the offer becomes due ("pending"), unless
+    it is already pending or declined."""
+    if offer_state(data) is not None or paths.wrapped_key_path().is_file():
+        return
+    if all_values(data):
+        data["passphrase_offer"] = OFFER_PENDING
+
+
+def decline_offer(data: dict[str, Any]) -> None:
+    data["passphrase_offer"] = OFFER_DECLINED
+
+
+def notice_shown(data: dict[str, Any] | None, name: str) -> bool:
+    notes = (data or {}).get("notices")
+    return isinstance(notes, dict) and isinstance(notes.get(name), str)
+
+
+def mark_notice(data: dict[str, Any], name: str) -> None:
+    notes = data.get("notices")
+    if not isinstance(notes, dict):
+        notes = data["notices"] = {}
+    notes[name] = now()
+
+
+# ---------------------------------------------------------------------------
 # Machine identity
 # ---------------------------------------------------------------------------
 
@@ -636,17 +747,21 @@ def forget_sudo(data: dict[str, Any], host: str, user: str) -> bool:
     return m.pop(user, None) is not None
 
 
-# The user's answer to gate check's "store the sudo password, or set up
-# passwordless sudo?" per (host, user): "password" or "nopasswd". Per machine
-# (an install on this machine's hosts), so export leaves it out.
+# The user's answer to gate check's "store the sudo password?" per (host,
+# user): "password" (stored) or "ask" (PLAN-v4 phase 7: left to the per-call
+# dialog). Per machine (an install on this machine's hosts), so export leaves
+# it out.
+SUDO_CHOICES = ("password", "ask")
+
+
 def sudo_choice(data: dict[str, Any], host: str, user: str) -> str | None:
     c = ((data.get("sudo_choice") or {}).get(host) or {}).get(user)
-    # "ask" (PLAN-v4 phase 7): leave the password to the per-call dialog;
-    # "nopasswd" is only kept from earlier versions (the gateway installed a rule then)
-    return c if c in ("password", "nopasswd", "ask") else None
+    return c if c in SUDO_CHOICES else None
 
 
 def set_sudo_choice(data: dict[str, Any], host: str, user: str, choice: str | None) -> None:
+    if choice is not None and choice not in SUDO_CHOICES:
+        raise ValueError(f"unknown sudo choice {choice!r}")
     m = data.setdefault("sudo_choice", {}).setdefault(host, {})
     if choice is None:
         m.pop(user, None)
@@ -704,9 +819,26 @@ def meta(data: dict[str, Any]) -> dict[str, Any]:
             "ssh_fingerprint": (a.get("ssh_key") or {}).get("fingerprint"),
             "entra": bool((a.get("entra") or {}).get("refresh_token")
                           or (a.get("entra") or {}).get("client_secret")),
+            "entra_info": entra_info(a),
             "bound": list((a.get("bound") or {}).get("hosts") or []),
         }
     return out
+
+
+def entra_info(rec: dict[str, Any]) -> dict[str, Any]:
+    """An account record's Entra credential without any value: what is
+    stored (a refresh token, a service principal's secret or certificate),
+    the browser sign-in's kind and the settings it was made for, and whether
+    a catalog's API scope is pinned (accounts.entra_fits decides with it)."""
+    e = rec.get("entra") or {}
+
+    def s(k: str) -> str:
+        v = e.get(k)
+        return v if isinstance(v, str) else ""
+    return {"refresh": bool(e.get("refresh_token")),
+            "secret": bool(e.get("client_secret") or e.get("client_certificate")),
+            "kind": s("kind"), "tenant_id": s("tenant_id"), "client_id": s("client_id"),
+            "scope": s("scope"), "pinned": bool((rec.get("bound") or {}).get("scope"))}
 
 
 def all_values(data: dict[str, Any]) -> list[str]:
@@ -758,14 +890,16 @@ def labeled_values(data: dict[str, Any]) -> list[tuple[str, str, str]]:
     return [(e, w, v) for _s, e, w, v in labeled_secrets(data)]
 
 
+# What of the vault an export carries (SPEC 16): the secrets and what they
+# belong to. Everything else is this machine's (approvals, the form's last
+# good copy, events, sudo choices, the machine record) or not this gateway's
+# (any other field stays out, so the import's strict check never sees it).
+EXPORT_KEYS = ("version", "localhost", "hosts", "accounts", "aliases")
+
+
 def export_view(data: dict[str, Any]) -> dict[str, Any]:
-    """The vault minus cache-like and per-machine consent state (SPEC 16; the
-    baseline mark is this machine's: the importing vault keeps its own)."""
-    d = copy.deepcopy(data)
-    for k in ("approved", "imported", "form_last_good", "events", "events_seen", "sudo_choice",
-              BASELINE_KEY):
-        d.pop(k, None)
-    return d
+    """A copy of the vault's EXPORT_KEYS only."""
+    return {k: copy.deepcopy(data[k]) for k in EXPORT_KEYS if k in data}
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +1021,7 @@ def builtin_host_keys(host: str, port: int = 22) -> list[str]:
 def keyscan(host: str, port: int = 22) -> list[str]:
     """The host's SSH keys ('type key'), built-in for github.com, hf.co and the
     Nest; else ssh-keyscan (from the pixi env). [] if unreachable. Used only by
-    setup the user started (gate check); migration never scans."""
+    setup the user started (gate check)."""
     built = builtin_host_keys(host, port)
     if built:
         return built

@@ -73,6 +73,10 @@ SCOPES: dict[str, frozenset[str]] = {
     "shim gate": ALL,
     "hook-files": NONE,
     "hook-daemon": NONE,
+    # the http and download tools' hook reads rights and policy only; hook-mode
+    # (pre_bash.sh's record-only call) never reads the vault
+    "hook-mcp": NONE,
+    "hook-mode": NONE,
     "askpass": NONE,
     "gated": NONE,
 }
@@ -185,12 +189,7 @@ def merge(new: dict[str, Any], current: dict[str, Any], scope: frozenset[str], k
           entry_ok: EntryOk = lambda s, n: True) -> dict[str, Any]:
     """The document to save for a writer that saw make_view(current, ...):
     its sentinels swapped back for their values. Conflict when the result
-    adds, changes, moves or drops a value the writer couldn't see. The
-    vault's baseline mark (vault.BASELINE_KEY) stays as `current` has it: a
-    writer can neither drop it (that would give a new install an older one's
-    defaults) nor add it to an older vault. (With no vault yet, `current` is
-    empty(), which has it; a 0.6 conversion never writes through here: it
-    puts its key.txt in place first.)"""
+    adds, changes, moves or drops a value the writer couldn't see."""
     by_sentinel = {sentinel(key, d[k]): d[k] for _c, _e, d, k in slots(current)}
     out = copy.deepcopy(new)
     for _cls, _entry, d, k in list(slots(out)):
@@ -202,9 +201,6 @@ def merge(new: dict[str, Any], current: dict[str, Any], scope: frozenset[str], k
     if _hidden(out, scope, entry_ok) != _hidden(current, scope, entry_ok):
         raise Conflict("gateway: refused a vault change that would add, change or drop a "
                        "credential this program can't see")
-    out.pop(vault.BASELINE_KEY, None)
-    if vault.BASELINE_KEY in current:
-        out[vault.BASELINE_KEY] = current[vault.BASELINE_KEY]
     return out
 
 
@@ -397,8 +393,8 @@ class Broker:
         if self.mode() != "unwrapped":
             raise BrokerError("gateway: the vault key already has a passphrase (or there is "
                               "no vault key yet)")
-        if paths.v2_store_path().exists() and not paths.vault_path().exists():
-            raise BrokerError("gateway: the 0.6 vault hasn't been converted yet")
+        if vault.v06_waiting():
+            raise BrokerError(vault.V06_MESSAGE)
         try:
             key_text = paths.key_path().read_text(encoding="ascii", errors="replace")
         except OSError:
@@ -436,8 +432,8 @@ class Broker:
                 if self.mode() != "unwrapped":
                     raise BrokerError("gateway: the vault key already has a passphrase (or "
                                       "there is no vault key yet)")
-                if paths.v2_store_path().exists() and not paths.vault_path().exists():
-                    raise BrokerError("gateway: the 0.6 vault hasn't been converted yet")
+                if vault.v06_waiting():
+                    raise BrokerError(vault.V06_MESSAGE)
                 now = read_identity(paths.key_path().read_text(encoding="ascii", errors="replace"))
                 if now != ident:
                     raise BrokerError("gateway: the vault key changed while its passphrase was "
@@ -456,6 +452,98 @@ class Broker:
         finally:
             tmp.unlink(missing_ok=True)
         self.emit("vault.wrapped")
+
+    def change_passphrase(self, passphrase: Any) -> None:
+        """Wrap the unlocked identity with a new `passphrase` (PLAN-0.11
+        §19.14): the new key.wrapped is written beside the old, unwrapped to
+        check it, then put in place (the old one, which the old passphrase
+        opens, is replaced, never kept). The daemon stays unlocked."""
+        pw = self._check_passphrase(passphrase)
+        with self.mutex:
+            if self.mode() != "wrapped" or self._identity is None:
+                raise BrokerError("gateway: the vault must be unlocked (with a passphrase) to "
+                                  "change its passphrase")
+            ident = self._identity
+        rec = recipient_of(ident)
+        try:
+            blob = agepass.encrypt(f"{ident}\n".encode("ascii"), pw)
+        except agepass.AgePassError as e:
+            raise BrokerError(str(e)) from None
+        wrapped = paths.wrapped_key_path()
+        tmp = wrapped.with_name(f".{wrapped.name}.{secrets.token_hex(6)}.new")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                os.write(fd, blob)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                back = agepass.decrypt(tmp.read_bytes(), pw).decode("ascii", "replace")
+                if read_identity(back) != ident:
+                    raise BrokerError("gateway: the wrapped key didn't unwrap to the same key")
+            except (agepass.AgePassError, BrokerError) as e:
+                raise BrokerError("gateway: changing the vault passphrase failed its check "
+                                  f"({type(e).__name__}); nothing changed") from None
+            with vault.locked(), self.mutex:
+                if self.mode() != "wrapped" or self._identity != ident or \
+                        self.recipient() not in (None, rec):
+                    raise BrokerError("gateway: the vault key changed or was locked meanwhile; "
+                                      "nothing changed (try again)")
+                os.replace(tmp, wrapped)
+                _fsync_dir(wrapped.parent)
+                self.touch()
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.emit("vault.wrapped")
+
+    def remove_passphrase(self) -> None:
+        """Keep the vault key without a passphrase again (PLAN-0.11 §19.14):
+        key.txt (0600) from the unlocked identity, written whole first, then
+        key.wrapped and key.recipient removed (a crash between leaves key.txt,
+        which vault.key_mode() reads first). The passphrase offer becomes
+        "declined": the person chose none, so it isn't offered again
+        (/gate-unlock still sets one)."""
+        with vault.locked(), self.mutex:
+            if self.mode() != "wrapped" or self._identity is None:
+                raise BrokerError("gateway: the vault must be unlocked (with a passphrase) to "
+                                  "remove its passphrase")
+            ident = self._identity
+            if paths.vault_path().exists():
+                # the key really opens the vault; the offer declined first (still
+                # encrypted to the same key), so the vault never reads as
+                # unwrapped with the offer pending
+                data = vault.load()
+                if vault.offer_state(data) != vault.OFFER_DECLINED:
+                    vault.decline_offer(data)
+                    vault.save(data)
+            _write_private(paths.key_path(), (ident + "\n").encode("ascii"))
+            for p in (paths.wrapped_key_path(), paths.recipient_path()):
+                p.unlink(missing_ok=True)
+            _fsync_dir(paths.private_dir())
+            self._identity = None
+            self.unlocked_at = None
+            self._plain = None
+            self.touch()
+        self.emit("vault.unwrapped")
+
+    def start_over(self) -> Path:
+        """A vault whose passphrase is lost (wrapped and locked: PLAN-0.11
+        §19.14): vault.age, key.wrapped, key.recipient and cache.age move into
+        a new private/backups/startover-* folder (vault.move_aside); nothing is
+        deleted, and the next store makes a new vault and key. Returns the
+        folder."""
+        with vault.locked(), self.mutex:
+            if self.mode() != "wrapped":
+                raise BrokerError("gateway: only a vault whose key has a passphrase can start "
+                                  "over (this one has none, or there is no vault)")
+            if self._identity is not None:
+                raise BrokerError("gateway: the vault is unlocked, so its passphrase isn't lost: "
+                                  "change or remove it instead (gate passphrase)")
+            dest = vault.move_aside("startover")
+            self._plain = None
+        self.emit("vault.started_over")
+        return dest
 
     def unlock(self, passphrase: Any, how: str = "test") -> None:
         """Unwrap key.wrapped with `passphrase` (age's scrypt runs without the
@@ -528,12 +616,12 @@ class Broker:
                 self.touch()
         return data
 
-    def write(self, data: dict[str, Any], migrating: bool = False) -> None:
+    def write(self, data: dict[str, Any]) -> None:
         with self.mutex:
             self._require()
             self._plain = None
             try:
-                vault.save(data, migrating=migrating)
+                vault.save(data)
             finally:
                 self._plain = None
             self.touch()

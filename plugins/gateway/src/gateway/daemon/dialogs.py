@@ -82,7 +82,8 @@ CLIENT_SURFACES = ("terminal", "desktop")
 # persisted: a restarted gated asks again): "terminal", a password prompt in
 # a gateway terminal (daemon/terminals.py); "gated", a confirmation or a
 # notice gated itself asks (a remote host's changed host key or machine, a
-# refused key: daemon/remote.py, PLAN-v4 phase 6)
+# refused key: daemon/remote.py, PLAN-v4 phase 6; a browser sign-in's Open:
+# daemon/oauth.py, PLAN-0.11 §7, the only one carrying `signin` fields)
 OWNED = ("terminal", "gated")
 _ID = re.compile(r"d_[0-9a-f]{16}")
 _TOKEN = re.compile(r"[0-9a-f]{64}")
@@ -190,11 +191,32 @@ class Lease:
         return le
 
 
+# gated's own choice dialogs the mod draws from a fixed template of its own
+# (hooks/mod/dialog.ts): the vault passphrase offer (daemon/offer.py,
+# PLAN-0.11 §8). Only gated's choice dialogs carry `offer`.
+OFFERS = ("passphrase",)
+SIGNIN_KEYS = ("account", "kind", "tenant", "client", "scope", "host", "previous_client")
+# the variables a sign-in's Open answer may carry (Claude Code's own, sent by
+# the mod): the display and desktop for the system browser, and
+# SSH_CONNECTION (a session over ssh); daemon/oauth.py checks each value
+SIGNIN_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+              "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_DATA_DIRS",
+              "SSH_CONNECTION")
+
+
+def _signin_view(v: Any) -> dict[str, str] | None:
+    """The browser sign-in's fields (PLAN-0.11 §7.1) for the mod's fixed
+    template: gated's own validated values, cleaned again."""
+    if not isinstance(v, dict):
+        return None
+    return {k: clean_text(v.get(k), 1700 if k == "scope" else 120) for k in SIGNIN_KEYS}
+
+
 class Request:
     FIELDS = ("id", "kind", "owner", "lease", "session_pid", "session_start", "session_id",
               "title", "entry", "what", "target", "lines", "options", "checked", "default",
               "ok_label", "cancel_label", "default_cancel", "fields", "remember", "paste",
-              "input", "check", "pem",
+              "input", "check", "pem", "signin", "offer",
               "created", "deadline", "attempt", "error", "order")
 
     def __init__(self, **kw: Any):
@@ -224,6 +246,13 @@ class Request:
         # PLAN-v4 phase 7: a PEM certificate and key (an Azure service
         # principal's certificate): Paste may bring several lines
         self.pem: bool = bool(kw.get("pem", False))
+        # PLAN-0.11 §7: a browser sign-in's confirm dialog (gated's own: owner
+        # "gated"), drawn by the mod's fixed template; `env` holds the display
+        # variables the mod sends with Open (in memory only)
+        self.signin: dict[str, str] | None = kw.get("signin")
+        # PLAN-0.11 §8: gated's passphrase offer (a choice; the mod's template)
+        self.offer: str = kw.get("offer", "")
+        self.env: dict[str, str] = {}
         self.created: float = float(kw.get("created", _now()))
         self.deadline: float = float(kw.get("deadline", _now() + DEFAULT_LIFETIME))
         self.attempt: int = int(kw.get("attempt", 1))
@@ -266,6 +295,10 @@ class Request:
                "expires_in": max(0, int(self.deadline - now))}
         if self.secret() and self.key is not None:
             out["pub"] = _b64(bytes(self.key.public_key))
+        if self.signin is not None:
+            out["signin"] = dict(self.signin)
+        if self.offer:
+            out["offer"] = self.offer
         return out
 
     def ident(self) -> dict[str, Any]:
@@ -413,6 +446,17 @@ class Dialogs:
             le.pids[peer_pid] = peers.started(peer_pid)
         return le
 
+    def lease_session(self, token: Any, peer_pid: int) -> Any:
+        """The live session a dialog lease was taken for (the detached helper
+        proves its session with it: it runs outside the session's process
+        tree), or None when that session ended."""
+        with self.lock:
+            le = self._lease(token, peer_pid)
+            s = self.d.registry.live(le.session_pid)
+        if s is None or (le.session_start is not None and s.start != le.session_start):
+            return None
+        return s
+
     def _req(self, rid: Any) -> Request:
         if not isinstance(rid, str) or not _ID.fullmatch(rid) or rid not in self.requests:
             raise DialogError(404, "no_dialog", "gateway: no such dialog")
@@ -468,6 +512,10 @@ class Dialogs:
                     paste=bool(spec.get("paste", True)) and kind in ("secret", "unlock"),
                     input=bool(spec.get("input")) and kind == "text",
                     pem=bool(spec.get("pem")) and kind == "secret",
+                    signin=_signin_view(spec.get("signin")) if owner == "gated" and kind == "confirm"
+                    else None,
+                    offer=spec.get("offer") if owner == "gated" and kind == "choice"
+                    and spec.get("offer") in OFFERS else "",
                     check=check, created=_now(), deadline=_now() + life, order=self.order)
         r.new_key()
         self.requests[r.id] = r
@@ -795,6 +843,12 @@ class Dialogs:
                 return {"ok": False, "error": problem[0], "state": "done"}
             r.answer = ans
             r.state = "checking"
+            if r.signin is not None:
+                # the browser sign-in's Open: the display variables of Claude
+                # Code's environment (the UI plane), for the system browser
+                env = body.get("env")
+                r.env = {k: v for k, v in env.items() if k in SIGNIN_ENV and isinstance(v, str)
+                         and len(v) <= 1000} if isinstance(env, dict) else {}
             self._changed()
             if r.owner == "gated":
                 self._run_vault(r)          # gated's own confirmation: its handler acts on the OK
@@ -832,8 +886,10 @@ class Dialogs:
         as failed (the terminal moved on: there is nothing to retry). kind
         "confirm" or "info" (a remote host's changed identity, a refused key:
         daemon/remote.py): `handler(request, [])` runs on the person's OK only;
-        a cancel, a timeout or the session ending just close it."""
-        if kind not in ("secret", "confirm", "info"):
+        a cancel, a timeout or the session ending just close it. kind
+        "choice" (the vault passphrase offer, daemon/offer.py):
+        `handler(request, [the option picked])`, likewise only on a pick."""
+        if kind not in ("secret", "confirm", "info", "choice"):
             raise DialogError(400, "bad_request", "gateway: unknown dialog kind")
         ok, why = self.available(session)
         if not ok:
@@ -859,6 +915,8 @@ class Dialogs:
         owned = r.owner in OWNED
         handler = (self.owned.get(r.id) or (None, None))[0] if owned else self.handlers.get(r.kind)
         values = list((r.answer or {}).get("values") or [])
+        if r.kind == "choice" and isinstance((r.answer or {}).get("choice"), str):
+            values = [r.answer["choice"]]              # (the option picked, one of r.options)
         r.answer = None
         r.busy = True
 

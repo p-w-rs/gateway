@@ -33,8 +33,9 @@ attach your vault, your `gateway.toml`, transcripts or the audit log.
   other processes can read, telemetry, or any program other than the one it
   was handed to.
 - **Credential misuse.** A credential goes to a host or site it isn't bound
-  to, to a program that wasn't allowed it, or is used after you removed or
-  narrowed the right.
+  to, or to a program that wasn't allowed it; or it is used after you
+  narrowed the right (narrowing applies at once), or after you approved its
+  removal in the dialog (until then the approved entry keeps gating).
 - **Guard bypasses that reach a credential.** A way for Claude's commands to
   get or use a stored credential without the right and your OK: around the
   stand-ins, the approval hook, the consent dialog, the vault or the
@@ -47,6 +48,9 @@ attach your vault, your `gateway.toml`, transcripts or the audit log.
   can read.
 - A bypass that reaches no credential, such as a harmless command running
   without a prompt. Open a normal issue for those.
+- What Claude does with your own tools and credentials (your ssh agent and
+  keys, your `GH_TOKEN`, your git and sudo) for targets you never put in
+  `gateway.toml`: the gateway gates only what is configured.
 - Bugs in Claude Code, pixi or the tools the gateway runs (OpenSSH, age,
   gh, tmux). Report those to their maintainers.
 

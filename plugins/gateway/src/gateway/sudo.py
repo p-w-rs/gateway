@@ -1,11 +1,21 @@
 """The local sudo stand-in and its one-shot askpass (SPEC 9.1).
 
-`sudo APT…` in Claude's terminal resolves to this stand-in. It:
+`sudo APT…` in Claude's terminal resolves to this stand-in, which exists only
+while this computer's sudo is configured (a `sudo` key in [hosts.localhost],
+or the approval or the configured list saying so) or an elevation
+restriction applies here (PLAN-0.11 §1.2, §1.5). It reads every right in
+the session's mode the hook recorded for a command Claude typed
+(modes.current_for), else in the modeless rule. It:
 
+0. passes a sudo that nothing configures to the user's own sudo
+   (envfile.pass_through: full argv, environment unchanged, nothing
+   supplied), unless an elevation restriction refuses it in this mode, or
+   asks and the command isn't one Claude typed;
 1. refuses when localhost sudo is `false`; `"ask"` is refused unless Claude's
    own command shell started it with nothing in between (Claude Code can only
    prompt for a command Claude typed: ancestry.typed_by_claude, which
-   `scripts = true` doesn't relax);
+   `scripts = true` doesn't relax) and the approval hook's record of this
+   very command exists (asks.standin: a sourced script's `sudo` has none);
 2. refuses `-S`/`-A` (a caller must not feed its own password or askpass);
 3. probes `sudo -n true` (cached 10 min) and, if passwordless, just execs the
    real sudo — nothing is stored or asked;
@@ -84,6 +94,15 @@ NOT_DIRECT = ("gateway: sudo started by {culprit} got no password (only Claude's
 JOINED_NOT_KEPT = ("gateway: the sudo password for this machine was entered in another command's "
                    "gateway dialog and can't be read back here (it isn't kept when Remember it is "
                    "unticked); run the command again.")
+
+
+# The local sudo dialog's "Remember it" box starts unticked, like the remote
+# one (PLAN-0.11 §9.1; ssh_sudo.REMEMBER_DEFAULT and REMEMBER_NOTE, a test
+# keeps them in step): a password typed for a command is used for that
+# command only unless the person ticks the box to keep it in the vault.
+REMEMBER_DEFAULT = False
+REMEMBER_NOTE = ("Tick Remember it to keep it for later commands (unticked, it is used for this "
+                 "command only).")
 
 
 def not_direct_who(culprit: str | None) -> str:
@@ -390,6 +409,31 @@ class _StderrRelay:
                 pass
 
 
+# What a configured sudo gets of the caller's environment besides the
+# account CLIs' allowlist (clis.ENV_ALLOW): the terminal type, which sudo's
+# own env_reset keeps too, and the editor `sudo -e` (sudoedit) runs as the
+# user. Everything else (the user's tokens, agents, proxies, LD_*/DYLD_*) is
+# dropped, so `sudo -E` and `--preserve-env` preserve only these (PLAN-0.11
+# §19.14).
+ENV_EXTRA = ("TERM", "SUDO_EDITOR", "VISUAL", "EDITOR")
+
+
+def sudo_env(fifo: str | None = None) -> dict[str, str]:
+    """The environment the system sudo runs with for a configured sudo:
+    clis.ENV_ALLOW and ENV_EXTRA from the caller's, plus, with `fifo`, what
+    the one-shot askpass needs (SUDO_ASKPASS, GW_ASKPASS_FIFO, DISPLAY).
+    Never the caller's whole environment."""
+    from .clis import ENV_ALLOW
+    keep = set(ENV_ALLOW) | set(ENV_EXTRA)
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    if fifo is not None:
+        env["SUDO_ASKPASS"] = str(paths.bin_dir() / "gate-askpass")
+        env["GW_ASKPASS_FIFO"] = fifo
+        # DISPLAY lets sudo use askpass with no tty for nested/absolute-path sudo.
+        env["DISPLAY"] = os.environ.get("DISPLAY") or "gw:0"
+    return env
+
+
 def _run_with_askpass(real: str, argv: list[str], password: str) -> tuple[int, bool]:
     """Run `real -A argv` feeding `password` through a one-shot FIFO askpass.
     Returns (exit_code, rejected).
@@ -414,12 +458,8 @@ def _run_with_askpass(real: str, argv: list[str], password: str) -> tuple[int, b
     served = threading.Event()
     t = threading.Thread(target=_serve_fifo, args=(fifo, password, stop, served), daemon=True)
     t.start()
-    env = dict(os.environ)
-    env["SUDO_ASKPASS"] = str(paths.bin_dir() / "gate-askpass")
-    env["GW_ASKPASS_FIFO"] = fifo
-    # DISPLAY lets sudo use askpass with no tty for nested/absolute-path sudo.
-    env.setdefault("DISPLAY", "gw:0")
-    proc = subprocess.Popen([real, "-A", *_strip_n(argv)], env=env, stderr=subprocess.PIPE)
+    proc = subprocess.Popen([real, "-A", *_strip_n(argv)], env=sudo_env(fifo),
+                            stderr=subprocess.PIPE)
     assert proc.stderr is not None
     relay = _StderrRelay(os.dup(proc.stderr.fileno()), password)
     proc.stderr.close()
@@ -468,9 +508,10 @@ def _safe_send(proc: subprocess.Popen, n: int) -> None:
 
 
 def _exec_real(real: str, argv: list[str]) -> int:
-    """exec the real sudo, inheriting stdio (no password supplied)."""
+    """exec the real sudo, inheriting stdio (no password supplied), with the
+    configured sudo's allowlisted environment (sudo_env)."""
     try:
-        os.execv(real, [real, *argv])
+        os.execve(real, [real, *argv], sudo_env())
     except OSError:
         return 1
     return 0  # unreachable
@@ -490,45 +531,128 @@ def _typed_by_claude() -> tuple[bool, str]:
 SUDO_CHECK = {"section": "hosts", "entry": "localhost", "right": "sudo"}
 
 
-def _rights_now(fresh: bool = False) -> tuple[dict[str, Any] | None, str | None, bool]:
-    """(vault data, refusal or None, scripts) from the effective localhost
-    sudo right as it is now (fresh: the form read again, not from this
-    process's cache). Refused: sudo off or waiting for the user's OK; an
-    "ask" right for anything but a command Claude typed (Claude Code can only
-    prompt for that one, whatever scripts says; inside a checkpoint job the
-    approval hook's job wording, since nobody can be asked there)."""
+# What the stand-in does with this computer's sudo (PLAN-0.11 §1.5): gate it
+# (a `sudo` key in [hosts.localhost], or the approval or the configured list
+# saying so), refuse it, or pass it to the user's own sudo (no `sudo` key:
+# the user's own; with only an elevation restriction, once that restriction
+# lets it through).
+GATED = "gated"
+PASS = "pass"
+# The command this stand-in call serves (main sets it): an "ask" passes only
+# with the approval hook's record of this very command (asks.standin).
+_CALL: dict[str, Any] = {}
+# Why the vault couldn't be read at the last _load (locked: gated's own
+# text): the configured sudo is refused with it; an unconfigured sudo still
+# passes through.
+_UNREADABLE: dict[str, str] = {}
+
+
+def _load(fresh: bool = False) -> tuple[dict[str, Any] | None, Any, Any, str | None]:
+    """(vault data, form, effective rights, the session's mode) as they are
+    now (fresh: the form read again, not from this process's cache). The
+    mode is the one the hook recorded for a command Claude typed
+    (modes.current_for), else None: the modeless rule. A locked vault still
+    classifies (the configured list): compute(locked=True); why it couldn't
+    be read is kept for the gated path (_UNREADABLE)."""
     if fresh:
         from . import form as formmod
         formmod.clear_cache()
     locked = False
+    _UNREADABLE.clear()
     try:
         data = vault.load() if vault.exists() else None
-    except vault.VaultLocked:
+    except vault.VaultLocked as e:
         data, locked = None, True
-    except Exception:  # noqa: BLE001
+        _UNREADABLE["message"] = str(e) or "gateway: the gateway vault is locked"
+    except Exception as e:  # noqa: BLE001
         data = None
+        _UNREADABLE["message"] = (f"gateway: the vault can't be read ({type(e).__name__}); "
+                                  "run gate status")
     form = consent.load_form(data)
-    eff = consent.compute(form, data)
+    from . import modes
+    try:
+        mode = modes.current_for("standin")
+    except Exception:  # noqa: BLE001 - the modeless rule
+        mode = None
+    _CALL["mode"] = modes.audit_word(mode)      # for its audit lines (lead decision 19.8)
+    eff = consent.compute(form, data, mode, locked=locked)
+    return data, form, eff, mode
+
+
+def _audit_mode() -> str:
+    """The mode the stand-in decided in, for its audit lines (lead decision
+    19.8: the one _load resolved with, else the recorded mode, else
+    "modeless")."""
+    from . import modes
+    return modes.standin_audit_mode(_CALL)
+
+
+def _refused(reason: str) -> None:
+    """Audit a refusal with the mode the stand-in decided in."""
+    audit.refusal("sudo", "localhost", reason, mode=_audit_mode())
+
+
+def _rights_now(fresh: bool = False) -> tuple[dict[str, Any] | None, str | None, bool, str]:
+    """(vault data, refusal or None, scripts, GATED or PASS) from this
+    computer's effective sudo as it is now (fresh: the form read again).
+
+    Not configured (PLAN-0.11 §1.5): the user's own sudo (PASS), unless an
+    elevation restriction refuses it in this mode ("deny"), or asks (then
+    only a command Claude typed: the hook asked). Configured: refused when
+    it is refused outright (eff.refusal: the configured list while the vault
+    can't be read, gateway.toml gone), off ("deny" in this mode), waiting
+    for the user's OK, or while the vault can't be read (locked: the
+    vault's own message, which says how to unlock it); an "ask" right for
+    anything but a command Claude typed (Claude Code can only prompt for
+    that one, whatever scripts says; inside a checkpoint job the approval
+    hook's job wording, since nobody can be asked there)."""
+    data, form, eff, mode = _load(fresh)
+    from . import modes, policy
     eh = eff.hosts.get("localhost")
-    right = eh.sudo if eh is not None else False
     scripts = bool(eh.scripts) if eh is not None else False
-    if right is False:
-        fh = form.hosts.get("localhost")
-        return data, (WAITING if (fh is not None and fh.sudo is not False) else OFF), scripts
+    word = eff.word("localhost", "sudo", mode)
     # the policy's elevation restrictions ([hosts.localhost.policy] elevation,
     # [policy] elevation; PLAN-v4 phase 7), with the rule behind a refusal
-    from . import policy
-    d = policy.decide(eff, "elevation")
-    if d.word is False:
-        return data, d.message("sudo (root)"), scripts
-    if right == "ask" or d.word == "ask":
+    d = policy.decide(eff, "elevation", mode=mode)
+
+    def ask_refusal() -> str | None:
         typed, by = _typed_by_claude()
-        if not typed:
-            # a locked vault: say how sudo's own right comes back (consent.LOCKED_SUDO_NOTE)
-            note = consent.locked_sudo_note(form) if locked and right == "ask" else ""
-            return data, (ASK_JOB if by == ancestry.CHECKPOINT else
-                          ASK_PANE if by == ancestry.TERMINAL else ASK_INDIRECT) + note, scripts
-    return data, None, scripts
+        if typed:
+            # and the approval hook's record of this very command (taken
+            # once: asks.standin; lead decision 19.14)
+            from . import asks
+            got = asks.standin("sudo", list(_CALL.get("argv") or []), ("hosts", "localhost"))
+            if got == "ok":
+                return None
+            return asks.refusal(got, [consent.ask_phrase("localhost", "sudo")], "sudo ...")
+        return (ASK_JOB if by == ancestry.CHECKPOINT else
+                ASK_PANE if by == ancestry.TERMINAL else ASK_INDIRECT)
+
+    if word == modes.UNCONFIGURED:
+        if d.value == "deny":
+            return data, d.message("sudo (root)"), scripts, PASS
+        if d.value == "ask":
+            return data, ask_refusal(), scripts, PASS
+        return data, None, scripts, PASS
+    refused = eff.refusal("localhost")
+    if refused is not None:
+        return data, f"gateway: sudo on this machine is refused: {refused}", scripts, GATED
+    if word == "deny":
+        # waiting: the form gives more (or took the key out: the approved
+        # sudo keeps gating until the user's OK, PLAN-0.11 §1.1)
+        fh = form.hosts.get("localhost")
+        fmv = fh.mode_value("sudo") if fh is not None else None
+        waiting = fmv is None or fmv.word(mode) != "deny"
+        return data, (WAITING if waiting else OFF), scripts, GATED
+    if d.value == "deny":
+        return data, d.message("sudo (root)"), scripts, GATED
+    if _UNREADABLE.get("message"):
+        # the configured sudo needs the vault (its password, its approval):
+        # refused before anything else, whoever runs it (PLAN-0.11 §19.16)
+        return data, _UNREADABLE["message"], scripts, GATED
+    if word == "ask" or d.value == "ask":
+        return data, ask_refusal(), scripts, GATED
+    return data, None, scripts, GATED
 
 
 def _in_gateway_terminal() -> bool:
@@ -548,24 +672,34 @@ def _in_gateway_terminal() -> bool:
 
 
 def main(argv: list[str]) -> int:
+    # Effective localhost sudo right (PLAN-0.11 §1.5): this computer's sudo
+    # that nothing configures is the user's own, run with the full argv and
+    # the environment unchanged (no password supplied, nothing asked).
+    from . import asks
+    asks.reset()
+    _CALL.clear()
+    _CALL.update(argv=list(argv))
+    data, msg, scripts, how = _rights_now()
+    if msg is not None:
+        print(msg, file=sys.stderr)
+        _refused(msg)
+        return 1
+    if how == PASS:
+        from . import envfile
+        return envfile.pass_through("sudo", list(argv), "localhost",
+                                    entries=["this computer's sudo (gateway.toml)"])
+
     real = _real_sudo()
     if real is None:
         print(UNTRUSTED, file=sys.stderr)
-        audit.refusal("sudo", "localhost", "sudo binary not trusted")
-        return 1
-
-    # Effective localhost sudo right.
-    data, msg, scripts = _rights_now()
-    if msg is not None:
-        print(msg, file=sys.stderr)
-        audit.refusal("sudo", "localhost", msg)
+        _refused("sudo binary not trusted")
         return 1
 
     direct, culprit = ancestry.is_direct("sudo", entry_scripts=scripts)
 
     if _has_S_or_A(argv):
         print(NO_SA, file=sys.stderr)
-        audit.refusal("sudo", "localhost", NO_SA)
+        _refused(NO_SA)
         return 1
 
     # In a gateway terminal the real sudo asks on the pane's tty: gated's
@@ -584,7 +718,7 @@ def main(argv: list[str]) -> int:
     if not direct:
         msg = NOT_DIRECT.format(culprit=not_direct_who(culprit))
         print(msg, file=sys.stderr)
-        audit.refusal("sudo", "localhost", msg)
+        _refused(msg)
         return _exec_real(real, argv)
 
     user = paths.local_user()
@@ -594,8 +728,12 @@ def main(argv: list[str]) -> int:
     if asked:
         # The dialog may have been open for minutes: gated rechecked the right
         # before it handed the password over, and it is checked once more
-        # here, right before sudo runs (the form may have changed meanwhile).
-        _data, msg, scripts_now = _rights_now(fresh=True)
+        # here, right before sudo runs (the form may have changed meanwhile;
+        # a sudo no longer configured gets no stored or typed password).
+        _data, msg, scripts_now, how_now = _rights_now(fresh=True)
+        if msg is None and how_now != GATED:
+            msg = ("gateway: sudo on this machine stopped going through the gateway while its "
+                   "dialog was open; run the command again (your own sudo then runs it)")
         if msg is None and scripts_now != scripts:
             direct, culprit = ancestry.is_direct("sudo", entry_scripts=scripts_now)
             if not direct:
@@ -603,10 +741,10 @@ def main(argv: list[str]) -> int:
         if msg is not None:
             password = None
             print(msg, file=sys.stderr)
-            audit.refusal("sudo", "localhost", f"{msg} (after the dialog)")
+            _refused(f"{msg} (after the dialog)")
             return 1
 
-    audit.use("sudo", "localhost", None, ["sudo", *argv], secrets=[password])
+    audit.use("sudo", "localhost", None, ["sudo", *argv], secrets=[password], mode=_audit_mode())
     rc, rejected = _run_with_askpass(real, argv, password)
     if rejected:
         _mark_stale(user)
@@ -619,7 +757,7 @@ def _sudo_prompt(user: str) -> str:
     try:
         return popup.secret_prompt(
             "sudo password", "localhost", target=f"{user}@localhost",
-            note="Untick Remember it to use it for this command only (nothing is stored).")
+            note=REMEMBER_NOTE)
     except Exception:  # noqa: BLE001
         return "Type the sudo password for this machine."
 
@@ -646,13 +784,13 @@ def _password_for(data: dict[str, Any] | None, user: str) -> tuple[str | None, b
     collected through the gateway's dialog (asked True). None (with a printed
     reason) when it is stale or no dialog could open.
 
-    The dialog offers "Remember it" (ticked by default): kept ticked, the
-    dialog stores the value itself (store=, run where the dialog runs), so an
-    answer that comes after this process gave up waiting (exit 75) is kept,
-    and a second sudo that joined the same dialog re-reads it (load=);
-    unticked, it is used for this command only and never stored. gated
-    rechecks localhost's sudo right before it hands the value over
-    (SUDO_CHECK). A rejected saved password opens the one re-entry dialog
+    The dialog offers "Remember it" (unticked by default, REMEMBER_DEFAULT):
+    ticked, the dialog stores the value itself (store=, run where the dialog
+    runs), so an answer that comes after this process gave up waiting (exit
+    75) is kept, and a second sudo that joined the same dialog re-reads it
+    (load=); left unticked, it is used for this command only and never
+    stored. gated rechecks localhost's sudo right before it hands the value
+    over (SUDO_CHECK). A rejected saved password opens the one re-entry dialog
     (popup.reenter, which dedupes and remembers a cancel) and is never fed
     again."""
     from . import popup
@@ -676,27 +814,28 @@ def _password_for(data: dict[str, Any] | None, user: str) -> tuple[str | None, b
     if entry is not None and entry.get("stale"):
         msg = _reenter(user)
         print(msg, file=sys.stderr)
-        audit.refusal("sudo", "localhost", msg)
+        _refused(msg)
         return None, False
     # No saved password: open a secret dialog (verified; it stores the value
-    # when "Remember it" stays ticked).
+    # only when the person ticks "Remember it").
     try:
         outcome, value = popup.secret("localhost", "sudo password", prompt, verify=verify_local,
-                                      store=store, load=load, remember=True, check=SUDO_CHECK)
+                                      store=store, load=load, remember=REMEMBER_DEFAULT,
+                                      check=SUDO_CHECK)
     except Exception as e:  # noqa: BLE001
         print(NO_PW, file=sys.stderr)
-        audit.refusal("sudo", "localhost", f"{NO_PW} ({type(e).__name__})")
+        _refused(f"{NO_PW} ({type(e).__name__})")
         return None, False
     if outcome == popup.Outcome.OK and value:
         return value, True
     if outcome == popup.Outcome.OK:
         # joined another command's dialog whose password wasn't kept
         print(JOINED_NOT_KEPT, file=sys.stderr)
-        audit.refusal("sudo", "localhost", JOINED_NOT_KEPT)
+        _refused(JOINED_NOT_KEPT)
         return None, False
     if outcome != popup.Outcome.UNAVAILABLE:     # (unavailable: popup printed why)
         print(popup.message(outcome, "localhost", "sudo password"), file=sys.stderr)
-    audit.refusal("sudo", "localhost", f"{NO_PW} ({outcome})")
+    _refused(f"{NO_PW} ({outcome})")
     return None, False
 
 

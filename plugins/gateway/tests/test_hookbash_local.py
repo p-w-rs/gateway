@@ -49,13 +49,14 @@ def test_local_sudo_true_allows_only_in_auto():
         assert _decide("sudo ls", "default") is None
 
 
-def test_implicit_localhost_sudo_asks():
-    # No [hosts.localhost] at all: localhost is implicit with sudo = "ask"
-    # (the default): Claude Code asks, in auto mode too; never allowed.
+def test_implicit_localhost_sudo_is_the_users_own():
+    # No [hosts.localhost] at all (PLAN-0.11 §1.5): this computer's sudo is
+    # the user's own: no decision (Claude Code's own permissions), in auto
+    # mode too; never allowed.
     with H.gateway_env() as env:
         _approved(env, '[hosts.box]\naddress = "u@box.example.com"\nssh = true\n')
-        assert _decide("sudo ls", "auto") == "ask"
-        assert _decide("sudo ls", "bypassPermissions") == "ask"
+        assert _decide("sudo ls", "auto") is None
+        assert _decide("sudo ls", "bypassPermissions") is None
 
 
 def test_pending_new_host_is_denied_with_the_next_step():
@@ -131,17 +132,17 @@ def test_reasons_start_with_gateway():
 
 def test_missing_vault_and_form_no_crash():
     with H.gateway_env():
-        # no form, no vault: localhost implicit sudo "ask" -> ask, even in auto
-        assert _decide("sudo ls", "auto") == "ask"
-        assert _decide("curl http://x", "auto") == "deny"
+        # no form, no vault: this computer's sudo is the user's own: no decision
+        assert _decide("sudo ls", "auto") is None
+        assert _decide("curl http://x", "auto") == "ask"     # a network command (PLAN-0.11 §3)
 
 
 
 def test_user_terminal_tool_gets_denies_and_asks_but_never_allow():
     """PreToolUse also covers mcp__terminal__run_in_terminal (the user's own
     Terminal panel): there sudo/ssh aren't the stand-ins, so nothing is
-    allowed by the gateway; denies (curl, private paths, rights false) and
-    asks still apply."""
+    allowed by the gateway; denies (private paths, rights false) and asks
+    (a network command, PLAN-0.11 §3) still apply."""
     with H.gateway_env() as env:
         env.write_form('[hosts.localhost]\nsudo = true\n[hosts.off]\naddress = "u@off.example.com"\n'
                        'ssh = false\n')
@@ -157,20 +158,19 @@ def test_user_terminal_tool_gets_denies_and_asks_but_never_allow():
         assert decide("sudo ls", "Monitor") == "allow", "Monitor is judged like Bash (no scrub rule)"
         assert decide("sudo ls", "mcp__terminal__run_in_terminal") is None
         assert decide("gate status", "mcp__terminal__run_in_terminal") is None
-        assert decide("curl https://x.example", "mcp__terminal__run_in_terminal") == "deny"
+        assert decide("curl https://x.example", "mcp__terminal__run_in_terminal") == "ask"
         assert decide("cat ~/.config/gateway/private/key.txt",
                       "mcp__terminal__run_in_terminal") == "deny"
         assert decide("ssh off true", "mcp__terminal__run_in_terminal") == "deny"
 
 
-def test_gate_secret_is_denied_in_every_tool_and_terminal_flows_in_the_panel():
-    """Review round 5: `gate secret`'s process-tree check doesn't see the
-    desktop app's Terminal panel (its shells run under the app's helper), and
-    Claude can type there with mcp__terminal__run_in_terminal. So the hook
-    denies `gate secret` for every tool (Bash, Monitor, the panel), also
-    behind a wrapper or inside a command string, and gate export / import /
-    copy-to typed into the panel (without a screen they ask there for the
-    user's one-time code). A command that only names it (grep) is fine."""
+def test_gate_dialog_commands_are_denied_in_the_terminal_panel():
+    """gate export / import / copy-to ask the user in the gateway's dialog,
+    which only a command Claude runs with the Bash tool can open: typed into
+    the desktop app's Terminal panel (mcp__terminal__run_in_terminal) they
+    are denied, also behind a wrapper; in Bash they aren't. The removed `gate
+    secret` has no rule of its own any more (gate itself says it doesn't
+    know the command)."""
     with H.gateway_env() as env:
         _approved(env, '[hosts.box]\naddress = "u@box.example.com"\nssh = true\n')
 
@@ -178,30 +178,17 @@ def test_gate_secret_is_denied_in_every_tool_and_terminal_flows_in_the_panel():
             o = hooks_bash.main({"tool_name": tool, "tool_input": {"command": cmd},
                                  "permission_mode": "auto", "cwd": str(env.root)})
             return o["hookSpecificOutput"] if o else {}
-        tools = ("Bash", "Monitor", "mcp__terminal__run_in_terminal")
-        secret = ["gate secret box", "~/.config/gateway/gate secret box",
-                  "env -i PATH=/usr/bin ~/.config/gateway/gate secret box", "nohup gate secret box",
-                  "timeout 60 gate secret box", "echo box | xargs gate secret",
-                  "bash -c 'gate secret box'", "sh -c \"$HOME/.config/gateway/gate secret box\"",
-                  "eval 'gate secret box'", "for n in box; do gate secret $n; done",
-                  "find . -maxdepth 0 -exec gate secret box \\;", "gate status; gate secret box",
-                  "gate secret box <<< $("]
-        for tool in tools:
-            for cmd in secret:
-                d = out(cmd, tool)
-                assert d.get("permissionDecision") == "deny", (tool, cmd, d)
-                assert d["permissionDecisionReason"] == hooks_bash.DENY_GATE_SECRET, (tool, cmd)
-            for cmd in ("grep -n 'gate secret' README.md", "echo gate secret", "gate status"):
-                assert out(cmd, tool).get("permissionDecision") != "deny", (tool, cmd)
-        last = audit.last_refusal(None)
-        assert last and last["tool"] == "gate" and last["reason"] == hooks_bash.DENY_GATE_SECRET
         for cmd in ("gate export", "gate export /tmp/x.age", "~/.config/gateway/gate import f.age",
-                    "gate copy-to box", "env gate copy-to box"):
+                    "gate copy-to box", "env gate copy-to box", "timeout 60 gate export /tmp/x.age"):
             d = out(cmd, "mcp__terminal__run_in_terminal")
             assert d.get("permissionDecision") == "deny", (cmd, d)
             assert "Terminal panel" in d["permissionDecisionReason"], (cmd, d)
             assert out(cmd, "Bash").get("permissionDecision") != "deny", cmd
+        last = audit.last_refusal(None)
+        assert last and last["tool"] == "gate", last
         assert out("gate check box", "mcp__terminal__run_in_terminal").get("permissionDecision") is None
+        for tool in ("Bash", "Monitor", "mcp__terminal__run_in_terminal"):
+            assert out("gate secret box", tool).get("permissionDecision") != "deny", tool
 
 
 def test_allow_needs_the_effective_right_even_without_the_deny():
@@ -218,7 +205,9 @@ def test_allow_needs_the_effective_right_even_without_the_deny():
         form = env.form()
         eff = consent.compute(form, vault.load())
         st = bashparse.parse("ssh newbox uptime")[0][0]
-        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"]) is False
+        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"], mode="auto") is False
         st = bashparse.parse("sudo ls")[0][0]
         roots = hooks_bash._read_roots("/tmp")       # ls reads /tmp, a temp folder
-        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"], roots=roots) is True
+        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"], roots=roots, mode="auto") is True
+        # PLAN-0.11 §2: no mode (the modeless rule) never allows
+        assert hooks_bash._stage_allowed(st, form, eff, ["/tmp"], roots=roots) is False

@@ -19,7 +19,8 @@ waits for it) gives it HOOK_TIMEOUT, not 15 s, and then skips it for
 UNRESPONSIVE_TTL (the marker `<run>/gated-unresponsive`, cleared by the next
 answer), so a hung daemon costs one short wait, not one per call. A gateway
 hook (or `gated start`) whose session isn't registered yet registers it once
-and retries (planes.register_agent). Every vault read asks the daemon: nothing
+and retries (planes.register_agent); a registration refused because the
+daemon is stopping starts a new one and registers there (call()). Every vault read asks the daemon: nothing
 is kept in this process between reads, so a long-running process (the MCP
 server) gets VaultLocked at its next read once the vault is locked, and the
 daemon judges each read when it is made (session, scope, lock). The daemon
@@ -132,10 +133,29 @@ def socket_path() -> Path:
     return paths.gated_socket()
 
 
+REGISTER = "/agent/register"
+
+
 def call(method: str, path: str, body: Any = None, *, timeout: float = 15.0,
          sock: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     """One request; the JSON answer, or DaemonError (Unreachable when nothing
-    answers at the socket)."""
+    answers at the socket). A session's registration (POST /agent/register:
+    a hook, `gated start --register`, a vault call's) that the daemon refuses
+    because it is stopping (503 "stopping": its idle exit began) starts a new
+    daemon (lifecycle.ensure_running waits for the old one to go) and is
+    sent there, once."""
+    try:
+        return _call(method, path, body, timeout=timeout, sock=sock)
+    except DaemonError as e:
+        if not (e.code == "stopping" and method == "POST" and path == REGISTER and sock is None):
+            raise
+    from . import lifecycle
+    lifecycle.ensure_running()
+    return _call(method, path, body, timeout=timeout, sock=sock)
+
+
+def _call(method: str, path: str, body: Any = None, *, timeout: float = 15.0,
+          sock: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     conn = _UnixHTTPConnection(os.fspath(sock or socket_path()), timeout)
     try:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
@@ -308,8 +328,8 @@ def vault_read() -> dict[str, Any]:
     return data
 
 
-def vault_write(data: dict[str, Any], migrating: bool = False) -> None:
-    _vault_call("/agent/vault/write", {"data": data, "migrating": bool(migrating)})
+def vault_write(data: dict[str, Any]) -> None:
+    _vault_call("/agent/vault/write", {"data": data})
 
 
 def cache_read() -> dict[str, Any]:
@@ -338,6 +358,34 @@ def open_own(blob: bytes) -> bytes:
 def _ensure() -> None:
     from . import lifecycle
     lifecycle.ensure_running()
+
+
+def vault_passphrase(action: str) -> dict[str, Any]:
+    """`gate passphrase`: gated opens its own vault dialog for `action`
+    ("passphrase", "remove", "start-over") in this program's session:
+    {available, id} or {available: False, reason, message}. Starts the
+    daemon once when nothing answers."""
+    started = False
+    while True:
+        try:
+            return call("POST", "/agent/vault/passphrase", {"action": action}, timeout=15)
+        except Unreachable as e:
+            if started:
+                return {"available": False, "reason": "unreachable",
+                        "message": f"gateway: the gateway daemon couldn't be reached "
+                                   f"({e.message.removeprefix('gateway: ')})"}
+            try:
+                _ensure()
+            except DaemonError as e2:
+                return {"available": False, "reason": "unreachable", "message": e2.message}
+            started = True
+        except DaemonError as e:
+            if e.status == 403 and e.code != "other_config":
+                return {"available": False, "reason": "no_session",
+                        "message": "gateway: this program isn't running inside a Claude Code "
+                                   "session the gateway knows, so no gateway dialog can open; "
+                                   "ask Claude in a Claude Code session"}
+            return {"available": False, "reason": e.code, "message": e.message}
 
 
 def dialog_lease() -> dict[str, Any]:

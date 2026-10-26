@@ -454,8 +454,12 @@ class CatalogServer:
     a storage pass pointing at a local 'remote' dir; search/show/files echo."""
 
     def __init__(self, client_id: str = "99999999-8888-7777-6666-555555555555",
-                 expect_bearer: str | None = None, redirect_to: str | None = None):
+                 expect_bearer: str | None = None, redirect_to: str | None = None,
+                 extra_config: dict[str, Any] | None = None):
         self.client_id = client_id
+        # more /api/config fields (PLAN-0.11 §7.4: an authority, a tenant or a
+        # scope a catalog names must never be used)
+        self.extra_config = dict(extra_config or {})
         self.expect_bearer = expect_bearer
         self.redirect_to = redirect_to.rstrip("/") if redirect_to else None
         self.calls: list[dict[str, Any]] = []
@@ -493,7 +497,7 @@ class CatalogServer:
                 if path == "/api/config":
                     return self._send({"tenantId": "11111111-2222-3333-4444-555555555555",
                                        "clientId": server.client_id,
-                                       "cliClientId": server.client_id})
+                                       "cliClientId": server.client_id, **server.extra_config})
                 auth = self.headers.get("Authorization", "")
                 server.calls.append({"method": "GET", "path": self.path, "auth": auth})
                 if path.startswith("/api/catalog"):

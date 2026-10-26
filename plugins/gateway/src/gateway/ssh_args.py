@@ -388,6 +388,108 @@ def parse_ssh(argv: list[str], forwards: bool = False) -> SshArgs:
     return a
 
 
+@dataclass
+class Lenient:
+    """What a lenient parse finds (PLAN-0.11 §1.4 step 1): the destination,
+    its options and the remote command, refusing nothing (the refusals apply
+    only on a configured target's gated path)."""
+    dest: str | None = None
+    opts: list[tuple[str, str | None]] = field(default_factory=list)
+    command: list[str] = field(default_factory=list)
+    login: str | None = None
+    port: str | None = None
+
+    def o_values(self, key: str) -> list[str]:
+        """Every `-o KEY=VALUE` value for this (lowercase) keyword."""
+        out = []
+        for c, v in self.opts:
+            if c == "o" and v:
+                m = _O_RE.match(v)
+                if m and m.group(1).lower() == key:
+                    out.append(m.group(2).strip().strip("\"'"))
+        return out
+
+    def jumps(self) -> list[str]:
+        """ProxyJump hops (-J, -o ProxyJump), each [user@]host[:port]."""
+        out: list[str] = []
+        for v in [v for c, v in self.opts if c == "J" and v] + self.o_values("proxyjump"):
+            out += [h.strip() for h in v.split(",") if h.strip() and h.strip().lower() != "none"]
+        return out
+
+    @property
+    def command_text(self) -> str:
+        return " ".join(self.command)
+
+
+def _getopt_lenient(argv: list[str], i: int, flags: frozenset[str], argopts: frozenset[str],
+                    out: list[tuple[str, str | None]]) -> tuple[int, bool]:
+    """_getopt that refuses nothing: an unknown letter counts as a flag, a
+    missing value ends the options."""
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            return i + 1, True
+        if not a.startswith("-") or a == "-":
+            return i, False
+        j = 1
+        while j < len(a):
+            c = a[j]
+            if c in argopts:
+                if j + 1 < len(a):
+                    val: str | None = a[j + 1:]
+                else:
+                    i += 1
+                    val = argv[i] if i < n else None
+                out.append((c, val))
+                break
+            out.append((c, None))
+            j += 1
+        i += 1
+    return i, False
+
+
+def parse_lenient(argv: list[str], tool: str = "ssh") -> Lenient:
+    """ssh's (or scp's / sftp's) command line as OpenSSH reads it, refusing
+    nothing. For ssh: options, the destination, options again unless `--`
+    came first, then the remote command. For scp and sftp: `dest` is None;
+    their operands are in `command` (classified one by one by the caller)."""
+    argv = list(argv)
+    lp = Lenient()
+    if tool == "ssh":
+        i, term = _getopt_lenient(argv, 0, SSH_FLAGS, SSH_ARGOPTS, lp.opts)
+        if i < len(argv):
+            lp.dest = argv[i]
+            i += 1
+            if not term and i < len(argv):
+                i, _ = _getopt_lenient(argv, i, SSH_FLAGS, SSH_ARGOPTS, lp.opts)
+        lp.command = argv[i:]
+    else:
+        flags, argopts = (SCP_FLAGS, SCP_ARGOPTS) if tool == "scp" else (SFTP_FLAGS, SFTP_ARGOPTS)
+        ops: list[str] = []
+        i = 0
+        while i < len(argv):          # scp and sftp take options among their operands too
+            i, term = _getopt_lenient(argv, i, flags, argopts, lp.opts)
+            if term:
+                ops += argv[i:]
+                break
+            if i < len(argv):
+                ops.append(argv[i])
+                i += 1
+        lp.command = ops
+    port_letter = "p" if tool == "ssh" else "P"
+    for c, v in lp.opts:
+        if c == "l" and lp.login is None:
+            lp.login = v
+        elif c == port_letter and v is not None and lp.port is None:
+            lp.port = v
+    if lp.login is None:
+        lp.login = (lp.o_values("user") or [None])[0]
+    if lp.port is None:
+        lp.port = (lp.o_values("port") or [None])[0]
+    return lp
+
+
 def check_copy(tool: str, argv: list[str]) -> None:
     """Refused options of scp / sftp (their operands are checked by the ssh
     stand-in they run). Raises Refused."""
@@ -748,20 +850,21 @@ def _shown(p: str) -> str:
     return s if len(s) <= 80 else s[:77] + "..."
 
 
-def decide_path(eff: Any, action: str, host: str, path: str | None) -> Any:
+def decide_path(eff: Any, action: str, host: str, path: str | None,
+                mode: str | None = None) -> Any:
     """policy.decide for one action of an ssh call on `host` (a form host's
-    name): with a path, in the workspace that holds it and in every workspace
-    it may reach (workspaces_for); the strictest decision applies, and a
-    refusal from a workspace that only may be reached says why."""
+    name) in `mode` (None: the modeless rule): with a path, in the workspace
+    that holds it and in every workspace it may reach (workspaces_for); the
+    strictest decision applies (by its per-mode word), and a refusal from a
+    workspace that only may be reached says why."""
     from . import policy
-    from .consent import RANK
     if not path:
-        return policy.decide(eff, action, host=host)
+        return policy.decide(eff, action, host=host, mode=mode)
     eh = eff.hosts.get(host)
     best, best_how = None, "in"
     for ws, how in workspaces_for(eh, path):
-        d = policy.decide(eff, action, host=host, workspace=ws)
-        if best is None or RANK.get(d.word, 0) < RANK.get(best.word, 0):
+        d = policy.decide(eff, action, host=host, workspace=ws, mode=mode)
+        if best is None or policy.RANK[d.value] < policy.RANK[best.value]:
             best, best_how = d, how
     if best.word is not True and best.workspace and best_how != "in":
         ew = eh.workspaces.get(best.workspace) if eh is not None else None

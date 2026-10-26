@@ -7,8 +7,8 @@ org turns into a clear hint to authorize the token for the org.
 
 The OAuth device-flow sign-in (a code to type on a GitHub web page) is gone:
 the gateway shows no web page or code to type elsewhere (the brief, section
-11). A token is pasted into the gateway's dialog instead
-(popup.signin_unavailable says so). Tests point the GitHub endpoints at a
+11). A token is pasted into the gateway's dialog instead. Tests point the
+GitHub endpoints at a
 local server with testing.override(github_base={"web":..., "api":...}).
 Requests go through entra.urlopen: no redirects (urllib would resend the
 token header to the new host), no proxy variables, the build's CA bundle.

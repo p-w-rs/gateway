@@ -1,72 +1,90 @@
 # Managed execution (gate-sh, managed.py)
 
-PLAN-v4 phase 4 (2026-10-20). Code: `plugins/gateway/hooks/gate-sh` (the
-prefix, POSIX sh), `src/gateway/managed.py` (its settings, rc and state, the
-host inspection), `[shell]` in `form.py`, its consent in `consent.py`
-(`_shell`, `approved_shell`, `EffectiveShell`), the "managed shell
-unavailable" path in `hooks/pre_bash.sh`, `hooks_bash.py` (`_managed_gate`)
-and `hooks/launch.sh` (`degraded_bash`), and the mod
+PLAN-v4 phase 4 (2026-10-20), reworked by PLAN-0.11 §1.6-§1.8 (0.11.0).
+Code: `plugins/gateway/hooks/gate-sh` (the prefix, POSIX sh),
+`src/gateway/managed.py` (its settings, rc and state, the host inspection),
+`[shell]` in `form.py`, its consent in `consent.py` (`_shell`,
+`approved_shell`, `EffectiveShell`), the env file (`envfile.env_text`),
+`hooks_bash.py` (`_managed_gate`'s notice, the route checks) and the mod
 (`hooks/mod/register.tsx` `managedSetup`/`managedNow`, `hooks/mod/lib.ts`
 `managedPlan`/`parseManagedState`/`managedLines`). Tests:
-`tests/test_managed.py`, the mod's `register.test.ts` and `lib.test.ts`;
-mutations: `tests/mutations_managed.py`; live: `tests/acceptance_managed.py`.
-Why it is built this way: [DECISIONS.md](../DECISIONS.md), "PLAN-v4 phase 4:
-managed execution"; the platform facts: [FEASIBILITY-v4.md](../FEASIBILITY-v4.md) P2.
+`tests/test_managed.py`, `tests/test_posture.py`, the mod's `register.test.ts`
+and `lib.test.ts`; mutations: `tests/mutations_managed.py`,
+`tests/mutations_posture.py`; live: `tests/acceptance_managed.py`. Why it is
+built this way: [DECISIONS.md](../DECISIONS.md), "PLAN-v4 phase 4: managed
+execution" and "0.11.0"; the platform facts:
+[FEASIBILITY-v4.md](../FEASIBILITY-v4.md) P2.
 
 ## What it does
 
 In managed mode Claude's Bash runs in the gateway's own bash (bash 5 from the
-gateway's pixi env), with the gateway's rc and a curated environment, never
-the user's login shell, its rc files, aliases, functions, PATH or credential
-variables. It covers every route Claude Code runs a command by: the Bash tool,
-`run_in_background`, Monitor, the user's `!` commands, subagents' Bash and
-skills' `!` injection all go through Claude Code's one shell function, which
-honours `CLAUDE_CODE_SHELL_PREFIX`.
+gateway's pixi env) with the user's own environment: the inherited variables
+minus Claude Code's own credentials, the variables that make a shell run code
+at startup, and the gateway's internal names. The gateway's stand-ins come
+first on PATH, only for what gateway.toml configures, and nothing the user's
+snapshot defines can shadow them. It covers every route Claude Code runs a
+command by: the Bash tool, `run_in_background`, Monitor, the user's `!`
+commands, subagents' Bash and skills' `!` injection all go through Claude
+Code's one shell function, which honours `CLAUDE_CODE_SHELL_PREFIX`.
+
+Since 0.11.0 the managed shell is a convenience, not a guard: when it isn't
+ready, Claude's commands run without its settings in the shell Claude Code
+itself uses, and without the mod in the user's own shell, with a notice
+either way; the classic Bash hook judges them the same way.
 
 ```
 Claude Code ── <shell> -c "'<root>/hooks/gate-sh' '<script>'"      (Bash tool, !, subagents, ...)
             ── /bin/sh -c "'<root>/hooks/gate-sh' '<hook string>'"  (classic shell-form hooks)
 gate-sh  ├─ a hook string (anything without a Bash-tool script's shape): exec /bin/sh -c STRING
-         └─ a Bash-tool script: snapshot `source` replaced by `. rc.bash`, the rest unchanged,
-            exec env -u NAME... PATH=... SHELL=... <managed bash> --noprofile --norc -c ". rc.bash && <rest>"
-            (every variable the curated environment doesn't keep removed by name; no value on argv)
+         └─ a Bash-tool script: snapshot `source` replaced by `. rc.bash <bash snapshot>`, the rest
+            unchanged, exec env -u NAME... PATH=... SHELL=... <managed bash> --noprofile --norc -c
+            ". rc.bash SNAP && <rest>" (the removals by name; no value on argv)
+            not ready: exec env -u NAME... <the shell that made the snapshot> -c '<script>'
+            (found as Claude Code finds its shell; never /bin/sh), one notice
 ```
 
 ## Settings: `[shell]` in gateway.toml
 
 ```toml
 [shell]
-managed = "on"            # "on" (default) | "warn" | "off"; true/false mean on/off
+managed = "on"            # "on" (default) | "off"; true/false mean on/off
 import_path = ["/opt/homebrew/bin", "~/.cargo/bin"]   # host folders for the managed PATH
-import_env = ["JAVA_HOME"]                            # variables taken from Claude Code's environment
+import_env = ["JAVA_HOME"]                            # names listed in gate status
 ```
 
-- **on**: the mod sets the prefix; without it (no mod) the classic Bash hook
-  denies Bash and Monitor with "managed shell unavailable" and the reason.
-- **warn**: as on while the mod runs; without it, commands run in the user's
-  own shell and the user sees a notice once per session.
-- **off**: no prefix; Claude Code's own shell, as before v4.
+- **on**: the mod sets the prefix. Without it (no mod) commands run in the
+  user's own shell with a notice once per session, still judged by the hook.
+- **off**: no prefix; Claude Code's own shell. The env file still puts the
+  present stand-ins first and removes Claude Code's own credential
+  variables.
+- `"warn"` is gone (0.11.0): written, it is a mistake (`gate status` names
+  it) and counts as "on".
 
-Consent (`consent._shell`, the "settings" pseudo-entry): lowering `managed`
-(on → warn → off), a new `import_path` folder and a new `import_env` name are
-widenings, effective only after the user's OK in the gateway dialog (`gate
-check settings`, or `gate check all`); until then the approved values apply
-(an approval from before phase 4 has none: on, no imports). Raising `managed`
-and removing an import are narrowings, effective at once and ratcheted into
-the approval. A bad `managed` value keeps the approved mode (an error in `gate
-status`, nothing ratchets).
+Consent (`consent._shell`, the "settings" pseudo-entry, `SHELL_RANK = {"off":
+0, "on": 1}`): turning `managed` off, a new `import_path` folder and a new
+`import_env` name are widenings, effective only after the user's OK in the
+gateway dialog (`gate check settings`); until then the approved values apply.
+Turning it on and removing an import are narrowings, effective at once and
+ratcheted into the approval. A bad `managed` value counts as "on" and
+changes nothing in the approval.
+
+`import_env` no longer changes what reaches Claude's shell (the inherited
+environment keeps those names anyway, minus the removals); it is still
+validated and listed (`managed.env_plan`). A remote host's runtime has its
+own, `[hosts.NAME.shell] import_env`, which still copies values from that
+host's login environment (remote.md).
 
 Validation (`form.import_path_entry`, `form.import_env_entry`):
 `import_path` takes absolute folders or `~/...` (expanded with the user's
 home), no `:`, nothing unsafe, never inside `~/.config/gateway`; at most 32.
 `import_env` takes variable names, refuses those always passed (HOME, LANG,
 ...), credential-looking names (TOKEN, SECRET, PASSW, PASSPHRASE, CRED, API_KEY,
-ACCESS_KEY, PRIVATE_KEY, CLIENT_KEY, CLIENT_CERT, AUTH, COOKIE, SESSION_KEY, and the env file's list
-of the user's token and agent variables: an account holds those), and what
-would change how a shell, the loader or the stand-ins work (PATH, IFS, ENV,
-BASH_ENV, BASH_FUNC_*, SHELLOPTS, PS*, PROMPT_COMMAND, CDPATH, LD_*, DYLD_*,
-GIT_SSH*, GIT_ASKPASS, GIT_CONFIG*, SSH_*, SUDO_*, RSYNC_RSH, the gateway's
-and Claude Code's own); at most 32. A bad entry is left out with an error.
+ACCESS_KEY, PRIVATE_KEY, CLIENT_KEY, CLIENT_CERT, AUTH, COOKIE, SESSION_KEY:
+an account holds those), and what would change how a shell, the loader or
+the stand-ins work (PATH, IFS, ENV, BASH_ENV, BASH_FUNC_*, SHELLOPTS, PS*,
+PROMPT_COMMAND, CDPATH, LD_*, DYLD_*, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG*,
+SSH_*, SUDO_*, RSYNC_RSH, the gateway's and Claude Code's own); at most 32. A
+bad entry is left out with an error.
 
 ## The mod (session start)
 
@@ -78,7 +96,8 @@ built, `CLAUDE_CODE_SHELL=<the env's bash>` (Claude Code honours it when it is
 set before its first shell use, so the shell it starts gate-sh from is the
 managed bash, not the login shell: no `~/.zshenv` per command). A plugin path
 holding " -" can't be carried by the prefix (Claude Code splits a prefix at
-its last " -" to take flags): no prefix then, and the classic hook reports it.
+its last " -" to take flags): no prefix then, and the commands run in the
+user's own shell with the classic hook's notice.
 `state.json` sits in the data folder, which a command can rewrite, so the mod
 takes only two things from it: the mode, and whether the data folder's gate-sh
 copy is the prefix (only that exact path, and only while the copy's text is
@@ -140,130 +159,187 @@ after it), a first `source` of anything but
 snapshot in another segment (never run anywhere: it has a tool script's
 shape, so `/bin/sh -c` would be a fallback).
 
-It then replaces only the snapshot's `source` with `. <rc.bash>`, keeps the
-rest byte for byte (so other plugins' env files, the eval'd command, the
-tracker and the exit status are Claude Code's), and runs
-`exec /usr/bin/env -u NAME ... PATH=<managed PATH> SHELL=<bash> <bash> --noprofile --norc -c ". rc && rest"`:
+It then replaces only the snapshot's `source` with `. <rc.bash> <bash
+snapshot>`, keeps the rest byte for byte (so other plugins' env files, the
+eval'd command, the tracker and the exit status are Claude Code's), and runs
+`exec /usr/bin/env -u NAME ... PATH=<managed PATH> SHELL=<bash> <bash> --noprofile --norc -c ". rc SNAP && rest"`:
 one process from Claude Code's point of view, so its interrupt and timeout
 kill it (verified: Escape and a Bash `timeout` stop the command as without
 the gateway).
 
-**Not ready** (exit 75, nothing run): `GW_MANAGED_DIR` missing or relative,
-no `conf`, no managed bash yet (the env is building), no `rc.bash`. The
-message says why, from file tests only (`gw_setup_state`, no process
-started): the data folder gone (uninstalled or removed: restart Claude Code,
-or reinstall), setup failed (an env folder with `install.log` and no
-`.ready`, no live `.building` lock: the log and `/gate-doctor`; a lock whose
-`owner` names a builder and pixi child that are gone, read with `read` and
-tested with `kill -0`, both builtins, is stale, as after ensure-env's
-timeout killed a build: `gw_lock_live`; a lock with no owner file yet counts
-as live, and without ps a reused pid looks alive, so the doubt is always
-"still setting up"), pixi missing
-(launch.sh's `find_pixi` places and Claude Code's PATH: https://pixi.sh), else
-still setting up; the failed and pixi-missing sentences are launch.sh's
-`not_ready_text` ones (test_managed compares them). So the
-mod's status line says `ready` only once `conf` exists too (`launch.sh
-status` reports `"managed"`, by existence; until then `finishing setup…`,
-lib.ts `setupReady`): acceptance 2026-10-21 found Bash refused with 75 for
-8-10 s after "gate: ready" on a first session and after an interrupted
-setup, while the warm-up ran before the settings were written. **Stale**:
-when gateway.toml (or the vault-unlocked marker) is newer than `conf`, gate-sh
-first runs `$DATA/managed/sync` (`run.py managed-sync`) so a narrowing
-applies to this command even before FileChanged runs; when that can't renew
-it, exit 75.
+**The environment** (PLAN-0.11 §1.6): the inherited one, which is Claude
+Code's, minus by name:
 
-**The curated environment**: `HOME USER LOGNAME LANG LC_* TERM
-TMPDIR TZ PWD XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
-XDG_RUNTIME_DIR __CF_USER_TEXT_ENCODING`, Claude Code's own (`CLAUDECODE`,
-`CLAUDE_*`, `GIT_EDITOR`, `AI_AGENT`, `COREPACK_ENABLE_AUTO_PIN`,
-`NoDefaultCurrentDirectoryInExePath`), `GW_MANAGED_DIR`, the approved
-`import_env` names, `PATH`, `SHELL=<managed bash>`; never a credential-looking
-name (the words above; so `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code's peer
-`CLAUDE_CODE_MESSAGING_TOKEN`, its mTLS `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`,
-`CLAUDE_CODE_CLIENT_KEY` and `CLAUDE_CODE_CLIENT_CERT` and its
-`CLAUDE_CODE_HOST_CREDS_FILE` are dropped; `test_managed` sets every `CLAUDE_*`
-name in Claude Code 2.1.301's own credential lists, a sample of the others and
-one `CLAUDE_*` probe per word; `ANTHROPIC_*` isn't passed at all), except the user's own agent and token variables (the env file's list)
-when `others = "mine"` is approved. The rc then sets what the env file sets
-(the stand-ins first, the git include, `GIT_SSH_COMMAND`, `RSYNC_RSH`).
-`managed.PLATFORM_NAMES`, `CLAUDE_NAMES`, `GATEWAY_NAMES` and
-`CREDENTIAL_WORDS` mirror gate-sh's lists (a test compares them, and that
-import_env refuses every credential word).
+- Claude Code's own credentials: every `CLAUDE_*` or `ANTHROPIC_*` name that
+  holds a credential word (`managed.CREDENTIAL_WORDS`: TOKEN, SECRET, PASSW,
+  PASSPHRASE, CRED, API_KEY, APIKEY, ACCESS_KEY, PRIVATE_KEY, CLIENT_KEY,
+  CLIENT_CERT, AUTH, COOKIE, SESSION_KEY) and a fixed list
+  (`CLAUDE_CRED_NAMES`: `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_CLIENT_KEY`,
+  `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`, `CLAUDE_CODE_CLIENT_CERT`,
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`);
+- the variables that make a shell run code or change its parsing
+  (`STARTUP_NAMES`: `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`,
+  `PROMPT_COMMAND`, `CDPATH`, `IFS`, `GLOBIGNORE`, `BASH_XTRACEFD`) and every
+  `BASH_FUNC_*` (exported functions; the user's functions come from the
+  snapshot instead), and any name no shell takes as a variable;
+- the gateway's internal `GW_*` names except `GW_MANAGED_DIR`.
+
+Everything else is kept: the user's `SSH_AUTH_SOCK`, `GH_TOKEN`, cloud
+credentials, proxies and toolchain variables are theirs, for their own
+unconfigured tools (a configured stand-in's child still gets a clean
+per-call environment: `clis.child_env`, `ssh_conf`, `githelper.gated_env`).
+`managed.py` holds the same lists (`CLAUDE_CRED_NAMES`, `STARTUP_NAMES`,
+`DROP_PREFIXES`, `GATEWAY_NAMES`, `CREDENTIAL_WORDS`; `managed.dropped(name)`
+is the rule in Python) and `test_managed` compares them.
 
 How: gate-sh lists its own environment (`env`, every line holding a `=`
-gives a name) and passes `env` a `-u NAME` for every name it doesn't keep,
-so the kept variables reach the managed bash through the environment and
-only names reach any command line. It used to pass the kept variables as
-`NAME=VALUE` arguments to `env -i` (phase 4 review): every local user can
-read a process's arguments (`/proc/PID/cmdline` is world-readable on Linux
-without `hidepid`, `ps` shows them on macOS), while its environment is the
-owner's, so the user's own tokens under `others = "mine"`, approved imports
-and Claude Code's variables were readable by anyone while `env` ran
-(`test_no_value_reaches_a_command_line` records env's arguments, and on
-Linux also scans every `/proc/*/cmdline` during 40 runs).
+gives a name) and passes `env` a `-u NAME` for every name it removes, so the
+kept variables reach the managed bash through the environment and only names
+reach any command line (every local user can read a process's arguments:
+`/proc/PID/cmdline` on Linux without `hidepid`, `ps` on macOS;
+`test_no_value_reaches_a_command_line` records env's arguments and on Linux
+also scans every `/proc/*/cmdline` during 40 runs). When `env` itself fails,
+gate-sh exits 126 instead of running the command with nothing removed. It
+resets `IFS` to the default after the hook-string branch, so an inherited
+one never splits anything there.
 
 `GW_MANAGED_DIR` passes so that a Claude Code started from a command (a
-`claude -p`, an Agent SDK script, a scratch-config session) stays managed:
-it inherits `CLAUDE_CODE_SHELL_PREFIX` and `CLAUDE_CODE_SHELL` and runs its
-own commands through gate-sh with this session's managed settings (phase 4
-review: without the folder every one of its commands failed with 75; with
-the gateway loaded, its own mod sets all three again). A prefix set by hand
-without the folder gets a 75 that says so.
+`claude -p`, an Agent SDK script, a scratch-config session) stays managed: it
+inherits `CLAUDE_CODE_SHELL_PREFIX` and `CLAUDE_CODE_SHELL` and runs its own
+commands through gate-sh with this session's managed settings; with the
+gateway loaded, its own mod sets all three again.
 
-**PATH**: `$DATA/bin` (the stand-ins), `$DATA/managed/bin` (the runtime
-tools: `bash` from the env, and `pixi`, the plugin's prerequisite, as found by
-launch.sh's rules), the approved `import_path` folders in form order, then
-`/usr/bin:/bin:/usr/sbin:/sbin`; last, other plugins' `bin/` folders, read
-(never sourced) from the snapshot's `export PATH=` line, keeping only
-folders `X/bin` whose `X/.claude-plugin/plugin.json` exists (Claude Code puts
-installed plugins' bin/ on PATH through the snapshot). Nothing else of the
-login PATH.
+**PATH**: `$DATA/bin` (the stand-ins present for the configured set), then
+the snapshot's PATH (its `export PATH=` line, read, never sourced; Claude
+Code's own PATH when there is no snapshot or no such line), then other
+plugins' `bin/` folders from Claude Code's PATH (only `X/bin` whose
+`X/.claude-plugin/plugin.json` exists) that it lacks, then the approved
+`import_path` folders; each folder once.
+
+**Not ready**: `GW_MANAGED_DIR` missing or relative, no `conf`, no managed
+bash yet (the env is building, failed, or pixi is too old), no `rc.bash`, or
+settings that can't be renewed. gate-sh then runs the script byte for byte
+(the snapshot's `source` included) without the gateway's settings, in the
+shell that made the script's snapshot (`gw_fallback_shell`, mirrored by
+`managed.fallback_shell`; a test compares). The snapshot's name says which
+(`snapshot-zsh-*`, `snapshot-bash-*`), and the binary is found the way
+Claude Code 2.1.310 finds its shell: `CLAUDE_CODE_SHELL`, then `SHELL` (as
+Claude Code has it, in the environment: bash run as sh, macOS's `/bin/sh`,
+sets one of its own, the login shell, when there is none), then the
+preferred shell on Claude Code's PATH, in `/bin`, `/usr/bin`,
+`/usr/local/bin`, `/opt/homebrew/bin`, the other in those places, the
+other on PATH; bash is preferred when `SHELL` holds "bash", else zsh. The
+first that is the snapshot's shell is taken (Claude Code's naming: a path
+holding "zsh" is a zsh, else one holding "bash" a bash): an executable
+file by its absolute path, without `=` (env would read it as an
+assignment); PATH lookups take absolute folders only. Without a snapshot,
+any bash or zsh in that order. Never `/bin/sh`: dash, Debian's, has no
+`source`, so the snapshot was skipped without a word. With no such shell
+it refuses (126: the snapshot's shell, or a bash or zsh, is needed). Once
+the env is built the mod sets `CLAUDE_CODE_SHELL` to the env's bash, so
+that is the shell for a bash snapshot. It keeps Claude Code's own PATH and
+the same removals, and says on stderr, naming the shell: "gateway: this
+command ran without the gateway's managed settings, in SHELL: the managed
+shell isn't ready (WHAT). WHY AND WHAT TO DO". The reason comes from file
+tests only (`gw_setup_state`, no process started) on the env the settings
+name, or on every env when they name none or one that is gone: the data folder gone
+(uninstalled or removed: restart Claude Code, or reinstall), a build
+running ("still setting up"), setup failed (an env folder with
+`install.log` and no `.ready`, no live `.building` lock: the log and
+`/gate-doctor`; a lock whose `owner` names a builder and pixi child that
+are gone, read with `read` and tested with `kill -0`, both builtins, is
+stale: `gw_lock_live`; a lock with no owner file yet counts as live, and
+without ps a reused pid looks alive, so the doubt is always "still setting
+up"), an env built (`.ready` and its python3) with no build running: "the
+managed shell's settings are missing or couldn't be renewed; a new session
+writes them again", pixi missing (launch.sh's `find_pixi` places and Claude
+Code's PATH: https://pixi.sh), else still setting up (no build started yet);
+the failed and pixi-missing sentences are launch.sh's `not_ready_text` ones
+(test_managed compares them). The approval hook has judged the command already, and the stand-ins
+in `$DATA/bin` (written by launch.sh's cold path) still say "still setting
+up" for configured targets. A script with a tool script's shape that
+doesn't parse (126) is still refused. **Stale**: when gateway.toml (or the
+vault-unlocked marker) is newer than `conf`, gate-sh first runs
+`$DATA/managed/sync` (`run.py managed-sync`) so a narrowing applies to this
+command even before FileChanged runs; when that can't renew it, the
+not-ready path.
+
+## The rc
+
+`managed.rc_text`: `envfile.env_text()` (the env file: the stand-ins first,
+Claude Code's credential names unset, the stand-in names' aliases and
+functions removed), Claude Code's own helpers its snapshot carries (`rg`
+from Claude Code's embedded copy when none is on PATH, its pkill guard;
+never a user file), then the user's snapshot and the tail:
+
+- **The snapshot** (`RC_SNAPSHOT`): gate-sh passes a bash snapshot
+  (`snapshot-bash-*.sh`) as the rc's `$1`, and the rc sources it (the
+  user's aliases, functions and options), then puts the managed PATH back.
+  On the latest Claude Code the snapshot is made by `CLAUDE_CODE_SHELL`,
+  the managed bash, so it is normally a bash one. A zsh snapshot (made
+  before the prefix applied) gives only its PATH line; its aliases and
+  functions don't carry (a stated limit; `[shell] import_path` and the
+  session's offer cover a zsh user's PATH).
+- **The tail** (`managed.rc_tail`), every line alias-proof (a backslash
+  before each command word, no reserved word): POSIX mode by assignment
+  (`POSIXLY_CORRECT=y`, so special builtins come before functions); the
+  snapshot's `DEBUG`, `RETURN` and `ERR` traps cleared; the functions and
+  aliases of `TAIL_BUILTINS` (`command builtin hash type unalias unset exec
+  source . test shopt trap readonly`) and of every stand-in present in
+  `$DATA/bin` (checked with `test -e` at run time) removed; then it fails
+  closed, through a `${VAR:?TEXT}` expansion error that ends the bash
+  before the command, when POSIX mode didn't take (a read-only
+  `POSIXLY_CORRECT`: `TAIL_NO_POSIX`) or one of those functions survived
+  (read-only, found with the special builtin `readonly -f`:
+  `TAIL_READONLY`); then POSIX mode off (alias expansion back on where the
+  snapshot had it), `hash -r`.
+
+`test_managed` defines hostile aliases and functions with each of these
+names, plus `BASH_ENV`, `ENV` and `BASH_FUNC_ssh%%`, and checks that `ssh`
+still resolves to the stand-in.
 
 ## managed.py: the files
 
 `sync(form, eff)` writes `$DATA/managed/` (0700) whole (temp file, then
-rename): `conf` (0600; `bash=`, `rc=`, `path=`, `env=`, `mine=`, `form=`,
+rename): `conf` (0600; `bash=`, `rc=`, `standins=`, `imports=`, `form=`,
 `sync=`, `unlocked=`, read line by line by gate-sh, never sourced),
-`rc.bash` (0600; `envfile.env_text(others)` plus Claude Code's own helpers
-its snapshot carries: `rg` from Claude Code's embedded copy when none is on
-PATH, its pkill guard; never a user file), `state.json` (0600; mode, form
-mode, bash and version, readiness, PATH and variables with origins, pending
-widenings, whether the vault was readable), `bin/bash` and `bin/pixi`
-(symlinks), `sync` (a stub like the stand-ins', `run.py managed-sync`).
-`conf` is written last and never dated before gateway.toml.
+`rc.bash` (0600; `rc_text`, above), `state.json` (0600; mode, form mode,
+bash and version, readiness, PATH and variables with origins, pending
+widenings, whether the vault was readable, the tool folders found), `sync`
+(a stub like the stand-ins', `run.py managed-sync`), and a copy of gate-sh
+when an install dropped its executable bit. `conf` is written last and
+never dated before gateway.toml.
 
 Who writes them: SessionStart (`envfile.sync`), `launch.sh ensure-env` right
-after a build and before the env's warm-up (a first session's SessionStart
-ran before any Python could; the warm-up takes seconds on macOS), and on an
-env built by a setup that was interrupted before them (no `conf`), FileChanged
-on gateway.toml, `consent.approve("settings")`, gate-sh's renewal
-(`run.py managed-sync`), and the first command after a vault unlock (gated's
-broker touches `<run>/gated-unlocked`; approved imports are inside the
-vault, so a session started with a locked vault has the defaults until then).
+after a build and before the env's warm-up, FileChanged on gateway.toml,
+`consent.approve("settings")`, gate-sh's renewal (`run.py managed-sync`), and
+the first command after a vault unlock (gated's broker touches
+`<run>/gated-unlocked`; approved imports are inside the vault, so a session
+started with a locked vault has the defaults until then).
 
 `status_lines(eff)` is `gate status`'s section: the mode (and a pending
 change), the bash, every PATH folder with its origin ("the gateway's
-stand-ins", "gateway.toml [shell] import_path, line 4; Homebrew", "system"),
-the variables, what waits for the OK.
+stand-ins", "gateway.toml [shell] import_path, line 4; Homebrew"), the
+listed variables, what waits for the OK.
 
-## The classic Bash hook without the prefix
+## Without the prefix (PLAN-0.11 §1.8)
 
-`pre_bash.sh` reads the payload's `tool_name`; for Bash and Monitor, when
-`CLAUDE_CODE_SHELL_PREFIX` isn't this plugin's `hooks/gate-sh` (by string or
-same file), every call goes to Python with `GW_MANAGED_CHECK=1` (the word list
-alone decides otherwise). `hooks_bash._managed_gate` reads the effective mode
-(vault approval + form): "on" denies with `MANAGED_DENY` (why: no prefix at
-all, mods off or Claude Code older than 2.1.287 or the session started before
-managed mode was switched on; or another prefix, named), "warn" adds
-`MANAGED_WARN` as a `systemMessage` once per session (a marker in the session
-dir) and judges the command as usual, "off" judges it as usual. While no env
-can run Python, launch.sh's cold guard denies such a call by text
-(`degraded_bash_text("managed")`, byte-identical to envfile's). The Terminal
-panel (`run_in_terminal`) and checkpoint's `job_start` aren't the managed
-shell and get no managed check.
-
-Without the mod there is also no dialog, so an approval of "warn" or "off"
-can't be given then; the deny says so (turn mods on or update Claude Code).
+No blanket refusal. Without the mod (switched off, a path holding " -"), or
+with another plugin's prefix, Claude's commands run in Claude Code's own
+shell: it sources the user's snapshot, then the env files. The gateway's env
+file prepends `$DATA/bin` and, inside Claude Code (`CLAUDECODE` set),
+`unset`s Claude Code's own credential names and runs `unalias` and `unset
+-f` on every stand-in name present in `$GW_BIN` (POSIX, idempotent under
+`set -eu` in sh, dash, bash and zsh: `unalias x 2>/dev/null || :`), so a
+snapshot alias can't skip a stand-in the hook judged. The classic Bash hook
+enforces every right, policy and per-mode value, the network class and the
+configured-only route check as usual; `hooks_bash._managed_gate` adds one
+notice per session (`MANAGED_NOTICE`, a marker in the session dir) to a
+call that reaches Python while the effective mode is "on". The env file no
+longer sets `GIT_SSH_COMMAND` or `RSYNC_RSH`, injects a git include, or
+unsets the user's own variables.
 
 ## Host inspection (the gw tool `host_inspect`)
 
@@ -308,48 +384,127 @@ machine's `env_import` policy is allow (`managed.imports_allowed`;
 `path_plan`, `env_plan` and the conf follow it), so `env_import = "deny"`
 takes them out at once (a narrowing).
 
-## Alternate routes (phase 7)
+## Alternate routes
 
-The stand-ins are first on PATH, so `ssh`, `scp`, `sudo`, `gh`, ... by their
-bare names reach the gateway. In managed mode (`[shell] managed` "on" or
-"warn") the approval hook also refuses the ordinary ways around them
-(`hooks_bash._alternate_route`), each with "runs the system's TOOL around
-the gateway":
+The stand-ins are first on PATH, so `ssh`, `scp`, `sudo`, `git`, `gh`, ... by
+their bare names reach the gateway. The approval hook also refuses the ways
+around them, **only when they reach a configured target** and **in every
+mode**, managed shell on or off and mods off included (PLAN-0.11 §1.7;
+`hooks_bash._alternate_route`, `_route_argv`, `_reaches`). Nothing
+configured: nothing to refuse. The target is resolved with the configured
+set (names, `gw-NAME`, addresses, `also` entries, account hosts and owners)
+and, for git, the shared resolver (`gitroute`: a repository with a
+configured remote). Each refusal names the stand-in route ("goes around the
+gateway's ssh stand-in, and homelab goes through the gateway; use `ssh
+homelab ...`"), never `managed = "off"`. `gate with NAME --` is unwrapped
+first, nested ones however deep (in text, only right after a command start,
+and only an entry's name counts as the account). Program names are compared
+without letter case (`_prog`; macOS's file systems ignore it, so
+`/usr/bin/SSH box`, `ENV -i ssh box` and `COMMAND -p ssh box` are routes
+too).
 
-- a credential tool (`ROUTE_TOOLS`: ssh, scp, sftp, slogin, ssh-add,
-  ssh-agent, ssh-copy-id, sudo, sudoedit, gh, hf, huggingface-cli, az,
-  databricks, crane, pijul, dvc) by a path (`/usr/bin/ssh`, `./sudo`), unless
-  the path is the stand-in itself;
-- `command -p TOOL`, `env -i TOOL` / `env -u ... TOOL`, and `PATH=`,
-  `GIT_SSH=`, `GIT_SSH_COMMAND=`, `RSYNC_RSH=` or `SUDO_ASKPASS=` assigned for
-  a command (also in text the parser can't split);
-- `rsync -e/--rsh` (also inside combined short options: `-ae /usr/bin/ssh`,
-  `-aze/usr/bin/ssh`) and `git -c core.sshCommand=` / `ssh.variant=` (also
-  as one word, `-ccore.sshCommand=...`) / `--config-env=` naming any ssh but
-  the bare `ssh`, and `git config core.sshCommand VALUE` / `ssh.variant`
-  (any scope: a reroute that outlives the command);
-- `GIT_SSH_VARIANT=` and git's configuration from the environment
-  (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`/`VALUE_n`, `GIT_CONFIG_PARAMETERS`,
-  ...) assigned for a command, like the variables above.
+- a tool (`ROUTE_TOOLS`: ssh, scp, sftp, slogin, ssh-add, ssh-agent,
+  ssh-copy-id, sudo, sudoedit, gh, hf, huggingface-cli, az, databricks,
+  crane, pijul, dvc, rsync, git, su, doas, pkexec, runuser) by a path
+  (`/usr/bin/ssh homelab`, `./sudo`), unless the path is the stand-in
+  itself; an account CLI by path is refused while an account of its kind
+  exists, since its destination can't be told from the words (lead
+  decision 19.10: run it by its name and the stand-in passes an
+  unconfigured destination to the user's tool); target-less tools by path
+  (`/usr/bin/ssh-add -l`) get no decision;
+- tools with no stand-in by any name: slogin to a configured host ("use
+  `ssh HOST ...`"), and huggingface-cli (hf's older name) while a
+  huggingface account exists ("run the same command as `hf ...`": hf's
+  stand-in gates it); both are trigger words in pre_bash.sh;
+- a login shell or PATH-resetting wrapper running a stand-in name (`bash
+  -l`, `zsh -l`, `sh -l`, `su`/`su -`, `sudo` (secure_path), `sudo -i`,
+  `doas`, `env -i`, `env -`, `env -u PATH`, macOS's `env -P DIRS`, `command
+  -p`): they rebuild PATH, and on macOS path_helper puts `/usr/bin` first, so
+  they count as a tool by path; pre_bash.sh forwards an account CLI's plain
+  name beside any of these (`test_every_posture_deny_row_reaches_python`);
+- a PATH or transport change for a command or in an earlier stage of the
+  same command (`PATH=`, `hash -p`, an alias, `GIT_SSH`, `GIT_SSH_COMMAND`,
+  `RSYNC_RSH`, `SUDO_ASKPASS`, git's configuration from the environment,
+  `rsync -e/--rsh` also inside combined short options, `git -c
+  core.sshCommand=`/`ssh.variant=`, `-o ProxyCommand=`, `-o HostName=`), and
+  the words of such a transport line itself;
+- `ssh -J` or `-o ProxyJump=` naming a configured host, and a ProxyCommand
+  naming a configured address;
+- in a repository with a configured remote, `git config` writes to the
+  guarded keys (`credential.*`, `core.sshCommand`, `url.*`, `remote.*.url`,
+  `remote.*.pushurl`, `remote.*.proxy`, `include.*`, `includeIf.*`,
+  `core.hooksPath`, `core.fsmonitor`, ...: `githelper.GUARDED`; the git
+  stand-in refuses them too), a `!` alias, and `-c` pairs that set
+  credentials, includes or the ssh command;
+- a written-out command string (a shell's or su's `-c`, trap's action, an
+  alias's value, a `-C` callback), parsed and judged like the outer command.
 
-Forms whose credential tool the parser can't resolve are denied too, with
-"may run the system's TOOL around the gateway" (`_route_deny_hidden`), in
-every permission mode (never left to Claude Code's own mode):
+While this computer's sudo is configured, su, doas, pkexec, runuser,
+sudoedit (by its bare name: sudo's own binary, but no stand-in supplies its
+password) and osascript's `with administrator privileges` are denied ("use
+sudo; the gateway supplies its password in its dialog"), also in text the parser can't
+follow (`_other_elevation`, `_elevation_tool`, `_text_elevator`); with only
+an elevation restriction here its deny denies and its "ask" asks; otherwise
+they are the user's own. They are never allowed.
 
-- PATH, a transport variable (`GIT_SSH*`, `RSYNC_RSH`, `SUDO_ASKPASS`,
-  `GIT_CONFIG_*`) changed by an earlier statement of the same command
-  (`export`, `declare`/`typeset`/`readonly`/`local`, `unset`, `printf -v`,
-  `read`), or `hash -p` / an alias of a tool, before a later stage runs the
-  tool it reroutes (`_route_changes`);
-- a variable as the program (`$X box uptime`, `"$x/ssh" ...`; behind sudo,
-  timeout or xargs it is that program's argument and SPEC 8's table
-  applies);
-- a command the parser can't split (an assignment statement, a function,
-  `eval`, `exec`, a command substitution) or a stage that runs code its words
-  don't show (`sh -c`/`bash -c` strings, `| sh`, a `<<<` here-string into a
-  shell, `find -exec`, `xargs`, `env -S`, a loop): the text scan
-  (`_route_text`) refuses a credential tool named by a path other than the
-  stand-in's where it can run as a program (`_text_runs`). A path whose
+**Commands that hide their program or host** (`_hidden_rule`): a variable,
+computed, globbed or brace-expanded program (`{/usr/bin/ssh,box} id`), a
+variable `-c` string (also after a value option: `bash -o posix -c
+"$CMD"`), `eval` and `source`/`.` (also behind `builtin`, `command`,
+`time`, `!`, a reserved word or a case arm), `exec` running a program, a
+function definition, a computed trap, alias or `-C` callback, `coproc`, an
+osascript script that starts with a variable, an ssh-family, git, gate or
+sudo stage whose target is a variable, and what runs below xargs, parallel
+or find -exec (`_TEXT_HIDES`, `_TEXT_HIDES_CHILD`, `_text_exec`, `_hides`,
+`_alternate_route`). One is refused when its text names a configured name,
+address, `also` entry or `gw-NAME` (`HIDDEN_NAMED`, with the spelled-out
+form to use); otherwise it gets no decision. What it runs reaches no "ask"
+unasked: a stand-in passes an "ask" only for a command Claude typed with
+the approval hook's record of that exact command (`asks.py`, invariant 6),
+and nothing the hook can't read gets one, so `source ./deploy.sh` needs no
+prompt and its `ssh box` is refused by the stand-in ("run `ssh box ...` as
+its own command"). git with a variable for its subcommand or remote is
+refused while an entry git may reach is "ask" (`GIT_HIDDEN`: no record of
+it can be written).
+
+Text the parser can't follow that names an "ask" target with an ssh-family
+or sudo word (`_fallback_asks`, every such target named in the prompt), and
+a hidden stage of that kind beside a stage the hook asks about, are asked
+about, with records for the ssh and sudo commands the hook can read there,
+and for the account-CLI and `gate with` commands whose account is "ask"
+(`_fallback_records`, never twice for words the structured judge recorded;
+and
+`_lenient_commands`: quotes and backslashes as the shell reads them,
+redirections and here-document bodies dropped, `&`, subshells, `$(...)`
+and backquotes split out, eval's words, a shell's `-c` string and trap's
+action read too); one whose words hold a variable, `$(...)`, a glob or
+`~user`, or whose folder a `cd` hides, is denied instead (`ASK_HIDDEN`).
+
+Known misses of the hidden-command rule (a guardrail): bash's evaluation
+of a variable's contents as an arithmetic expression or a prompt (`echo
+$((X))`, `[[ $X -gt 1 ]]`, `echo "${X@P}"`, where X holds a `$(...)` in an
+array subscript or a prompt), and a command substitution inside a quoted
+array subscript (`printf -v 'a[$(...)]' x`, `(( a['$(...)'] ))`): they run
+in Claude's shell with no word the rule looks for; a function or alias
+from the user's own bash snapshot (below). A configured name in them isn't
+refused up front; an "ask" they reach is still refused by its stand-in (no
+record). A record lives until the session's next Bash or Monitor call,
+whose hook drops it first (a declined prompt's, a stage that never ran):
+what else Claude Code runs without a PreToolUse hook (a skill's or slash
+command's `!` injection, the user's own `!` commands) isn't covered in
+between. The records live in the user's run folder: a process running as
+the user could write one (a guardrail, like the typed walk).
+
+For text the parser can't follow (a command substitution, a loop, `sh -c`
+strings, `| sh`, a `<<<` here-string into a shell, `find -exec`, `xargs`,
+`env -S`), the text scan (`_route_text`) refuses only what reaches a
+configured target (`_text_reach`: a configured name in the text, git's
+configured repository, this computer's configured sudo, an account of the
+tool's kind): a tool named by a path other than the stand-in's where it can
+run as a program (`_text_runs`), a stand-in name after a login shell or a
+PATH-resetting wrapper or in a plain sudo's own command, and a
+PATH/transport change with a tool named after it. Where a tool can run as
+a program (`_text_runs`): a path whose
   parent is a `…bin` folder and whose basename is a tool is a program
   **anywhere** except as a plain operand of a command that never runs it (so
   `sudo cat /etc/ssh/sshd_config`, `sudo tee -a /etc/ssh/sshd_config.d/x.conf`,
@@ -360,7 +515,7 @@ every permission mode (never left to Claude Code's own mode):
   (env, nohup, sudo, timeout, xargs incl. `-a`, nice, macOS's arch, ...), a
   shell's or su's `-c` string, su's `-s` shell, find's `-exec`, a known
   runner (sshpass, strace, ltrace, dtruss, flock, script, unbuffer, chroot,
-  tmux, screen, ssh-agent, ...), or GNU sed's `e` command (also glued to its
+  tmux, screen, ssh-agent, watch, ...), or GNU sed's `e` command (also glued to its
   path, `1e/x/ssh`) — or as a transport option's value (rsync `-e`, scp
   `-S`, tar `-I`, `--rsh`, ProxyCommand), glued to `=` (`--rsh=`, `GIT_SSH=`),
   or anywhere in a text piped into a shell or in a shell's `<<<` here-string.
@@ -374,16 +529,16 @@ every permission mode (never left to Claude Code's own mode):
   a non-bin path in it is a limit (below). The commands that never run an
   operand are `_TEXT_DATA` (cat, cp, mv, rm, ls, grep, sed without an `e`,
   chmod, tar/rsync/scp as a local copy, head, tail, wc, echo, printf, test,
-  ...; `less` isn't one — it runs `!`). Also refused: a variable or a
-  command's output as the program (`$(which -a ssh) box`; a computed folder
-  with a named program, `$(git rev-parse --show-toplevel)/x.sh`, passes;
-  assignments before the program are skipped), a shell's or su's `-c` string
-  that is a variable or a command's output (`bash -c "$CMD"`: whatever it
-  holds runs unseen; the refusal says to write the command in the string, or
-  run it as its own command), a PATH/transport change,
-  `unset PATH`, `hash -p`, `command -p` or `env -i`/`-u`/`-S` with a tool
-  named after it (`sudo env -i make` is sudo's own business), an alias or a
-  function named after a tool, and git's ssh setting with git anywhere.
+  ...; `less` isn't one — it runs `!`). A variable or a command's output as
+  the program (`$(which -a ssh) box`; a computed folder with a named
+  program, `$(git rev-parse --show-toplevel)/x.sh`, passes; assignments
+  before the program are skipped) and a shell's or su's `-c` string that is a
+  variable or a command's output (`bash -c "$CMD"`) go to the
+  hidden-command rule above. A PATH/transport change, `unset PATH`, `hash
+  -p`, `command -p` or `env -i`/`-`/`-u`/`-P`/`-S` with a tool named after it (`sudo
+  env -i make` is sudo's own business), an alias or a function named after a
+  tool, and git's ssh setting count when that tool reaches a configured
+  target.
   Here-documents that are data (`cat > f <<EOF`) aren't read; one a shell
   reads (`bash <<EOF`, `| sh`, `bash <<< '…'`) is. An ssh stage's remote
   command is never scanned (it runs on the host, where remote sudo has its
@@ -401,38 +556,35 @@ every permission mode (never left to Claude Code's own mode):
   a bin-folder path as the operand of a program the scan doesn't know is
   refused (`sudo dpkg -S /usr/bin/ssh`, `sudo setcap ... /usr/local/bin/gh`),
   and so is a here-string to a reader (`cat <<< /usr/bin/ssh`) inside hidden
-  text.
+  text. A function or alias from the user's bash snapshot (`deploy`, whose
+  body runs `ssh box`) isn't hidden text to the hook: it runs in Claude's
+  shell, so an "ask" right it uses passes as typed (the README's Limits).
 
-git and rsync by a path still pass: the gateway's env file routes their
-transport through `GIT_SSH_COMMAND` / `RSYNC_RSH`, which reach the stand-in
-either way. With `managed = "off"` none of this applies (the person chose
-their own shell).
-
-**The residual limit, stated:** Claude's commands run as the user. A
-script or program that runs `/usr/bin/ssh` itself (not typed on the
-command line the hook sees), copies a binary, or calls `execve` directly is
-not seen by any hook, and a typed command can still be obfuscated past a
-text scan (a tool's path decoded at run time inside a string a shell then
-runs). What it can't do is get the gateway's credentials: those stay in
-the vault (encrypted; with a wrapped key only gated
-decrypts) and go only to the stand-ins' children after their checks. What it
-can do is use the user's own credentials outside the gateway (their own
-`~/.ssh` keys and agent, a `gh` login, a cached sudo timestamp), exactly as
-any program the user runs could. The hook's checks are guardrails against a
-cooperative model, not a sandbox (README "Security and privacy").
+**The residual limit, stated:** Claude's commands run as the user, with
+the user's own agent and token variables (PLAN-0.11 §1.10). A script or
+program that runs `/usr/bin/ssh` itself (not typed on the command line the
+hook sees), copies a binary, or calls `execve` directly is not seen by any
+hook, and a typed command can still be obfuscated past a text scan (a
+tool's path decoded at run time inside a string a shell then runs). What it
+can't do is get the gateway's credentials: those stay in the vault
+(encrypted; with a wrapped key only gated decrypts) and go only to the
+stand-ins' children after their checks. What it can do is use the user's
+own credentials outside the gateway (their own `~/.ssh` keys and agent, a
+`gh` login, a cached sudo timestamp), exactly as any program the user runs
+could, and that reaches a configured host whose limits the user's own key
+or token also opens. The hook's checks are guardrails against a cooperative
+model, not a sandbox (README "Security and privacy").
 
 ## Cost
 
-Measured on macOS arm64 (2026-10-20): a trivial tool script takes about
-23 ms through gate-sh against 4 ms for bash alone (the env listing, the
-snapshot's PATH line, `env`, the managed bash and its rc); a hook string
-about 12 ms against 5 ms (one more `/bin/sh`). After the review fixes, side
-by side on a loaded machine with 117 variables in the environment: 24 ms
-per tool script with `env -u` against 25 ms with the earlier `env -i`
-form (the names removed are collected in one string, not re-set one by
-one). The classic hook's managed
-check costs nothing while the prefix is the gateway's (a string compare in
-`pre_bash.sh`); without it every Bash and Monitor call starts Python once.
+Measured on macOS arm64 for 0.10.0 (2026-10-20): a trivial tool script took
+about 23 ms through gate-sh against 4 ms for bash alone (the env listing,
+the snapshot's PATH line, `env`, the managed bash and its rc); a hook string
+about 12 ms against 5 ms (one more `/bin/sh`). 0.11.0's rc also sources the
+user's bash snapshot, whose cost is the user's own. The prefilter starts
+Python only for its trigger words, except while the mode epoch marker exists
+(a per-mode value makes the mode matter): then every Bash and Monitor call
+starts Python once (`hook-mode`). 0.11.0's measurements are in TESTING.md.
 
 ## Known limits
 
@@ -475,9 +627,9 @@ check costs nothing while the prefix is the gateway's (a string compare in
   there is one) runs every command. A rewritten `state.json` alone can only
   take the prefix away (the mod takes the managed bash from `launch.sh
   status` and the copy only while it holds the plugin's gate-sh), and then
-  the classic hook denies in managed mode.
-- The curated environment removes what it doesn't keep by name, from the
-  environment's own listing. An entry whose name holds a line break (only a
+  the commands run in the user's own shell, still judged by the hook.
+- The removals go by name, from the environment's own listing. An entry
+  whose name holds a line break (only a
   program calling `execve` directly can make one; bash passes it on, zsh and
   dash drop it) shows up under another name and can't be removed; Claude
   Code never makes one.
@@ -491,5 +643,11 @@ check costs nothing while the prefix is the gateway's (a string compare in
   function and so in the managed shell too.
 - Other plugins' and tools' variables in Claude Code's environment (for
   example `CHECKPOINT_HOME`, a corporate `HTTPS_PROXY` or `SSL_CERT_FILE`)
-  don't reach Claude's commands unless imported (`import_env`); other
-  plugins' own hooks, MCP servers and env files still get or set them.
+  reach Claude's commands (0.11.0). The configured stand-ins' children,
+  the gated git included, drop proxy and CA variables.
+- The user's own credential variables are in Claude's shell (0.11.0). The
+  output masker masks the values of credential-named variables in Claude
+  Code's environment; a variable only the shell snapshot exports isn't seen
+  by the hook and isn't masked.
+- A zsh snapshot gives only its PATH: a zsh user's aliases and functions
+  don't reach Claude's commands.

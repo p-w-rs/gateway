@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""PLAN-v4 phase 4 in the real TUI: managed execution (brief 3, 8, 14.6).
+"""PLAN-v4 phase 4 and PLAN-0.11 §1.6-1.8 in the real TUI: managed execution
+(brief 3, 8, 14.6).
 
-    pixi exec --spec python=3.12 --spec pyte python tests/acceptance_managed.py \\
+    pixi exec --spec python --spec pyte python tests/acceptance_managed.py \\
         --tmp DIR [--keep] [--pixi-cache DIR] [--only a,b,...]
 
 The gateway is installed the normal way through the TUI harness's e2e route
@@ -10,19 +11,35 @@ marker that keeps every gateway location in a scratch root), next to a probe
 plugin ("probe") whose string-form hooks write their environment, $0 and
 payloads, whose SessionStart hook writes an env file, with a bin/ program and
 a skill with ! injection. Sessions run against the harness's fake Messages
-API; HOME is scratch, with rc files that define a function, an alias and a
-variable (the shell snapshot Claude Code makes from them carries them). The
+API; HOME is scratch, with rc files that define a function, an alias, a
+variable, and a function and an alias named ssh (the shell snapshot Claude
+Code makes from them carries them). The sessions' environment holds the
+user's own SSH_AUTH_SOCK and GH_TOKEN (fake values), a plain variable,
+BASH_ENV, and a synthetic credential canary in one of Claude Code's own
+variables (CLAUDE_CODE_CLIENT_KEY_PASSPHRASE). gateway.toml configures one
+host (box.invalid, approved here: no dialog), so the ssh stand-in exists;
+e2e.json's user_tools names recording fakes for the user's own ssh. The
 gateway's pixi env is built before any session.
 
 Sections (a baseline config has only the probe plugin, for comparison):
 
   route    every route Claude Code runs commands by goes through gate-sh into
-           the managed bash (bash 5 from the gateway env), never the
-           snapshot: the Bash tool, run_in_background, a subagent's Bash, the
-           user's ! command, a skill's ! injection; the curated environment
-           (names only; a synthetic credential canary in Claude Code's own
-           environment never reaches a command), the gateway PATH, the probe
-           plugin's bin/ and its env file kept
+           the managed bash (bash 5 from the gateway env): the Bash tool,
+           run_in_background, a subagent's Bash, the user's ! command, a
+           skill's ! injection; the user's environment kept (SSH_AUTH_SOCK,
+           GH_TOKEN, the plain variable) and Claude Code's credential
+           variables and BASH_ENV removed (the canary reaches no command);
+           the user's function from the snapshot when Claude Code made a bash
+           snapshot (which shell made it is recorded); PATH: the stand-ins
+           first, then the snapshot's PATH, the probe plugin's bin/ and its
+           env file kept; the ssh stand-in is what `ssh` names, whatever the
+           rc's ssh alias and function say; and one more session with
+           SHELL=/bin/bash, so Claude Code makes a bash snapshot (the rc
+           sources only a bash one) holding that alias and function: the
+           user's function is there and `ssh` still names the stand-in
+  passthru a by-path ssh to the configured host is refused (a route around the
+           stand-in), while `ssh` to a host nothing configures runs the user's
+           own ssh (the recording fake) with the full argv
   hooks    the probe plugin's string-form hooks run through the prefix with
            the same $0 and environment as in the baseline (but the
            variables the gateway's mod sets); PreToolUse and PostToolUse see
@@ -31,19 +48,32 @@ Sections (a baseline config has only the probe plugin, for comparison):
            "don't ask again" writes a rule for the original command, and the
            next matching command runs without a prompt; results and exit
            codes as in the baseline
+  gitask   bypassPermissions mode, a git push to the URL of a host set to
+           ssh = "ask" (PLAN-0.11 §6.5, requirement 24): Claude Code prompts
+           (only a hook's ask does in that mode) with the gateway's reason;
+           declined, nothing ran
   cancel   an interrupt (Escape) and a Bash timeout stop a long command (the
            file it would write never appears, its process is gone), as in the
            baseline
   print    claude -p: the prefix is set and the command runs in the managed bash
+  notready the managed shell not ready (its rc file moved away for one
+           command): the command runs without the managed settings (no rc
+           in place of the snapshot's source, SHELL not the managed bash),
+           in the shell that made the session's snapshot (a bash one:
+           CLAUDE_CODE_SHELL, here the env's bash), with the gateway's
+           one-line notice naming that shell and why (settings missing, not
+           "still setting up"), Claude Code's credential still removed
   nomods   the gateway installed with "modules" removed from hooks.json (no
-           mod): Bash is denied with "managed shell unavailable"; with an
-           approved [shell] managed = "warn", it runs in the user's own shell
-           with a notice once per session
+           mod): Bash runs in Claude Code's own shell with the gateway's notice
+           once per session, and the gateway still judges each command (a read
+           of its private folder is denied); a ! command runs in Claude Code's
+           own shell
 
 Monitor isn't offered by Claude Code 2.1.301 against the fake API (a
 server-side feature gate); its commands use the same shell path (code
 evidence in docs/dev/modules/managed.md). Prints one line per check and a JSON
-summary to --tmp/acceptance-managed.json; exits non-zero on any failure.
+summary to --tmp/acceptance-managed.json (with the shells that made the
+snapshots); exits non-zero on any failure.
 """
 from __future__ import annotations
 
@@ -63,11 +93,13 @@ PLUGIN = HERE.parent
 REPO = PLUGIN.parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
+import acceptance_lib as L  # noqa: E402
 from tui import driver, gwe2e, install, safety, scan  # noqa: E402
 from tui.fakeapi import FakeAPI, tool_results  # noqa: E402
 
 RESULTS: list[dict] = []
 NOTES: list[str] = []
+SUMMARY: dict = {}           # facts for the JSON summary (which shells made the snapshots)
 PREBUILD_TIMEOUT = 1800
 # what differs between a hook's environment with the gateway and without it:
 # the gateway mod's own variables (SHLVL too since 0.9.1, where Claude Code
@@ -126,6 +158,8 @@ PROBE_HOOK_ENV = '{ echo "ZERO=$0"; env | LC_ALL=C sort; } > "$PROBE_OUT/hook-en
 # executable's path, ends in this); never told apart by version (Debian's own
 # bash is 5.2 like the env's; macOS's is 3.2).
 MANAGED_BASH = "/.pixi/envs/default/bin/bash"
+# gate-sh's not-ready reason once the env is built (gw_setup_state)
+NOT_READY_SETTINGS = "settings are missing or couldn't be renewed"
 # The probe plugin's hooks do nothing where PROBE_OUT isn't set (claude -p's
 # session): a redirect to "/pre-env.txt" fails, and under dash that is exit
 # status 2, a blocking hook error.
@@ -165,7 +199,9 @@ def make_probe_repo(src: Path) -> None:
 
 
 def make_home(home: Path, marker: Path) -> None:
+    # (the ssh function first: defined after the alias, its name would be alias-expanded)
     rc = ("userfunc() { echo user-function; }\nalias ll='ls -l'\nexport RC_VAR=from-the-user-rc\n"
+          "ssh() { echo user-function-ssh; }\nalias ssh='echo user-alias-ssh'\n"
           f": > '{marker}'\n")
     # .zshenv: every zsh reads it (Claude Code's own launcher too, without the gateway)
     for n in (".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile", ".zshenv"):
@@ -267,7 +303,16 @@ def results_text(api: FakeAPI) -> list[str]:
 ROUTE_CMD = ('echo "route:bash=${BASH_VERSION-}:zsh=${ZSH_VERSION-}:pe=${PROBE_ENVFILE-}:rc=${RC_VAR-}:bp=${BASH-}"; '
              "type userfunc >/dev/null 2>&1 && echo has-userfunc || echo no-userfunc; "
              "probe-bin-tool; env | sed 's/=.*//' | LC_ALL=C sort > names.txt; env > fullenv.txt; "
-             'echo "$PATH" > path.txt; echo "SHELL=$SHELL" > shell.txt')
+             'echo "$PATH" > path.txt; echo "SHELL=$SHELL" > shell.txt; '
+             "{ command -v ssh; type -t ssh; } > ssh-is.txt 2>&1")
+# the sessions' environment: the user's own (kept in Claude's shell since 0.11, PLAN-0.11
+# §1.6, §1.10; fake values) and a startup vector (removed by name)
+USER_ENV = {"GH_TOKEN": "acc-fake-gh-token-not-a-secret", "ACC_USER_VAR": "from-the-users-environment"}
+FAKE_HOST = "box.invalid"          # the configured host (approved here; never reachable)
+# gateway.toml: that host, and one set to ssh = "ask" at a closed port (the gitask section)
+FORM = (f'[hosts.box]\naddress = "tester@{FAKE_HOST}"\n\n'
+        '[hosts.boxask]\naddress = "tester@127.0.0.1:9"\nssh = "ask"\n')
+ASK_PUSH = "git -C pushprobe push boxask:repo.git HEAD:refs/heads/main"
 
 
 BG_CMD = 'echo "bg:$BASH_VERSION:${BASH-}" > bg.txt'
@@ -351,7 +396,7 @@ def main(argv: list[str]) -> int:
                "claude": subprocess.run([driver.find_claude(), "--version"], capture_output=True,
                                         text=True).stdout.strip(),
                "passed": len(RESULTS) - len(failed), "failed": len(failed), "checks": RESULTS,
-               "notes": NOTES}
+               "notes": NOTES, **SUMMARY}
     out = Path(a.tmp) / "acceptance-managed.json"
     out.write_text(json.dumps(summary, indent=1))
     print(f"\n{summary['passed']} passed, {summary['failed']} failed in {summary['seconds']} s; {out}")
@@ -360,14 +405,19 @@ def main(argv: list[str]) -> int:
     return 1 if failed else 0
 
 
-def session(root: Path, name: str, cfg: Path, env: dict, replies, **kw) -> driver.Session:
+def session(root: Path, name: str, cfg: Path, env: dict, replies, shell: str | None = None,
+            **kw) -> driver.Session:
+    """A session with a scratch HOME (make_home's rc files) and SHELL, which
+    picks the shell Claude Code makes its snapshot with: zsh where /bin/zsh
+    exists (every macOS), unless `shell` says otherwise."""
     home = root / f"{name}-home"
     home.mkdir(parents=True, exist_ok=True)
     make_home(home, root / f"{name}-rc-ran")
     out = root / f"{name}-probe"
     out.mkdir(exist_ok=True)
+    sh = shell or ("/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash")
     s = driver.Session(root / name, config_dir=cfg, home=home,
-                       extra_env={**env, "PROBE_OUT": str(out), "SHELL": "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash"},
+                       extra_env={**env, "PROBE_OUT": str(out), "SHELL": sh},
                        replies=replies, debug_file=True, cols=160, rows=48, start=False, **kw)
     return s
 
@@ -376,10 +426,12 @@ def run(root: Path, env: dict, canary: scan.Canary, only: set[str]) -> None:
     want = (lambda x: not only or x in only)
     src = root / "probe-src"
     make_probe_repo(src)
-    # Claude Code's mTLS key passphrase passed the curated environment before the
-    # phase 4 review (PASSW isn't in PASSPHRASE); the key itself isn't set, so
-    # Claude Code doesn't use it
-    cred_env = {"GITHUB_TOKEN": canary.value, "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": canary.value}
+    # One of Claude Code's own credential variables holds the canary (its mTLS key
+    # passphrase; the key itself isn't set, so Claude Code doesn't use it): gate-sh removes
+    # it by name. The user's own variables and BASH_ENV (a startup vector, removed) beside it.
+    (root / "bash-env.sh").write_text(": the BASH_ENV of the sessions\n")
+    cred_env = {"CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": canary.value, **USER_ENV,
+                "SSH_AUTH_SOCK": str(root / "fake-agent.sock"), "BASH_ENV": str(root / "bash-env.sh")}
     # the baseline: only the probe plugin
     base = {}
     with install.Hermetic(root / "hb", extra_env=env) as hb:
@@ -387,7 +439,9 @@ def run(root: Path, env: dict, canary: scan.Canary, only: set[str]) -> None:
         if want("route") or want("hooks") or want("perms") or want("cancel"):
             base = baseline(root, hb, {**env, **cred_env}, want)
     with install.Hermetic(root / "h", extra_env=env) as h:
-        gi = h.install_gateway_e2e(REPO)
+        # the user's own ssh for the pass-through: a recording fake (e2e.json's user_tools)
+        fakes = L.write_user_tools(root / "user-tools", ("ssh", "scp", "sftp", "git"), sys.executable)
+        gi = h.install_gateway_e2e(REPO, e2e_config={"user_tools": str(fakes)})
         check("the gateway is installed through the e2e route (marker proven)", gi.proof is not None)
         h.install_from(src, repo="managed-probe", plugin="probe")
         ok, detail = prebuild_env(root, h, gi, env)
@@ -396,10 +450,28 @@ def run(root: Path, env: dict, canary: scan.Canary, only: set[str]) -> None:
         note(detail.splitlines()[0])
         check("the env's build wrote the managed shell's files (launch.sh managed_sync)",
               (gi.root / "data" / "managed" / "conf").is_file(), str(sorted(gi.root.glob("data/managed/*"))))
-        if want("route") or want("hooks") or want("perms") or want("cancel"):
-            managed_session(root, h, gi, {**env, **cred_env}, canary, base, want)
+        # one configured host, so the ssh stand-in exists (approved here: no dialog opens in a test
+        # step that doesn't answer one)
+        gi.gateway_home.mkdir(parents=True, exist_ok=True)
+        (gi.gateway_home / "gateway.toml").write_text(FORM)
+        r = seed(gi, "from gateway import vault\n"
+                     "if not vault.exists():\n    vault.ensure_key()\n    vault.save(vault.empty())\n"
+                     "consent.approve('box', form=consent.load_form())\n"
+                     "consent.approve('boxask', form=consent.load_form())\n"
+                     "e = consent.compute(consent.load_form(), vault.load())\n"
+                     "print('approved' if not e.pending and 'box' in e.hosts else 'pending')")
+        check("the configured host is approved in the scratch vault (seeded)",
+              r.stdout.strip().endswith("approved"), (r.stdout + r.stderr)[-400:])
+        if want("route") or want("hooks") or want("perms") or want("cancel") or want("passthru"):
+            managed_session(root, h, gi, {**env, **cred_env}, canary, base, want, fakes)
+        if want("route"):
+            step_bash_snapshot(root, h, {**env, **cred_env}, canary)
         if want("print"):
             step_print(root, h, gi, env)
+        if want("gitask"):
+            step_git_ask(root, h, {**env, **cred_env}, canary, fakes)
+        if want("notready"):
+            step_notready(root, h, gi, {**env, **cred_env}, canary)
     if want("nomods"):
         step_nomods(root, env, src)
 
@@ -507,7 +579,8 @@ def cancel_steps(s: driver.Session) -> dict:
     return out
 
 
-def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dict, want) -> None:
+def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dict, want,
+                    fakes: Path) -> None:
     print("managed: the gateway and the probe plugin", flush=True)
     s = session(root, "m1", h.inst.config_dir, env, scripted_replies(), permission_mode="bypassPermissions")
     s.redact(canary.value)
@@ -520,11 +593,22 @@ def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dic
         files = files_of(work)
         res = results_text(s.api)
         route = next((r for r in res if "route:bash=" in r), "")
-        check("route: the Bash tool ran in the managed bash 5, not the login shell or its snapshot "
-              "(no user function, no rc variable), with the probe's env file and its bin/ program",
-              re.search(r"route:bash=5\.\d+[^:]*:zsh=:pe=from-the-probe-env-file:rc=:bp=\S*" + re.escape(MANAGED_BASH) + r"\n",
-                        route + "\n") is not None
-              and "no-userfunc" in route and "probe-bin-tool-ran" in route, route[:400])
+        # PLAN-0.11 §1.6: the rc sources a bash snapshot (the user's functions and aliases);
+        # a zsh snapshot gives only its PATH (a stated limit). Which shell made it, on the
+        # latest Claude Code, is recorded here.
+        shells = L.snapshot_shells(h.inst.config_dir)
+        note(f"the shell snapshots in the gateway session's config were made by: {shells or 'none found'}")
+        SUMMARY["snapshot_shells"] = shells
+        check("route: Claude Code made a shell snapshot (recorded: which shell made it)", bool(shells))
+        bash_snap = bool(shells) and shells[-1] == "bash"
+        check("route: the Bash tool ran in the managed bash 5 with the probe's env file and its bin/ "
+              "program, and the user's function from the snapshot exactly when Claude Code made a bash "
+              "snapshot",
+              re.search(r"route:bash=5\.\d+[^:]*:zsh=:pe=from-the-probe-env-file:rc=[^:]*:bp=\S*"
+                        + re.escape(MANAGED_BASH) + r"\n", route + "\n") is not None
+              and ("has-userfunc" in route) == bash_snap and "probe-bin-tool-ran" in route, route[:400])
+        note(f"the user rc's exported variable in the command: {'yes' if 'rc=from-the-user-rc' in route else 'no'} "
+             "(a snapshot carries functions, aliases and PATH)")
         check("route: run_in_background ran in the managed bash",
               re.fullmatch(r"bg:5\.[^:]*:\S*" + re.escape(MANAGED_BASH) + r"\n", files.get("bg.txt", "")) is not None,
               files.get("bg.txt", ""))
@@ -533,33 +617,39 @@ def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dic
                            files.get("sub.txt", "")) is not None,
               files.get("sub.txt", ""))
         names = set(files.get("names.txt", "").split())
-        allowed = re.compile(r"(HOME|USER|LOGNAME|LANG|LC_[A-Z_]*|TERM|TMPDIR|TZ|PWD|OLDPWD|SHLVL|_|PATH|"
-                             r"SHELL|XDG_(CONFIG|DATA|CACHE|STATE)_HOME|XDG_RUNTIME_DIR|__CF_USER_TEXT_ENCODING|"
-                             r"CLAUDECODE|CLAUDE_[A-Z0-9_]*|GIT_EDITOR|AI_AGENT|COREPACK_ENABLE_AUTO_PIN|"
-                             r"NoDefaultCurrentDirectoryInExePath|GW_MANAGED_DIR|GW_GITCFG_SET|GIT_CONFIG_COUNT|"
-                             r"GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_SSH_COMMAND|RSYNC_RSH|"
-                             r"PROBE_ENVFILE|GIT_CONFIG_PARAMETERS)")
-        extra = sorted(n for n in names if not allowed.fullmatch(n))
-        check("route: the command's environment is the curated one (platform, Claude Code's own, the gateway "
-              "env file's, the probe's env file; nothing else)", names and not extra, f"unexpected: {extra}")
-        cred = [n for n in names if re.search(r"TOKEN|SECRET|PASSW|PASSPHRASE|CRED|API_KEY|CLIENT_KEY|"
-                                              r"CLIENT_CERT|AUTH|ANTHROPIC", n)]
-        check("route: no credential-looking variable reached the command (GITHUB_TOKEN, ANTHROPIC_API_KEY, "
-              "CLAUDE_CODE_MESSAGING_TOKEN, CLAUDE_CODE_CLIENT_KEY_PASSPHRASE were in Claude Code's "
-              "environment)", not cred, str(cred))
+        kept = ["GH_TOKEN", "ACC_USER_VAR", "SSH_AUTH_SOCK", "GW_MANAGED_DIR"]
+        check("route: the user's own environment reaches the command (SSH_AUTH_SOCK, GH_TOKEN, a plain "
+              "variable; PLAN-0.11 §1.6), and GW_MANAGED_DIR (a nested claude stays managed)",
+              bool(names) and all(n in names for n in kept), f"missing: {[n for n in kept if n not in names]}")
+        gone = sorted(n for n in names if n in ("BASH_ENV", "ENV", "ANTHROPIC_API_KEY",
+                                                 "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE")
+                      or n.startswith("BASH_FUNC_") or (n.startswith("GW_") and n != "GW_MANAGED_DIR")
+                      or (re.match(r"(CLAUDE|ANTHROPIC)_", n)
+                          and re.search(r"TOKEN|SECRET|PASSW|PASSPHRASE|CRED|API_KEY|CLIENT_KEY|CLIENT_CERT|AUTH", n)))
+        check("route: Claude Code's own credential variables (ANTHROPIC_API_KEY, CLAUDE_CODE_CLIENT_KEY_PASSPHRASE, "
+              "...), BASH_ENV and the gateway's internal GW_* names never reach the command", not gone, str(gone))
         rep = scan.Report()
         rep.scan_tree(work, canary)
         check("route: the credential canary in Claude Code's environment is in no file the commands wrote",
               rep.clean(), rep.summary())
         path = files.get("path.txt", "").strip().split(":")
-        check("route: PATH starts with the gateway's stand-ins and runtime tools, then system folders; the "
-              "probe plugin's bin/ (if Claude Code put it on PATH) last; none of the login PATH",
-              len(path) >= 6 and path[0].endswith("/data/bin") and path[1].endswith("/data/managed/bin")
-              and path[2:6] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-              and all(p.endswith("/bin") and "/probe/" in p for p in path[6:]), ":".join(path))
+        own = [d for d in s.env.get("PATH", "").split(":") if d.startswith("/") and os.path.isdir(d)]
+        check("route: PATH starts with the gateway's stand-ins, then the snapshot's PATH (the system "
+              "folders in it), no runtime-tools folder (PLAN-0.11 §1.6)",
+              bool(path) and path[0].endswith("/data/bin") and "/usr/bin" in path
+              and not any(p.endswith("/data/managed/bin") for p in path), ":".join(path))
+        note(f"the session's PATH folders in the command's PATH: {sum(d in path for d in own)} of {len(own)} "
+             "(the snapshot's PATH is the login shell's)")
         check("route: SHELL is the managed bash", re.search(r"SHELL=.*/data/envs/[0-9a-f]+/\.pixi/envs/default/bin/bash\n",
                                                            files.get("shell.txt", "")) is not None,
               files.get("shell.txt", ""))
+        ssh_is = files.get("ssh-is.txt", "").split()
+        check("route: `ssh` names the gateway's ssh stand-in (a configured host exists), not the rc's ssh "
+              "alias or function (the rc's tail removes them; PLAN-0.11 §1.6)",
+              len(ssh_is) >= 2 and ssh_is[0].endswith("/data/bin/ssh") and ssh_is[1] == "file",
+              files.get("ssh-is.txt", ""))
+        bfiles = base.get("files", {})
+        note(f"baseline: `ssh` there is {' '.join(bfiles.get('ssh-is.txt', '').split())[:80]!r} (the snapshot's alias)")
         # tool results and exit codes as in the baseline
         bres = base.get("results", [])
         mine = [r for r in res if "result-text-42" in r or "before-exit" in r]
@@ -615,11 +705,13 @@ def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dic
             res = results_text(s.api)
             st = next((r for r in res if "Managed shell:" in r), "")
             check("route: gate status (run in the managed bash) lists the managed shell's PATH with origins",
-                  "Managed shell: on" in st and "(the gateway's stand-ins)" in st and "(system)" in st, st[-1200:])
+                  "Managed shell: on" in st and "(the gateway's stand-ins)" in st and "(your own PATH" in st, st[-1200:])
             hi = next((r for r in res if '"login_path"' in r), "")
             check("route: the gw host_inspect tool answers read-only (login PATH folders, toolchains, the "
                   "managed PATH), allowed without a prompt", '"how": "read from files' in hi and '"managed"' in hi,
                   hi[:600])
+        if want("passthru"):
+            passthru_steps(s, work, fakes)
         if want("perms"):
             s.close()
             p = perm_session(root, "m2", h.inst.config_dir, env)
@@ -652,6 +744,201 @@ def managed_session(root: Path, h, gi, env: dict, canary: scan.Canary, base: dic
         s.close()
 
 
+BASH_SNAP_CMD = ("type userfunc >/dev/null 2>&1 && echo has-userfunc > bs-func.txt || echo no-userfunc > bs-func.txt; "
+                 "{ command -v ssh; type -t ssh; } > bs-ssh.txt 2>&1")
+
+
+def step_bash_snapshot(root: Path, h, env: dict, canary: scan.Canary) -> None:
+    """PLAN-0.11 §1.6, §14 where Claude Code makes a bash snapshot (SHELL=/bin/bash):
+    the gateway rc sources it, so the user's function reaches the command, and
+    `ssh` still names the stand-in, not the snapshot's ssh alias or function
+    (the rc's tail removes them). The route session's SHELL is zsh wherever
+    /bin/zsh exists, and the rc sources only a bash snapshot, so only here are
+    the alias and the function really in the way."""
+    print("route: a session whose shell snapshot bash made (SHELL=/bin/bash)", flush=True)
+    if not os.path.exists("/bin/bash"):
+        check("route (bash snapshot): /bin/bash exists", False)
+        return
+    cfg = h.inst.config_dir
+    before = L.snapshot_files(cfg)
+    s = session(root, "m6", cfg, env, [bash(BASH_SNAP_CMD, "bash snapshot probe"), "bash snapshot done"],
+                shell="/bin/bash", permission_mode="bypassPermissions")
+    s.redact(canary.value)
+    s.start()
+    shells: list[str] = []
+    new: list[Path] = []
+    text = ""
+    try:
+        s.wait_ready(180)
+        s.submit("probe the bash snapshot")
+        ran = wait(s, lambda: (s.cwd / "bs-ssh.txt").exists(), 60)
+        s.pump(2)
+        # read while the session runs: Claude Code 2.1.310 removes a session's snapshot
+        # when the session ends ("Cleaned up session snapshot" in its debug log)
+        shells = L.snapshot_shells(cfg, skip=before)
+        new = [p for p in L.snapshot_files(cfg) if p not in before]
+        text = "\n".join(p.read_text(errors="replace") for p in new)
+    finally:
+        s.close()
+    SUMMARY["snapshot_shells_bash_session"] = shells
+    check("route (bash snapshot): Claude Code made a bash snapshot for the session (SHELL=/bin/bash), and it "
+          "holds the rc's ssh alias or function", shells == ["bash"]
+          and ("user-alias-ssh" in text or "user-function-ssh" in text), f"shells {shells}; {len(new)} new file(s)")
+    func = (s.cwd / "bs-func.txt").read_text().strip() if (s.cwd / "bs-func.txt").exists() else ""
+    check("route (bash snapshot): the managed bash sourced the bash snapshot (the user's function is there)",
+          ran and func == "has-userfunc", func)
+    got = (s.cwd / "bs-ssh.txt").read_text() if ran else ""
+    ssh_is = got.split()
+    check("route (bash snapshot): `ssh` still names the gateway's ssh stand-in, not the snapshot's ssh alias or "
+          "function (the rc's tail removes them; PLAN-0.11 §1.6)",
+          len(ssh_is) >= 2 and ssh_is[0].endswith("/data/bin/ssh") and ssh_is[1] == "file", got)
+
+
+def passthru_steps(s: driver.Session, work: Path, fakes: Path) -> None:
+    """PLAN-0.11 §1.3, §1.7: the configured host by the system's ssh is a route
+    around the stand-in (the hook refuses it, in every mode); a host nothing
+    configures goes through the ssh stand-in to the user's own ssh (the
+    recording fake): the full argv, the recursion guard set."""
+    print("passthru: a by-path ssh to the configured host, an unconfigured host", flush=True)
+    n0 = len(s.api.main_requests())
+    s.api.push(bash(f"/usr/bin/ssh {FAKE_HOST} true; echo by-path-ran > bypath.txt", "the system's ssh"),
+               bash("ssh other.invalid echo hi-from-the-fake > pt.txt", "an unconfigured host"),
+               "passthru done")
+    s.submit("run the ssh checks")
+    wait(s, lambda: len(s.api.main_requests()) >= n0 + 3, 120)
+    s.pump(2)
+    res = results_text(s.api)
+    deny = next((r for r in res if L.ROUTE_SSH in r), "")
+    check("passthru: the system's ssh to the configured host is refused by the hook (a route around the "
+          "stand-in), and nothing ran", bool(deny) and "box" in deny and not (work / "bypath.txt").exists(),
+          json.dumps(res[-3:])[:800])
+    runs = [r for r in L.user_tool_runs(fakes, "ssh") if r.get("argv") == ["other.invalid", "echo", "hi-from-the-fake"]]
+    got = (work / "pt.txt").read_text() if (work / "pt.txt").exists() else ""
+    check("passthru: `ssh` to a host nothing configures runs the user's own ssh (the recording fake) with the "
+          "full argv, through the stand-in's pass-through (GW_PASSTHRU set)",
+          got.strip() == L.FAKE_RAN.format(tool="ssh") and len(runs) == 1
+          and str((runs[0].get("env") or {}).get("GW_PASSTHRU", "")).startswith("ssh:1:"),
+          json.dumps({"pt.txt": got, "runs": runs[-2:]})[:600])
+
+
+def step_git_ask(root: Path, h, env: dict, canary: scan.Canary, fakes: Path) -> None:
+    """PLAN-0.11 §6.5 (requirement 24): a git push whose URL names a host set to
+    ssh = "ask" is asked about by the hook before it runs. In bypassPermissions
+    mode Claude Code prompts only for a hook's ask, so the prompt is the
+    gateway's; declined, the push never ran (neither the gated git nor the
+    user's own git or ssh started)."""
+    print("gitask: a git push to an \"ask\" host's URL, bypassPermissions", flush=True)
+    work = root / "m5" / "work"
+    repo = work / "pushprobe"
+    repo.mkdir(parents=True, exist_ok=True)
+    git = shutil.which("git") or "/usr/bin/git"
+    genv = {"PATH": "/usr/bin:/bin", "HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "LANG": "C"}
+    (repo / "README").write_text("acceptance push probe\n")
+    for args in (["init", "-q"], ["add", "README"], ["-c", "user.email=acc@example.com", "-c", "user.name=acc",
+                                                     "-c", "commit.gpgsign=false", "commit", "-qm", "probe"]):
+        subprocess.run([git, "-C", str(repo), *args], env=genv, capture_output=True, timeout=60)
+    n_runs = len(L.user_tool_runs(fakes, with_g=True))
+    s = session(root, "m5", h.inst.config_dir, env, [bash(ASK_PUSH, "push the probe"), "push answered"],
+                permission_mode="bypassPermissions")
+    s.redact(canary.value)
+    s.start()
+    try:
+        s.wait_ready(180)
+        s.submit("push it")
+        asked = wait(s, lambda: "Do you want to proceed?" in s.text(), 60)
+        shown = L.flat(s.text())
+        check("gitask: in bypassPermissions mode Claude Code prompts for the push (only a hook's ask does there: "
+              "the gateway asked up front)", asked, s.text()[-1200:])
+        note(f"gitask: the prompt {'names' if 'boxask' in shown else 'does not name'} boxask (the hook's reason)")
+        if asked:
+            s.pump(1.0)
+            s.send("\x1b")              # declined
+            wait(s, lambda: "Do you want to proceed?" not in s.text(), 15)
+        s.pump(3.0)
+    finally:
+        s.close()
+    check("gitask: declined, nothing ran (the stand-ins never reached the user's ssh or git: the fakes' log "
+          "has no new run)",
+          len(L.user_tool_runs(fakes, with_g=True)) == n_runs, json.dumps(L.user_tool_runs(fakes, with_g=True)[n_runs:])[:400])
+
+
+def step_notready(root: Path, h, gi, env: dict, canary: scan.Canary) -> None:
+    """PLAN-0.11 §1.6, §19.15: the managed shell not ready (here its rc file
+    moved away for one command): the command runs byte for byte without the
+    managed settings, in the shell that made its snapshot (a bash snapshot:
+    CLAUDE_CODE_SHELL, which the mod sets to the env's bash once it is
+    built; a zsh one: a zsh), with Claude Code's credentials still removed
+    and one stderr line naming that shell and why (the rc missing; the env
+    is built, so its settings are missing, never "still setting up" or "your
+    own shell"); no refusal. Only the managed path sources the rc in place of
+    the snapshot (bash's BASH_EXECUTION_STRING then starts with `.`, else
+    with the snapshot's `source`): that may not be seen. SHELL tells nothing
+    for a bash snapshot: Claude Code (2.1.310) itself gives every Bash-tool
+    command SHELL = the shell it runs, CLAUDE_CODE_SHELL here (the env's
+    bash, the value the managed path sets too); with a zsh snapshot it must
+    not be the env's bash. Nor does PATH: the gateway's session env file,
+    which both paths source, puts the stand-ins first."""
+    print("notready: the managed shell's rc moved away for one command", flush=True)
+    conf = gi.root / "data" / "managed" / "conf"
+    rc = next((Path(ln[3:]) for ln in conf.read_text().splitlines() if ln.startswith("rc=")), None) \
+        if conf.is_file() else None
+    if rc is None or not rc.is_file():
+        check("notready: the managed shell's rc is found (managed/conf)", False, str(rc))
+        return
+    cfg = h.inst.config_dir
+    before = L.snapshot_files(cfg)
+    s = session(root, "m4", cfg, env, [], permission_mode="bypassPermissions")
+    s.redact(canary.value)
+    t_start = time.time()
+    s.start()
+    hidden = rc.with_name(rc.name + ".acc-hidden")
+    shells: list[str] = []
+    try:
+        s.wait_ready(180)
+        # the gateway's session start rewrites the managed shell's files (managed.sync: the
+        # rc, then conf last); on Claude Code 2.1.310 the prompt is up before it is done, and
+        # an rc moved away before then is written again: move it once conf is this session's
+        check("notready: this session's start rewrote the managed shell's settings (conf) first",
+              wait(s, lambda: conf.is_file() and conf.stat().st_mtime >= t_start, 60))
+        s.api.push(bash('echo "nr:${BASH-}:${SHELL-}:${BASH_EXECUTION_STRING%% *}:'
+                        '${CLAUDE_CODE_CLIENT_KEY_PASSPHRASE+set}" > nr.txt', "not ready"),
+                   "notready done")
+        os.rename(rc, hidden)
+        s.submit("run it while the shell isn't ready")
+        ok = wait(s, lambda: (s.cwd / "nr.txt").exists(), 60)
+        wait(s, lambda: "notready done" in s.text(), 30)
+        # read while the session runs (2.1.310 removes a session's snapshot when it ends)
+        shells = L.snapshot_shells(cfg, skip=before)
+    finally:
+        if hidden.exists():
+            os.rename(hidden, rc)
+        s.close()
+    got = (s.cwd / "nr.txt").read_text().strip() if ok else ""
+    res = results_text(s.api)
+    named = next((m.group(1) for r in res for m in [re.search(
+        re.escape(L.NOT_READY) + r", in (/.+?): the managed shell isn't ready \(", r)] if m), "")
+    bash_snap = shells == ["bash"]
+    fields = got.split(":") if got.startswith("nr:") else []
+    check("notready: the command ran in the shell that made the session's snapshot, the one the notice names "
+          "(a bash snapshot: CLAUDE_CODE_SHELL, the env's bash; a zsh one: a zsh), with Claude Code's "
+          "credential still removed",
+          ok and len(fields) == 5 and shells in (["bash"], ["zsh"]) and fields[4] == ""
+          and ((bash_snap and MANAGED_BASH in named and fields[1] == named)
+               or (not bash_snap and "zsh" in named and MANAGED_BASH not in named and fields[1] == "")),
+          f"snapshot {shells}; {got!r} / {named!r}")
+    check("notready: without the managed settings (the rc wasn't sourced in place of the snapshot: the script "
+          "still starts with its own `source`; SHELL is Claude Code's own for its shell: with a bash snapshot "
+          "the shell the notice names, with a zsh one not the managed bash)",
+          len(fields) == 5 and fields[3] != "." and (fields[3] == "source" or not bash_snap)
+          and ((bash_snap and fields[2] == named) or (not bash_snap and MANAGED_BASH not in fields[2])),
+          f"{got!r}")
+    check("notready: the gateway says so in one line (the command's stderr): its rc missing, and with the env "
+          "built its settings missing (not 'still setting up', not 'your own shell')",
+          any(L.NOT_READY in r and "its rc file is missing" in r and NOT_READY_SETTINGS in r
+              and "still setting up" not in r and "own shell" not in r for r in res), json.dumps(res)[:600])
+
+
 def step_print(root: Path, h, gi, env: dict) -> None:
     print("print: claude -p", flush=True)
     for f in gwe2e.session_gateways(h.inst.config_dir, root / "p-work", []):
@@ -679,8 +966,18 @@ def step_print(root: Path, h, gi, env: dict) -> None:
         api.stop()
 
 
+# No mod, so no prefix: pre_bash.sh sends every Bash call to Python. Each probe also has
+# a trigger word that runs nothing (`ssh-probe` is an echo's word), so it reaches the hook
+# by the word list too, and no real tool ever runs (PLAN-0.11 §13).
+NOMODS_FIRST = 'echo ssh-probe > /dev/null; echo "nm:${BASH_VERSION-}:${ZSH_VERSION-}:${BASH-}" > nm.txt'
+NOMODS_SECOND = "echo ssh-probe again > nm2.txt"
+
+
 def step_nomods(root: Path, env: dict, src: Path) -> None:
-    """The gateway without its mod (modules removed from hooks.json)."""
+    """The gateway without its mod (modules removed from hooks.json; PLAN-0.11
+    §1.8): no blanket refusal. Bash runs in Claude Code's own shell with the
+    gateway's notice once per session, and the classic hook still judges every
+    command it sees (a read of the gateway's private folder is denied)."""
     print("nomods: the gateway with no mod", flush=True)
     copy = root / "gateway-nomods"
     install.snapshot_tree(REPO, copy)
@@ -694,18 +991,39 @@ def step_nomods(root: Path, env: dict, src: Path) -> None:
         ok, detail = prebuild_env(root, h, gi, env)
         if not check("nomods: the env is built", ok, detail):
             return
-        replies = [bash('echo "nm:${BASH_VERSION-}:${ZSH_VERSION-}" > nm.txt', "no-mods probe"), "denied turn"]
+        priv = gi.gateway_home / "private" / "vault.age"
+        # the first command reaches the hook, which tells once; the second reads the private folder
+        replies = [bash(NOMODS_FIRST, "no-mods probe"), "probe turn",
+                   bash(f"cat '{priv}' > nm-priv.txt", "private read"), "denied turn",
+                   bash(NOMODS_SECOND, "second probe"), "second turn"]
         s = session(root, "n1", h.inst.config_dir, env, replies, permission_mode="bypassPermissions")
         s.start()
         try:
             s.wait_ready(180)
             s.submit("run it")
-            wait(s, lambda: len(s.api.main_requests()) >= 2, 60)
+            ran = wait(s, lambda: (s.cwd / "nm.txt").exists(), 60)
+            wait(s, lambda: "probe turn" in s.text(), 30)
+            s.pump(2)
+            got = (s.cwd / "nm.txt").read_text() if ran else ""
+            check("nomods: no blanket refusal: the command runs, in Claude Code's own shell (not the managed bash)",
+                  ran and MANAGED_BASH not in got, got)
+            s.submit("read the vault")
+            wait(s, lambda: "denied turn" in s.text(), 60)
             s.pump(2)
             res = results_text(s.api)
-            check("nomods: managed mode (the default) denies Bash with 'managed shell unavailable', nothing ran",
-                  any("managed shell unavailable" in r and "mods" in r for r in res)
-                  and not (s.cwd / "nm.txt").exists(), json.dumps(res)[:800])
+            check("nomods: the classic hook still judges: a read of the gateway's private folder is denied",
+                  any("private keys and vault" in r for r in res) and not (s.cwd / "nm-priv.txt").exists(),
+                  json.dumps(res)[-800:])
+            s.submit("run the second")
+            wait(s, lambda: (s.cwd / "nm2.txt").exists(), 60)
+            wait(s, lambda: "second turn" in s.text(), 30)
+            s.pump(3)
+            screen = L.flat(s.all_text() if hasattr(s, "all_text") else s.text())
+            n = screen.count(L.MANAGED_NOTICE)
+            tn = sum(L.flat(t.read_text()).count(L.MANAGED_NOTICE) for t in s.transcripts())
+            check("nomods: the gateway's notice (your commands run in your own shell, and the gateway still "
+                  "judges them), once in the session", n == 1 or (n == 0 and tn == 1),
+                  f"{n} on screen, {tn} in the transcript\n{screen[-1500:]}")
             s.send("!")
             s.pump(0.5)
             s.type('echo "nmbang:${BASH_VERSION-}:${ZSH_VERSION-}:${BASH-}" > nmbang.txt')
@@ -714,37 +1032,6 @@ def step_nomods(root: Path, env: dict, src: Path) -> None:
             got = (s.cwd / "nmbang.txt").read_text() if (s.cwd / "nmbang.txt").exists() else ""
             check("nomods: a ! command (no hook sees it) runs in Claude Code's own shell: the documented limit",
                   bool(got) and MANAGED_BASH not in got, got)
-        finally:
-            s.close()
-        # an approved "warn" (seeded: no dialog can open without the mod)
-        (gi.gateway_home).mkdir(parents=True, exist_ok=True)
-        (gi.gateway_home / "gateway.toml").write_text('[shell]\nmanaged = "warn"\n')
-        r = seed(gi, "consent.approve('settings', form=consent.load_form())\n"
-                     "print(managed.load_state()['mode'])")
-        check("nomods: managed = \"warn\" approved in the scratch vault (seeded)", r.stdout.strip() == "warn",
-              r.stderr[-400:])
-        replies = [bash('echo "w1:${BASH_VERSION-}:${ZSH_VERSION-}:${BASH-}" > w1.txt', "warn probe 1"), "warn 1",
-                   bash('echo "w2" > w2.txt', "warn probe 2"), "warn 2"]
-        s = session(root, "n2", h.inst.config_dir, env, replies, permission_mode="bypassPermissions")
-        s.start()
-        try:
-            s.wait_ready(180)
-            s.submit("run it")
-            wait(s, lambda: (s.cwd / "w1.txt").exists(), 60)
-            wait(s, lambda: "warn 1" in s.text(), 30)
-            s.pump(2)
-            s.submit("run the second")
-            ok = wait(s, lambda: (s.cwd / "w2.txt").exists(), 60)
-            s.pump(3)
-            screen = s.all_text() if hasattr(s, "all_text") else s.text()
-            w1 = (s.cwd / "w1.txt").read_text() if (s.cwd / "w1.txt").exists() else ""
-            check("nomods warn: commands run (in Claude Code's own shell, not the managed bash)",
-                  ok and bool(w1) and MANAGED_BASH not in w1, w1)
-            flat = re.sub(r"\s+", " ", screen)
-            n = flat.count("the managed shell isn't active in this session")
-            tn = sum(t.read_text().count("the managed shell isn't active in this session") for t in s.transcripts())
-            check("nomods warn: a visible notice, once in the session", n == 1 or (n == 0 and tn == 1),
-                  f"{n} on screen, {tn} in the transcript\n{screen[-1500:]}")
         finally:
             s.close()
 

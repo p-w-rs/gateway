@@ -178,10 +178,15 @@ def test_ssh_sudo_wrong_saved_password_verified_before_use() -> None:
     with H.ssh_env() as s:
         t = _box(s)
         s.set_sudo("box", H.real_user(), "not the password")
+        s.set(mode="acceptEdits")          # the session's mode the hook recorded
         r = s.run("ssh", "box", "for i in 1 2 3 4 5; do sudo true 2>/dev/null; done; echo ran")
         assert r.returncode == 1 and "ran" not in r.stdout, r     # the command never ran
         assert ("gateway: the saved sudo password for box was rejected; a gateway dialog to "
                 "enter it again is open in Claude Code; don't retry") in r.stderr
+        # its use and the rejection are audited with that mode (lead decision 19.8)
+        use, ref = s.audit("use")[-1], s.audit("refusal")[-1]
+        assert use["tool"] == "ssh" and use.get("mode") == "acceptEdits", use
+        assert "was rejected" in ref["reason"] and ref.get("mode") == "acceptEdits", ref
         assert _attempts(t) == 1                                  # one failed attempt in all
         assert len(_verifies(t)) == 1 and not [c for c in t.commands() if "echo ran" in c]
         e = vault.sudo_entry(s.vault(), "box", H.real_user())
@@ -256,7 +261,7 @@ def test_ssh_sudo_missing_password_asks_with_verification() -> None:
         assert f"{H.real_user()}@127.0.0.1:{t.port}" in calls[0]["prompt"]
         assert "SHA256:" in calls[0]["prompt"] and "never sees what you type" in calls[0]["prompt"]
         assert "commands Claude runs on box could read it" in calls[0]["prompt"]   # the caveat
-        assert "Untick Remember it to use it for this command only" in calls[0]["prompt"]
+        assert "Tick Remember it to keep it for later commands" in calls[0]["prompt"]   # 27g
         assert "NOPASSWD" not in calls[0]["prompt"]
         assert vault.sudo_entry(s.vault(), "box", H.real_user())["password"] == PW
         assert len(_verifies(t)) == 2         # in the pop-up only; a fresh value isn't re-verified
@@ -526,8 +531,9 @@ def test_ssh_rsync_with_sudo_rsync_and_a_stored_password_completes() -> None:
 
 def test_ssh_sudo_dialog_names_its_rights_offers_remember_and_rechecks_before_use() -> None:
     """Phase 3 review: the remote sudo dialog names box's ssh and sudo rights
-    for gated's recheck and offers "Remember it" (ticked by default:
-    stored; unticked: used for this command only); and a right switched off
+    for gated's recheck and offers "Remember it" (unticked by default since
+    PLAN-0.11 §9.1, 27g: used for this command only; ticked: stored; the fake
+    dialog's plain answer here ticks it); and a right switched off
     while the dialog was open is read again before the password is placed
     on the host (nothing staged, nothing run)."""
     from gateway import paths
@@ -539,7 +545,7 @@ def test_ssh_sudo_dialog_names_its_rights_offers_remember_and_rechecks_before_us
         assert r.returncode == 0 and r.stdout == "kept\n", r
         c = s.popup_calls()[-1]
         assert c["check"] == {"section": "hosts", "entry": "box", "right": ["ssh", "sudo"]}, c
-        assert c["remember"] is True
+        assert c["remember"] is False
         assert vault.sudo_entry(s.vault(), "box", H.real_user())["password"] == PW
         # unticked: the command runs, nothing is stored
         with vault.edit() as d:
@@ -559,3 +565,17 @@ def test_ssh_sudo_dialog_names_its_rights_offers_remember_and_rechecks_before_us
         assert "late" not in r.stdout, r.stdout
         assert len(_staged(t)) - len(_verifies(t)) == staged, "the command's password was staged"
         assert not _runs(t, "late")
+        # sudo turned to "ask" while the dialog was open: Claude typed the
+        # command, but the approval hook asked about nothing (sudo was true),
+        # so there is no record: refused after the dialog (should-fix 5)
+        s.write_form(form)
+        s.approve()
+        with vault.edit() as d:
+            d["hosts"]["box"]["sudo"] = {}
+        s.set(typed=True, asked=False)
+        s.set(popup={"secret": [["ok", PW, {"write": [str(paths.form_path()),
+                                                      form + 'sudo = "ask"\n']}]]})
+        r = s.run("ssh", "box", "sudo echo later")
+        assert r.returncode != 0 and "didn't ask you about this command" in r.stderr, r
+        assert "later" not in r.stdout and not _runs(t, "later"), r.stdout
+        assert len(_staged(t)) - len(_verifies(t)) == staged, "the command's password was staged"

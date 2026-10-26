@@ -10,25 +10,6 @@ import harness as H
 from gateway import audit, paths, testing
 
 
-def test_checkpoint_state_dir_follows_xdg_state_home_outside_tests():
-    """Claude's context mentions checkpoint jobs when checkpoint's state folder
-    exists (`${XDG_STATE_HOME:-~/.local/state}/checkpoint`). Only an absolute
-    XDG_STATE_HOME is checked here, so the real home is never resolved."""
-    old = os.environ.get("XDG_STATE_HOME")
-    base = Path(H.tmp_base()) / "xdg-state-probe"
-    try:
-        os.environ["XDG_STATE_HOME"] = str(base)
-        assert testing.active() is None
-        assert paths.checkpoint_state_dir() == base / "checkpoint"
-        with H.gateway_env() as env:
-            assert paths.checkpoint_state_dir() == env.user_home / ".local" / "state" / "checkpoint"
-    finally:
-        if old is None:
-            os.environ.pop("XDG_STATE_HOME", None)
-        else:
-            os.environ["XDG_STATE_HOME"] = old
-
-
 def test_layout_under_override():
     with H.gateway_env() as env:
         h = env.home
@@ -49,6 +30,17 @@ def test_layout_under_override():
         assert paths.env_python() == paths.env_dir() / ".pixi" / "envs" / "default" / "bin" / "python3"
         assert paths.run_py() == H.PLUGIN / "run.py"
         assert paths.tool("age").endswith("/age")
+
+
+def test_the_0_11_paths_follow_the_override():
+    """PLAN-0.11's new locations: the configured list (private, readable
+    while the vault is locked), the gated git's global config and the
+    prefilter's network words (plugin data)."""
+    with H.gateway_env() as env:
+        assert paths.configured_path() == env.home / "private" / "configured.json"
+        assert paths.is_protected(paths.configured_path()), "the file guard covers private/"
+        assert paths.git_global_path() == env.data / "git" / "global"
+        assert paths.network_words_path() == env.data / "network-words"
 
 
 def test_run_dir_mode_and_type_checks():
@@ -358,6 +350,51 @@ def test_audit_fallback_scrubs_only_long_literals():
         rec = audit.read(1)[0]
         assert "pw12" in rec["argv"], "short values aren't scrubbed by literal (that would reveal them)"
         assert "longer-secret-1" not in rec["argv"]
+
+
+def test_every_refusal_in_the_code_is_audited_with_its_mode():
+    """Lead decision 19.8: every audit.refusal call passes the mode it was
+    decided in (a mode key, or "modeless"); verify012 found the stand-ins'
+    without one. The stand-ins' tests check the lines they write
+    (test_ssh_ask, test_sudo_standin, test_ask_records, test_git_standin)."""
+    found, missing = _calls_without_a_mode(lambda f: f == ("audit", "refusal"))
+    assert found >= 10 and missing == [], (found, missing)
+
+
+def _calls_without_a_mode(match) -> tuple[int, list[str]]:
+    """(calls in src/ that `match` picks by (owner name or "", function
+    name), those among them with no `mode=` or an empty one)."""
+    import ast
+    found, missing = 0, []
+    for p in sorted((H.PLUGIN / "src" / "gateway").rglob("*.py")):
+        for node in ast.walk(ast.parse(p.read_text(), str(p))):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if isinstance(f, ast.Attribute):
+                key = (f.value.id if isinstance(f.value, ast.Name) else "", f.attr)
+            elif isinstance(f, ast.Name):
+                key = ("", f.id)
+            else:
+                continue
+            if not match(key):
+                continue
+            found += 1
+            mode = {k.arg: k.value for k in node.keywords}.get("mode")
+            if mode is None or (isinstance(mode, ast.Constant) and not mode.value):
+                missing.append(f"{p.relative_to(H.PLUGIN)}:{node.lineno}")
+    return found, missing
+
+
+def test_every_credential_use_in_the_code_is_audited_with_its_mode():
+    """Lead decision 19.8 (verify013): every audit.use call passes the mode
+    the use was decided in, and so does every call that mints an Entra token
+    (its own audit line). The stand-ins' tests check the lines they write."""
+    found, missing = _calls_without_a_mode(lambda f: f == ("audit", "use"))
+    assert found >= 12 and missing == [], (found, missing)
+    found, missing = _calls_without_a_mode(
+        lambda f: f[1] in ("access_token", "acr_token", "entra_token"))
+    assert found >= 6 and missing == [], (found, missing)
 
 
 def test_last_refusal_fallback_stays_in_this_session():

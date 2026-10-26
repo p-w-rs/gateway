@@ -37,6 +37,11 @@ KINDS: dict[str, tuple[str, ...]] = {
     "vault.unlocked": ("how",),
     "vault.locked": ("reason",),
     "vault.wrapped": (),
+    # the passphrase removed (the key kept without one again), and a locked
+    # vault whose passphrase was lost moved aside (no vault until the next
+    # store): PLAN-0.11 §19.14
+    "vault.unwrapped": (),
+    "vault.started_over": (),
     "host.state": ("host", "name", "state", "reachable", "auth", "runtime", "identity"),
     "auth.waiting": ("request", "session", "dialog", "terminal"),
     "auth.supplied": ("request", "outcome"),

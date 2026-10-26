@@ -5,24 +5,84 @@ Public API and behaviour of the modules the `ux` group owns: `popup.py`,
 `hooks_post.py`, `hooks_prompt.py`, `hooks_filechanged.py`, and the sh hooks
 `hooks/post.sh`, `hooks/prompt.sh`, `hooks/mcp_perm.sh`. Contract:
 [SPEC-v3.md](../SPEC-v3.md) §6, §12, §14, §15, §16 and [PLAN-v4](../PLAN-v4.md)
-phase 3 (native dialogs). Python 3.12 stdlib only;
+phase 3 (native dialogs), with [PLAN-0.11](../PLAN-0.11.md) §2.10, §8 and §9
+where they differ. Stdlib only, on the lock's Python;
 messages start with `gateway:` and say what to do next; every credential use
-is audited (`audit.use`), every refusal too (`audit.refusal`).
+is audited (`audit.use`), every refusal too (`audit.refusal`), each with the
+mode it was decided in.
+
+## 0.11.0 changes in this group (PLAN-0.11)
+
+Where the sections below say otherwise, this holds:
+
+- **http and download** (§2.10, lead decision 19.1): `mcp_perm.sh` hands
+  them to `launch.sh hook-mcp` (`hooks_mcp.py`): the `network` policy in the
+  payload's mode gives deny or ask; allow only for the user's explicit
+  per-mode allow in this computer's `network` policy, never for a call with
+  an account; anything else no decision. `web._network_ok` reads the same
+  policy in the session's recorded mode (or the modeless rule) and lets an
+  "ask" through (the hook asked up front); an account's `use`, `credential`
+  and `write` are read in that mode, and an "ask" there still refuses.
+  `[network] commands` is never read here (network.md).
+- **Masking every tool** (§9.1): hooks.json's PostToolUse and
+  PostToolUseFailure matchers are `.*`; `post.sh` skips `TodoWrite`,
+  `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `EnterPlanMode`,
+  `ExitPlanMode` (`hooks_post.SKIP_TOOLS`, compared by a test) and checks
+  the user's credential variables with builtins (one list of names,
+  compared with Python's), starting Python only for a value of 8 or more
+  characters, a token shape, or any response once a vault exists.
+  `hooks_post.env_secrets` masks those values and every credential-named
+  variable's in Claude Code's environment, besides the vault's.
+- **AskUserQuestion** (§9.2): `hooks/tool_guard.sh` denies a question,
+  header or option that asks for a secret (a request word before a secret
+  word, a line that is only the word, "PIN" in capitals; a heuristic),
+  with "gateway: ask for secrets only through the gateway's dialog (gate
+  check NAME, gate login NAME)."
+- **The passphrase offer** (§8): `popup.offer_passphrase()` after every
+  secret store (`popup.secret`'s store, `gate_setup`'s token, key and
+  sign-in stores, gated's own sign-in store); gated's `daemon/offer.py`
+  shows it.
+- **gate_setup**: `gate check NAME` and `gate check all` bring a pending
+  removal to the consent dialog (`removed_entries`); a browser sign-in runs
+  from the gate process through gated (`_browser_signin`); `status_line`
+  and `_account_has_credential` use `accounts.entra_fits`.
+- **transfer** (§9.3, lead decisions 11 and 12): `FORMATS = (3,)`;
+  `SETTINGS_TABLES = ("shell", "policy", "network", "vault")`, and imported
+  settings are approved in the import's own dialog (`plan_import` fills
+  `changes["settings"]`; changes already waiting in this machine's own form
+  are listed under their own heading and approved only with the file's);
+  this machine's settings are their own item (`LOCALHOST_ITEM`, unticked:
+  `[hosts.localhost]`'s sudo, scripts, policy and workspaces, never an
+  address), a keep/replace choice on import, a replace that drops sudo shown
+  as a widening; the confirm lists every grant, import and workspace a new
+  host brings, one line each (`entry_details`, `fit_lines`), and comes in
+  parts (`confirm_pages` through `popup.dialog_parts`, "Part i of n" in the
+  heading and again in the question beside the buttons, at most
+  `MAX_CONFIRM_PAGES` = 10: nothing is imported until the last part is
+  accepted); a browser sign-in's
+  refresh token isn't exported (the account needs a new sign-in on the
+  other machine); the success message says to import inside a Claude Code
+  session.
+- **Sudo**: the local and the remote sudo dialog's Remember it starts
+  unticked (`sudo.REMEMBER_DEFAULT`, `ssh_sudo.REMEMBER_DEFAULT`, with the
+  same note: a password is used once unless the person ticks the box).
 
 ## popup.py (SPEC 6, PLAN-v4 phase 3): the only way to ask the user anything
 
 Every question is a native dialog inside Claude Code: a pane the gate mod
 draws from a request gated holds, with a private `Client` field for secrets
 (`dialog.py` here, `daemon/dialogs.py` in gated, `hooks/mod/` in Claude
-Code). No OS dialog, terminal prompt, browser, web page or device code; no
-`gate secret`, no one-time codes (DECISIONS "PLAN-v4 phase 3").
+Code). No OS dialog, terminal prompt, web page or device code; no `gate
+secret`, no one-time codes (DECISIONS "PLAN-v4 phase 3"). The system browser
+opens only for a browser sign-in, from gated after the person presses Open in
+its confirm dialog (daemon.md, "Browser sign-in").
 
 Kinds (all take a validated entry name; free text is never shown):
 
 | call | returns | notes |
 |---|---|---|
-| `consent(entry, changes, *, extra_lines=(), on_ok=None, lazy=False)` | Outcome | one line per change (`Change.what` or text); **Approve** / **Decline**, Decline focused first |
-| `secret(entry, what, prompt, verify=None, *, store=None, load=None, lazy=True, detail=None, wait=True, remember=None, check=None, target=None)` | (Outcome, value) | the private field; `verify(v) -> (ok, msg)` reopens the same dialog with "That didn't work: MSG" (try N of 3, a new key pair each time) and never stores a failing value; `store(v)` runs in the helper once the value is good and, where `remember` offers the choice (True: ticked; the sudo stand-in and remote sudo pass it), only if the person kept it ticked; `check` names the form entry and rights gated rechecks before handing the value over (`{"section": "hosts", "entry", "right": "sudo" \| "ssh" \| ["ssh", "sudo"]}` or `{"section": "accounts", "entry", "kind"}`; every sudo, ssh and account dialog passes one); a joined request returns `load()` on ok |
+| `consent(entry, changes, *, extra_lines=(), on_ok=None, lazy=False)` | Outcome | one line per change (`Change.what` or text); **Approve** / **Decline**, Decline focused first. A dialog shows at most `DIALOG_LINES` (40, as gated and the pane), counted as the rows its lines take in a `PANE_COLUMNS` (72) column pane, wrapped as the pane wraps them (`pane_rows`: wrap-ansi's hard wrap without trimming, as Claude Code's text does, a character of East Asian width W or F two columns (`cells`); a docked pane at a 170-column terminal is about 75 columns wide); a longer one comes in parts (`consent_pages`, through `dialog_parts`, which the import confirm uses too): "part i of n" in the heading and "Part i of n." again at the start of the question beside the buttons (the pane opens scrolled to its end), every change line whole on one part where it fits, **Next** / **Decline** on each but the last; nothing is approved before the last part's Approve, and a Decline on any part changes nothing. More than `CONSENT_PARTS` (10) parts: `failed` with no dialog, and `gate check` says "nothing was approved for NAME: its changes need more than 10 gateway dialogs, so none was opened; make fewer changes ..." |
+| `secret(entry, what, prompt, verify=None, *, store=None, load=None, lazy=True, detail=None, wait=True, remember=None, check=None, target=None)` | (Outcome, value) | the private field; `verify(v) -> (ok, msg)` reopens the same dialog with "That didn't work: MSG" (try N of 3, a new key pair each time) and never stores a failing value; `store(v)` runs in the helper once the value is good and, where `remember` offers the choice (True or False: the box's first state; the sudo stand-in and remote sudo pass False, so it starts unticked), only if the box is ticked when the person submits; `check` names the form entry and rights gated rechecks before handing the value over (`{"section": "hosts", "entry", "right": "sudo" \| "ssh" \| ["ssh", "sudo"]}` or `{"section": "accounts", "entry", "kind"}`; every sudo, ssh and account dialog passes one); a joined request returns `load()` on ok |
 | `choice(entry, question, options, *, on_answer=None, what="choice")` | (Outcome, option) | fixed option texts, one button per row (hotkeys 1-9) |
 | `text(entry, prompt, *, default="", what=...)` | (Outcome, text) | a public text to copy (a public key: Copy button), or a typed host name (an `Input`: never a secret) |
 | `checklist(entry, prompt, options, checked, *, what=...)` | (Outcome, [options]) | export/copy groups |
@@ -31,7 +91,8 @@ Kinds (all take a validated entry name; free text is never shown):
 | `hostkey(entry, old, new, *, address=None, known=None, on_ok=None, lazy=True)` | Outcome | old/new fingerprints (a fixed known_hosts note after a fingerprint is kept); **Trust new key** / Cancel, Cancel first |
 | `reenter(entry, what, prompt, verify=None, *, store=None, detail=None, check=None)` | message | stale credential: opens one re-entry dialog without waiting, returns `gateway: the saved WHAT for ENTRY was rejected; a gateway dialog to enter it again is open in Claude Code; don't retry` |
 | `run(entry, what, job, *, kind, lazy, digest, detail, notice, load, wait)` | (Outcome, value) | broker a multi-step job (gate check "setup", export, import, copy) |
-| `signin_unavailable(kind, name)` | text | browser and device-code sign-ins are unavailable, with what works instead (PAT, service principal, an existing refresh token) |
+| `signin_unavailable(why)` | text | the fixed "browser sign-in isn't available here" text (no display, or the reason gated gave), with what works instead (a session with a display; a service principal for azure) |
+| `offer_passphrase()` | text | the vault passphrase offer's one entry point, called right after a secret was stored, outside the vault lock (in the detached helper, after its job ended, with its lease); gated decides whether to show it (daemon.md) |
 
 Outcomes (`popup.Outcome`): `ok`, `cancelled` (Cancel or Decline),
 `timeout` (nobody answered), `unavailable` (no native dialog here: claude -p,
@@ -189,17 +250,21 @@ how-to line, so it survives truncation; review round 2).
   `signin`, `host-keys`, or everything; account bindings stay; it keeps no
   copy of the vault: forgetting means gone. When older copies in
   `private/backups` may still hold the entry, `gate rotate`'s, an import's
-  backup or the 0.6 conversion's (`vault.older_copies`), its output names
-  them and how the user deletes them in their own terminal: `cd
-  ~/.config/gateway/private/backups && rm -r <globs>`; Claude's tools can't
-  reach that folder), `rotate(host)` (→ `ssh.rotate(host, before_change=)`:
+  backup, a start-over's folder or the 0.6 conversion's
+  (`vault.older_copies`), its output names them and says that `gate forget
+  --backups` deletes them), `forget_backups()` (`gate forget --backups`,
+  PLAN-0.11 §19.14: the older copies, at most `BACKUPS_PER_DIALOG` (30) at
+  a time, listed by name in one confirm dialog run through `popup.run`
+  (Cancel the default); on Delete, `vault.delete_older_copies` removes
+  those still older copies then and nothing else; Cancel, a timeout or no
+  dialog deletes nothing), `rotate(host)` (→ `ssh.rotate(host, before_change=)`:
   just before the rotation first changes the vault, under its lock, a copy
   of vault.age goes to `private/backups/rotate-<time>-<hex>.vault.age`
   (`vault.snapshot`, 0600, the newest 5 kept), and the output names it; a
   rotation that fails before that keeps none and prints the ssh module's
   own message; there is no restore command: SPEC 15 says how to copy it
-  back by hand), `secret_removed(name)` (`gate secret`: exit 2 with
-  `SECRET_REMOVED`, where credentials are entered now).
+  back by hand). (`gate secret`, removed in 0.9.0, lost its stub in 0.11.0:
+  gate reports it as an unknown command.)
 - `plan_for(...)` (requester side, no dialog): pending changes; for hosts a
   keyscan (`ssh.keyscan_host`) when nothing is pinned or an address/via
   changed; whether a key, a sudo password or an account credential is
@@ -210,7 +275,8 @@ how-to line, so it survives truncation; review round 2).
   that couldn't be used.
 - The job (one broker request `setup`, so it runs in the helper and survives
   exit 75): consent dialog listing exactly the changes + host-key
-  fingerprints (a pure host-key change uses `popup.hostkey`, with the
+  fingerprints (in parts when longer than one dialog; more than 10 parts:
+  refused with no dialog; a pure host-key change uses `popup.hostkey`, with the
   `~/.ssh/known_hosts` hint); `consent.approve(NAME, changes_shown)` (a
   `ConsentChanged` re-asks with the new changes, up to 3 times); pins the
   scanned keys (`hosts[N].host_keys`, `pinned_at`, a `hostkey` event); key:
@@ -281,10 +347,11 @@ add`), and the other reserved words are refused everywhere (acceptance
   home; default `~/Downloads/gateway-YYYYMMDD.age`); pop-ups (since PLAN-v4
   phase 7 a per-item checklist, `export_items`: each host, its secrets (keys,
   sudo passwords), each account, its credentials, the settings tables
-  ([settings], [shell], [policy], [vault]) and this machine's sudo password,
-  unticked by default; passphrase typed twice in the private field, ≥ 12
-  chars; no generated one, since showing it would put it on the dialog's
-  command line, round 2); `export_content(form, data, picked)` = format 3
+  ([shell], [policy], [network], [vault]), this machine's settings
+  ([hosts.localhost]: sudo, scripts, policy, workspaces) and its sudo
+  password, the last two unticked by default; passphrase typed twice in the
+  private field, ≥ 12 chars; no generated one, since showing it would put
+  it on the dialog's command line, round 2); `export_content(form, data, picked)` = format 3
   (`gateway_export: 3`, `schema: 3`, form text generated from the ticked
   validated entries, written per table so policy, workspace and shell
   sub-tables travel with their entry; vault = the picked records, secrets only
@@ -299,9 +366,9 @@ add`), and the other reserved words are refused everywhere (acceptance
   wrong passphrase (`WrongPassphrase`) asks again (3 tries), a damaged or
   altered file (`agepass.Tampered`: age's MAC, header or chunk errors, a
   truncated file; or a format 3 digest that doesn't match) stops at once with
-  "the file was changed or damaged"; `parse_incoming` (format 1 through
-  `migrate.map_export_v1`, formats 2 and 3 strictly; a newer format or schema
-  is refused as "made by a newer gateway": unknown fields refused, vault
+  "the file was changed or damaged"; `parse_incoming` (format 3 strictly;
+  formats 1 and 2 are refused as "from an older gateway" since 0.11.0; a newer
+  format or schema is refused as "made by a newer gateway": unknown fields refused, vault
   entries must be in the file's form, keys must be OpenSSH keys matching
   their public half, bindings valid hosts, ...); `find_this_machine`
   (`/etc/ssh/ssh_host_*_key.pub` vs pinned keys, then machine id, then a
@@ -325,9 +392,12 @@ add`), and the other reserved words are refused everywhere (acceptance
   (0700), the vault is saved, then the form written atomically; a failure
   restores both (`_restore`) and says nothing changed; then
   `consent.approve(NAME, the lines shown)`, `verify_imported` (each imported
-  account checked through its adapter; an Entra refresh token, session state
-  from another machine, that doesn't check out is marked
-  `reauthentication_required`, "needs a fresh sign-in"), `import` event.
+  account checked through its adapter), `needs_signin` (an account that signs
+  in through the browser is named as needing a new sign-in, `gate login NAME`
+  in a session: a browser sign-in's refresh token is never exported, and a
+  file holding one is refused), the vault passphrase offer
+  (`popup.offer_passphrase`, once the import's job has ended; not for
+  `--from-peer`), `import` event.
 - `--from-peer -`: only when `started_by_sshd()` (test override
   `peer_parent_ok`): walking up through shells (by executable path), the first
   other process must be the system sshd's session child, a root-owned
@@ -344,8 +414,7 @@ add`), and the other reserved words are refused everywhere (acceptance
   key to authorized_keys) passes.
 - Imported host keys get `pinned_at` = the import time (never the file's).
 - `copy_to(host)`: form host with ssh on, host keys pinned, pinned before this
-  session (`pinned_too_recently`: `pinned_at`, else the migration's time for
-  v2 pins, else refused as unknown; compared with the session record in
+  session (`pinned_too_recently`: `pinned_at`, else refused as unknown; compared with the session record in
   `private/sessions/<sid>.env`; with no session id or no record, pinned at
   least `MIN_PIN_AGE` (12 h) ago); remote gate present;
   remote recipient from `gate pubkey`; pop-ups: groups (with
@@ -505,8 +574,7 @@ that isn't a request -32600, batches accepted, errors without exception text.
   closed); form newer than the session's context record (or no record: a
   SessionStart that Claude Code cancelled leaves none), or a new open
   dialog request → Python; a `<task-notification>` once a vault exists →
-  Python, blocked if Python can't answer (round 4); an unshown migration
-  report (`private/migrated.unshown`) → Python. The home comes from the
+  Python, blocked if Python can't answer (round 4). The home comes from the
   password database (`hooks/home.sh`, as launch.sh and post.sh; never
   `$HOME`; the hooks get Claude Code's environment, not Claude's Bash).
   `hooks_prompt.main`: block + transcript/history scrub (same-length `*`

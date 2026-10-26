@@ -7,7 +7,9 @@ stand-in, the git helper, the MCP server or gate when the vault key is
 wrapped (client.py). ensure_running():
 
   1. GET /health; an answer from the same or a newer version is used (a newer
-     daemon serving an older plugin is reported in the answer's "skew").
+     daemon serving an older plugin is reported in the answer's "skew"),
+     unless it is stopping ("stopping": it refuses new sessions): then it is
+     waited for, and step 3 starts a new one.
   2. An older daemon is asked to restart (/local/restart): it stops when it
      holds no terminals or jobs, and the new version starts; otherwise it is
      kept and reported ("old gateway daemon still runs N jobs").
@@ -16,8 +18,11 @@ wrapped (client.py). ensure_running():
   /health names the data folder the daemon serves ("data"); `gated
   start|status` from another one (a second CLAUDE_CONFIG_DIR) add
   "other_config", the words /gate-doctor shows (planes.other_config_note).
-  3. Otherwise, under <run>/gated.start.lock (flock), `run.py gated serve
-     --detach` is started and its /health awaited.
+  3. Otherwise, under <run>/gated.start.lock (flock), once no daemon holds
+     the instance lock (one finishing its exit), `run.py gated serve
+     --detach` is started and its /health awaited; a holder that starts
+     answering meanwhile and isn't stopping (a gated still starting) is
+     used instead.
 
 serve(): takes <run>/gated.lock (flock, non-blocking: a second daemon exits at
 once), detaches (fork, setsid, fork; stdin /dev/null, stdout and stderr to
@@ -26,12 +31,16 @@ its daemon is gone, even after kill -9), writes <run>/gated.pid (its pid and
 start time, for its tmux watchdog), listens on <run>/gated.sock (0600),
 then writes ~/.config/gateway/run/contract.json (0600, folder 0700) and
 emits daemon.started. It exits after IDLE_EXIT with no live registered
-session, terminal or job, when its socket is removed (the run dir deleted:
+session, terminal or job (decided under `idle_lock`, which a registration
+also takes: a session answered 200 is counted, and a registration after the
+decision is refused, 503 "stopping", so its client starts a new daemon),
+when its socket is removed (the run dir deleted:
 nobody can reach it), when the plugin folder it runs from is gone (an
 uninstall, or an update's sweep of the old version folder: `replaced`) or
 marked orphaned by Claude Code (`.orphaned_at`: uninstalled, or replaced by
-an update; then only once no live session is registered) and it holds no
-terminal or job, on SIGTERM/SIGINT or /local/stop:
+an update; then only once no live session is registered, decided under
+`idle_lock` too) and it holds no terminal or job, on SIGTERM/SIGINT or
+/local/stop:
 daemon.stopping, the vault locked, the socket and contract.json (when still
 its own) removed, and its tmux server stopped once no terminal or job of it
 runs there (Supervisor.stop_server; a live pane keeps the server for the
@@ -61,7 +70,9 @@ Test overrides: `run.py --test gated ...` with GATEWAY_TEST_ROOT (and
 GATEWAY_TEST_RUN for a short run dir) runs everything inside the test root;
 <root>/gated-test.json holds the test knobs (idle_exit, tick, lock_after,
 test_routes, test_entries, ring, disk_max, log_max, busy, clipboard, tmux,
-watch_tick), read only under a test override.
+watch_tick, stop_linger, idle_gap, idle_hold and register_gap (the idle
+exit's race windows held open); the browser sign-in's browser, browser_platform, signin_timeout
+and entra_authority), read only under a test override.
 """
 from __future__ import annotations
 
@@ -81,7 +92,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .. import paths, ssh_conf, testing, vault
+from .. import audit, paths, ssh_conf, testing, vault
 from . import (CONTRACT_ID, CONTRACT_VERSIONS, FEATURES, PROTOCOL, plugin_version, skew_text,
                version_key)
 from . import broker as brokermod
@@ -90,6 +101,7 @@ from . import client, dialogs, events, planes, remote, server, terminals
 IDLE_EXIT = 30 * 60
 TICK = 30.0
 START_WAIT = 10.0
+STOP_LINGER = 0.05           # a stopping daemon still answers this long (the stop's own answer)
 LOG_MAX = 1_000_000
 DRAIN_LOG = "gated-drain.log"   # in the gateway home's run/: the draining daemon's log lines
 DRAIN_LOG_MAX = 65536
@@ -99,6 +111,88 @@ PAUSE_WAIT = 60.0            # drain waits at most this long for the pauses bein
 class StartError(client.DaemonError):
     def __init__(self, message: str):
         super().__init__(0, "start", message)
+
+
+# ---------------------------------------------------------------------------
+# CONTRACT-v1 rights (PLAN-0.11 §2.11)
+# ---------------------------------------------------------------------------
+
+# A per-mode word -> CONTRACT-v1's allow / ask / deny, from the modeless rule
+# (no session's mode applies to a snapshot): cc and allow are allow (the
+# gateway lets it through; Claude Code decides), ask is ask, deny is deny.
+# This computer's sudo when nothing configures it ("unconfigured") is the
+# user's own sudo, which the gateway lets through untouched (PLAN-0.11 §1.5;
+# hooks_bash.UNCONFIGURED_SUDO): "allow". Indexed, never .get: an unknown
+# word raises.
+CONTRACT_WORDS = {"deny": "deny", "ask": "ask", "cc": "allow", "allow": "allow",
+                  "unconfigured": "allow"}
+CONTRACT_RANK = {"deny": 0, "ask": 1, "allow": 2}
+
+
+def contract_rights(eff: Any, host: str | None = None, account: str | None = None
+                    ) -> dict[str, str]:
+    """Every action's effective decision on a host (or with an account) in
+    CONTRACT-v1's words: policy.decide in the modeless rule (mode None),
+    each value mapped by CONTRACT_WORDS. The contract's text and checkpoint's
+    copy are unchanged."""
+    from .. import form as formmod
+    from .. import policy
+    out: dict[str, str] = {}
+    if account is not None:
+        for a in formmod.ACCOUNT_POLICY_KEYS:
+            out[a] = CONTRACT_WORDS[policy.decide(eff, a, account=account, mode=None).value]
+        return out
+    local = host in (None, "", "localhost")
+    for a in formmod.LOCALHOST_POLICY_KEYS if local else formmod.HOST_POLICY_KEYS:
+        try:
+            out[a] = CONTRACT_WORDS[policy.decide(eff, a, host=host, mode=None).value]
+        except ValueError:
+            continue
+    return out
+
+
+def ui_modes(values: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """/gate-hosts and /gate-accounts (PLAN-0.11 §2.8, §2.9): an entry's
+    effective rights (ssh, sudo, use) that are per-mode tables, each as its
+    six-mode map, for the pane to draw in words (manage.ts modeText); a
+    bare word's expansion is left out (the pane shows rights only as
+    tables)."""
+    return {k: mv.map() for k, mv in values.items() if isinstance(mv.snapshot(), dict)}
+
+
+# A decision's word in the panes (manage.ts takes deny / ask / cc / allow):
+# this computer's unconfigured sudo is the user's own, left to Claude Code
+# ("cc": the gateway decides nothing for it).
+UI_WORDS = {"deny": "deny", "ask": "ask", "cc": "cc", "allow": "allow", "unconfigured": "cc"}
+
+
+def ui_policy_modes(eff: Any, host: str | None = None, account: str | None = None
+                    ) -> dict[str, dict[str, str]]:
+    """/gate-hosts and /gate-accounts (PLAN-0.11 §2.9): each action whose
+    policy is a per-mode table (the entry's own or [policy]'s) as its
+    effective decision in each mode (policy.decide per mode: the base right
+    and every layer), for the pane to draw in §2.8's words (manage.ts
+    modeText) instead of the one modeless word of `rights`."""
+    from .. import form as formmod
+    from .. import modes, policy
+    if account is not None:
+        own, keys = eff.accounts[account].policy_modes, formmod.ACCOUNT_POLICY_KEYS
+    else:
+        local = host in (None, "", "localhost")
+        own = eff.hosts["localhost" if local else host].policy_modes
+        keys = formmod.LOCALHOST_POLICY_KEYS if local else formmod.HOST_POLICY_KEYS
+    out: dict[str, dict[str, str]] = {}
+    for k in keys:
+        if not any(mv is not None and isinstance(mv.snapshot(), dict)
+                   for mv in (own.get(k), eff.policy_modes.get(k))):
+            continue
+        try:
+            out[k] = {m: UI_WORDS[policy.decide(eff, k, host=None if account is not None else host,
+                                                account=account, mode=m).value]
+                      for m in modes.KEYS}
+        except ValueError:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +296,32 @@ def _wait_gone(pid: int, deadline: float) -> None:
         time.sleep(0.025)
 
 
+def _wait_instance_free(deadline: float) -> dict[str, Any] | bool:
+    """Wait until no daemon holds the instance lock (<run>/gated.lock): one
+    that no longer answers may still be finishing its exit (its socket gone,
+    its tmux server being stopped), and a daemon started before it lets go
+    exits at once. True once it is free; the holder's /health once it
+    answers and isn't stopping (a gated still starting, e.g. a slow start
+    whose first starter gave up after START_WAIT: the start uses it); False
+    at the deadline."""
+    fd = os.open(paths.gated_lock(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return True
+            except BlockingIOError:
+                h = client.health(timeout=0.5)
+                if h is not None and not h.get("stopping"):
+                    return h
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.025)
+    finally:
+        os.close(fd)
+
+
 def _pid_alive(pid: Any) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -255,7 +375,10 @@ def ensure_running(wait: float = START_WAIT) -> dict[str, Any]:
     socket but doesn't answer (stopped, hung) gets UNRESPONSIVE_GRACE (it may
     be finishing its start), then StartError: another start would exit at
     once on its instance lock, so waiting `wait` for it would only stall
-    every caller (a hook, the mod's session start)."""
+    every caller (a hook, the mod's session start). A daemon that answers
+    but is stopping (its idle exit, a stop request: "stopping" in /health)
+    takes no new session: it is waited for (its pid, then the instance lock)
+    and a new one started."""
     mine = plugin_version()
     deadline = time.monotonic() + wait
     h, unresponsive = _health_or_unresponsive(1.0)
@@ -264,10 +387,14 @@ def ensure_running(wait: float = START_WAIT) -> dict[str, Any]:
         if h is None and unresponsive:
             raise StartError("gateway: the gateway daemon is running but isn't answering (stopped "
                              "or hung); /gate-doctor shows its state")
-    if h is not None and version_key(str(h.get("version") or "0")) >= version_key(mine):
+    if h is not None and not h.get("stopping") and \
+            version_key(str(h.get("version") or "0")) >= version_key(mine):
         return _skew(h, mine)
     with _start_lock(wait):
         h = client.health(timeout=1.0)
+        if h is not None and h.get("stopping"):
+            _wait_gone(int(h.get("pid") or 0), deadline)
+            h = None
         if h is not None and version_key(str(h.get("version") or "0")) < version_key(mine):
             try:
                 r = client.call("POST", "/local/restart", {"version": mine}, timeout=5)
@@ -282,8 +409,15 @@ def ensure_running(wait: float = START_WAIT) -> dict[str, Any]:
             h = None
         if h is not None:
             return _skew(h, mine)
-        _spawn()
-        h = _wait_health(deadline)
+        free = _wait_instance_free(deadline)
+        if free is False:
+            raise StartError("gateway: the last gateway daemon is still stopping, so a new one can't "
+                             "start yet; try again in a moment (/gate-doctor shows its state)")
+        if free is True:
+            _spawn()
+            h = _wait_health(deadline)
+        else:
+            h = free                    # a gated still starting, which answers now
     if h is None:
         raise StartError(f"gateway: the gateway daemon didn't start (its log: "
                          f"{paths.describe(paths.gated_log())})")
@@ -329,6 +463,20 @@ class Daemon:
         self.t0 = time.monotonic()
         self.idle_exit = _num(self.k, "idle_exit", IDLE_EXIT)
         self.tick_s = _num(self.k, "tick", TICK)
+        # how long it still answers after deciding to stop (the answer to a stop
+        # request goes out first); test knobs that hold the idle exit's race
+        # windows open: a pause between the ticker's prune and its idle or
+        # orphaned-plugin decision, one inside the idle decision after it
+        # decided to stop (under idle_lock, before `stopping` is set), and one
+        # inside a registration (server._registering)
+        self.stop_linger = _num(self.k, "stop_linger", STOP_LINGER)
+        self.idle_gap = _num(self.k, "idle_gap", 0.0)
+        self.idle_hold = _num(self.k, "idle_hold", 0.0)
+        self.register_gap = _num(self.k, "register_gap", 0.0)
+        # the idle decision and a session's registration, one at a time: a
+        # registration answered 200 is one the next idle decision counts, and
+        # one that comes after the decision to stop is refused (503 "stopping")
+        self.idle_lock = threading.Lock()
         if testing.get("e2e"):
             # the e2e suite's and the TUI harness's scratch copies: their run
             # dir goes when they finish, and the daemon with it, at once
@@ -361,6 +509,18 @@ class Daemon:
         self.remote.on_machine_change = self.terminals.machine_changed
         self.dialogs.handlers["unlock"] = self._unlock_answer
         self.dialogs.handlers["passphrase"] = self._passphrase_answer
+        if testing.active() is not None:
+            # the browser sign-in's test knobs (PLAN-0.11 §7.6, daemon/oauth.py): a
+            # program run instead of the system browser, the platform the display
+            # rule follows, a shorter wait, and a local authority (a fake OAuth server)
+            for name in ("browser", "browser_platform", "signin_timeout", "entra_authority"):
+                if self.k.get(name) is not None:
+                    testing.active().extra[name] = self.k[name]
+        from . import oauth
+        # the browser sign-in (PLAN-0.11 §7): at most one at a time
+        self.signins = oauth.SignIns(self)
+        from .offer import Offers
+        self.offers = Offers(self)            # the vault passphrase offer (PLAN-0.11 §8)
         self.routes = server.routes(bool(self.k.get("test_routes")) and testing.active() is not None)
         if self.k.get("test_entries") and testing.active() is not None:
             testing.active().extra["gated_test_entries"] = True
@@ -501,6 +661,9 @@ class Daemon:
              **self.terminals.counts()}
         if self.draining:
             h["draining"] = self.draining
+        if self.stopping.is_set():
+            # going away (ensure_running waits for it to go and starts a new one)
+            h["stopping"] = self.stop_reason or "exit"
         return h
 
     def locked_message(self, peer: Any) -> str:
@@ -520,7 +683,9 @@ class Daemon:
 
     # -- the vault's dialogs (unlock; set a passphrase) --------------------------
     UNLOCK_LINES = ["The gateway vault is locked. Type its passphrase to unlock it.",
-                    "It unlocks the vault on this computer only; Claude never sees what you type."]
+                    "It unlocks the vault on this computer only; Claude never sees what you type.",
+                    "Passphrase lost? Cancel, then gate passphrase --start-over (or ask Claude) "
+                    "moves this vault aside, nothing deleted, so you can start again."]
     SET_LINES = ["Set a passphrase for the gateway vault (at least 12 characters).",
                  "The vault key is then kept encrypted with it (age's scrypt), and only the "
                  "gateway daemon holds it unlocked; you type it again after a restart, a lock "
@@ -529,9 +694,43 @@ class Daemon:
                  "up again.",
                  "Type it in both fields. Claude never sees what you type."]
 
+    # Vault care from chat (PLAN-0.11 §19.14), all in gated's own dialogs:
+    # an unlocked vault's passphrase changed or removed (/gate-unlock's menu,
+    # or `gate passphrase [--remove]`), and a locked vault whose passphrase is
+    # lost started over (`gate passphrase --start-over`: its files moved
+    # into private/backups, nothing deleted).
+    MANAGE_WHAT = "vault passphrase menu"
+    CHANGE, REMOVE = "Change passphrase", "Remove passphrase"
+    MANAGE_LINES = ["The gateway vault is unlocked.",
+                    "Change passphrase: type a new one (the old one stops working). Remove "
+                    "passphrase: the vault key is kept without one again, so any program running "
+                    "as you can read the stored secrets.",
+                    "/gate-lock locks the vault now."]
+    CHANGE_WHAT = "vault passphrase change"
+    CHANGE_LINES = ["Type a new passphrase for the gateway vault (at least 12 characters).",
+                    "The old passphrase stops working. A forgotten passphrase can't be "
+                    "recovered.",
+                    "Type it in both fields. Claude never sees what you type."]
+    REMOVE_WHAT = "vault passphrase removal"
+    REMOVE_LINES = ["Remove the gateway vault's passphrase?",
+                    "The vault key is then kept without one (private/key.txt), so any program "
+                    "running as you, a script Claude writes included, can read the stored "
+                    "secrets. The gateway won't offer a passphrase again; /gate-unlock sets one "
+                    "any time.",
+                    "Cancel keeps the passphrase."]
+    START_OVER_WHAT = "vault start over"
+    START_OVER_LINES = ["Start the gateway vault over? Use this only when its passphrase is lost.",
+                        "The vault, its wrapped key and cache move into "
+                        "~/.config/gateway/private/backups/startover-... (nothing is deleted; "
+                        "the old passphrase still opens them there). gateway.toml stays.",
+                        "Afterwards nothing is stored or approved: import your last export, or "
+                        "set each entry up again (gate check NAME).",
+                        "Cancel changes nothing."]
+
     def vault_dialog(self, session: Any) -> dict[str, Any]:
-        """Open the unlock dialog (wrapped and locked) or the set-a-passphrase
-        dialog (unwrapped) in `session`; or say why neither applies."""
+        """/gate-unlock: the unlock dialog (wrapped and locked), the
+        set-a-passphrase dialog (unwrapped), or, unlocked, the menu to change
+        or remove the passphrase, in `session`; or say why none applies."""
         state = self.broker.state()
         if state == "locked":
             return self.dialogs.open_vault(session, "unlock", {
@@ -542,11 +741,101 @@ class Daemon:
                 "title": "Set a vault passphrase", "entry": "vault", "what": "new vault passphrase",
                 "lines": self.SET_LINES, "ok_label": "Set passphrase"})
         if state == "unlocked":
-            return {"ok": True, "available": False, "reason": "unlocked",
-                    "message": "gateway: the vault is unlocked already (/gate-lock locks it)"}
+            return self._open_gated(session, {
+                "title": "The gateway vault's passphrase", "entry": "vault",
+                "what": self.MANAGE_WHAT, "lines": self.MANAGE_LINES,
+                "options": [self.CHANGE, self.REMOVE]},
+                lambda _r, values: self._manage_answer(session, values), kind="choice")
         return {"ok": True, "available": False, "reason": "none",
                 "message": "gateway: there is no vault yet (it is made when the first credential "
                            "is stored)"}
+
+    def vault_passphrase(self, session: Any, action: Any) -> dict[str, Any]:
+        """`gate passphrase [--remove|--start-over]` (POST /agent/vault/passphrase):
+        "passphrase" sets one (no passphrase yet) or changes it (unlocked);
+        "remove" and "start-over" open their confirm dialogs. Each in gated's
+        own dialog in `session`, or why not."""
+        state = self.broker.state()
+
+        def no(reason: str, message: str) -> dict[str, Any]:
+            return {"ok": True, "available": False, "reason": reason, "message": message}
+        if action not in ("passphrase", "remove", "start-over"):
+            raise server._err(400, "bad_request", "gateway: unknown vault action")
+        if state == "none":
+            return no("none", "gateway: there is no vault yet (it is made when the first "
+                              "credential is stored)")
+        if action == "start-over":
+            if state != "locked":
+                return no(state, "gateway: the vault isn't locked behind a lost passphrase ("
+                          + ("unlocked: change or remove its passphrase with gate passphrase"
+                             if state == "unlocked" else "its key has no passphrase") + "); "
+                          "there is nothing to start over")
+            return self._open_gated(session, {
+                "title": "Start the gateway vault over?", "entry": "vault",
+                "what": self.START_OVER_WHAT, "lines": self.START_OVER_LINES,
+                "ok_label": "Start over", "default_cancel": True},
+                lambda _r, _v: self._start_over_answer(), kind="confirm")
+        if state == "locked":
+            return no("locked", "gateway: the vault is locked: /gate-unlock unlocks it first (a "
+                                "lost passphrase: gate passphrase --start-over)")
+        if action == "remove":
+            if state != "unlocked":
+                return no(state, "gateway: the vault key has no passphrase to remove")
+            return self._open_gated(session, {
+                "title": "Remove the vault passphrase?", "entry": "vault",
+                "what": self.REMOVE_WHAT, "lines": self.REMOVE_LINES,
+                "ok_label": "Remove passphrase", "default_cancel": True},
+                lambda _r, _v: self._remove_answer(), kind="confirm")
+        if state == "unwrapped":
+            return self.vault_dialog(session)
+        return self._open_change(session)
+
+    def _open_change(self, session: Any) -> dict[str, Any]:
+        return self.dialogs.open_vault(session, "passphrase", {
+            "title": "Change the vault passphrase", "entry": "vault", "what": self.CHANGE_WHAT,
+            "lines": self.CHANGE_LINES, "ok_label": "Change passphrase"})
+
+    def _open_gated(self, session: Any, spec: dict[str, Any], handler: Any, *,
+                    kind: str) -> dict[str, Any]:
+        """One of gated's own vault dialogs (owner "gated"), at most one of a
+        kind per session (a second ask shows the open one)."""
+        with self.dialogs.lock:
+            for r in self.dialogs._session_reqs(session):
+                if r.owner == "gated" and r.entry == "vault" and r.what == spec["what"]:
+                    return {"ok": True, "available": True, "id": r.id, "existing": True}
+        return self.dialogs.open_owned(session, spec, handler, kind=kind)
+
+    def _manage_answer(self, session: Any, values: list[str]) -> tuple[bool, str]:
+        choice = values[0] if values else ""
+        if choice == self.CHANGE:
+            if self.broker.state() != "unlocked":
+                return False, "the vault isn't unlocked any more"
+            r = self._open_change(session)
+            return True, "type the new one in the dialog that opened" if r.get("available") \
+                else str(r.get("message") or "no dialog could open").removeprefix("gateway: ")
+        if choice == self.REMOVE:
+            r = self.vault_passphrase(session, "remove")
+            return True, "confirm it in the dialog that opened" if r.get("available") \
+                else str(r.get("message") or "no dialog could open").removeprefix("gateway: ")
+        return False, "not one of the options"
+
+    def _remove_answer(self) -> tuple[bool, str]:
+        try:
+            self.broker.remove_passphrase()
+        except (brokermod.BrokerError, vault.VaultError) as e:
+            return False, str(e).removeprefix("gateway: ")
+        audit.log("vault_passphrase", outcome="removed")
+        return True, "the vault key has no passphrase now"
+
+    def _start_over_answer(self) -> tuple[bool, str]:
+        try:
+            dest = self.broker.start_over()
+        except (brokermod.BrokerError, vault.VaultError, OSError) as e:
+            return False, (str(e) if isinstance(e, (brokermod.BrokerError, vault.VaultError))
+                           else f"the files couldn't be moved ({type(e).__name__})"
+                           ).removeprefix("gateway: ")
+        audit.log("vault_start_over", outcome="moved", backup=paths.describe(dest))
+        return True, f"the old vault is in {paths.describe(dest)}; import your last export"
 
     def _unlock_answer(self, r: Any, values: list[str]) -> tuple[bool, str]:
         if self.broker.state() != "locked":
@@ -558,6 +847,13 @@ class Daemon:
         return True, "the vault is unlocked"
 
     def _passphrase_answer(self, r: Any, values: list[str]) -> tuple[bool, str]:
+        if getattr(r, "what", "") == self.CHANGE_WHAT:
+            try:
+                self.broker.change_passphrase(values[0])
+            except brokermod.BrokerError as e:
+                return False, str(e).removeprefix("gateway: ")
+            audit.log("vault_passphrase", outcome="changed")
+            return True, "the vault passphrase is changed"
         if self.broker.mode() != "unwrapped":
             return True, "the vault key has a passphrase already"
         try:
@@ -661,10 +957,10 @@ class Daemon:
                     rec["runtime_version"] = s["runtime_version"]
                     rec["platform"] = s.get("platform")
             if eff is not None:
-                # PLAN-v4 phase 7: each action's effective decision (policy.py)
-                from .. import policy
+                # PLAN-v4 phase 7: each action's effective decision (policy.py),
+                # in CONTRACT-v1's words (PLAN-0.11 §2.11)
                 try:
-                    rec["rights"] = policy.rights(eff, n)
+                    rec["rights"] = contract_rights(eff, host=n)
                 except Exception:  # noqa: BLE001
                     pass
             out.append(rec)
@@ -675,7 +971,7 @@ class Daemon:
         (adapters.summary: no network, never a value) and their policy
         decisions, for CONTRACT-v1 snapshots and /gate-accounts; a state that
         changed since the last look is published as `account.state`."""
-        from .. import adapters, policy
+        from .. import adapters
         try:
             data = self.broker.read(touch=False) if paths.vault_path().exists() else vault.empty()
         except Exception:  # noqa: BLE001 - locked: names and kinds only
@@ -700,7 +996,7 @@ class Daemon:
                    **{k: r[k] for k in ("login", "credential", "expires_at") if r.get(k)}}
             if eff is not None and r["account"] in eff.accounts:
                 try:
-                    rec["rights"] = policy.account_rights(eff, r["account"])
+                    rec["rights"] = contract_rights(eff, account=r["account"])
                 except Exception:  # noqa: BLE001
                     pass
             now[r["account"]] = r["state"]
@@ -715,18 +1011,15 @@ class Daemon:
         each entry's effective decisions compared with the last tick's; a
         rise is a widening the person approved, a fall a narrowing, a gone
         entry removed. Never a value, only names and words."""
-        from .. import consent, policy
         try:
             eff = self.effective()
             if eff is None:
                 return
             now: dict[str, int] = {}
             for n in eff.hosts:
-                now[n] = sum(consent.RANK.get({"allow": True, "ask": "ask"}.get(v, False), 0)
-                             for v in policy.rights(eff, n).values())
+                now[n] = sum(CONTRACT_RANK[v] for v in contract_rights(eff, host=n).values())
             for n in eff.accounts:
-                now[n] = sum(consent.RANK.get({"allow": True, "ask": "ask"}.get(v, False), 0)
-                             for v in policy.account_rights(eff, n).values())
+                now[n] = sum(CONTRACT_RANK[v] for v in contract_rights(eff, account=n).values())
             before = getattr(self, "_rights_seen", None)
             if before is not None:
                 for n, v in now.items():
@@ -757,9 +1050,21 @@ class Daemon:
             if eff is not None and h.get("name") in eff.form.hosts:
                 fh = eff.form.hosts[h["name"]]
                 h["user"] = fh.user() if not fh.is_local else ""
+            if eff is not None and h.get("name") in eff.hosts:
+                h["modes"] = ui_modes(eff.hosts[h["name"]].modes)
+                try:
+                    h["policy_modes"] = ui_policy_modes(eff, host=h["name"])
+                except Exception:  # noqa: BLE001 - the pane shows the modeless words then
+                    pass
         accts = self.accounts()
         for a in accts:
             a["pending"] = pending.get(a["account"], [])[:20]
+            if eff is not None and a["account"] in eff.accounts:
+                a["modes"] = ui_modes(eff.accounts[a["account"]].modes)
+                try:
+                    a["policy_modes"] = ui_policy_modes(eff, account=a["account"])
+                except Exception:  # noqa: BLE001
+                    pass
         return {"ok": True, "hosts": hosts, "workspaces": self.workspaces(), "accounts": accts,
                 "settings_pending": pending.get("settings", [])[:20]}
 
@@ -795,7 +1100,7 @@ class Daemon:
         self.events.emit("daemon.stopping", reason=reason)
 
         def _down() -> None:
-            time.sleep(0.05)                  # let the answer go out first
+            time.sleep(self.stop_linger)      # let the answer go out first
             if self.server is not None:
                 self.server.shutdown()
         threading.Thread(target=_down, daemon=True).start()
@@ -920,6 +1225,39 @@ class Daemon:
             return "the plugin folder it runs from is orphaned (uninstalled) and no session uses it"
         return ""
 
+    def _idle_stop(self, busy: str) -> bool:
+        """The idle decision, under idle_lock: a session registered since
+        the tick's prune counts (registry.count()), so a registration that was
+        answered 200 never meets an idle exit; one that comes after this
+        decision finds `stopping` set and is refused (server._registering).
+        True when it decided to stop."""
+        with self.idle_lock:
+            if self.registry.count() or busy:
+                self.last_busy = time.monotonic()
+                return False
+            if time.monotonic() - self.last_busy < self.idle_exit:
+                return False
+            if self.idle_hold:
+                self.log(f"idle: stopping in {self.idle_hold:g} s")   # the test knob's window
+                time.sleep(self.idle_hold)
+            self.log(f"no live session for {int(self.idle_exit)} s: exiting")
+            self.stop_soon("idle")
+            return True
+
+    def _orphan_stop(self, busy: str) -> bool:
+        """The orphaned plugin's exit (`.orphaned_at`, no live session, nothing
+        running), decided under idle_lock like the idle exit: a session
+        registered since the tick's prune counts (registry.count()), and a
+        registration after the decision is refused (server._registering).
+        True when it decided to stop."""
+        with self.idle_lock:
+            if busy or not self.plugin_orphaned(self.registry.count()):
+                return False
+            self.log("the plugin folder it runs from is orphaned (uninstalled or replaced) and "
+                     "no session uses it: exiting")
+            self.stop_soon("plugin removed")
+            return True
+
     def _ticker(self) -> None:
         while not self.stopping.wait(self.tick_s):
             try:
@@ -957,21 +1295,27 @@ class Daemon:
                 if not replaced:
                     self.watch_rights()          # it imports from the code folder
                 live = self.registry.prune()
-                if self.plugin_orphaned(live) and not self.busy():
-                    self.log("the plugin folder it runs from is orphaned (uninstalled or replaced) and "
-                             "no session uses it: exiting")
-                    self.stop_soon("plugin removed")
-                    return
+                if self.plugin_orphaned(live):
+                    busy = self.busy()
+                    if not busy:
+                        if self.idle_gap:
+                            self.log(f"orphaned: deciding in {self.idle_gap:g} s")   # the test knob's window
+                            time.sleep(self.idle_gap)
+                        if self._orphan_stop(busy):
+                            return
+                        live = self.registry.count()      # a session registered meanwhile
                 why = self.uninstalled_reason(live)
                 if why:
                     self.drain(why)
                     continue
                 self.dialogs.tick()
-                if live or self.busy():
-                    self.last_busy = time.monotonic()
-                elif time.monotonic() - self.last_busy >= self.idle_exit:
-                    self.log(f"no live session for {int(self.idle_exit)} s: exiting")
-                    self.stop_soon("idle")
+                busy = self.busy()
+                if self.idle_gap and not (live or busy) and \
+                        time.monotonic() - self.last_busy >= self.idle_exit:
+                    self.log(f"idle: deciding in {self.idle_gap:g} s")   # the test knob's window
+                    time.sleep(self.idle_gap)
+                if self._idle_stop(busy):
+                    return
             except Exception as e:  # noqa: BLE001 - the ticker never dies
                 self.log(f"tick failed: {type(e).__name__}")
 
@@ -1075,6 +1419,8 @@ class Daemon:
                 self.stop_reason = self.stop_reason or "exit"
                 self.stopping.set()
                 self.events.emit("daemon.stopping", reason=self.stop_reason)
+            with contextlib.suppress(Exception):
+                self.signins.stop_all()          # its listener closed, signin-active removed
             self.terminals.stop()
             self.remote.stop()
             if self.stop_reason == "socket gone":
@@ -1180,6 +1526,22 @@ def _parent_facts(ppid: int) -> dict[str, Any]:
     return out
 
 
+def _started(h: dict[str, Any]) -> dict[str, Any]:
+    """`gated start`'s answer: the daemon's health, other_config, and the
+    facts about its parent."""
+    out = dict(h)
+    note = planes.other_config_note(out)
+    if note:
+        out["other_config"] = note
+    # The mod runs `launch.sh gated start` through $.process.run; launch.sh
+    # execs Python, so the parent is the Claude Code process the mod runs in
+    # when the engine starts children directly (named only when it is a
+    # Claude Code executable; the daemon checks the claim against the
+    # kernel's peer pid either way).
+    out.update(_parent_facts(os.getppid()))
+    return out
+
+
 def main(args: list[str]) -> int:
     """run.py gated serve [--detach] | start [--register] | status | stop."""
     sub = args[0] if args else "status"
@@ -1194,20 +1556,15 @@ def main(args: list[str]) -> int:
         except paths.PathError as e:
             print(json.dumps(_run_dir_refused(e), sort_keys=True))
             return 1
-        out = dict(h)
-        note = planes.other_config_note(out)
-        if note:
-            out["other_config"] = note
-        # The mod runs `launch.sh gated start` through $.process.run; launch.sh
-        # execs Python, so the parent is the Claude Code process the mod runs in
-        # when the engine starts children directly (named only when it is a
-        # Claude Code executable; the daemon checks the claim against the
-        # kernel's peer pid either way).
-        out.update(_parent_facts(os.getppid()))
+        out = _started(h)
         if "--register" in args[1:]:
             try:
                 r = client.call("POST", "/agent/register",
                                 {"session_id": os.environ.get("CLAUDE_CODE_SESSION_ID", "")})
+                # refused as stopping, it went to a new daemon (client.call): that one's health
+                now = client.health(timeout=1.0)
+                if now is not None and now.get("pid") != h.get("pid"):
+                    out = _started(_skew(now, plugin_version()))
                 out["registered"] = r.get("registered")
             except client.DaemonError as e:
                 out["registered"] = None

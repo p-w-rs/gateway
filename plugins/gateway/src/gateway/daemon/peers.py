@@ -145,27 +145,22 @@ def exe_is_claude(e: str) -> bool:
 
 
 def is_claude(pid: int) -> bool:
-    """Is `pid` a Claude Code process: by executable path, or node running
-    npm's cli.js (an npm install before 2.1.113; by its argv, read from the
-    kernel: ancestry.is_claude_node)?"""
+    """Is `pid` a Claude Code process, by its executable path?"""
     e = exe(pid)
-    if not e:
-        return False
-    return exe_is_claude(e) or ancestry.is_claude_node(e, argv(pid))
+    return bool(e) and exe_is_claude(e)
 
 
 def claude_install(pid: int) -> str:
     """How the Claude Code process `pid` was installed, in words for
     /gate-doctor ("" when it isn't recognized as Claude Code)."""
     e = exe(pid)
-    if not e or not is_claude(pid):
+    if not e or not exe_is_claude(e):
         return ""
-    av = argv(pid)
     for h in _homes():
-        kind = ancestry.claude_install(e, av, h)
+        kind = ancestry.claude_install(e, h)
         if kind and not kind.startswith("an executable named"):
             return kind
-    return ancestry.claude_install(e, av)
+    return ancestry.claude_install(e)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +170,8 @@ def claude_install(pid: int) -> str:
 # run.py modes a gateway process may run in (run.py's dispatch). "shim" is
 # followed by the stand-in's name.
 HOOK_MODES = ("hook-session", "hook-session-async", "hook-subagent", "hook-bash", "hook-files",
-              "hook-post", "hook-prompt", "hook-filechanged", "hook-daemon")
+              "hook-post", "hook-prompt", "hook-filechanged", "hook-daemon", "hook-mcp",
+              "hook-mode")
 ENTRY_MODES = HOOK_MODES + ("mcp", "shim", "askpass", "git-credential", "gate", "gated")
 
 

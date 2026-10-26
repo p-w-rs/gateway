@@ -61,19 +61,42 @@ def test_edit_saves_only_on_change_and_lock_serializes():
         assert vault.load()["counter"] == 5
 
 
-def test_save_refuses_new_vault_while_v2_waits():
+def test_save_refuses_a_new_vault_beside_a_gateway_06_vault():
+    """The kept 0.6 detector: while store.age is here and vault.age isn't,
+    no vault is created (gateway 0.10.0 converts it first), whatever the
+    caller; once a vault exists, a leftover store.age changes nothing."""
     with H.gateway_env():
         paths.ensure_home()
         paths.v2_store_path().write_bytes(b"v2 ciphertext")
+        assert vault.v06_waiting()
         try:
             vault.save(vault.empty())
         except vault.VaultError as e:
-            assert "migrat" in str(e)
+            assert str(e) == vault.V06_MESSAGE == (
+                "gateway: a gateway 0.6 vault is here; convert it with gateway 0.10.0 first "
+                "(see CHANGELOG 0.11.0)"), str(e)
         else:
             raise AssertionError("must not create vault.age while store.age waits")
         assert not vault.exists()
-        vault.save(vault.empty(), migrating=True)
-        assert vault.exists()
+        # no way around it: no flag on save, gated's write or its client (the
+        # daemon's write route took a "migrating" field from any client)
+        import inspect
+        from gateway.daemon import broker, client
+        assert list(inspect.signature(vault.save).parameters) == ["data"]
+        assert list(inspect.signature(broker.Broker.write).parameters) == ["self", "data"]
+        assert list(inspect.signature(client.vault_write).parameters) == ["data"]
+        try:
+            broker.Broker().write(vault.empty())
+        except vault.VaultError as e:
+            assert str(e) == vault.V06_MESSAGE
+        else:
+            raise AssertionError("gated's write created vault.age while store.age waits")
+        assert not vault.exists()
+        paths.v2_store_path().unlink()
+        assert not vault.v06_waiting()
+        vault.save(vault.empty())
+        paths.v2_store_path().write_bytes(b"left over")
+        assert not vault.v06_waiting()
         vault.save(vault.load())  # an existing vault may be saved
 
 
@@ -203,35 +226,46 @@ def test_load_rejects_wrong_version_and_missing_key():
             raise AssertionError("missing key must fail")
 
 
-def test_the_baseline_mark_new_vaults_carry_and_every_writer_keeps():
-    """A new vault (empty(), also what a missing vault loads as) carries the
-    baseline mark and keeps it through save, load and edit; an older vault
-    (written without it) never gets it from a load, an edit or a save; export
-    leaves it out (this machine's); older_install tells them apart (no vault
-    and anything that isn't a vault document count as new)."""
-    old = {"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {}, "accounts": {},
-           "approved": {}, "form_last_good": None, "aliases": {}, "events": [],
-           "events_seen": 0, "migrated": None}
-    with H.gateway_env():
-        assert vault.empty()[vault.BASELINE_KEY] == vault.BASELINE
-        assert vault.load()[vault.BASELINE_KEY] == vault.BASELINE, "no vault loads as a new one"
-        with vault.edit() as d:
-            d["aliases"]["a"] = "b"
-        assert vault.load()[vault.BASELINE_KEY] == vault.BASELINE
-        assert not vault.older_install(vault.load())
-        assert vault.BASELINE_KEY not in vault.export_view(vault.load())
+def test_vaults_carry_no_install_marks_and_export_only_their_secrets():
+    """A new vault has no install mark and no 0.6 conversion record; a vault
+    an older gateway wrote with them (`baseline`, `migrated`, `imported`)
+    loads, edits and saves as any other (the fields are left alone, never
+    read), and export_view carries only what an export needs, so the
+    import's strict check never meets them."""
+    old = {"version": 3, "machine": {"id": "m"}, "localhost": {"sudo": {}}, "hosts": {},
+           "accounts": {}, "approved": {}, "form_last_good": None, "aliases": {"a": "b"},
+           "events": [], "events_seen": 0, "migrated": {"from": "v2", "at": "2026-10-01"},
+           "baseline": 2, "imported": {"rights": {}}, "sudo_choice": {}}
+    assert set(vault.empty()) == {"version", "machine", "localhost", "hosts", "accounts",
+                                  "approved", "form_last_good", "aliases", "events",
+                                  "events_seen"}
+    for name in ("BASELINE", "BASELINE_KEY", "older_install"):
+        assert not hasattr(vault, name), name
     with H.gateway_env():
         vault.save(json.loads(json.dumps(old)))
-        d = vault.load()
-        assert vault.BASELINE_KEY not in d and vault.older_install(d), "load adds no mark"
         with vault.edit() as d:
-            d["aliases"]["a"] = "b"
+            d["aliases"]["c"] = "d"
         d = vault.load()
-        assert d["aliases"] == {"a": "b"} and vault.BASELINE_KEY not in d
-        vault.save(d)
-        assert vault.older_install(vault.load())
-    assert not vault.older_install(None) and not vault.older_install({})
-    assert not vault.older_install({"approved": {}}), "not a vault document"
-    assert vault.older_install({**old, vault.BASELINE_KEY: 1})
-    assert vault.older_install({**old, vault.BASELINE_KEY: True})
-    assert not vault.older_install({**old, vault.BASELINE_KEY: vault.BASELINE + 1})
+        assert d["aliases"] == {"a": "b", "c": "d"}
+        assert set(vault.export_view(d)) == set(vault.EXPORT_KEYS) == {
+            "version", "localhost", "hosts", "accounts", "aliases"}
+
+
+def test_sudo_choice_takes_only_password_and_ask():
+    """`gate check`'s sudo choice is "password" or "ask"; "nopasswd" (when the
+    gateway still installed a sudoers rule) is neither read nor written."""
+    d = vault.empty()
+    vault.set_sudo_choice(d, "localhost", "me", "ask")
+    assert vault.sudo_choice(d, "localhost", "me") == "ask"
+    vault.set_sudo_choice(d, "localhost", "me", "password")
+    assert vault.sudo_choice(d, "localhost", "me") == "password"
+    d["sudo_choice"]["localhost"]["me"] = "nopasswd"
+    assert vault.sudo_choice(d, "localhost", "me") is None
+    try:
+        vault.set_sudo_choice(d, "localhost", "me", "nopasswd")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nopasswd accepted")
+    vault.set_sudo_choice(d, "localhost", "me", None)
+    assert vault.sudo_choice(d, "localhost", "me") is None and "localhost" not in d["sudo_choice"]

@@ -1,26 +1,31 @@
 # Capability matrix
 
-What the gateway (`gate@gateway`) does on each Claude Code surface, from which
-version, and what still works when mods are off. Mods (hooks modules) are an
+What the gateway (`gate@gateway`) does on each Claude Code surface, and what
+still works when mods are off. Mods (hooks modules) are an
 early-access Claude Code feature that Anthropic can switch off remotely, so
 every security control lives in the classic hooks and holds without them; the
 mod adds the status line, provisioning at session start, the session's
-registration on the gateway daemon's UI plane, `/gate-doctor` and the
-gateway's dialogs (PLAN-v4 phase 3). Without mods nothing can be asked: a
-credential, a consent or a host key that needs the person is reported as
-unavailable (what is needed and where it can be given), never asked another
-way. `/gate-doctor` prints the rows for the surfaces it runs on
+registration on the gateway daemon's UI plane, `/gate-doctor`, the
+gateway's dialogs (PLAN-v4 phase 3) and the managed shell. Without mods
+nothing can be asked: a credential, a consent or a host key that needs the
+person is reported as unavailable (what is needed and where it can be
+given), never asked another way; Claude's commands then run in the user's
+own shell, still judged by the classic hooks (since 0.11.0; before, they
+were refused). `/gate-doctor` prints the rows for the surfaces it runs on
 (`hooks/mod/lib.ts`, `CAPABILITIES`; a test keeps that table and this one in
 step).
 
 Cells: **yes** works, and was exercised on macOS arm64 with Claude Code
-2.1.301 (2026-10-19: repo suites, the e2e suite, or a real interactive session
+2.1.301 (and for 0.11.0 with 2.1.310) (2026-10-19: repo suites, the e2e suite, or a real interactive session
 driven in a PTY against a local fake API); **untested** expected to work, not
 exercised; **no** not available on that surface; **planned** a later
 [PLAN-v4](dev/PLAN-v4.md) phase. "-p / SDK" is `claude -p` and SDK hosts (no
 surface draws); "Remote Control" a session driven from another device.
+Only the newest Claude Code is supported, so the table names no minimum
+versions; `/gate-doctor` names the Claude Code this release was tested with.
 The cells are the doctor's own table as shipped in plugin 0.9.0, unchanged
-in 0.10.0 (they change only with the code). The live acceptance of 2026-10-21 (installed copies,
+in 0.10.0 and 0.11.0 (they change only with the code; 0.11.0's live runs
+are in [TESTING.md](dev/TESTING.md)). The live acceptance of 2026-10-21 (installed copies,
 macOS 2.1.301 and the Debian 13 arm64 VM's 2.1.304; PLAN-v4's matrix) later
 exercised more on the terminal surface than the cells claim: the stand-ins
 and the http tool (`acceptance_canaries.py`), the policy and export/import
@@ -30,22 +35,22 @@ other way round. The desktop app, VS Code, mobile and Remote Control were
 not driven at all (no way to drive them from the test harness; the desktop
 app needs a manual check).
 
-| Feature | terminal | desktop | VS Code | mobile | -p / SDK | Remote Control | minimum | without mods |
-|---|---|---|---|---|---|---|---|---|
-| Bash approval hook, file guard, output masking, paste guard (classic hooks) | yes | untested | untested | untested | yes | untested | 2.1.299 (tested) | yes |
-| Stand-ins on PATH (sudo, ssh, git, gh, ...) and the gw MCP tools (http, download) | untested | untested | untested | untested | yes | untested | 2.1.299 (tested) | yes |
-| Cold-start guard while the env builds (sh, no Python) | yes | untested | untested | untested | yes | untested | 2.1.301 (tested) | yes |
-| /gate:status and /gate:help (Markdown commands, a model turn) | untested | untested | untested | untested | untested | untested | 2.1.299 (tested) | yes |
-| /gate-doctor (immediate, no model turn) | yes | untested | untested | untested | yes | untested | 2.1.287 terminal, 2.1.286 desktop | no |
-| Setup status line and provisioning at session start (mod) | yes | untested | untested | untested | no | untested | 2.1.287 terminal, 2.1.286 desktop | no |
-| Gateway daemon (gated): CONTRACT-v1 discovery, snapshot and events; the vault broker | yes | untested | untested | untested | untested | untested | 2.1.301 (tested) | yes |
-| Native gateway dialogs: credential field with sealed delivery, consent, host key, vault passphrase; /gate-dialog, /gate-unlock, /gate-lock | yes | untested | no | no | no | no | 2.1.301 (tested) | no |
-| Managed shell (CLAUDE_CODE_SHELL_PREFIX -> gate-sh): Bash, background, ! commands, subagents, skill injection | yes | untested | untested | untested | yes | untested | 2.1.301 (tested) | no |
-| Terminals and jobs (tmux supervisor in gated): gw terminal_* and job_* tools, CONTRACT-v1 job routes, password prompts through the dialog | yes | untested | untested | untested | untested | untested | 2.1.301 (tested) | yes |
-| Remote terminals and jobs (the managed remote runtime over ssh): host on terminal_open, job_start and CONTRACT-v1 jobs, host_runtime, the host key and machine checks | untested | untested | untested | untested | untested | untested | 2.1.299 (the gw tools) | yes |
-| Shared terminal pane and takeover (Client): /gate-terminal | yes | untested | no | no | no | no | 2.1.301 (tested) | no |
-| Policy (allow, ask, deny per host, workspace, account and action), workspaces, forwarding grants, account states, export and import format 3 | untested | untested | untested | untested | untested | untested | 2.1.299 (the hooks and stand-ins) | yes |
-| Hosts and accounts panes (immediate): /gate-hosts, /gate-accounts | untested | untested | no | no | no | no | 2.1.287 terminal, 2.1.286 desktop | no |
+| Feature | terminal | desktop | VS Code | mobile | -p / SDK | Remote Control | without mods |
+|---|---|---|---|---|---|---|---|
+| Bash approval hook, file guard, output masking, paste guard (classic hooks) | yes | untested | untested | untested | yes | untested | yes |
+| Stand-ins on PATH (sudo, ssh, git, gh, ...) and the gw MCP tools (http, download) | untested | untested | untested | untested | yes | untested | yes |
+| Cold-start guard while the env builds (sh, no Python) | yes | untested | untested | untested | yes | untested | yes |
+| /gate:status and /gate:help (Markdown commands, a model turn) | untested | untested | untested | untested | untested | untested | yes |
+| /gate-doctor (immediate, no model turn) | yes | untested | untested | untested | yes | untested | no |
+| Setup status line and provisioning at session start (mod) | yes | untested | untested | untested | no | untested | no |
+| Gateway daemon (gated): CONTRACT-v1 discovery, snapshot and events; the vault broker | yes | untested | untested | untested | untested | untested | yes |
+| Native gateway dialogs: credential field with sealed delivery, consent, host key, vault passphrase; /gate-dialog, /gate-unlock, /gate-lock | yes | untested | no | no | no | no | no |
+| Managed shell (CLAUDE_CODE_SHELL_PREFIX -> gate-sh): Bash, background, ! commands, subagents, skill injection | yes | untested | untested | untested | yes | untested | no |
+| Terminals and jobs (tmux supervisor in gated): gw terminal_* and job_* tools, CONTRACT-v1 job routes, password prompts through the dialog | yes | untested | untested | untested | untested | untested | yes |
+| Remote terminals and jobs (the managed remote runtime over ssh): host on terminal_open, job_start and CONTRACT-v1 jobs, host_runtime, the host key and machine checks | untested | untested | untested | untested | untested | untested | yes |
+| Shared terminal pane and takeover (Client): /gate-terminal | yes | untested | no | no | no | no | no |
+| Policy (allow, ask, deny per host, workspace, account and action), workspaces, forwarding grants, account states, export and import format 3 | untested | untested | untested | untested | untested | untested | yes |
+| Hosts and accounts panes (immediate): /gate-hosts, /gate-accounts | untested | untested | no | no | no | no | no |
 
 ## Notes per row
 
@@ -99,8 +104,8 @@ app needs a manual check).
   The daemon's own tests also ran on Linux (Debian 13 arm64, SO_PEERCRED).
   The UI plane needs the mod; everything else works without it.
   Since 0.10.0 it recognizes a Claude Code installed with npm
-  (`@anthropic-ai/claude-code`: its `bin/claude.exe`, or `node` running its
-  `cli.js`) besides the native installer and the desktop app; `/gate-doctor`
+  (`@anthropic-ai/claude-code`: its `bin/claude.exe`) besides the native
+  installer and the desktop app; `/gate-doctor`
   names the install it found (the repo tests use a fake npm layout; no real
   npm install was driven). One daemon per user serves one Claude Code
   configuration (`CLAUDE_CONFIG_DIR`) at a time: sessions of another
@@ -112,23 +117,34 @@ app needs a manual check).
   session (SessionStart and the Bash hook's cold-start denies); `-p` by the
   e2e suite (`pixi run e2e`). They run on the machine that runs Claude Code,
   so a remote surface (mobile, Remote Control) gets the same decisions; that
-  is not exercised.
+  is not exercised. Since 0.11.0 they also mask every tool's output (post.sh
+  skips only tools whose response is fixed text or Claude's own input),
+  refuse an AskUserQuestion that asks for a secret, and refuse the
+  browser-automation tools while a browser sign-in runs
+  (`hooks/tool_guard.sh`); the Browser pane and Claude in Chrome payloads are
+  tested from recorded payloads only (desktop-only tools).
 - **Stand-ins and gw tools.** `-p` by the e2e suite (ssh, git, http, sudo
   scenarios against local servers). An interactive session runs the same
   hooks and env file; on the terminal surface the http tool (a stored key
   sent to a local service, `Bearer ***` in the result) and the sudo
   stand-in's dialog were exercised live on 2026-10-21
-  (`tests/acceptance_canaries.py`, macOS and the VM). Since 0.10.0 the
-  gateway gives the `http` and `download` tools no permission decision in
-  any mode: Claude Code's mode decides (a prompt in default and plan mode,
-  the reviewer in auto mode).
+  (`tests/acceptance_canaries.py`, macOS and the VM). Since 0.11.0 a
+  stand-in is on PATH only for a tool that can reach something gateway.toml
+  configures, and passes everything else to the user's own tool; the `http`
+  and `download` tools get deny or ask from the `network` policy in the
+  payload's mode, allow only for the user's explicit per-mode allow, and
+  otherwise no decision (Claude Code's mode decides).
 - **Cold-start guard.** While no env can run Python, launch.sh's
-  `degraded_bash` denies, by text: anything naming the gateway's private
-  folder or `~/.config/gateway` other than `gateway.toml`, session
+  `degraded_bash` decides by text: it denies anything naming the gateway's
+  private folder or `~/.config/gateway` other than `gateway.toml`, session
   transcripts, credential helpers / `age -d` / access tokens / token-bearing
-  command lines, and curl/wget once a vault exists ("still setting up" in
-  the reason). Exercised in an interactive session and in `claude -p` with
-  pixi hidden (so the env never built), 2026-10-19.
+  command lines ("still setting up" in the reason), and asks about network
+  commands (denies them while gateway.toml has a `[network]` table, whose
+  value sh can't read). The stand-ins it writes exist only while
+  gateway.toml may configure something and say "still setting up" (sudo's
+  runs the real sudo, which gets nothing from the gateway). Exercised in an
+  interactive session and in `claude -p` with pixi hidden (so the env never
+  built), 2026-10-19, before the 0.11.0 network rule.
 - **`/gate-doctor`.** A mod command: `$.command.register` takes letters,
   digits, `_` and `-` only, so not `/gate:doctor` (a colon is refused, and
   the engine doesn't prefix a mod's command with the plugin name), and
@@ -147,7 +163,12 @@ app needs a manual check).
 - **Native gateway dialogs (PLAN-v4 phase 3).** Every question the
   gateway asks is a pane inside Claude Code, drawn by the mod from requests
   the gateway daemon holds (docs/dev/modules/daemon.md, "Dialogs"); no OS
-  dialog, terminal prompt or browser opens. A secret is typed into a
+  dialog or terminal prompt opens, and the system browser only for a
+  browser sign-in (azure with `sign_in = "browser"`, ml-catalog; 0.11.0),
+  after the person presses Open in the gateway's confirm dialog. 0.11.0
+  adds that confirm and the vault passphrase offer (repo suites:
+  `test_accounts_entra`, `test_accounts_asiml`, `test_offer`; live runs in
+  [TESTING.md](dev/TESTING.md)). A secret is typed into a
   `Client` field (keys reach only it, after a click; bullets drawn) and
   leaves it sealed to the request's own key (TweetNaCl box; gated opens it
   with PyNaCl). `Client` exists on the terminal and desktop surfaces only.
@@ -159,8 +180,9 @@ app needs a manual check).
   painted draft: DECISIONS "Acceptance fixes"). Claude Code 2.1.301
   reports clicks only in its fullscreen layout, so on the terminal's main
   screen (`CLAUDE_CODE_NO_FLICKER=0`, tmux) the field isn't drawn: the
-  dialog says to start with `CLAUDE_CODE_NO_FLICKER=1` or to use Paste from
-  clipboard, which works from the keyboard (`/gate-dialog`, Tab, Enter).
+  dialog says to type `/tui fullscreen` (Claude Code's own command; it
+  restarts and resumes the session) or to use Paste from clipboard, which
+  works from the keyboard (`/gate-dialog`, Tab, Enter).
   Paste leaves the value on the clipboard (the main-screen dialog, a toast
   after each Paste and `/gate-doctor` say so).
   On Linux without `DISPLAY` or `WAYLAND_DISPLAY` Paste can't work, so on the
@@ -176,9 +198,12 @@ app needs a manual check).
   `CLAUDE_CODE_SHELL` to the gateway env's bash) at session start
   ([FEASIBILITY-v4](dev/FEASIBILITY-v4.md) P2, docs/dev/modules/managed.md): every
   command Claude Code starts through its shell runs in the gateway's bash 5
-  with the gateway rc and a curated environment, never the login shell or its
-  snapshot; classic hook strings and MCP server commands pass through gate-sh
-  exactly as `/bin/sh -c`. The terminal cell: `tests/acceptance_managed.py`
+  with the gateway rc; since 0.11.0 with the user's own environment (minus
+  Claude Code's credentials and the shell's startup variables) and a bash
+  snapshot's aliases and functions, the stand-ins unshadowable; classic hook
+  strings and MCP server commands pass through gate-sh exactly as `/bin/sh
+  -c`. The terminal cell (0.10.0's curated environment):
+  `tests/acceptance_managed.py`
   (real interactive sessions through the TUI harness, 2026-10-20, 38 of 38):
   the Bash tool, `run_in_background`, a subagent's Bash, the user's `!`
   command and a skill's `!` injection all ran in the managed bash; a probe
@@ -191,13 +216,13 @@ app needs a manual check).
   shell function as Bash (`Rue(..., "bash")` in 2.1.301), not exercised.
   Desktop, VS Code, mobile and Remote Control: the prefix is set in the
   Claude Code process the mod runs in, so surfaces attached to it should get
-  it too; not exercised. Without mods (switched off, or Claude Code older than
-  2.1.287) nothing sets the prefix: the classic Bash hook denies Bash and
-  Monitor with "managed shell unavailable" in managed mode (`[shell] managed
-  = "on"`, the default), or lets them run in the user's own shell with a
-  notice once per session when `managed = "warn"` was approved; the user's
-  `!` commands and skills' `!` injection reach no hook there and run in the
-  user's shell (a known limit, in the acceptance run too). Not managed by
+  it too; not exercised. Without mods nothing sets the prefix: since 0.11.0
+  Bash and Monitor run in the user's own shell with a notice once per
+  session, with the env file's stand-ins first and Claude Code's own
+  credential variables unset, and the classic Bash hook judges them as
+  usual (0.10.0 refused them: "managed shell unavailable"); the user's `!`
+  commands and skills' `!` injection reach no hook there (a known limit).
+  Not managed by
   design: the desktop app's Terminal panel (the user's own shell) and
   checkpoint's own job runner (its own shell with env.sh), which checkpoint
   uses only when the gateway doesn't serve its session; otherwise checkpoint
@@ -235,7 +260,7 @@ app needs a manual check).
 
 | | |
 |---|---|
-| Local | macOS (arm64, x86-64) and Linux (x86-64, aarch64): the lock covers osx-arm64, osx-64, linux-64, linux-aarch64. Tested: macOS arm64 (repo suites, the TUI acceptance runs); Linux aarch64 (Debian 13 VM: the whole repo suite, gate-sh with dash and bash, and the TUI acceptance runs through Claude Code 2.1.304, installed from a git marketplace with pixi's git: dialogs, canaries, managed, install, native UI, terminals, 2026-10-21). x86-64 (Intel Macs, Linux x86-64): untested, no such machine here. Remote hosts: linux-aarch64 (the VM) and osx-arm64 (a local sshd) tested at the daemon level; linux-64 and osx-64 untested. |
+| Local | macOS (arm64, x86-64) and Linux (x86-64, aarch64): the lock covers osx-arm64, osx-64, linux-64, linux-aarch64. Tested: macOS arm64 (repo suites, the TUI acceptance runs); Linux aarch64 (Debian 13 VM: the whole repo suite, gate-sh with dash and bash, and the TUI acceptance runs through Claude Code 2.1.304, installed from a git marketplace with pixi's git: dialogs, canaries, managed, install, native UI, terminals, 2026-10-21; for 0.11.0 the same on Claude Code 2.1.310, 2026-10-25: [TESTING.md](dev/TESTING.md)). x86-64 (Intel Macs, Linux x86-64): untested, no such machine here. Remote hosts: linux-aarch64 (the VM) and osx-arm64 (a local sshd) tested at the daemon level; linux-64 and osx-64 untested. |
 | Windows | Native Windows unsupported (POSIX `sh` hooks, no win-64 in the lock, POSIX-only Python modules). Remedy: WSL 2, where the Linux rules apply. |
-| pixi | `requires-pixi = ">=0.68.0"`, no upper bound. Tested 2026-10-19 with the launcher's own `pixi install --locked --manifest-path` on a copy: 0.68.0, 0.69.0, 0.70.0, 0.81.0, 0.82.0 install the lock (format v7) unchanged; 0.61.0-0.67.0 refuse it. `/gate-doctor` warns (doesn't fail) for a pixi newer than 0.82.0. |
+| pixi | `requires-pixi = ">=0.83.0"`, the pixi the lock was made with (latest only: every dependency is `"*"`, relocked by `pixi run update-deps`), no upper bound. Tested 2026-10-23 with the launcher's own `pixi install --locked --manifest-path` on a copy: 0.83.0 installs the lock (format v7) unchanged; 0.81.0 refuses the manifest ("requires pixi"), which the launcher reports as pixi too old (`pixi self-update`). `/gate-doctor` warns for a pixi older than the tested one and notes a newer one. |
 | git | Claude Code needs `git` to add or update a git/GitHub marketplace. `pixi global install git` provides it (verified on macOS and the VM: marketplace add, install, update, disable, enable, uninstall with only pixi's git on PATH; without git, `Executable not found in $PATH: "git"`). It lands in `~/.pixi/bin`, which pixi's installer normally puts on PATH; the VM's pixi hadn't, so there `PATH="$HOME/.pixi/bin:$PATH"` was needed for `claude plugin marketplace add|update`. The update itself (`claude plugin update` after `marketplace update`, in a new process with the ordinary PATH) made no pixi call and reused the built env (acceptance 2026-10-21). |

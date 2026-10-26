@@ -13,12 +13,16 @@ name = "gateway-runtime"
 channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
 
+# Latest only (PLAN-0.11 section 5): bash and tmux are "*", the newest at the
+# last relock (`pixi run update-deps` in the plugin folder); pixi-unpack is
+# exactly the main lock's pixi-pack (one repository, one version; update-deps
+# writes it and test_packaging compares them on every platform).
 [dependencies]
-bash = "5.*"             # the remote managed shell (no profile, no user rc)
-tmux = "3.*"             # the remote supervisor: a private socket under the runtime folder
+bash = "*"               # the remote managed shell (no profile, no user rc)
+tmux = "*"               # the remote supervisor: a private socket under the runtime folder
 
 [feature.unpacker.dependencies]
-pixi-unpack = "0.7.*"    # unpacks the runtime pack on the host (with its openssl and libgcc)
+pixi-unpack = "==0.7.11" # unpacks the runtime pack on the host (with its openssl and libgcc)
 
 [environments]
 unpacker = { features = ["unpacker"], no-default-feature = true }

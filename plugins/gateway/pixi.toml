@@ -8,26 +8,28 @@
 name = "gateway"
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
-# pixi.lock is format v7. Tested (2026-10-19, macOS arm64, the launcher's own
-# `pixi install --locked --manifest-path` on a copy, scratch cache): 0.68.0,
-# 0.69.0, 0.70.0, 0.81.0 and 0.82.0 install it unchanged; 0.61.0-0.67.0 refuse
-# ("Lock-file version 7 is newer than supported"). No upper bound: one would
-# break every user the day pixi updates (/gate-doctor warns about a pixi newer
-# than 0.82.0 instead). Keep in step with hooks/mod/lib.ts and the docs.
-requires-pixi = ">=0.68.0"
+# Latest only (PLAN-0.11 section 5): every dependency is "*", so the lock is
+# conda-forge's newest at the last relock (`pixi run update-deps`,
+# tests/update_deps.py), and requires-pixi is the pixi that made it, the newest
+# then (update-deps sets it and hooks/mod/lib.ts's PIXI_TESTED together;
+# test_packaging keeps them in step). No upper bound: one would break every
+# user the day pixi updates (/gate-doctor only notes a newer pixi). An older
+# pixi refuses the manifest ("requires pixi"); launch.sh recognizes that and
+# says "update pixi: pixi self-update".
+requires-pixi = ">=0.83.0"
 
 [dependencies]
-python = "3.12.*"
-age = "1.3.*"            # the vault's encryption (stdin/stdout only)
+python = "*"             # the gateway's code: stdlib only, on the lock's Python (gated also imports PyNaCl)
+age = "*"                # the vault's encryption (stdin/stdout only)
 gh = "*"                 # GitHub CLI, run only by the gh stand-in (own config dir, injected token)
 git-lfs = "*"            # LFS for git pushes/pulls
 openssh = "*"            # ssh, scp, sftp, ssh-agent, ssh-add, ssh-keygen, ssh-keyscan: one version everywhere
-git = "*"                # fallback only: a git stand-in when the system has no git
-pynacl = "1.6.*"         # libsodium for gated: opens the native dialog's sealed boxes (X25519 box)
-bash = "5.*"             # the managed shell (PLAN-v4 phase 4): Claude's Bash runs in this bash, never the login shell
-tmux = "3.*"             # gated's terminal supervisor (PLAN-v4 phase 5): its own server on a private socket, its own config
-pixi-pack = "0.7.*"      # the remote runtime (PLAN-v4 phase 6): packs runtime/pixi.toml for a host's platform
-zstd = "1.*"             # the remote runtime: opens the target platform's pixi-unpack conda package (.tar.zst)
+git = "*"                # the gated git: always this one in a configured repository (PLAN-0.11 §6)
+pynacl = "*"             # libsodium for gated: opens the native dialog's sealed boxes (X25519 box)
+bash = "*"               # the managed shell (PLAN-v4 phase 4), whatever its major version: Claude's Bash runs in it
+tmux = "*"               # gated's terminal supervisor (PLAN-v4 phase 5): its own server on a private socket, its own config
+pixi-pack = "*"          # the remote runtime (PLAN-v4 phase 6): packs runtime/pixi.toml for a host's platform
+zstd = "*"               # the remote runtime: opens the target platform's pixi-unpack conda package (.tar.zst)
 
 # Optional tools, one environment each, installed on first use by the stand-in
 # that needs them (`pixi install --locked -e NAME`, one stderr line). The
@@ -51,8 +53,10 @@ crane = "*"              # container registries (the crane stand-in)
 # conda-forge's Rust. The gateway runs this task with
 # CARGO_INSTALL_ROOT=<plugin data>/pijul, so the binary lands in the data
 # folder (it survives plugin updates). Its libgit2 needs iconv: conda-forge's
-# libiconv, never the macOS SDK's (nothing calls xcrun). (pijul 1.0.0-beta.24
-# doesn't compile without its default `git` feature.)
+# libiconv, never the macOS SDK's (nothing calls xcrun). (pijul doesn't
+# compile without its default `git` feature.) The --version is exact: pijul's
+# newest release, pre-releases included (it has only betas, which a plain
+# `cargo install` skips); update-deps bumps it.
 [feature.pijul.target.unix.dependencies]
 rust = "*"
 c-compiler = "*"
@@ -95,3 +99,9 @@ e2e = "python tests/e2e/run_e2e.py"
 # Before a commit (after `git add -A`): does the git index hold the tested
 # tree? Read-only (git ls-files); 0 ready, 1 not ready, 2 can't tell.
 release-check = "python tests/release_check.py"
+# The per-release relock (tests/update_deps.py): with the newest pixi, both
+# locks to conda-forge's newest, requires-pixi, lib.ts's PIXI_TESTED and the
+# docs' quote of requires-pixi to that pixi, pixi-unpack to pixi-pack's
+# version, pijul to its newest release (all or nothing); prints what moved,
+# reinstalls and runs the suite (--no-install, --no-test).
+update-deps = "python tests/update_deps.py"

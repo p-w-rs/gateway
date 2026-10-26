@@ -40,12 +40,6 @@ def test_waiting_ok_message_names_the_gateway_dialog_and_where_it_works():
     assert "gate secret" not in msg and "pop-up" not in msg and "not claude -p" in msg, msg
 
 
-def test_gate_secret_names_the_entry_in_its_removal_note():
-    with U.ux_env(), U.env_vars(CLAUDECODE="1"):
-        rc, _o, err = _out(gate_setup.secret_removed, "homelab")
-        assert rc == 2 and "gate check homelab" in err and "NAME" not in err, err
-
-
 def test_the_ask_reason_lists_every_ask_right():
     form = ('[hosts.askhost]\naddress = "u@ask.example.com"\nssh = "ask"\nsudo = "ask"\n')
     with H.gateway_env() as env:
@@ -61,7 +55,7 @@ def test_the_ask_reason_lists_every_ask_right():
 
 def test_an_unknown_git_server_isnt_sent_after_an_account_kind_that_doesnt_exist():
     m = accounts.no_git_account("gitlab.com")
-    assert "https" in m and 'others = "mine"' in m and "ask the user to add one" not in m, m
+    assert "the user's own ssh and git" in m and "others" not in m and "ask the user to add one" not in m, m
     assert "kind github" in accounts.no_git_account("github.com")
 
 

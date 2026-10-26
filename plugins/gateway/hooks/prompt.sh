@@ -7,8 +7,6 @@
 #  (c) a gateway dialog request (private/pending/*.json) newer than what this
 #      session was shown -> launch.sh hook-prompt adds a systemMessage (fails
 #      open);
-#  (c2) a conversion from 0.6 whose report the user hasn't seen
-#      (private/migrated.unshown) -> launch.sh hook-prompt shows it (fails open);
 #  (d) a Claude Code task notification (<task-notification>) once a vault
 #      exists: its "waiting for input" notice quotes a background command's raw
 #      output, which can hold a stored value with no token shape -> launch.sh
@@ -132,10 +130,6 @@ if [ -n "$sid" ] && [ -f "$form" ]; then
   if [ ! -f "$state" ] || [ -n "$(find "$form" -newer "$state" 2>/dev/null)" ]; then
     other=1
   fi
-fi
-# A conversion from 0.6 whose report the user hasn't seen (migrate.report_flag).
-if [ -z "$other" ] && [ -f "$priv/migrated.unshown" ]; then
-  other=1
 fi
 if [ -z "$other" ] && [ -n "$sid" ] && [ -d "$pend" ]; then
   if [ -n "$(find "$pend" -maxdepth 1 -name '*.json' 2>/dev/null | head -n 1)" ]; then

@@ -1,5 +1,5 @@
 """SessionStart / SubagentStart hooks: output shape, context (SPEC 13),
-systemMessages, migration report once, narrowing at session start."""
+systemMessages, a gateway 0.6 vault named once, narrowing at session start."""
 from __future__ import annotations
 
 import contextlib
@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Iterator
 
 import harness as H
-from gateway import consent, envfile, hooks_session, migrate, paths, vault
+from gateway import consent, envfile, hooks_session, paths, vault
+from gateway import form as formmod
 
 FORM = '''[hosts.localhost]
 sudo = true
@@ -82,57 +83,112 @@ def test_fresh_install_writes_everything():
         assert hso["hookEventName"] == "SessionStart"
         assert hso["watchPaths"] == [str(paths.form_path())]
         assert "systemMessage" not in out, out.get("systemMessage")
-        assert paths.form_path().read_text() == migrate.STARTER
-        assert ef.read_text() == envfile.env_text("refuse")
-        assert paths.env_sh_path().read_text() == envfile.env_text("refuse")
-        assert (paths.bin_dir() / "ssh").exists() and paths.launcher_path().exists()
+        assert paths.form_path().read_text() == formmod.STARTER
+        assert ef.read_text() == envfile.env_text()
+        assert paths.env_sh_path().read_text() == envfile.env_text()
+        # nothing configured: gate and its helpers, no stand-in (PLAN-0.11 §1.2)
+        assert (paths.bin_dir() / "gate").exists() and paths.launcher_path().exists()
+        assert not (paths.bin_dir() / "ssh").exists() and not (paths.bin_dir() / "sudo").exists()
         assert not vault.exists(), "a fresh install needs no vault yet"
         ctx = hso["additionalContext"]
-        assert ctx.startswith(hooks_session.INTRO) and "localhost (sudo: asks the user each time)" in ctx
-        assert 'approve them (without a prompt where the right is true; "ask" asks the user)' in ctx
-        assert '[hosts.localhost]' in migrate.STARTER and 'sudo = "ask"' in migrate.STARTER, \
-            "a new install starts with sudo on this computer set to ask"
+        assert ctx.startswith(hooks_session.INTRO) and \
+            "localhost (sudo: your own, not through the gateway; see below)" in ctx
+        assert hooks_session.OWN_SUDO_HOWTO in ctx, "this computer's own sudo needs no password"
+        assert "Anything not in gateway.toml uses your own ssh, git, gh and sudo" in ctx
+        # never "approved without a prompt": an "ask" right asks the user
+        assert 'so the gateway can approve them ("ask" asks the user).' in ctx, ctx
+        assert "Don't remove or rename a gateway.toml entry" in ctx
+        assert formmod.STARTER.count("\n") == 3 and all(
+            l.startswith("#") for l in formmod.STARTER.splitlines()), \
+            "the starter is three comment lines: nothing configured"
+        # a bare true asks nothing only in Auto and Bypass (PLAN-0.11 §2.3; WS-9)
+        assert "true = yes (in Auto and Bypass without asking)" in formmod.STARTER
+        assert "may do it without asking" not in formmod.STARTER
         assert hooks_session.context_state("s1")["form_sha256"]
         # resume: same file, truncated, same content
         hooks_session.session_main({"session_id": "s1", "source": "resume"})
-        assert ef.read_text() == envfile.env_text("refuse")
+        assert ef.read_text() == envfile.env_text()
 
 
-# The starter form every install before this decision wrote (sudo on this
-# computer true), byte for byte.
-OLD_STARTER = (migrate.HEADER + "\n[hosts.localhost]                  # this computer, whichever "
-               "one you're on\nsudo = true\n")
-# What such an install's vault holds once anything was approved (consent's
-# snapshot of that form): localhost sudo true.
-OLD_APPROVED = {"settings": {"others": "refuse",
-                             "shell": {"managed": "on", "import_path": [], "import_env": []},
-                             "policy": {}},
-                "hosts": {"localhost": {"sudo": True, "scripts": False}}, "accounts": {}}
+def test_a_gateway_06_vault_is_named_once_and_nothing_is_written_beside_it():
+    """A gateway 0.6 install (store.age, no vault.age) is converted by gateway
+    0.10.0, never here: SessionStart says so in one message, writes no
+    starter form and creates no vault (so the conversion still finds the
+    install untouched), and leaves store.age and key.txt as they are; the env
+    file is written as on any start."""
+    with H.gateway_env() as env, env_file(env) as ef:
+        paths.ensure_home()
+        paths.v2_store_path().write_bytes(b"age-encryption.org/v1 a 0.6 store")
+        paths.v2_key_path().write_text("AGE-SECRET-KEY-1NOTAREALKEY\n")
+        for sid in ("v06-1", "v06-2"):
+            out = hooks_session.session_main({"session_id": sid, "source": "startup"})
+            msg = out.get("systemMessage", "")
+            assert msg.count(vault.V06_MESSAGE) == 1, msg
+            assert "couldn't update the vault" not in msg, msg
+            assert not paths.form_path().exists(), "no starter form beside a 0.6 vault"
+            assert not paths.vault_path().exists(), "no vault beside a 0.6 vault"
+        assert paths.v2_store_path().read_bytes() == b"age-encryption.org/v1 a 0.6 store"
+        assert paths.v2_key_path().read_text() == "AGE-SECRET-KEY-1NOTAREALKEY\n"
+        assert ef.read_text() == envfile.env_text(), "the env is still written"
+        # a narrowing in a form written by hand doesn't create a vault either
+        # (nor the private folder and its lock: the ratchet doesn't try)
+        env.write_form('[hosts.localhost]\nsudo = false\n')
+        out = hooks_session.session_main({"session_id": "v06-3", "source": "startup"})
+        assert out["systemMessage"].count(vault.V06_MESSAGE) == 1
+        assert not paths.vault_path().exists() and not paths.lock_path().exists()
+        # once converted (vault.age is there), a leftover store.age changes nothing
+        paths.v2_store_path().unlink()
+        vault.save(vault.empty())
+        paths.v2_store_path().write_bytes(b"left over")
+        out = hooks_session.session_main({"session_id": "v06-4", "source": "startup"})
+        assert vault.V06_MESSAGE not in out.get("systemMessage", "")
+        assert vault.load()["approved"]["rights"]["hosts"]["localhost"]["sudo"] is False, \
+            "a stray store.age beside the vault doesn't stop the ratchet"
 
-# vault.empty() as every gateway before the baseline mark wrote it (the same
-# keys and values): an older install's vault (vault.older_install).
-OLD_EMPTY = {"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {}, "accounts": {},
+
+# A form that sets this computer's sudo to true (the starter of gateway 0.9.1
+# and before said so).
+SUDO_TRUE = formmod.STARTER + "\n[hosts.localhost]\nsudo = true\n"
+# the change lines (lead decision 4: what each mode now does, bare words too)
+LOCAL_ASK_TO_TRUE = ("localhost: sudo on this computer: in Auto and Bypass permissions modes the "
+                     "gateway now approves without asking you; elsewhere Claude Code decides "
+                     "(was: asks you in every mode)")
+BOX_FALSE_TO_TRUE = ("box: sudo on box: in Auto and Bypass permissions modes the gateway now "
+                     "approves without asking you; elsewhere Claude Code decides (was: refused "
+                     "in every mode)")
+# What a vault holds once that form was approved (consent's snapshot of it).
+SUDO_TRUE_APPROVED = {"settings": {"shell": {"managed": "on", "import_path": [],
+                                             "import_env": []},
+                                   "policy": {}},
+                      "hosts": {"localhost": {"sudo": True, "sudo_configured": True,
+                                              "scripts": False}}, "accounts": {}}
+
+
+# An empty vault as gateway 0.9.1 and before wrote it (no install mark; 0.10.0
+# kept sudo = true for such a vault): now just a vault.
+VAULT_091 = {"version": 3, "machine": {}, "localhost": {"sudo": {}}, "hosts": {}, "accounts": {},
              "approved": {}, "form_last_good": None, "aliases": {}, "events": [],
              "events_seen": 0, "migrated": None}
 
 
-def _old_vault(shape: str) -> dict:
-    """The vaults the older code wrote with no approval in them (review round
-    2's P02, P03 and P16): a sudo password remembered from the dialog; `gate
-    check localhost` answered "ask each time"; `gate check localhost` with
-    "store the password" (approved {}, the choice, the password, the old
-    starter as the last good form, the machine record)."""
-    d = json.loads(json.dumps(OLD_EMPTY))
+def _unapproved_vault(shape: str) -> dict:
+    """Vaults with this computer's sudo used but no approval in them, as
+    gateway 0.9.1 and before left them (review round 2's P02, P03 and P16):
+    a sudo password remembered from the dialog; `gate check localhost`
+    answered "ask each time"; `gate check localhost` with "store the
+    password" (approved {}, the choice, the password, the sudo-true form as
+    the last good form, the machine record)."""
+    d = json.loads(json.dumps(VAULT_091))
     user = paths.local_user()
     if shape == "P02":
         vault.set_sudo(d, "localhost", user, "pw-local-not-real-1")
-        d["form_last_good"] = OLD_STARTER
+        d["form_last_good"] = SUDO_TRUE
     elif shape == "P03":
         vault.set_sudo_choice(d, "localhost", user, "ask")
     elif shape == "P16":
         vault.set_sudo(d, "localhost", user, "pw-local-not-real-2")
         vault.set_sudo_choice(d, "localhost", user, "password")
-        d["form_last_good"] = OLD_STARTER
+        d["form_last_good"] = SUDO_TRUE
         vault.ensure_machine(d)
     return d
 
@@ -144,19 +200,19 @@ def _bash_decision(command: str, mode: str = "auto"):
     return out and out["hookSpecificOutput"]["permissionDecision"]
 
 
-def test_an_existing_install_keeps_sudo_true_on_upgrade():
-    """New installs start with sudo = "ask" on this computer; an existing
-    form that says sudo = true (the old starter) with its approval in the
-    vault keeps exactly that: the form untouched, sudo true, nothing waiting
-    for an OK, the hook allowing `sudo ls` in auto mode as before."""
+def test_an_approved_sudo_true_stays_true():
+    """A form that says sudo = true with its approval in the vault keeps
+    exactly that across session starts: the form untouched, sudo true,
+    nothing waiting for an OK, the hook allowing `sudo ls` in auto mode."""
     with H.gateway_env() as env, env_file(env):
-        env.write_form(OLD_STARTER)
-        data = json.loads(json.dumps(OLD_EMPTY))          # an existing install's vault
-        data["approved"] = {"form_sha256": None, "at": None, "rights": json.loads(json.dumps(OLD_APPROVED))}
-        data["form_last_good"] = OLD_STARTER
+        env.write_form(SUDO_TRUE)
+        data = vault.empty()
+        data["approved"] = {"form_sha256": None, "at": None,
+                            "rights": json.loads(json.dumps(SUDO_TRUE_APPROVED))}
+        data["form_last_good"] = SUDO_TRUE
         vault.save(data)
         out = hooks_session.session_main({"session_id": "up1", "source": "startup"})
-        assert paths.form_path().read_text() == OLD_STARTER, "the form is left as it was"
+        assert paths.form_path().read_text() == SUDO_TRUE, "the form is left as it was"
         assert vault.load()["approved"]["rights"]["hosts"]["localhost"]["sudo"] is True
         eff = consent.compute(consent.load_form(), vault.load())
         assert eff.hosts["localhost"].sudo is True and not eff.pending, eff.pending
@@ -164,43 +220,29 @@ def test_an_existing_install_keeps_sudo_true_on_upgrade():
         assert _bash_decision("sudo ls") == "allow"
         hooks_session.session_main({"session_id": "up2", "source": "startup"})
         assert vault.load()["approved"]["rights"]["hosts"]["localhost"]["sudo"] is True
-        assert paths.form_path().read_text() == OLD_STARTER
+        assert paths.form_path().read_text() == SUDO_TRUE
 
 
-def test_a_new_installs_sudo_raised_to_true_waits_for_the_ok():
-    """The new starter's "ask" is what the user approved by installing: Claude
-    editing it to true is a widening (the dialog's OK, `gate check
-    localhost`); meanwhile sudo still asks and the hook never allows it."""
-    with H.gateway_env() as env, env_file(env):
-        hooks_session.session_main({"session_id": "n1", "source": "startup"})
-        assert paths.form_path().read_text() == migrate.STARTER and not vault.exists()
-        env.write_form(migrate.STARTER.replace('sudo = "ask"', "sudo = true"))
-        out = hooks_session.session_main({"session_id": "n2", "source": "startup"})
-        eff = consent.compute(consent.load_form(), vault.load() if vault.exists() else None)
-        assert eff.hosts["localhost"].sudo == "ask"
-        assert [c.render() for c in eff.pending] == ['localhost: sudo "ask" -> true'], eff.pending
-        assert "gate check localhost" in out["hookSpecificOutput"]["additionalContext"]
-        assert _bash_decision("sudo ls") == "ask", "never allowed: sudo asks"
-        assert _bash_decision("sudo ls", "bypassPermissions") == "ask"
+def test_sudo_raised_to_true_waits_for_the_ok():
+    """This computer's sudo asks by default: Claude setting it to true is a
+    widening (the dialog's OK, `gate check localhost`); meanwhile sudo still
+    asks and the hook never allows it. Also with the form there before the
+    first session (no vault)."""
+    for first in ("starter", "form"):
+        with H.gateway_env() as env, env_file(env):
+            if first == "starter":
+                hooks_session.session_main({"session_id": "n1", "source": "startup"})
+                assert paths.form_path().read_text() == formmod.STARTER and not vault.exists()
+            env.write_form(SUDO_TRUE)
+            out = hooks_session.session_main({"session_id": "n2", "source": "startup"})
+            assert paths.form_path().read_text() == SUDO_TRUE
+            eff = consent.compute(consent.load_form(), vault.load() if vault.exists() else None)
+            assert eff.hosts["localhost"].sudo == "ask", first
+            assert [c.render() for c in eff.pending] == [LOCAL_ASK_TO_TRUE], eff.pending
+            assert "gate check localhost" in out["hookSpecificOutput"]["additionalContext"]
+            assert _bash_decision("sudo ls") == "ask", "never allowed: sudo asks"
+            assert _bash_decision("sudo ls", "bypassPermissions") == "ask"
 
-
-def test_an_old_starter_with_no_vault_waits_for_the_ok():
-    """The one install that changes: an old starter (sudo = true) on a machine
-    whose vault was never made (nothing stored, nothing approved; a form that
-    never said sudo asks there too). Its true was only ever the old default,
-    indistinguishable from an edit of the new starter, so it waits for the
-    user's OK like that edit (`gate check localhost`) and sudo asks meanwhile;
-    the form is left as it is. (A machine with an older vault keeps its true:
-    test_an_older_vault_with_no_approval_keeps_sudo_true.)"""
-    with H.gateway_env() as env, env_file(env):
-        env.write_form(OLD_STARTER)
-        out = hooks_session.session_main({"session_id": "o1", "source": "startup"})
-        assert paths.form_path().read_text() == OLD_STARTER
-        eff = consent.compute(consent.load_form(), vault.load() if vault.exists() else None)
-        assert eff.hosts["localhost"].sudo == "ask"
-        assert [c.render() for c in eff.pending] == ['localhost: sudo "ask" -> true'], eff.pending
-        assert "gate check localhost" in out["hookSpecificOutput"]["additionalContext"]
-        assert _bash_decision("sudo ls") == "ask", "never allowed: sudo asks"
 
 def _job_decision(command: str):
     from gateway import hooks_bash
@@ -214,155 +256,127 @@ def _sudo_now() -> object:
     return eff.hosts["localhost"].sudo, [c.render() for c in eff.pending]
 
 
-def test_an_older_vault_with_no_approval_keeps_sudo_true():
-    """The vaults the older code wrote whenever this computer's sudo was used
-    (a password remembered, `gate check localhost` answered either way) hold no
-    approval. Their effective right was the old baseline, true; it stays true:
-    no OK waiting, the hook allowing `sudo ls` in auto mode, a job with sudo
-    not refused, through two session starts, and the vault stays an older one
-    (no baseline mark added)."""
+def test_a_vault_with_no_approval_asks_for_sudo_until_the_ok():
+    """Nothing approved means nothing approved, whoever wrote the vault: a
+    vault with sudo used here but no approval (as gateway 0.9.1 and before
+    left them, with no install mark) and a form saying sudo = true waits for
+    the user's OK; sudo asks meanwhile, a job with sudo is refused, through
+    two session starts."""
     for shape in ("P02", "P03", "P16"):
         with H.gateway_env() as env, env_file(env):
-            env.write_form(OLD_STARTER)
-            vault.save(_old_vault(shape))
-            assert vault.older_install(vault.load()), shape
+            env.write_form(SUDO_TRUE)
+            vault.save(_unapproved_vault(shape))
             for i in range(2):
                 out = hooks_session.session_main({"session_id": f"{shape}-{i}", "source": "startup"})
                 ctx = out["hookSpecificOutput"]["additionalContext"]
-                assert "localhost (sudo: yes" in ctx, (shape, ctx)
-                assert "gate check localhost" not in ctx, (shape, ctx)
-            assert _sudo_now() == (True, []), shape
-            assert _bash_decision("sudo ls") == "allow", shape
-            assert _job_decision("sudo make install") is None, shape
-            data = vault.load()
-            assert vault.BASELINE_KEY not in data, "an older vault stays one"
-            ap = (data.get("approved") or {}).get("rights")
-            assert ap is None or ap["hosts"]["localhost"]["sudo"] is True, (shape, ap)
-            assert paths.form_path().read_text() == OLD_STARTER
-
-
-def test_an_older_vault_keeps_the_old_default_where_the_form_doesnt_say_sudo():
-    """On an older install a form without [hosts.localhost], or with one that
-    has no sudo key, keeps the old implicit true (nothing narrows, nothing is
-    ratcheted), also once another entry is approved; a missing form with
-    nothing to restore gets the old starter back. On a new install (a vault
-    with the mark, or none) the same forms ask."""
-    forms = ('[settings]\nothers = "refuse"\n', '[hosts.localhost]\nscripts = false\n',
-             '[hosts.localhost]\nnote = "this mac"\n')
-    for text in forms:
-        with H.gateway_env() as env, env_file(env):
-            env.write_form(text)
-            vault.save(_old_vault("P16"))
-            hooks_session.session_main({"session_id": "nk1", "source": "startup"})
-            assert _sudo_now() == (True, []), text
-            assert _bash_decision("sudo ls") == "allow", text
+                assert "gate check localhost" in ctx, (shape, ctx)
+            assert _sudo_now() == ("ask", [LOCAL_ASK_TO_TRUE]), shape
+            assert _bash_decision("sudo ls") == "ask", shape
+            assert _job_decision("sudo make install") == "deny", shape
             ap = (vault.load().get("approved") or {}).get("rights")
-            assert ap is None or ap["hosts"]["localhost"]["sudo"] is True, (text, ap)
-            env.write_form(text + '\n[hosts.box]\naddress = "u@box.example.com"\n')
-            consent.approve("box", form=env.form())
-            data = vault.load()
-            assert data["approved"]["rights"]["hosts"]["localhost"]["sudo"] is True, text
-            assert _sudo_now() == (True, []), text
-            assert vault.BASELINE_KEY not in data
-        for new_vault in (True, False):
+            assert ap is None or ap["hosts"]["localhost"]["sudo"] != True, (shape, ap)  # noqa: E712
+            assert paths.form_path().read_text() == SUDO_TRUE
+
+
+def test_this_computers_sudo_is_the_users_own_where_the_form_doesnt_say_it():
+    """PLAN-0.11 §1.5: a form without [hosts.localhost], or with one that has
+    no sudo key, leaves this computer's sudo to the user (no stand-in, no
+    decision), whatever the vault holds (one with no approval, an empty one,
+    none), also once another entry is approved; a missing form with nothing
+    to restore gets the starter, which configures nothing."""
+    forms = ("", '[hosts.localhost]\nscripts = false\n', '[hosts.localhost]\nnote = "this mac"\n')
+    for text in forms:
+        for kind in ("P16", "empty", "none"):
             with H.gateway_env() as env, env_file(env):
                 env.write_form(text)
-                if new_vault:
-                    vault.save(vault.empty())
-                hooks_session.session_main({"session_id": "nk2", "source": "startup"})
-                assert _sudo_now() == ("ask", []), (text, new_vault)
-                assert _bash_decision("sudo ls") == "ask", (text, new_vault)
-    # no form and nothing to restore (P03 kept no copy): the old starter
+                if kind != "none":
+                    vault.save(_unapproved_vault(kind) if kind == "P16" else vault.empty())
+                hooks_session.session_main({"session_id": "nk1", "source": "startup"})
+                assert _sudo_now()[1] == [], (text, kind)
+                assert not (paths.bin_dir() / "sudo").exists(), (text, kind)
+                assert _bash_decision("sudo ls") is None, (text, kind)
+                if kind == "P16":
+                    env.write_form(text + '\n[hosts.box]\naddress = "u@box.example.com"\n')
+                    consent.approve("box", form=env.form())
+                    rights = vault.load()["approved"]["rights"]
+                    assert rights["hosts"]["localhost"].get("sudo_configured") is not True, text
+                    assert _bash_decision("sudo ls") is None, text
     with H.gateway_env() as env, env_file(env):
-        vault.save(_old_vault("P03"))
+        vault.save(_unapproved_vault("P03"))
         hooks_session.session_main({"session_id": "nk3", "source": "startup"})
-        assert paths.form_path().read_text() == migrate.STARTER_OLDER == OLD_STARTER
-        assert _sudo_now() == (True, [])
-        assert _bash_decision("sudo ls") == "allow"
+        assert paths.form_path().read_text() == formmod.STARTER
+        assert _bash_decision("sudo ls") is None
 
 
-def test_a_locked_vault_asks_for_sudo_and_says_to_unlock_it():
-    """Round 4 (the lead's decision on the round-3 review's item 5): while a
-    passphrase vault is locked its baseline mark and approvals can't be read,
-    so an older install's sudo true (the old starter's, or the unsaid
-    default) runs as "ask": it fails closed. The hook's prompt, a job's
-    refusal and the sudo stand-in's refusals then say that unlocking the
-    vault (/gate-unlock) brings the right back. No note where the form itself
-    says "ask", nor once the vault is readable again."""
+def test_a_locked_vault_refuses_the_configured_sudo_up_front():
+    """While a passphrase vault is locked its approvals and the sudo password
+    can't be read, so this computer's configured sudo is refused up front,
+    like the configured hosts and accounts (PLAN-0.11 §19.16): the Bash
+    hook denies with the vault's own message (how to unlock it) wherever it
+    would ask (Bash, Monitor, the Terminal panel, a job, terminal_send, text
+    it can't follow), and the sudo stand-in refuses with the same words,
+    whoever runs it, before any record is looked at. A sudo the form turns
+    off keeps its own refusal; no sudo key is the user's own sudo; unlocked,
+    the approved true applies again."""
     from gateway import ancestry, hooks_bash, sudo
 
-    def reason(tool: str, command: str) -> tuple:
-        ti = {"command": command} if tool == "Bash" else {"name": "j", "command": command}
-        out = hooks_bash.main({"tool_name": tool, "permission_mode": "auto", "tool_input": ti})
+    def reason(tool: str, command: str, mode: str = "auto") -> tuple:
+        ti = ({"name": "j", "command": command} if tool.endswith("job_start") else
+              {"id": "t_01ARZ3NDEKTSV4RRFFQ69G5FAV", "text": command}
+              if tool == hooks_bash.GW_SEND_TOOL else {"command": command})
+        out = hooks_bash.main({"tool_name": tool, "permission_mode": mode, "tool_input": ti})
         h = (out or {}).get("hookSpecificOutput") or {}
         return h.get("permissionDecision"), h.get("permissionDecisionReason", "")
 
+    msg = "gateway: the gateway vault is locked (test)"
+
     def locked():
-        raise vault.VaultLocked("gateway: the gateway vault is locked (test)")
+        raise vault.VaultLocked(msg)
 
-    job = "mcp__plugin_check_jobs__job_start"
-    for text in (OLD_STARTER, migrate.HEADER):
-        with H.gateway_env() as env, env_file(env):
-            env.write_form(text)
-            vault.save(_old_vault("P16"))
-            assert reason("Bash", "sudo ls")[0] == "allow"     # readable: the older install's true
-            saved = vault.load, sudo._typed_by_claude
-            vault.load = locked
-            try:
-                d, why = reason("Bash", "sudo ls")
-                assert d == "ask" and "/gate-unlock" in why, (text, why)
-                assert why.endswith(consent.LOCKED_SUDO_NOTE), (text, why)
-                d, why = reason(job, "sudo make install")
-                assert d == "deny" and "a job can't use" in why, (text, why)
-                assert "/gate-unlock" in why, (text, why)
-                assert why.endswith(consent.LOCKED_SUDO_NOTE), (text, why)
-                for by, msg in (("", sudo.ASK_INDIRECT), (ancestry.TERMINAL, sudo.ASK_PANE),
-                                (ancestry.CHECKPOINT, sudo.ASK_JOB)):
-                    sudo._typed_by_claude = lambda by=by: (False, by)
-                    assert sudo._rights_now()[1] == msg + consent.LOCKED_SUDO_NOTE, (text, by)
-                # the form's own "ask": the same either way, no note
-                env.write_form(text + '\n[hosts.localhost]\nsudo = "ask"\n'
-                               if text == migrate.HEADER else
-                               text.replace("sudo = true", 'sudo = "ask"'))
-                d, why = reason("Bash", "sudo ls")
-                assert d == "ask" and "/gate-unlock" not in why, (text, why)
-                sudo._typed_by_claude = lambda: (False, "")
-                assert sudo._rights_now()[1] == sudo.ASK_INDIRECT, text
-            finally:
-                vault.load, sudo._typed_by_claude = saved
-            env.write_form(text)
-            assert reason("Bash", "sudo ls")[0] == "allow"     # unlocked: true again
-
-
-def test_a_new_installs_vaults_carry_the_baseline_mark():
-    """Every vault a new install makes carries the mark, whoever makes it (the
-    first stored value, a narrowing, an approval), so its unsaid sudo stays
-    "ask" and an old-style `sudo = true` still waits for the OK."""
-    makers = (
-        lambda env: vault.save(vault.empty()),
-        lambda env: _edit_alias(),
-        lambda env: consent.ratchet(env.form()),
-    )
-    for i, make in enumerate(makers):
-        with H.gateway_env() as env, env_file(env):
-            env.write_form('[hosts.localhost]\nsudo = false\n' if i == 2 else
-                           '[hosts.localhost]\nscripts = false\n')
-            assert not vault.exists()
-            make(env)
-            data = vault.load()
-            assert data[vault.BASELINE_KEY] == vault.BASELINE and not vault.older_install(data), i
-            if i == 2:
-                env.write_form('[hosts.localhost]\nscripts = false\n')
-            assert _sudo_now()[0] == ("ask" if i != 2 else False), i
-            env.write_form(OLD_STARTER)
-            sudo, pending = _sudo_now()
-            assert sudo == ("ask" if i != 2 else False) and pending, (i, sudo, pending)
-            assert _bash_decision("sudo ls") != "allow", i
-
-
-def _edit_alias() -> None:
-    with vault.edit() as d:
-        d["aliases"]["x"] = "y"
+    tools = ("Bash", "Monitor", "mcp__terminal__run_in_terminal", hooks_bash.JOB_TOOL,
+             hooks_bash.GW_JOB_TOOL, hooks_bash.GW_SEND_TOOL)
+    with H.gateway_env() as env, env_file(env):
+        env.write_form(SUDO_TRUE)
+        data = _unapproved_vault("P16")
+        data["approved"] = {"form_sha256": None, "at": None,
+                            "rights": json.loads(json.dumps(SUDO_TRUE_APPROVED))}
+        vault.save(data)
+        assert reason("Bash", "sudo ls")[0] == "allow"     # readable: the approved true
+        saved = vault.load, sudo._typed_by_claude
+        vault.load = locked
+        try:
+            for form in (SUDO_TRUE, SUDO_TRUE.replace("sudo = true", 'sudo = "ask"')):
+                env.write_form(form)
+                for tool in tools:
+                    assert reason(tool, "sudo make install") == ("deny", msg), (form, tool)
+                for text in ("eval 'sudo ls'", "env bash -c 'sudo ls' && true", "sudo ls 'x",
+                             "for f in a; do sudo ls $f; done"):
+                    assert reason("Bash", text) == ("deny", msg), (form, text)
+                # the stand-in: the vault's message for every caller, typed or not
+                for typed, by in ((False, ""), (False, ancestry.TERMINAL),
+                                  (False, ancestry.CHECKPOINT), (True, "")):
+                    sudo._typed_by_claude = lambda typed=typed, by=by: (typed, by)
+                    assert sudo._rights_now()[1:] == (msg, False, sudo.GATED), (form, by)
+            assert "configured sudo are refused" in hooks_session.VAULT_LOCKED
+            # off in plan mode: the form's own refusal, not the vault's
+            env.write_form(SUDO_TRUE.replace("sudo = true", 'sudo = { default = true, plan = false }'))
+            d, why = reason("Bash", "sudo ls", "plan")
+            assert d == "deny" and "sudo is off on this machine in Plan mode" in why, why
+            assert reason("Bash", "sudo ls", "default") == ("deny", msg)
+            # no sudo key and no configured list: the user's own sudo (PLAN-0.11
+            # §16: the list is what classifies while the vault is locked)
+            env.write_form(formmod.STARTER)
+            assert reason("Bash", "sudo ls")[0] is None
+            assert sudo._rights_now()[1:] == (None, False, sudo.PASS)
+            # the configured list says sudo here goes through the gateway: refused
+            consent.write_listed(SUDO_TRUE_APPROVED)
+            d, why = reason("Bash", "sudo ls")
+            assert d == "deny" and "the gateway vault is locked" in why, why
+            assert consent.LISTED_SUDO in sudo._rights_now()[1]
+        finally:
+            vault.load, sudo._typed_by_claude = saved
+        env.write_form(SUDO_TRUE)
+        assert reason("Bash", "sudo ls")[0] == "allow"     # unlocked: true again
 
 
 def test_context_from_validated_form_only():
@@ -427,45 +441,66 @@ def test_context_truncates_long_forms():
         assert "host-number-000" in ctx and "more." in ctx and "Accounts: key-000" in ctx
 
 
-def test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_there():
-    """checkpoint's job_start runs commands as detached jobs: Claude is told
-    how the gateway treats them, but only when checkpoint's state folder
-    exists (each plugin works alone); the line survives truncation."""
+def test_context_mentions_checkpoint_jobs_only_when_checkpoint_is_live():
+    """PLAN-0.11 §9.4: Claude is told how the gateway treats checkpoint's
+    jobs only while checkpoint is live: gated touched <run>/checkpoint-seen
+    (a CONTRACT-v1 client) less than a day ago. Checkpoint's state folder no
+    longer counts; the line survives truncation."""
     import os
+    import time
     with H.gateway_env() as env, env_file(env):
         env.write_form(FORM)
         approve_everything(env)
-        old = os.environ.get("XDG_STATE_HOME")
-        os.environ["XDG_STATE_HOME"] = str(env.root / "xdg")       # ignored under a test override
-        (env.root / "xdg" / "checkpoint").mkdir(parents=True)
-        try:
-            ctx = hooks_session.session_main({"session_id": "c1"})["hookSpecificOutput"][
-                "additionalContext"]
-            assert hooks_session.JOBS_HOWTO not in ctx and "job_start" not in ctx
-            (env.user_home / ".local" / "state" / "checkpoint").mkdir(parents=True)
-            ctx = hooks_session.session_main({"session_id": "c2"})["hookSpecificOutput"][
-                "additionalContext"]
-            assert hooks_session.JOBS_HOWTO in ctx, ctx
-            assert "curl is refused" in ctx and 'an "ask" right' in ctx and "env.sh" in ctx
-            # checkpoint 0.6+ delegates to gated while it serves the session: the
-            # context names that runner first, checkpoint's own (env.sh) only otherwise
-            assert "under the gateway's own job supervisor while it serves this session" in ctx, ctx
-            assert "on_pause" in ctx and "else under checkpoint's runner" in ctx, ctx
-            # integration review: what job_tail / job_stop return is masked now
-            assert "job_tail and job_stop mask stored secrets as ***" in ctx, ctx
-            sub = hooks_session.subagent_main({"session_id": "c2"})
-            assert hooks_session.JOBS_HOWTO in sub["hookSpecificOutput"]["additionalContext"]
-            env.write_form("".join(f'[hosts.host-number-{i:03d}]\naddress = "h{i}.example.com"\n'
-                                   for i in range(120)))
-            approve_everything(env)
-            ctx = hooks_session.session_main({})["hookSpecificOutput"]["additionalContext"]
-            assert len(ctx) <= hooks_session.CONTEXT_MAX and hooks_session.JOBS_HOWTO in ctx
-            assert "host-number-000" in ctx
-        finally:
-            if old is None:
-                os.environ.pop("XDG_STATE_HOME", None)
-            else:
-                os.environ["XDG_STATE_HOME"] = old
+        (env.user_home / ".local" / "state" / "checkpoint").mkdir(parents=True)
+        ctx = hooks_session.session_main({"session_id": "c1"})["hookSpecificOutput"][
+            "additionalContext"]
+        assert hooks_session.JOBS_HOWTO not in ctx and "job_start" not in ctx, "a folder isn't live"
+        seen = paths.checkpoint_seen_path()
+        seen.write_text("")
+        old = time.time() - hooks_session.CHECKPOINT_FRESH - 60
+        os.utime(seen, (old, old))
+        ctx = hooks_session.session_main({"session_id": "c1b"})["hookSpecificOutput"][
+            "additionalContext"]
+        assert hooks_session.JOBS_HOWTO not in ctx, "seen more than a day ago"
+        os.utime(seen, None)
+        ctx = hooks_session.session_main({"session_id": "c2"})["hookSpecificOutput"][
+            "additionalContext"]
+        assert hooks_session.JOBS_HOWTO in ctx, ctx
+        assert "a network command that [network] asks about" in ctx and 'an "ask" right' in ctx \
+            and "env.sh" in ctx and "curl is refused" not in ctx
+        # checkpoint 0.6+ delegates to gated while it serves the session: the
+        # context names that runner first, checkpoint's own (env.sh) only otherwise
+        assert "under the gateway's own job supervisor while it serves this session" in ctx, ctx
+        assert "on_pause" in ctx and "else under checkpoint's runner" in ctx, ctx
+        # integration review: what job_tail / job_stop return is masked now
+        assert "job_tail and job_stop mask stored secrets as ***" in ctx, ctx
+        sub = hooks_session.subagent_main({"session_id": "c2"})
+        assert hooks_session.JOBS_HOWTO in sub["hookSpecificOutput"]["additionalContext"]
+        env.write_form("".join(f'[hosts.host-number-{i:03d}]\naddress = "h{i}.example.com"\n'
+                               for i in range(120)))
+        approve_everything(env)
+        ctx = hooks_session.session_main({})["hookSpecificOutput"]["additionalContext"]
+        assert len(ctx) <= hooks_session.CONTEXT_MAX and hooks_session.JOBS_HOWTO in ctx
+        assert "host-number-000" in ctx
+
+
+def test_gated_touches_checkpoint_seen_when_a_contract_route_is_served():
+    """Lead decision 7: gated's writer. A CONTRACT-v1 client (a process below
+    a registered session) reaching a /v1/ route touches the file, at most
+    once a minute; a refused caller doesn't."""
+    import harness_daemon as D
+    with D.daemon_env() as de:
+        seen = paths.checkpoint_seen_path()
+        fc = de.claude()
+        st, _body = fc.http("GET", "/v1/capabilities")       # the UI process: refused
+        assert st == 403 and not seen.exists()
+        gate = D.probe_root(de.root)
+        st, _body = de.probe(fc, gate / "run.py", ["shim", "sudo"], "/v1/capabilities",
+                             method="GET")
+        assert st == 200 and seen.exists()
+        t1 = seen.stat().st_mtime
+        de.probe(fc, gate / "run.py", ["shim", "sudo"], "/v1/snapshot", method="GET")
+        assert seen.stat().st_mtime == t1, "at most once a minute"
 
 
 def test_on_a_headless_linux_server_the_display_note_never_pushes_out_the_hosts():
@@ -518,7 +553,7 @@ def test_a_linux_session_without_a_display_is_told_once_that_paste_cannot_work()
             assert hooks_session.NO_DISPLAY_NOTE in ctx and ctx.count("No graphical display") == 1, ctx
             note = hooks_session.NO_DISPLAY_NOTE
             assert "Paste from clipboard can't work" in note and "main screen" in note \
-                and "CLAUDE_CODE_NO_FLICKER=1" in note and "desktop" in note, note
+                and "/tui fullscreen" in note and "NO_FLICKER" not in note and "desktop" in note, note
             assert len(ctx) <= hooks_session.CONTEXT_MAX
             assert "graphical display" not in out.get("systemMessage", ""), "the context only"
             sub = hooks_session.subagent_main({"session_id": "nodisplay"})
@@ -557,7 +592,7 @@ def test_pending_widening_shown_to_user_and_claude():
         env.write_form('[hosts.box]\naddress = "u@box.example.com"\nsudo = true\n[hosts.new]\naddress = "n.example.com"\n')
         out = hooks_session.session_main({})
         msg = out["systemMessage"]
-        assert "waiting for your OK" in msg and "box: sudo false -> true" in msg and "new: new host" in msg
+        assert "waiting for your OK" in msg and BOX_FALSE_TO_TRUE in msg and "new: new host" in msg
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert "new (not active yet" in ctx and "box (ssh, sudo: off" in ctx and "a change waits" in ctx
 
@@ -573,40 +608,12 @@ def test_narrowing_applies_and_ratchets_at_session_start():
         assert d["events"][-1]["what"] == "narrow"
         env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
         out = hooks_session.session_main({})
-        assert "box: sudo false -> true" in out["systemMessage"]
-
-
-def test_migration_report_shown_once():
-    with H.gateway_env() as env, env_file(env):
-        paths.ensure_home()
-        H.write_v2_vault(paths.home(), {"version": 2, "secrets": {"OPENAI_API_KEY": {
-            "value": "sk-test-abcdefghijklmnop123", "hosts": ["api.openai.com"]}}, "sudo": {}, "accounts": {}})
-        out = hooks_session.session_main({})
-        msg = out["systemMessage"]
-        assert msg.startswith("gateway: converted your 0.6 vault") and "OPENAI_API_KEY -> openai-api-key" in msg
-        assert "sk-test" not in msg and "since your last session" not in msg
-        assert "openai-api-key" in out["hookSpecificOutput"]["additionalContext"]
-        out2 = hooks_session.session_main({})
-        assert "converted" not in out2.get("systemMessage", "")
-        assert vault.load()["migrated"]["shown"] is True
-
-
-def test_migration_failure_message():
-    with H.gateway_env() as env, env_file(env) as ef:
-        paths.ensure_home()
-        paths.v2_store_path().write_bytes(b"broken")
-        paths.v2_key_path().write_text("AGE-SECRET-KEY-1XXXX\n")
-        out = hooks_session.session_main({})
-        assert "gateway: migration failed: " in out["systemMessage"]
-        assert "run gate migrate" in out["systemMessage"]
-        assert ef.read_text() == envfile.env_text("refuse"), "the env is still written"
-        assert not paths.form_path().exists(), "no starter form while v2 waits"
-        assert not vault.exists()
+        assert BOX_FALSE_TO_TRUE in out["systemMessage"]
 
 
 def test_pending_popups_and_events():
     with H.gateway_env() as env, env_file(env):
-        env.write_form(migrate.STARTER)
+        env.write_form(formmod.STARTER)
         vault.save(vault.empty())
         with vault.edit() as d:
             vault.add_event(d, "widen", "box: new host (address u@box)")
@@ -632,6 +639,29 @@ def test_pending_popups_and_events():
         msg2 = hooks_session.session_main({"session_id": "s-pend"}).get("systemMessage", "")
         assert "since your last session" not in msg2
         assert "gateway dialog for gh" not in msg2, "shown once per session"
+
+
+def test_the_since_your_last_session_notice_marks_a_cut_event():
+    """mac-tui plugin bug 3: each event was cut at 120 characters with
+    nothing to show it, mid-word ("...approves without asking you; else").
+    Now a longer detail ends at a word with "…", and a shorter one is whole."""
+    long = ("sudo on this computer: in Auto and Bypass permissions modes the gateway now approves "
+            "without asking you; elsewhere Claude Code decides (was: asks you in every mode)")
+    assert len(long) > 120
+    with H.gateway_env() as env, env_file(env):
+        env.write_form(formmod.STARTER)
+        vault.save(vault.empty())
+        with vault.edit() as d:
+            vault.add_event(d, "widen", long)
+            vault.add_event(d, "narrow", "box: ssh true -> \"ask\"")
+        msg = hooks_session.session_main({"session_id": "s-cut"})["systemMessage"]
+    line = next(ln for ln in msg.splitlines() if "since your last session" in ln)
+    shown = line.split(" widen: ", 1)[1].split("; 20", 1)[0]
+    assert shown.endswith("…") and len(shown) <= 120, shown
+    assert long.startswith(shown[:-1]) and long[len(shown) - 1] in " ;,", "cut at a word, not inside one"
+    assert line.endswith('narrow: box: ssh true -> "ask"'), line
+    assert hooks_session.cut_words("x" * 130, 120) == "x" * 119 + "…"
+    assert hooks_session.cut_words("short", 120) == "short"
 
 
 def test_syntax_error_uses_last_good_form():
@@ -666,7 +696,7 @@ def test_session_hook_subprocess_shape():
         out = json.loads(r.stdout)
         assert set(out) <= {"hookSpecificOutput", "systemMessage"}
         assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
-        assert ef.read_text() == envfile.env_text("refuse")
+        assert ef.read_text() == envfile.env_text()
         r = H.run_py(env, "--test", "hook-subagent", payload={"hook_event_name": "SubagentStart"})
         assert json.loads(r.stdout)["hookSpecificOutput"]["hookEventName"] == "SubagentStart"
 
@@ -675,19 +705,20 @@ def test_degraded_output_still_writes_env():
     with H.gateway_env() as env, env_file(env) as ef:
         out = hooks_session.degraded_output(RuntimeError("boom"))
         assert out["systemMessage"].startswith("gateway: session setup failed (RuntimeError)")
-        assert ef.read_text() == envfile.env_text("refuse")
+        assert ef.read_text() == envfile.env_text()
         assert "boom" not in json.dumps(out)
 
 
-def test_others_mine_needs_ok_before_env_keeps_agent():
+def test_the_env_file_keeps_the_users_own_agent_and_tokens():
+    """PLAN-0.11 §1.6, §1.8: the user's agent and token variables are theirs,
+    for their own tools; Claude Code's own credential variables are removed
+    in Claude Code's shell (names only)."""
     with H.gateway_env() as env, env_file(env) as ef:
-        env.write_form('[settings]\nothers = "mine"\n')
+        env.write_form('[hosts.box]\naddress = "u@box.example.com"\n')
         hooks_session.session_main({})
-        assert "unset SSH_AUTH_SOCK" in ef.read_text(), "widening others waits for the OK"
-        vault.save(vault.empty())
-        consent.approve("settings", env.form())
-        hooks_session.session_main({})
-        assert "unset SSH_AUTH_SOCK" not in ef.read_text()
+        text = ef.read_text()
+        assert "SSH_AUTH_SOCK" not in text and "GH_TOKEN" not in text
+        assert "unset CLAUDE_CODE_OAUTH_TOKEN" in text and "ANTHROPIC_API_KEY" in text
 
 
 def test_missing_form_is_restored_not_replaced_by_the_starter():
@@ -744,29 +775,6 @@ def test_form_that_isnt_utf8_uses_the_last_good_form():
         assert d["form_last_good"] == good and "box" in d["approved"]["rights"]["hosts"]
 
 
-def test_leftover_v2_store_is_put_away_at_session_start():
-    from gateway import migrate as mig
-    with H.gateway_env() as env, env_file(env):
-        paths.ensure_home()
-        H.write_v2_vault(paths.home(), {"version": 2, "secrets": {"K": {"value": "v" * 16, "hosts": ["k.example.com"]}},
-                                        "sudo": {}, "accounts": {}})
-        assert mig.run("test").status == "migrated"
-        before = paths.vault_path().read_bytes()
-        # an old v2 session writes again: v2 starts from an empty vault and a new key
-        H.write_v2_vault(paths.home(), {"version": 2, "secrets": {"NEW_TOKEN": {"value": "n" * 20, "hosts": []}},
-                                        "sudo": {}, "accounts": {}})
-        out = hooks_session.session_main({})
-        msg = out["systemMessage"]
-        assert "showed up again" in msg and "NEW_TOKEN" in msg and "n" * 20 not in msg, msg
-        assert "aside" not in msg and "vault.age" not in msg, "never advice that replaces the v3 vault"
-        assert not paths.v2_store_path().exists() and not paths.v2_key_path().exists()
-        assert any(p.name.startswith("store-v2-stray-") for p in paths.backups_dir().iterdir())
-        d = vault.load()
-        assert set(d["accounts"]) == {"k"}, "the v3 vault keeps its entries"
-        assert d["events"][-1]["what"] == "migrate" and "NEW_TOKEN" in d["events"][-1]["detail"]
-        del before
-
-
 def test_unreadable_vault_is_reported_not_turned_into_pending():
     with H.gateway_env() as env, env_file(env) as ef:
         env.write_form(FORM)
@@ -775,7 +783,7 @@ def test_unreadable_vault_is_reported_not_turned_into_pending():
         out = hooks_session.session_main({})
         msg = out["systemMessage"]
         assert "the vault can't be read" in msg and "waiting for your OK" not in msg
-        assert ef.read_text() == envfile.env_text("refuse")
+        assert ef.read_text() == envfile.env_text()
 
 
 def test_missing_form_with_an_unreadable_vault_writes_no_starter():
@@ -820,8 +828,8 @@ def test_a_narrowing_outlives_a_syntax_error_and_a_deleted_form_without_a_vault(
             hooks_post.main({"tool_name": "Edit", "tool_input": {"file_path": str(paths.form_path())},
                              "tool_response": {}, "session_id": "s"})
 
-        narrowed = paths.form_path().read_text().replace('sudo = "ask"', "sudo = false")
-        assert narrowed != paths.form_path().read_text()
+        assert paths.form_path().read_text() == formmod.STARTER
+        narrowed = formmod.STARTER + "\n[hosts.localhost]\nsudo = false\n"
         env.write_form(narrowed)
         edited()
         assert vault.exists() and sudo() == "deny"
@@ -911,7 +919,7 @@ def test_session_start_needs_no_popup_or_urllib_when_nothing_is_pending():
         code = ("import json, os, sys; sys.path.insert(0, sys.argv[1])\n"
                 "from gateway import testing\n"
                 "with testing.override(sys.argv[2], machine_id='TEST-MACHINE-0001', "
-                "system_git=True, extra={'claude_ancestor': ''}):\n"
+                "system_git=True):\n"
                 "    from gateway import hooks_session\n"
                 "    out = hooks_session.session_main({'session_id': 'imp'})\n"
                 "print(json.dumps([out['hookSpecificOutput']['additionalContext'][:9], "
@@ -966,8 +974,7 @@ def _write_text(self, data, encoding=None, errors=None, newline=None):
         return f.write(data)
 pathlib.Path.write_text = _write_text
 from gateway import testing
-with testing.override(sys.argv[2], machine_id="TEST-MACHINE-0001", system_git=True,
-                      extra={"claude_ancestor": ""}):
+with testing.override(sys.argv[2], machine_id="TEST-MACHINE-0001", system_git=True):
     from gateway import hooks_session
     hooks_session.session_main({"session_id": "killed", "source": "startup"})
 print(json.dumps({"writes": count[0]}))
@@ -979,10 +986,10 @@ def _whole_or_absent(env, ef: Path, old_env: str) -> list[str]:
     new text: never a part."""
     from gateway import hooks_filechanged
     bad = []
-    checks = [(paths.form_path(), {migrate.STARTER}),
-              (ef, {old_env, envfile.env_text("refuse")}),
-              (paths.env_sh_path(), {envfile.env_text("refuse")}),
-              (paths.git_config_path(), {envfile.git_config_text("refuse")}),
+    checks = [(paths.form_path(), {formmod.STARTER}),
+              (ef, {old_env, envfile.env_text()}),
+              (paths.env_sh_path(), {envfile.env_text()}),
+              (paths.git_config_path(), {envfile.git_config_text()}),
               (paths.launcher_path(), {envfile.launcher_text()})]
     want = envfile.stand_ins()
     if paths.bin_dir().is_dir():
@@ -1024,7 +1031,7 @@ def test_a_killed_session_start_leaves_nothing_half_written_and_the_next_one_rec
             if total is None:              # a dry run counts the writes
                 assert r.returncode == 0, r.stderr
                 total = json.loads(r.stdout.strip().splitlines()[-1])["writes"]
-                assert total >= 18, total  # form, records, env file, env.sh, 13 stubs, ...
+                assert total >= 9, total   # form, records, env file, env.sh, the helpers, ...
                 continue
             assert r.returncode == 9, (n, r.returncode, r.stderr[-300:])
             bad = _whole_or_absent(env, ef, old_env)
@@ -1032,14 +1039,15 @@ def test_a_killed_session_start_leaves_nothing_half_written_and_the_next_one_rec
             ef2 = env.root / "session-env" / "sid2" / "sessionstart-hook-0.sh"
             with mock_env("CLAUDE_ENV_FILE", str(ef2)):
                 out = hooks_session.session_main({"session_id": "next", "source": "startup"})
-            assert "localhost (sudo: asks the user each time)" in \
+            assert "localhost (sudo: your own, not through the gateway; see below)" in \
                 out["hookSpecificOutput"]["additionalContext"]
-            assert paths.form_path().read_text() == migrate.STARTER
-            assert ef2.read_text() == paths.env_sh_path().read_text() == envfile.env_text("refuse")
+            assert paths.form_path().read_text() == formmod.STARTER
+            assert ef2.read_text() == paths.env_sh_path().read_text() == envfile.env_text()
             got = {p.name: p.read_text() for p in paths.bin_dir().iterdir()
                    if not p.name.startswith(".")}
-            assert got == envfile.stand_ins(), n
-            assert paths.git_config_path().read_text() == envfile.git_config_text("refuse")
+            form = formmod.load()
+            assert got == envfile.stand_ins(form, consent.compute(form, None)), n
+            assert not paths.git_config_path().exists()
             assert paths.launcher_path().read_text() == envfile.launcher_text()
             assert hooks_session.context_state("next") is not None
         n += 1

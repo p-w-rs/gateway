@@ -26,6 +26,8 @@ import {
   parseDaemon,
   parseManagedState,
   parseStatus,
+  REGISTER_TRIES,
+  registerStopping,
   setupReady,
   shlvlOk,
   shouldProvision,
@@ -43,6 +45,7 @@ import {
   NOT_RECEIVED,
   PANE,
   PASTE_NOTE,
+  SIGNIN_ENV,
   UNAVAILABLE_SURFACE,
   attemptLine,
   clientSurface,
@@ -62,6 +65,7 @@ import {
   type NextView,
 } from './dialog.ts'
 import {
+  ACCOUNTS_EDIT_HINT,
   ACCOUNTS_PANE,
   EDIT_HINT,
   HOSTS_PANE,
@@ -216,7 +220,7 @@ export const register: Register = (on) => {
     const regs = [
       () => $.command.register({ name: 'gate-doctor', description: 'Gateway diagnostics: versions, setup, pixi, vault, the gateway daemon and capabilities (no model turn)', immediate: true }),
       () => $.command.register({ name: 'gate-dialog', description: "Show the gateway's dialog that is waiting (a credential, a consent, a host key)", immediate: true }),
-      () => $.command.register({ name: 'gate-unlock', description: 'Unlock the gateway vault (or set its passphrase the first time) in a private dialog', immediate: true }),
+      () => $.command.register({ name: 'gate-unlock', description: 'Unlock the gateway vault, or set, change or remove its passphrase, in a private dialog', immediate: true }),
       () => $.command.register({ name: 'gate-lock', description: 'Lock the gateway vault now', immediate: true }),
       () => $.command.register({ name: 'gate-terminal', description: "Show a gateway terminal or job in a pane: watch it, take its input, hand it back (/gate-terminal [ID|new])", immediate: true }),
       () => $.command.register({ name: 'gate-hosts', description: "The gateway's hosts and workspaces: state, rights, add and edit (widenings need your OK in the gateway's dialog)", immediate: true }),
@@ -245,7 +249,8 @@ export const register: Register = (on) => {
       try {
         await managedSetup($, located, first)
       } catch {
-        // no prefix: the classic Bash hook reports the managed shell unavailable
+        // no prefix: Claude's commands run in the user's own shell, still judged by
+        // the classic Bash hook (PLAN-0.11 §1.8)
       }
       let ready = false
       if (e.isInteractive) {
@@ -314,8 +319,9 @@ export const register: Register = (on) => {
     return { text: S.placed ? 'the gateway dialog is open' : "the gateway dialog couldn't be shown here" }
   })
 
-  // /gate-unlock: the unlock dialog (a locked vault), or the first-time
-  // "set a vault passphrase" dialog (a vault whose key has none).
+  // /gate-unlock: the unlock dialog (a locked vault), the first-time "set a
+  // vault passphrase" dialog (a vault whose key has none), or gated's menu to
+  // change or remove the passphrase (an unlocked vault: PLAN-0.11 §19.14).
   on('command.run', { command: 'gate-unlock' }, async ($) => {
     const r = await ui($, 'POST', '/ui/vault/unlock', {})
     if (r === undefined) return { text: "the gateway daemon isn't reachable (/gate-doctor says why)" }
@@ -438,7 +444,7 @@ export const register: Register = (on) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: ACCOUNTS_PANE }, ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e) as any
+    const { Box, Text, Button, Input } = $.ui.resolve(e) as any
     const v = MS.view
     if (v === undefined) return <Box><Text dimColor>Loading the gateway's accounts…</Text></Box>
     const rows: any[] = []
@@ -455,6 +461,8 @@ export const register: Register = (on) => {
       <Box flexDirection="column">
         {rows.length > 0 ? rows : <Text dimColor>No accounts in gateway.toml yet.</Text>}
         <Text dimColor wrap="wrap">A browser login is never an API credential here: states come from each service's own API with the gateway's stored credential.</Text>
+        {e.surface !== 'mobile' ? <Input key="edit" label="edit" placeholder={ACCOUNTS_EDIT_HINT} submitLabel="apply"
+          onSubmit={(t: string) => void editLine($, t)} /> : null}
         {MS.note !== '' ? <Text key="note" dimColor wrap="wrap">{MS.note}</Text> : null}
         <Box flexDirection="row" gap={2}><Button key="refresh" onPress={() => void refreshManage($)}>Refresh</Button></Box>
       </Box>
@@ -875,7 +883,32 @@ async function cancelDialog($: Engine, d: DialogView): Promise<void> {
 }
 
 async function answer($: Engine, d: DialogView, extra: Record<string, unknown>): Promise<void> {
-  await ui($, 'POST', '/ui/dialog/answer', { id: d.id, button: 'ok', ...extra })
+  const body: Record<string, unknown> = { id: d.id, button: 'ok', ...extra }
+  // a browser sign-in's Open (PLAN-0.11 §7.2): the system browser gated opens
+  // needs Claude Code's display variables on Linux; they are checked there
+  if (d.signin !== null) body.env = await signinEnv($)
+  await ui($, 'POST', '/ui/dialog/answer', body)
+}
+
+// Claude Code's display and desktop variables for the system browser, and
+// SSH_CONNECTION (SIGNIN_ENV, in its order, each read by its literal name;
+// gated's own environment has none).
+async function signinEnv($: Engine): Promise<Record<string, string>> {
+  const got = await Promise.all([
+    $.env.get('DISPLAY').catch(() => undefined),
+    $.env.get('WAYLAND_DISPLAY').catch(() => undefined),
+    $.env.get('XAUTHORITY').catch(() => undefined),
+    $.env.get('XDG_RUNTIME_DIR').catch(() => undefined),
+    $.env.get('DBUS_SESSION_BUS_ADDRESS').catch(() => undefined),
+    $.env.get('XDG_CURRENT_DESKTOP').catch(() => undefined),
+    $.env.get('XDG_DATA_DIRS').catch(() => undefined),
+    $.env.get('SSH_CONNECTION').catch(() => undefined),
+  ])
+  const env: Record<string, string> = {}
+  got.forEach((v, i) => {
+    if (typeof v === 'string' && v !== '') env[SIGNIN_ENV[i]!] = v
+  })
+  return env
 }
 
 // "Paste from clipboard": gated reads the OS clipboard itself; the value never
@@ -995,36 +1028,44 @@ async function daemonRun($: Engine, located: Located, sub: 'status' | 'start'): 
 // draws on. The request goes from this process (the mod runs inside Claude
 // Code), so the daemon sees the Claude Code pid from the kernel; claude_pid,
 // when launch.sh's Python could name its parent as Claude Code, must match
-// it. An interactive session then runs the dialog loop.
+// it. A daemon that refuses it because it is stopping (its idle exit began:
+// lib.ts registerStopping) is replaced: `gated start` again (it waits for the
+// old one to go and starts a new one), then the registration again, at most
+// REGISTER_TRIES times. An interactive session then runs the dialog loop.
 async function registerSession($: Engine, located: Located, first = true): Promise<void> {
-  const d = await daemonRun($, located, 'start')
-  if (d !== undefined) S.noDisplay = await displayless($, d.platform)
-  if (d === undefined || !d.running || d.socket === '') return
-  S.socket = d.socket
-  if (first && d.skew !== '' && !S.skewShown) {
-    // the version-skew notice of `gated start`, once per session
-    S.skewShown = true
-    status($, 'skew', `daemon: ${clean(d.skew)}`)
-    $.clock.after(SKEW_SHOWN_MS, () => status($, 'skew', undefined))
-  }
-  try {
-    const claude = await $.session.version().catch(() => undefined)
-    const surfaces = await $.session.surfaces().catch(() => [] as readonly string[])
-    const body: Record<string, unknown> = {
-      session_id: await $.session.id().catch(() => ''),
-      surface: S.surface ?? '',
-      surfaces: [...surfaces],
-      version: claude?.version ?? '',
+  for (let tries = 0; tries < REGISTER_TRIES; tries++) {
+    const d = await daemonRun($, located, 'start')
+    if (d !== undefined) S.noDisplay = await displayless($, d.platform)
+    if (d === undefined || !d.running || d.socket === '') return
+    S.socket = d.socket
+    if (first && d.skew !== '' && !S.skewShown) {
+      // the version-skew notice of `gated start`, once per session
+      S.skewShown = true
+      status($, 'skew', `daemon: ${clean(d.skew)}`)
+      $.clock.after(SKEW_SHOWN_MS, () => status($, 'skew', undefined))
     }
-    if (d.parentPid > 0) body.claude_pid = d.parentPid
-    await $.http.fetch('http://gated/ui/register', {
-      method: 'POST',
-      socketPath: d.socket,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-  } catch {
-    // the classic hook-daemon hook registers the session too (without a UI)
+    let stopping = false
+    try {
+      const claude = await $.session.version().catch(() => undefined)
+      const surfaces = await $.session.surfaces().catch(() => [] as readonly string[])
+      const body: Record<string, unknown> = {
+        session_id: await $.session.id().catch(() => ''),
+        surface: S.surface ?? '',
+        surfaces: [...surfaces],
+        version: claude?.version ?? '',
+      }
+      if (d.parentPid > 0) body.claude_pid = d.parentPid
+      const r = await $.http.fetch('http://gated/ui/register', {
+        method: 'POST',
+        socketPath: d.socket,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      stopping = registerStopping(r.status, r.text)
+    } catch {
+      // the classic hook-daemon hook registers the session too (without a UI)
+    }
+    if (!stopping) break
   }
   if (first && S.interactive) void dialogLoop($).catch(() => undefined)
 }
@@ -1035,7 +1076,8 @@ async function registerSession($: Engine, located: Located, first = true): Promi
 // plan takes only the mode from it and the gate-sh copy's place (used only
 // while that copy holds the plugin's gate-sh); the managed bash comes from
 // launch.sh's status. A tampered state.json can thus only take the prefix
-// away, and then the classic Bash hook denies in managed mode (lib.ts
+// away, and then Claude's commands run in the user's own shell, still judged
+// by the classic Bash hook (lib.ts
 // managedPlan). GW_MANAGED_DIR tells gate-sh where its settings are;
 // CLAUDE_CODE_SHELL makes the managed bash, not the login shell, the shell
 // Claude Code starts gate-sh from (once the env is built).
@@ -1101,7 +1143,7 @@ async function managedNow($: Engine, located: Located, st: EnvStatus | undefined
         ...expected,
         prefix: undefined,
         shell: undefined,
-        inactive: expected.inactive ?? (prefix !== '' ? `another CLAUDE_CODE_SHELL_PREFIX is set (${prefix}); the classic Bash hook reports it` : 'no prefix was set in this session (it is set at session start; a new session sets it)'),
+        inactive: expected.inactive ?? (prefix !== '' ? `another CLAUDE_CODE_SHELL_PREFIX is set (${prefix}); Claude's commands run in your own shell (the classic Bash hook still judges them)` : 'no prefix was set in this session (it is set at session start; a new session sets it)'),
       }
   return { plan, state, replaced: S.managedReplaced }
 }

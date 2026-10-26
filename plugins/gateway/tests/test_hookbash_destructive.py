@@ -95,11 +95,13 @@ def test_hidden_command_runners_are_never_vouched_for():
             ("sudo xargs rm -rf", None),
             ("sudo parallel rm -rf ::: /", None),
             ("echo 'rm -rf /' | sudo at now", None),
-            ("sudo su", None),
-            ("sudo su -c 'rm -rf /'", None),
-            ("sudo runuser -u root -- rm x", None),
+            # the other elevation tools while this computer's sudo is configured
+            # (PLAN-0.11 §9.5): "use sudo", denied
+            ("sudo su", "deny"),
+            ("sudo su -c 'rm -rf /'", "deny"),
+            ("sudo runuser -u root -- rm x", "deny"),
             ("sudo -u root sudo -s", None),
-            ("sudo doas -s", None),
+            ("sudo doas -s", "deny"),
             ("sudo find / -delete", None),
             ("sudo find / -exec rm -rf {} +", None),
             ("sudo find /srv -name x -execdir rm '{}' +", None),

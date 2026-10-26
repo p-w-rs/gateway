@@ -8,8 +8,18 @@ native dialog inside Claude Code (section 6's OS dialogs, `gate secret`'s
 terminal path and the browser and device-code sign-ins are removed),
 Claude's commands run in the managed shell, the vault key can be
 passphrase-wrapped and held by the daemon, sudo never gets a sudoers rule,
-export is format 3, and policy and workspaces narrow the rights; the module
-docs ([modules/](modules/)) describe the code as it is. User guide:
+export is format 3, and policy and workspaces narrow the rights.
+**[PLAN-0.11.md](PLAN-0.11.md) supersedes both where they differ** (plugin
+0.11.0): only what gateway.toml configures goes through the gateway, and
+everything else uses the user's own tools (reversing the 2026-10-18 choice
+below that unlisted machines are refused); stand-ins exist only where
+something configured can be reached; rights and restrictions are per
+permission mode; network commands are one configurable class (curl and wget
+are no longer refused); git is a stand-in with its own config for configured
+repositories; azure and ml-catalog accounts can sign in through the browser;
+the 0.6 conversion, export formats 1 and 2 and `[settings]` are gone. The
+sections below carry short "0.11.0" notes where that changes them; the
+module docs ([modules/](modules/)) describe the code as it is. User guide:
 [../README.md](../../README.md); the plan this came from:
 [history/REDESIGN-v3.md](history/REDESIGN-v3.md). Decisions taken by the user on 2026-10-18:
 unlisted machines and git servers are **refused** (with an offer to add);
@@ -114,6 +124,8 @@ an installed plugin never are (`tests/e2e/README.md`).
 
 ## 2. The form (`gateway.toml`)
 
+> **0.11.0** ([PLAN-0.11.md](PLAN-0.11.md) §1, §2, §3): only what the form configures goes through the gateway; anything else is the user's own. `[settings]` is removed (a written one is a warning). Rights, the moded policy keys and `[network] commands` take a word (`true`/`"allow"`, `"cc"`, `"ask"`, `false`/`"deny"`) or a per-mode table with `default` required. `[network]` (`commands`, `extra`, `drop`) is new; `[hosts.localhost]` is optional (no `sudo` key: the user's own sudo). The user's reference is [CONFIG.md](../CONFIG.md).
+
 Parsed with `tomllib` after a lenient pre-pass: on lines matching
 `^\s*(ssh|sudo|scripts|use|default|packages)\s*=\s*(yes|no|on|off|ask|true|false)\s*(#.*)?$`
 bare words are normalized (`yes|on|true` → `true`, `no|off|false` →
@@ -133,6 +145,8 @@ anywhere (context, pop-ups, status) only after validation, with control
 characters, newlines and bidi overrides refused.
 
 ### `[settings]` (optional)
+
+> Removed in 0.11.0: there is no `others` key; unlisted machines and git servers use the user's own tools.
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -254,6 +268,8 @@ likewise.
   token until 2 minutes before expiry.
 
 ## 4. Migration from v2
+
+> Removed in 0.11.0: a 0.6 vault is converted with the published 0.10.0 first, and 0.11.0 refuses to create a vault beside one (`vault.v06_waiting`, `V06_MESSAGE`). This section is history.
 
 Trigger: the first v3 process (SessionStart, a shim, the MCP server or
 `gate migrate`) that finds `~/.config/gateway/store.age` and no
@@ -429,6 +445,8 @@ modules/ux.md and modules/daemon.md "Dialogs".)
 
 ## 7. Claude's environment (SessionStart)
 
+> **0.11.0** (PLAN-0.11 §1.2, §1.8): the env file puts `$DATA/bin` first and, in Claude's shell, unsets Claude Code's own credential variables and the stand-in names' aliases and functions; it no longer sets `GIT_SSH_COMMAND` or `RSYNC_RSH`, injects the git include, or unsets the user's own variables. Only the stand-ins that can reach something configured are written.
+
 `hooks/hooks.json` SessionStart runs two hooks:
 
 1. **sync** (exec form, timeout 20): `launch.sh hook-session`. Must finish
@@ -530,6 +548,8 @@ the stubs Python writes then fall back to it until the new one is ready.
 
 ## 8. Approval hook (PreToolUse, Bash|Monitor|mcp__terminal__run_in_terminal|mcp__plugin_check_jobs__job_start)
 
+> **0.11.0** (PLAN-0.11 §1.7, §2, §3, §6.5; lead decisions 1, 3, 10): every value is read in the payload's `permission_mode`, and the allow step needs the effective word `allow` in that mode (a bare `true`: auto and bypassPermissions). A target the configured set doesn't name gets no decision. The curl/wget refusal is gone: network commands are one class ([modules/network.md](modules/network.md)), asked about by default, and any hit keeps the allow off the whole command unless `[network] commands` allows in that mode. The route checks refuse only what reaches a configured target, in every mode, and the hidden-command rule refuses a hidden command that names one ([modules/managed.md](modules/managed.md#alternate-routes)); an "ask" holds only with the hook's record of the exact command (lead decision 14, `asks.py`); program names are compared without letter case; su, doas, pkexec, runuser, sudoedit and osascript's admin form are denied while this computer's sudo is configured; git's remote commands in a configured repository are judged up front. The gateway's own job_start and terminal_send are judged here too. The current rules: [modules/sudo.md](modules/sudo.md).
+
 `hooks/pre_bash.sh` (sh): if the payload (without its own `transcript_path`
 field) contains none of `sudo ssh scp sftp rsync curl wget gate gateway age
 credential GIT_TRACE_REDACT key.txt claude jsonl az` as words, exit 0 with no
@@ -567,11 +587,9 @@ Decision, in order:
    prompt`. Never rewrite. Also **deny** `az … get-access-token` as Claude's
    own Bash or Monitor command (the az stand-in gives tokens only to
    programs, section 9.5; not in the user's Terminal panel, whose az is the
-   user's own). Also **deny** `gate secret` in every tool (round 5: the
-   user's command; also behind a wrapper, or named inside a shell string,
-   `eval`, a loop or `find -exec`, or in a command the parser can't read),
-   and `gate export|import|copy-to` in the user's Terminal panel (section
-   15).
+   user's own). Also **deny** `gate export|import|copy-to` in the user's
+   Terminal panel and in a job (section 15). (The `gate secret` rule went
+   with its stub in 0.11.0.)
 2. **deny** any segment that reads or names `~/.config/gateway/private`
    (resolved), `key.txt`/`vault.age` there, or runs `age -d` on them, or
    runs `git credential`, the helper or askpass directly, or sets
@@ -747,6 +765,8 @@ Every decision reason starts with `gateway:` and says what to do next.
 
 ## 9. Stand-ins
 
+> **0.11.0** (PLAN-0.11 §1.2-§1.5, §6): a stand-in exists only for a tool that can reach something configured (`envfile.standins_for`), and git and az are stand-ins too. A stand-in classifies its target first: configured goes through the gateway; unconfigured execs the user's own tool (`envfile.user_tool`: PATH minus every stand-in folder) with the full argv and environment unchanged, guarded against loops; a configured host reached by another name (`ssh -G`, a hop, a ProxyCommand, an IP) is refused with the name to use. Per-mode values use the session's recorded mode for a command Claude typed, else the modeless rule. Current behaviour: the module docs.
+
 All stand-ins: read the form (cached by mtime) and vault under the lock
 only when they need a secret; check the target right (`false` → refuse,
 `"ask"` unless the stand-in was started by a command Claude typed (section
@@ -767,6 +787,8 @@ variables and dropping proxy/CA overrides unless the form allows them
 (it doesn't, in v3.0).
 
 ### 9.1 sudo (localhost)
+
+> **0.11.0**: present only while `[hosts.localhost] sudo` or an elevation restriction configures this computer's sudo; with a restriction only, its deny refuses, its ask needs a typed command, otherwise the user's sudo runs. [modules/sudo.md](modules/sudo.md).
 
 1. Right false → `gateway: sudo is off on this machine`, or, when the form
    turns it on and the change waits for the user's OK, `gateway: sudo on this
@@ -799,6 +821,8 @@ variables and dropping proxy/CA overrides unless the form allows them
    folder (its pid in the folder's `owner` file).
 
 ### 9.2 ssh family
+
+> **0.11.0**: a lenient parse and the user's own `ssh -G`, hops, ProxyCommand and resolved IPs classify the target before anything below; an unknown host passes through instead of being refused; scp and sftp classify each operand (a mix is refused); rsync is no stand-in (it starts `ssh` through PATH). [modules/ssh.md](modules/ssh.md).
 
 Target resolution: `ssh -G -F <generated config> "$@"` (8 ms) gives the
 host name ssh would use; the stand-in maps it to (a) a form host (by name,
@@ -917,6 +941,8 @@ it was typed for, or an `elevation` policy; section 15.)
 
 ### 9.4 git
 
+> **0.11.0** (PLAN-0.11 §6): `git` is a stand-in. In a repository with a configured remote (`gitroute`), and for a configured operand URL, the env's git runs with an allowlisted environment, this include file and `core.sshCommand` at command-line scope, and a read-only `GIT_CONFIG_GLOBAL`; everything else runs the user's git untouched. The include no longer comes from the env file. [modules/accounts.md](modules/accounts.md).
+
 `$DATA/git/config` (regenerated when the form changes; git re-reads it):
 
 ```ini
@@ -964,6 +990,8 @@ git over ssh to an account endpoint goes through the ssh stand-in
 host keys (github.com/hf.co keys built in).
 
 ### 9.5 Account CLIs
+
+> **0.11.0** (PLAN-0.11 §1.4): each resolves the destination as the tool would; a covered one takes the gated path below, an uncovered one passes through, one that can't be told uses the account while one of its kind exists. dvc goes to asiml only for pull and push in an asiml workspace.
 
 | stand-in | real binary | credential | refused subcommands |
 |---|---|---|---|
@@ -1103,6 +1131,8 @@ reveal them); they never pass through output paths the gateway controls.
 
 ## 12. Other hooks
 
+> **0.11.0** (PLAN-0.11 §9.1, §9.2, §7.2): PostToolUse and PostToolUseFailure match every tool (`.*`), post.sh skipping only tools whose response is fixed text or Claude's own input, and the values of the user's credential variables are masked too; `hooks/tool_guard.sh` denies an AskUserQuestion asking for a secret and the browser-automation tools while a browser sign-in runs.
+
 - **PostToolUse** (matcher `^(Bash|BashOutput|Monitor|Read|Grep|Edit|Write|MultiEdit|mcp__terminal__read_terminal|mcp__plugin_gate_gw__.*|mcp__ccd_session_mgmt__search_session_transcripts|mcp__ccd_session_mgmt__list_events|mcp__plugin_check_jobs__job_tail|mcp__plugin_check_jobs__job_status|mcp__plugin_check_jobs__job_stop)$`):
   `hooks/post.sh` prefilter: once a vault exists, every response runs
   Python (vault values without a token shape, such as sudo passwords,
@@ -1226,6 +1256,8 @@ reveal them); they never pass through output paths the gateway controls.
 
 ## 13. What Claude is told
 
+> **0.11.0** (PLAN-0.11 §1.9): the context says that anything not in gateway.toml uses Claude's own ssh, git, gh and sudo, that network commands are asked about, and (while it isn't configured) that the user's own sudo works only without a password; the checkpoint line appears only while checkpoint is live.
+
 SessionStart/SubagentStart `additionalContext` (≤ 2,500 chars), facts
 plus how-to:
 
@@ -1241,9 +1273,8 @@ Accounts: github-personal (octocat, default), github-work (octo-work; example-or
 - `gate status` shows everything; `gate why` explains the last refusal.
 ```
 
-When the checkpoint plugin's state folder exists
-(`${XDG_STATE_HOME:-~/.local/state}/checkpoint`, `paths.checkpoint_state_dir`),
-one more how-to line follows (it survives truncation like the others):
+When checkpoint has called gated in the last 24 hours (`<run>/checkpoint-seen`,
+PLAN-0.11 §9.4), one more how-to line follows (it survives truncation like the others):
 `- checkpoint jobs (job_start) get these stand-ins when checkpoint applies
 the gateway's env.sh, and are judged like Bash: curl is refused, and an
 "ask" right can't be used in a job (nobody can be asked while it runs), so
@@ -1254,6 +1285,8 @@ Generated from the validated form only (names, kinds, rights, logins,
 owners, sites); notes and other free text are never included.
 
 ## 14. MCP server
+
+> **0.11.0** (PLAN-0.11 §2.10, lead decision 19.1): `http` and `download` get deny or ask from the `network` policy in the payload's mode (`hooks_mcp`), allow only for the user's explicit per-mode allow, else no decision; web.py lets a network "ask" through.
 
 `.mcp.json`: server `gw`, `command: sh`, `args: [${CLAUDE_PLUGIN_ROOT}/hooks/launch.sh, mcp]`,
 `"alwaysLoad": true`. Hand-rolled stdio JSON-RPC (keep v2's), with
@@ -1432,6 +1465,8 @@ form's own hosts.
 
 ## 16. Export, import, copy-to
 
+> **0.11.0** (PLAN-0.11 §9.3, lead decisions 11, 12): format 3 only (PLAN-v4 phase 7; formats 1 and 2 are refused). Settings (`[shell]`, `[policy]`, `[network]`, `[vault]`) are approved in the import's one confirm; this machine's settings (`[hosts.localhost]`: sudo, scripts, policy, workspaces) are an item, unticked by default, kept or replaced on import; the confirm comes in parts when long; a browser sign-in's refresh token isn't exported; import runs inside a Claude Code session. [modules/ux.md](modules/ux.md).
+
 - Export format 2: age passphrase file (v2's pty runner), mode 0600,
   written outside any git work tree or cloud-synced folder (default
   `~/Downloads/gateway-YYYYMMDD.age`, never overwritten). Content:
@@ -1490,20 +1525,22 @@ exists, exec it with `-I -S run.py "$@"` (for `hook-session` after writing
 the safe env file, section 7); else for `ensure-env` build it (and warm it);
 for hooks and `mcp`, exec the newest other env under `$DATA/envs` that has
 `.ready` (touching its `.used`), if any; else for hooks print the documented
-degraded output (session: env file, stubs, git reset + a systemMessage and
-context by state: building, pixi missing, build failed), for `mcp` wait up
+degraded output (session: env file, stubs while something may be
+configured, a systemMessage and context by state: building, pixi missing,
+pixi too old, build failed), for `mcp` wait up
 to 4 s then exit 1.
 
-pixi.toml: python 3.12, age, gh, git-lfs, openssh, git (fallback only);
-features `hf` (huggingface_hub, hf-xet), `databricks` (databricks-cli),
-`dvc` (+ dvc-azure), `registry` (crane only), `pijul` (no conda-forge
-package for any of the four platforms: the cargo build of pijul
-1.0.0-beta.24 into `$DATA/pijul`, against the env's own libraries only:
-conda-forge libiconv for libgit2, `PKG_CONFIG_PATH` pinned to the env, an
-rpath to the env's lib folder, no xcrun). Platforms: osx-arm64, osx-64,
-linux-64, linux-aarch64 (no win-64). `requires-pixi = ">=0.68.0"` (the lock
-is format v7; tested with 0.68.0-0.70.0, 0.81.0 and 0.82.0, while 0.61.0-0.67.0
-refuse it; PLAN-v4 phase 1). Tasks: `test`, `mutations` (every mutation file
+pixi.toml (0.11.0, PLAN-0.11 §5: latest only): every dependency `"*"`
+(Python, PyNaCl, age, gh, git-lfs, openssh, git, bash, tmux, pixi-pack,
+zstd), relocked each release by `pixi run update-deps`; features `hf`
+(huggingface_hub, hf-xet), `databricks` (databricks-cli), `dvc` (+
+dvc-azure), `registry` (crane only), `pijul` (no conda-forge package: a
+cargo build of the newest pijul release, pre-releases included, into
+`$DATA/pijul`, against the env's own libraries only). Platforms:
+osx-arm64, osx-64, linux-64, linux-aarch64 (no win-64). `requires-pixi` is
+the pixi that made the lock, with no upper bound; an older pixi refuses the
+manifest, which launch.sh reports as pixi too old (`pixi self-update`).
+An older env is used only on the lock's Python minor. Tasks: `test`, `mutations` (every mutation file
 on scratch copies), `e2e`, `release-check`.
 
 ## 19. Files removed
