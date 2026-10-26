@@ -21,7 +21,7 @@ Claude: $ ssh homelab 'df -h'
         /dev/sda1   916G  402G  468G  47% /
 ```
 
-Plugin `gate` in the marketplace `gateway`, version 0.11.0. Sister plugins:
+Plugin `gate` in the marketplace `gateway`, version 0.11.1. Sister plugins:
 [checkpoint](https://github.com/p-w-rs/checkpoint) and
 [pixi-guard](https://github.com/p-w-rs/pixi-guard).
 
@@ -483,7 +483,7 @@ before updating, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
-0.11.0 (2026-10-26) is the latest release; what was verified for each release is in
+0.11.1 (2026-10-26) is the latest release; what was verified for each release is in
 [docs/dev/TESTING.md](docs/dev/TESTING.md). Never tested: the desktop app,
 real x86-64 hardware, real GitHub, Hugging Face or Azure services (the
 browser sign-in included), a run with the real model. To work on the

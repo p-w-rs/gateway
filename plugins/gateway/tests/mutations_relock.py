@@ -72,7 +72,7 @@ MUTATIONS = [
     ("the stand-ins say setup failed instead of pixi too old", L,
      "  elif pixi_too_old; then\n"
      "    printf '%s' \"gateway: the gateway can't set itself up: $GW_TOOOLD; tell the user to update pixi "
-     "(pixi self-update) and start a new session\"\n",
+     "($GW_PIXI_UPDATE) and start a new session\"\n",
      "",
      T + "test_pixi_too_old_is_recognized"),
     ("the launcher's pixi-too-old text differs from Python's", E,
@@ -104,8 +104,8 @@ MUTATIONS = [
      ' else "your pixi is too old"\n',
      T + "test_pixi_too_old_keeps_only_version_characters"),
     ("a quote in the record breaks SessionStart's JSON", L,
-     '    msg="gateway: the gateway can\'t set itself up: $(json_esc "$GW_TOOOLD"). Update pixi:',
-     '    msg="gateway: the gateway can\'t set itself up: $GW_TOOOLD. Update pixi:',
+     '    msg="gateway: the gateway can\'t set itself up: $(json_esc "$GW_TOOOLD"). Update pixi (',
+     '    msg="gateway: the gateway can\'t set itself up: $GW_TOOOLD. Update pixi (',
      T + "test_a_pixi_too_old_record_never_breaks_the_session_json"),
     ("a quote in the record breaks the not-ready context's JSON", L,
      "the gateway can't set itself up: $(json_esc \"$GW_TOOOLD\"). Tell the user once",

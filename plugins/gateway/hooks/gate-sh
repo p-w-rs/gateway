@@ -117,12 +117,13 @@ gw_lock_live() {
 # Why the gateway's settings can't be used, from file tests alone (no
 # process is started): its data folder gone (uninstalled, or the folder
 # removed), a build running (a live lock: gw_lock_live), its setup failed (an
-# env folder with install.log and no .ready, no live build lock), an env
-# already built (then its settings are what is missing or wasn't renewed),
-# pixi missing (launch.sh's find_pixi places), or else still setting up (no
-# build has started yet). launch.sh's not_ready_text tells the stand-ins the
-# same states apart; the failed and pixi-missing sentences are its own
-# (tests/test_managed.py compares them).
+# env folder with install.log and no .ready, no live build lock; pixi too old
+# when launch.sh's .pixi-too-old record is beside that log), an env already
+# built (then its settings are what is missing or wasn't renewed), pixi
+# missing (launch.sh's find_pixi places), or else still setting up (no build
+# has started yet). launch.sh's not_ready_text tells the stand-ins the same
+# states apart; the failed, pixi-too-old and pixi-missing sentences are its
+# own (tests/test_managed.py compares them).
 gw_setup_state() {
   set +f
   _data=${GW_MANAGED_DIR%/managed}
@@ -146,6 +147,18 @@ gw_setup_state() {
     if [ -z "$_log" ] && [ -f "$_d/install.log" ] && [ ! -e "$_d/.ready" ]; then _log=$_d/install.log; fi
   done
   if [ -n "$_log" ]; then
+    # pixi refused the manifest as too old: launch.sh's .pixi-too-old record
+    # beside that log (found= and needed= lines, version characters only)
+    if [ -f "${_log%/install.log}/.pixi-too-old" ]; then
+      _found= _need=
+      while IFS='=' read -r _k _v; do
+        case $_k in found) _found=$_v ;; needed) _need=$_v ;; esac
+      done < "${_log%/install.log}/.pixi-too-old"
+      if [ -n "$_found" ]; then _old="pixi $_found is too old"; else _old="this pixi is too old"; fi
+      [ -z "$_need" ] || _old="$_old (the gateway needs pixi $_need)"
+      printf '%s' "The gateway can't set itself up: $_old; tell the user to update pixi (pixi self-update, or your package manager for a Homebrew or MacPorts pixi) and start a new session."
+      return 0
+    fi
     printf '%s' "The gateway's setup failed (log: $_log); it is retried at the next session start; tell the user (/gate-doctor shows why)."
     return 0
   fi
@@ -376,10 +389,12 @@ gw_read_conf() {
 gw_read_conf || gw_notready "its settings haven't been written yet"
 # gateway.toml changed after the settings were written (FileChanged didn't
 # run yet), or the vault was unlocked since (approved imports are inside it):
-# renew them first, so a narrowing applies to this command.
+# renew them first, so a narrowing applies to this command. (With Claude
+# Code's PATH, as SessionStart has it: the tool folders it lists as not
+# imported leave out what the managed PATH holds already.)
 if { [ -n "$GW_FORM" ] && [ "$GW_FORM" -nt "$GW_CONF" ]; } ||
    { [ -n "$GW_UNLOCKED" ] && [ "$GW_UNLOCKED" -nt "$GW_CONF" ]; }; then
-  if [ -x "$GW_SYNC" ]; then "$GW_SYNC" < /dev/null > /dev/null 2>&1; fi
+  if [ -x "$GW_SYNC" ]; then PATH=$GW_PATH0 "$GW_SYNC" < /dev/null > /dev/null 2>&1; fi
   gw_read_conf || gw_notready "its settings couldn't be read"
   if [ -n "$GW_FORM" ] && [ "$GW_FORM" -nt "$GW_CONF" ]; then
     gw_notready "gateway.toml changed and its settings couldn't be renewed"

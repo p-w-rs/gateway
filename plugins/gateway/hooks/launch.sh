@@ -186,6 +186,9 @@ NOPIXI="gateway: the gateway can't set itself up: pixi isn't installed; tell the
 # (envfile.launcher_not_ready).
 LSTILL=$STILL
 LNOPIXI="gateway: pixi isn't installed, so the gateway can't set itself up; install it from https://pixi.sh and start a new Claude Code session"
+# How pixi is updated (envfile.PIXI_UPDATE, lib.ts's PIXI_UPDATE): pixi
+# self-update refuses a Homebrew or MacPorts pixi.
+GW_PIXI_UPDATE="pixi self-update, or your package manager for a Homebrew or MacPorts pixi"
 
 # Sets SHA: the first 12 hex digits of sha256(FILE), as paths.lock_sha12()
 # (nolock000000 when it can't be had). No subshell or cut: every hook call
@@ -666,10 +669,14 @@ ensure_env() {
 
 # The managed shell's files (src/gateway/managed.py) as soon as an env can
 # run Python: a first session's SessionStart ran before the env existed, and
-# hooks/gate-sh refuses to run anything until they are written.
+# hooks/gate-sh refuses to run anything until they are written. --setup:
+# first a missing gateway.toml as SessionStart writes it (the starter form on
+# a new install), so it is there when setup says ready, not only from the
+# next session on. Async (this hook or the mod's spawn), after the build
+# lock is gone; the form is linked into place whole.
 managed_sync() {
   [ -n "${GATEWAY_TEST_ROOT-}" ] && return 0
-  "$PY" -I -S -X "pycache_prefix=$PYC" "$ROOT/run.py" managed-sync </dev/null >/dev/null 2>&1
+  "$PY" -I -S -X "pycache_prefix=$PYC" "$ROOT/run.py" managed-sync --setup </dev/null >/dev/null 2>&1
   return 0
 }
 
@@ -719,7 +726,7 @@ not_ready_text() {
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "$NOPIXI"
   elif pixi_too_old; then
-    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; tell the user to update pixi (pixi self-update) and start a new session"
+    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; tell the user to update pixi ($GW_PIXI_UPDATE) and start a new session"
   elif build_failed; then
     printf '%s' "gateway: the gateway's setup failed (log: $ENVD/install.log); it is retried at the next session start; tell the user"
   else
@@ -732,7 +739,7 @@ launcher_not_ready_text() {
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "$LNOPIXI"
   elif pixi_too_old; then
-    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; update pixi (pixi self-update), then start a new Claude Code session"
+    printf '%s' "gateway: the gateway can't set itself up: $GW_TOOOLD; update pixi ($GW_PIXI_UPDATE), then start a new Claude Code session"
   elif build_failed; then
     printf '%s' "gateway: the gateway's setup failed (log: $ENVD/install.log); start a new Claude Code session to retry"
   else
@@ -746,7 +753,7 @@ not_ready_context() {
   if ! find_pixi >/dev/null 2>&1; then
     printf '%s' "Gateway (plugin): the gateway can't set itself up because pixi isn't installed. Tell the user once to install it from https://pixi.sh and start a new session; $tail"
   elif pixi_too_old; then
-    printf '%s' "Gateway (plugin): the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Tell the user once to update pixi (pixi self-update) and start a new session; $tail"
+    printf '%s' "Gateway (plugin): the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Tell the user once to update pixi ($GW_PIXI_UPDATE) and start a new session; $tail"
   elif build_failed; then
     printf '%s' "Gateway (plugin): the gateway's first-time setup failed (log: $(json_esc "$ENVD/install.log")); it is retried at the next session start. Tell the user once; $tail"
   else
@@ -767,7 +774,7 @@ degraded_session() {
   if ! find_pixi >/dev/null 2>&1; then
     msg="gateway: pixi isn't installed, so the gateway can't set itself up. Install it from https://pixi.sh, then start a new session."
   elif pixi_too_old; then
-    msg="gateway: the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Update pixi: pixi self-update, then start a new session."
+    msg="gateway: the gateway can't set itself up: $(json_esc "$GW_TOOOLD"). Update pixi ($GW_PIXI_UPDATE), then start a new session."
   elif build_failed; then
     msg="gateway: setting up failed; see $(json_esc "$ENVD/install.log") (it is retried at every session start)"
   else

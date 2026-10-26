@@ -14,9 +14,12 @@ and hooks/launch.sh; it puts its own src/ on sys.path).
     run.py gated serve [--detach] | start [--register] | status | stop   the gateway daemon
     run.py hook-daemon                                            async SessionStart: start gated,
                                                                   register the session
-    run.py managed-sync                                           renew the managed shell's files
+    run.py managed-sync [--setup]                                 renew the managed shell's files
                                                                   (hooks/gate-sh, when gateway.toml
-                                                                  is newer than its settings)
+                                                                  is newer than its settings);
+                                                                  --setup (launch.sh, a build done):
+                                                                  first a missing gateway.toml as
+                                                                  SessionStart writes it
 
 Hook modes read the hook's JSON on stdin and print the hook's JSON answer.
 Failure policy: hook-files fails closed (exit 2, the hook has onFailure:
@@ -232,7 +235,7 @@ def dispatch(mode: str, args: list) -> int:
     if mode == "managed-sync":
         from gateway import managed
         try:
-            return int(managed.sync_now() or 0)
+            return int(managed.sync_now(setup=args[:1] == ["--setup"]) or 0)
         except Exception as e:  # noqa: BLE001
             return _failed("managed-sync", e)
     if mode == "git-credential":

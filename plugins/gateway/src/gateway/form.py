@@ -53,7 +53,8 @@ KINDS = ("github", "huggingface", "azure", "ml-catalog", "pijul", "registry", "a
 RIGHT_WORDS = {"true": True, "yes": True, "on": True, "false": False, "no": False,
                "off": False, "ask": "ask"}
 # The form a new install starts with (SessionStart writes it when there is
-# neither a form nor anything stored): these three comment lines, no entry.
+# neither a form nor anything stored, and so does the end of the first setup:
+# managed.sync_now(setup=True)): these three comment lines, no entry.
 STARTER = (
     "# The machines and accounts Claude may use. Edit freely, or ask Claude.\n"
     "# Secrets never go here; the gateway asks for them in its dialog in Claude Code.\n"

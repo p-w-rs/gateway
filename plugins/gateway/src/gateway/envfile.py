@@ -750,9 +750,10 @@ def pixi_too_old_note() -> str:
             "then start a new session")
 
 
-# How pixi is updated (lib.ts's PIXI_UPDATE): pixi self-update refuses a
-# Homebrew or MacPorts pixi. (launcher_not_ready's text is launch.sh's, byte
-# for byte.)
+# How pixi is updated (lib.ts's PIXI_UPDATE, launch.sh's GW_PIXI_UPDATE): pixi
+# self-update refuses a Homebrew or MacPorts pixi. (launcher_not_ready's text
+# is launch.sh's, byte for byte; launch.sh's other not-ready texts and
+# gate-sh's notice give the same advice.)
 PIXI_UPDATE = "pixi self-update, or your package manager for a Homebrew or MacPorts pixi"
 
 
@@ -771,7 +772,7 @@ def launcher_not_ready(state: str = "building") -> str:
         return LAUNCHER_NOPIXI
     if state == "pixiold":
         return (f"gateway: the gateway can't set itself up: {pixi_too_old_words()}; update pixi "
-                "(pixi self-update), then start a new Claude Code session")
+                f"({PIXI_UPDATE}), then start a new Claude Code session")
     if state == "failed":
         return launcher_failed(paths.env_dir() / "install.log")
     return STILL_SETTING_UP

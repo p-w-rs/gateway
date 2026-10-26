@@ -170,7 +170,7 @@ plugins/gateway/
                                     fakes/ (fake_claude.py: a python named `claude`; fake_user_tool.py),
                                     test_*.py, mutation_check.py and mutations_*.py (one file per area;
                                     PLAN-0.11's: posture, modes, network, git, sso, offer, relock,
-                                    integration, final, asks),
+                                    integration, final, asks; 0.11.1's: setup),
                                     e2e/ (headless claude -p suite; tests/e2e.py forwards to it), tui/
                                     (the interactive TUI harness, identical in checkpoint; proxy.py: the
                                     record-only telemetry proxy), acceptance_*.py (live through tui/:
@@ -861,7 +861,11 @@ it and `hooks/mod/lib.ts`'s `PIXI_TESTED` together (`CLAUDE_TESTED` is the
 Claude Code of the last acceptance runs; `/gate-doctor` warns below either,
 notes above), and `test_packaging` keeps them, the docs and the pins in step.
 An older pixi refuses the manifest ("requires pixi"): launch.sh records it
-(`$ENVD/.pixi-too-old`, status `pixi_too_old`) and says "pixi self-update".
+(`$ENVD/.pixi-too-old`, status `pixi_too_old`), and its texts, gate-sh's
+not-ready notice, `gate status` and `/gate-doctor` say to update pixi with
+"pixi self-update, or your package manager for a Homebrew or MacPorts pixi"
+(`envfile.PIXI_UPDATE` = launch.sh's `GW_PIXI_UPDATE` = lib.ts's
+`PIXI_UPDATE`; tests compare them).
 The suite needs the pixi `requires-pixi` names too (`pixi self-update`; or,
 keeping an older one installed, run the commands above through `pixi exec
 --spec pixi==VERSION pixi ...` with requires-pixi's VERSION). The launcher's
@@ -1190,8 +1194,8 @@ it (`test_packaging`'s lock check runs that pixi).
 
 ## Status
 
-0.11.0 (2026-10-26, tag `v0.11.0`) is the last published release
-(CHANGELOG.md; PLAN-0.11.md): ungated
+0.11.1 (2026-10-26, tag `v0.11.1`) is the last published release: 0.11.0's
+setup messages and doc fixes. 0.11.0 (CHANGELOG.md; PLAN-0.11.md) brought: ungated
 unless configured (stand-ins only where something is configured, the user's
 own tools for everything else, removal as a widening), per-mode values for
 every right and restriction, the network class, the git stand-in, browser

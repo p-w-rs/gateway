@@ -972,6 +972,12 @@ def _launch_sh_sentence(name: str) -> str:
     src = (H.PLUGIN / "hooks" / "launch.sh").read_text()
     if name == "nopixi":
         m = re.search(r'^NOPIXI="gateway: ([^"]+)"$', src, re.M)
+    elif name == "pixiold":       # WORDS for launch.sh's GW_TOOOLD ("pixi 0.81.0 is too old ...")
+        m = re.search(r'''printf '%s' "gateway: (the gateway can't set itself up: \$GW_TOOOLD; '''
+                      r'''tell the user [^"]*)"''', src)
+        upd = re.search(r'^GW_PIXI_UPDATE="([^"]+)"$', src, re.M)
+        assert m and upd and upd.group(1) == envfile.PIXI_UPDATE, name
+        return m.group(1).replace("$GW_PIXI_UPDATE", upd.group(1)).replace("$GW_TOOOLD", "WORDS")
     else:
         m = re.search(r'''printf '%s' "gateway: (the gateway's setup failed \(log: \$ENVD/install\.log\)[^"]*)"''', src)
     assert m, name
@@ -1022,10 +1028,27 @@ def test_an_unready_managed_shell_says_what_is_wrong():
         want = _launch_sh_sentence("failed").replace("LOG", str(bad / "install.log"))
         assert want[0].upper() + want[1:] in err and "/gate-doctor" in err, (want, err)
         assert "still setting up" not in err, err
+        # pixi too old (the GitHub install test, 0.11.0: this said "setup failed;
+        # retried at the next session start"): launch.sh's record beside that log
+        # names the versions, and the advice is launch.sh's own (the package
+        # manager for a Homebrew or MacPorts pixi)
+        record = bad / ".pixi-too-old"
+        old = _launch_sh_sentence("pixiold")
+        for text, words in (("found=0.81.0\nneeded=>=0.83.0\n",
+                             "pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0)"),
+                            ("found=\nneeded=\n", "this pixi is too old")):
+            record.write_text(text)
+            err = refused(w.launch_env(withpixi))
+            say = old.replace("WORDS", words)
+            assert say[0].upper() + say[1:] + "." in err and envfile.PIXI_UPDATE in err, (say, err)
+            assert "failed" not in err and "retried" not in err and "still setting up" not in err, err
         # ... unless a build runs now (its lock; one without an owner file yet
         # counts as live, as in launch.sh)
         lock = envs / "0123456789ab.building"
         lock.mkdir()
+        err = refused(w.launch_env(withpixi))
+        assert "still setting up" in err and "failed" not in err and "too old" not in err, err
+        record.unlink()
         err = refused(w.launch_env(withpixi))
         assert "still setting up" in err and "failed" not in err, err
         # review round 2: a lock whose builder and pixi child are gone (a
@@ -1651,6 +1674,51 @@ def test_tool_folders_found_but_not_imported_are_offered_and_listed_never_import
         assert "- Tool folders here" not in hooks_session.context_text(form, eff, {})
 
 
+def test_tool_folders_already_on_the_managed_path_are_not_listed_as_found():
+    """The GitHub install test of 0.11.0: gate status and /gate-doctor said
+    "found here but not imported: ~/.local/bin, ~/.pixi/bin" (Debian) and
+    /opt/local/bin (macOS), each needing the user's OK, though the managed
+    shell's PATH held them already (Claude Code's own PATH, which the
+    snapshot's PATH starts from). A folder on the PATH the process inherited
+    is left out; one that isn't stays listed. gate-sh renews the settings
+    with Claude Code's PATH, not its own helper PATH, so state.json (what
+    /gate-doctor shows) leaves it out too; `gate status` in Claude's shell
+    sees the managed PATH itself."""
+    with world() as w:
+        h = w.env.user_home
+        for d in (".local/bin", ".cargo/bin"):
+            (h / d).mkdir(parents=True)
+            (h / d / "tool").write_text("")
+        local = str(h / ".local" / "bin")
+        form, eff, data = w.load()
+        found = managed.found_not_imported(eff, path="/usr/bin:/bin")
+        assert "~/.local/bin" in found and "~/.cargo/bin" in found, found
+        found = managed.found_not_imported(eff, path=f"/usr/bin:{local}/:relative/bin:/bin")
+        assert "~/.local/bin" not in found and "~/.cargo/bin" in found, found
+        old = os.environ.get("PATH", "")
+        try:                                    # this process's PATH by default (a hook's)
+            os.environ["PATH"] = f"{local}:/usr/bin:/bin"
+            found = managed.found_not_imported(eff)
+            line = next(ln for ln in managed.status_lines(eff) if "found here but not imported" in ln)
+        finally:
+            os.environ["PATH"] = old
+        assert "~/.local/bin" not in found and "~/.cargo/bin" in found, found
+        assert "~/.local/bin" not in line and "~/.cargo/bin" in line, line
+        # gate-sh's renewal (a newer gateway.toml) writes state.json with Claude Code's PATH
+        snap = w.snapshot()
+        for path, listed in ((f"{local}:/usr/bin:/bin:/usr/sbin:/sbin", False),
+                             ("/usr/bin:/bin:/usr/sbin:/sbin", True)):
+            w.sync()                 # the test's sync stub again (a renewal writes a plain one)
+            w.env.write_form("# renewed\n")
+            st = paths.form_path().stat()
+            os.utime(paths.form_path(), (st.st_atime, managed.conf_path().stat().st_mtime + 5))
+            r, _ = w.run("echo ran", snap=snap, extra={"PATH": path})
+            assert r.returncode == 0 and r.stdout == "ran\n" and r.stderr == "", r
+            assert managed.conf_path().stat().st_mtime > paths.form_path().stat().st_mtime, "renewed"
+            got = json.loads(managed.state_path().read_text())["found"]
+            assert ("~/.local/bin" in got) is listed and "~/.cargo/bin" in got, (path, got)
+
+
 def test_gate_status_shows_the_managed_shell_with_every_origin():
     from gateway import gate
     with world() as w:
@@ -1698,11 +1766,58 @@ def test_session_start_writes_the_managed_files():
 def test_launch_sh_writes_the_managed_files_once_a_build_finishes():
     """Right after the build, before the warm-up (seconds on macOS): gate-sh
     refuses every command until they exist. An env whose setup was
-    interrupted after the build (no conf) gets them at the next ensure-env."""
+    interrupted after the build (no conf) gets them at the next ensure-env,
+    and a missing gateway.toml with them (--setup)."""
     text = (H.PLUGIN / "hooks" / "launch.sh").read_text()
     assert '[ "$rc" -eq 0 ] && { managed_sync; warm_env; cleanup_envs; }' in text
     assert 'if ready; then [ -f "$DATA/managed/conf" ] || managed_sync; warm_env; cleanup_envs; return 0; fi' in text
-    assert '"$PY" -I -S -X "pycache_prefix=$PYC" "$ROOT/run.py" managed-sync' in text
+    assert '"$PY" -I -S -X "pycache_prefix=$PYC" "$ROOT/run.py" managed-sync --setup </dev/null' in text
+
+
+def test_the_first_setup_writes_the_starter_form_when_it_finishes():
+    """The first session's SessionStart runs before any env can run Python
+    (launch.sh's degraded path), so gateway.toml appeared only when the next
+    session started, though the README says the first session creates it
+    (the GitHub install test of 0.11.0: /gate-doctor said "not written yet"
+    after ready). launch.sh runs `managed-sync --setup` once the build is
+    done: a missing form is written as SessionStart writes it (the starter;
+    the vault's last good form; nothing over approvals it can't restore,
+    nothing beside a 0.6 vault), before conf, so gate-sh doesn't renew at
+    the first command. Without --setup (gate-sh's renewal, an approval) a
+    missing form stays missing."""
+    with H.gateway_env(entry=None, pixi="") as env:
+        env.o.entry = H.entry_cmd(env)
+        assert managed.sync_now() == 0 and not paths.form_path().exists()
+        r = subprocess.run([str(managed.sync_path()), "--setup"], capture_output=True, text=True,
+                           env=env.subprocess_env(), timeout=60)     # run.py managed-sync --setup
+        assert r.returncode == 0, r
+        assert paths.form_path().read_text() == F.STARTER
+        assert managed.conf_path().stat().st_mtime > paths.form_path().stat().st_mtime
+        # a form there is left as it is
+        env.write_form("# mine\n")
+        assert managed.sync_now(setup=True) == 0 and paths.form_path().read_text() == "# mine\n"
+        # a vault with a last good form: that one, never the starter
+        form = '[hosts.box]\naddress = "u@box.example.com"\n'
+        env.write_form(form)
+        vault.save(vault.empty())
+        consent.approve_all(env.form())
+        with vault.edit() as d:
+            d["form_last_good"] = form
+        paths.form_path().unlink()
+        assert managed.sync_now() == 0 and not paths.form_path().exists()
+        managed.sync_now(setup=True)
+        assert paths.form_path().read_text() == form
+        # approvals and no copy: left missing (no starter over them)
+        with vault.edit() as d:
+            d["form_last_good"] = None
+        paths.form_path().unlink()
+        managed.sync_now(setup=True)
+        assert not paths.form_path().exists()
+    with H.gateway_env() as env:                     # a 0.6 vault waiting for 0.10.0's conversion
+        paths.ensure_private()
+        paths.v2_store_path().write_text("age-encrypted 0.6 store\n")
+        managed.sync_now(setup=True)
+        assert not paths.form_path().exists()
 
 
 def test_bash_c_with_a_socket_on_stdin_sources_bashrc_at_shell_level_1_and_shlvl_1_stops_it():

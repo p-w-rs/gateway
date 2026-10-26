@@ -673,7 +673,13 @@ def test_pixi_too_old_is_recognized_and_every_not_ready_text_says_pixi_self_upda
     the build fails at once with "requires pixi". launch.sh records the found
     and needed versions, status reports them, and the session message,
     Claude's context, the stand-ins and the launcher (byte-identical to
-    Python's) say to update pixi instead of "setup failed, see the log"."""
+    Python's) say to update pixi instead of "setup failed, see the log":
+    pixi self-update, or the package manager for a Homebrew or MacPorts pixi,
+    where self-update refuses (the GitHub install test of 0.11.0 on a
+    MacPorts pixi: Claude was told only "pixi self-update")."""
+    upd = envfile.PIXI_UPDATE
+    src = (H.PLUGIN / "hooks" / "launch.sh").read_text()
+    assert f'\nGW_PIXI_UPDATE="{upd}"\n' in src, "launch.sh's advice is Python's and the mod's"
     with H.gateway_env() as env:
         fake = _refusing_pixi(env.root / "oldpixi")
         assert _ensure(env, fake).returncode != 0
@@ -685,16 +691,18 @@ def test_pixi_too_old_is_recognized_and_every_not_ready_text_says_pixi_self_upda
         words = "pixi 0.81.0 is too old (the gateway needs pixi >=0.83.0)"
         e = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
         out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"}, extra_env=e).stdout)
-        assert words in out["systemMessage"] and "pixi self-update" in out["systemMessage"], out
+        assert words in out["systemMessage"] and f"Update pixi ({upd})" in out["systemMessage"], out
         ctx = out["hookSpecificOutput"]["additionalContext"]
-        assert words in ctx and "pixi self-update" in ctx and "setup failed" not in ctx, ctx
+        assert words in ctx and f"update pixi ({upd})" in ctx and "setup failed" not in ctx, ctx
         stub = H.run_stub(env, "gate", "status")         # nothing configured: the helpers only
-        assert stub.returncode == 75 and words in stub.stderr and "pixi self-update" in stub.stderr, stub.stderr
+        assert stub.returncode == 75 and words in stub.stderr and f"update pixi ({upd})" in stub.stderr, \
+            stub.stderr
         lt = paths.launcher_path().read_text()
         assert lt == envfile.launcher_text("pixiold"), lt
-        assert words in lt and "pixi self-update" in lt and "tell the user" not in lt
+        assert words in lt and f"update pixi ({upd})" in lt and "tell the user" not in lt
         sub = json.loads(H.run_launch(env, "hook-subagent", extra_env=e).stdout)
         assert words in sub["hookSpecificOutput"]["additionalContext"]
+        assert f"update pixi ({upd})" in sub["hookSpecificOutput"]["additionalContext"]
         # any other failure isn't pixi's age: the next attempt clears the record
         other = _refusing_pixi(env.root / "netpixi", "error: network unreachable\n")
         assert _ensure(env, other).returncode != 0
@@ -736,8 +744,9 @@ def _too_old_texts(env, fake: Path, words: str) -> None:
     e = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
     assert envfile.pixi_too_old_words() == words
     out = json.loads(H.run_launch(env, "hook-session", payload={"session_id": "s1"}, extra_env=e).stdout)
-    assert words in out["systemMessage"] and "pixi self-update" in out["systemMessage"], out
+    assert words in out["systemMessage"] and envfile.PIXI_UPDATE in out["systemMessage"], out
     assert words in out["hookSpecificOutput"]["additionalContext"], out
+    assert envfile.PIXI_UPDATE in out["hookSpecificOutput"]["additionalContext"], out
     sub = json.loads(H.run_launch(env, "hook-subagent", extra_env=e).stdout)
     assert words in sub["hookSpecificOutput"]["additionalContext"], sub
     stub = H.run_stub(env, "gate", "status")             # nothing configured: the helpers only

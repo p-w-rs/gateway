@@ -549,10 +549,17 @@ def _write_conf(text: str) -> None:
         pass
 
 
-def sync_now() -> int:
-    """run.py managed-sync (gate-sh, when gateway.toml is newer than conf;
-    gated, after an unlock): load the form and the vault, persist a
-    narrowing, write the files. Exit 0 when they were written."""
+def sync_now(setup: bool = False) -> int:
+    """run.py managed-sync (gate-sh, when gateway.toml is newer than conf or
+    the vault was unlocked; an approval of the settings; launch.sh once a
+    build finishes, with --setup): load the form and the vault, persist a
+    narrowing, write the files. Exit 0 when they were written. With setup a
+    missing gateway.toml is first handled as SessionStart handles it
+    (hooks_session._missing_form: the starter form when nothing is stored,
+    the vault's last good form, else left missing): a first session's
+    SessionStart ran before any env could run Python, so without this the
+    form appeared only when the next session started. Written all at once
+    and before conf, so conf stays newer than the form."""
     from . import consent, vault
     from . import form as formmod
     data = None
@@ -564,6 +571,11 @@ def sync_now() -> int:
         data, readable = None, False
     formmod.clear_cache()
     form = formmod.load(last_good=(data or {}).get("form_last_good"))
+    if setup and not form.exists:
+        with contextlib.suppress(Exception):     # the next session start writes it anyway
+            from . import hooks_session
+            hooks_session._missing_form([], data, True)
+            form = formmod.load(last_good=(data or {}).get("form_last_good"), use_cache=False)
     with contextlib.suppress(Exception):
         if consent.ratchet(form) and vault.exists():
             data = vault.load()
@@ -797,14 +809,28 @@ _FOUND_SAFE = re.compile(r"[A-Za-z0-9._+@/~-]{1,200}")
 _FOUND_SKIP = ("/System/", "/Library/Apple/", "/usr/libexec/")
 
 
-def found_not_imported(eff: Any) -> list[str]:
+def inherited_path_dirs(path: str | None = None) -> set[str]:
+    """The absolute folders of `path` (default: this process's PATH),
+    normalized. The PATH a gateway process gets is Claude Code's own (the
+    hooks, the mod's setup, gate-sh's renewal) or, for a command Claude runs,
+    the managed PATH itself; the managed shell's PATH is the snapshot's PATH,
+    which Claude Code makes from its own PATH plus the login shell's setup,
+    or Claude Code's own PATH when there is no snapshot (gate-sh)."""
+    p = os.environ.get("PATH", "") if path is None else path
+    return {os.path.normpath(d) for d in p.split(":") if d.startswith("/")}
+
+
+def found_not_imported(eff: Any, path: str | None = None) -> list[str]:
     """Folders (~ for the home) that hold programs and that a login shell
     puts on PATH (login_path_entries) or a well-known toolchain installs
     into (TOOLCHAIN_DIRS), minus the system folders, the macOS system ones,
-    what is imported and the gateway's own folders; at most FOUND_MAX, names
-    of plain characters only (they go into Claude's context). Reads files
-    and lists folders only, like host_inspect."""
+    what is imported, what the managed shell's PATH holds already (the
+    inherited PATH: inherited_path_dirs(path)) and the gateway's own
+    folders; at most FOUND_MAX, names of plain
+    characters only (they go into Claude's context). Reads files and lists
+    folders only, like host_inspect."""
     imported = set(eff.shell.import_path) if getattr(eff, "shell", None) is not None else set()
+    on_path = inherited_path_dirs(path)
     gw_home, gw_data = _gateway_home_names()
     out: list[str] = []
     seen: set[str] = set()
@@ -814,7 +840,7 @@ def found_not_imported(eff: Any) -> list[str]:
         if d in seen or len(out) >= FOUND_MAX:
             return
         seen.add(d)
-        if d in SYSTEM_DIRS or d in imported or d.startswith(_FOUND_SKIP) \
+        if d in SYSTEM_DIRS or d in imported or d in on_path or d.startswith(_FOUND_SKIP) \
                 or d.startswith((gw_home, gw_data)):
             return
         t = _tilde(d)

@@ -4,6 +4,28 @@ What changed in each release of the gateway plugin (`gate@gateway`), newest
 first. Versions before 0.9.0 are summarized. How to update:
 [README.md](README.md), "Update, disable, uninstall".
 
+## 0.11.1 (2026-10-26)
+
+Fixes from installing 0.11.0 from GitHub on macOS and Linux.
+
+- **gateway.toml is written when the first setup finishes**, as the README
+  says. It used to appear only when the next session started, and
+  `/gate-doctor` said "not written yet" until then.
+- **A pixi that is too old**: what Claude is told at session start, and what
+  the gateway's commands and `~/.config/gateway/gate` say, now give both ways
+  to update it: `pixi self-update`, or your package manager for a Homebrew or
+  MacPorts pixi (where `pixi self-update` refuses). The notice for a command
+  that runs without the managed shell's settings now says pixi is too old
+  and how to update it, instead of "setup failed; it is retried at the next
+  session start".
+- **"found here but not imported"** (`gate status`, `/gate-doctor`, Claude's
+  session context) no longer lists folders already on Claude Code's own
+  PATH, such as `~/.local/bin`.
+- **0.11.0's "Before you update" corrected**: removing the marketplace also
+  uninstalls the gateway and deletes its data folder, so the 0.6-vault steps
+  now end by installing the gateway again (`claude plugin install
+  gate@gateway`).
+
 ## 0.11.0 (2026-10-26)
 
 The gateway now stands only between Claude and the machines and accounts in
@@ -22,11 +44,16 @@ kept).
   refuses. To convert: `claude plugin marketplace remove gateway`, `claude
   plugin marketplace add p-w-rs/gateway#v0.10.0`, `claude plugin install
   gate@gateway`, and start one session (it converts the vault and keeps the
-  old one in `private/backups/`). If 0.10.0 put converted entries in
+  old one in `private/backups/`). Removing the marketplace also uninstalls
+  the gateway and deletes its data folder (the built tools and the audit
+  log; the next session builds the tools again); `~/.config/gateway`, with
+  the vault, stays. If 0.10.0 put converted entries in
   `gateway.from-v2.toml`, copy the ones you want into gateway.toml while
   0.10.0 runs: 0.11.0 treats an entry copied in later as new (`gate check
   NAME`, and an account's credential is asked for again). Then remove the
-  marketplace and add it again without the tag.
+  marketplace again, add it without the tag (`claude plugin marketplace add
+  p-w-rs/gateway`) and install the gateway again (`claude plugin install
+  gate@gateway`).
 - **pixi 0.83 or newer** (`pixi self-update`, or your package manager for a
   Homebrew or MacPorts pixi) and **the latest Claude Code**
   are required. With an older pixi the gateway says "pixi self-update"

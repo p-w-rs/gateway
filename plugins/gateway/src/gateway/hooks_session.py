@@ -537,7 +537,9 @@ def _missing_form(msgs: list[str], data: dict[str, Any] | None, write: bool) -> 
     it). A vault with a last good form: restore that (never the starter, which
     would read as "every entry removed" and wipe approvals and bindings). A
     vault with approvals but no copy: leave it missing (nothing ratchets on a
-    missing form). Nothing stored: write the starter form (form.STARTER)."""
+    missing form). Nothing stored: write the starter form (form.STARTER).
+    Also run when the first setup finishes (managed.sync_now(setup=True)),
+    since the first session's SessionStart had no Python yet."""
     if vault.v06_waiting():
         return
     if data is None and vault.exists():

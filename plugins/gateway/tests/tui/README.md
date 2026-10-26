@@ -16,7 +16,7 @@ It imports nothing from either plugin or from the gateway's other test helpers
 child processes, as a pre-flight).
 
 Requirements: the newest Python (`--spec python`) with `pyte` (nothing else
-outside the stdlib), the `claude` CLI on PATH (checked against 2.1.301; mods
+outside the stdlib), the `claude` CLI on PATH (checked against 2.1.310; mods
 need 2.1.287 terminal), and `git` on PATH (Claude Code clones git marketplaces with it; the git
 server runs `git http-backend`). macOS and Linux (pty, termios).
 

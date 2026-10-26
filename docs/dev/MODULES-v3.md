@@ -629,7 +629,7 @@ modules/accounts.md.
   launch.sh writes the same bytes in its degraded session (round 3: the first
   session had no launcher though no-screen messages name it), in each of its
   states: `launcher_not_ready(state)` is `STILL_SETTING_UP` ("building"),
-  `LAUNCHER_NOPIXI` ("nopixi"), the "update pixi (pixi self-update)" text
+  `LAUNCHER_NOPIXI` ("nopixi"), the "update pixi (`PIXI_UPDATE`)" text
   ("pixiold", the build failed on pixi's "requires pixi" refusal) or
   `launcher_failed(log)` ("failed"), all written for the user (round 4: the pixi-missing and failed launchers
   repeated the stubs' "tell the user" text for Claude).
@@ -878,7 +878,8 @@ loop) the mod reads `$DATA/managed/state.json` and sets `GW_MANAGED_DIR`,
 "off") and, once the env is built, `CLAUDE_CODE_SHELL` (the env's bash); the
 three are its only env writes (docs/dev/modules/managed.md). `run.py
 managed-sync` (the `$DATA/managed/sync` stub; also `launch.sh ensure-env`
-after a build) rewrites the managed shell's files. The gw MCP server's tools
+after a build, with `--setup`: a missing gateway.toml first, as SessionStart
+writes it) rewrites the managed shell's files. The gw MCP server's tools
 include `http`, `download` and `host_inspect`; `mcp_perm.sh` allows
 `host_inspect` in every mode and hands `http` and `download` to
 `hooks_mcp` (the `network` policy per mode; 0.11.0).

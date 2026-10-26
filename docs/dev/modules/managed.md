@@ -248,7 +248,10 @@ name, or on every env when they name none or one that is gone: the data folder g
 (uninstalled or removed: restart Claude Code, or reinstall), a build
 running ("still setting up"), setup failed (an env folder with
 `install.log` and no `.ready`, no live `.building` lock: the log and
-`/gate-doctor`; a lock whose `owner` names a builder and pixi child that
+`/gate-doctor`; with launch.sh's `.pixi-too-old` record beside that log,
+pixi too old instead: the found and needed versions read from it, and to
+update pixi with `pixi self-update`, or the package manager for a Homebrew or
+MacPorts pixi; a lock whose `owner` names a builder and pixi child that
 are gone, read with `read` and tested with `kill -0`, both builtins, is
 stale: `gw_lock_live`; a lock with no owner file yet counts as live, and
 without ps a reused pid looks alive, so the doubt is always "still setting
@@ -256,7 +259,7 @@ up"), an env built (`.ready` and its python3) with no build running: "the
 managed shell's settings are missing or couldn't be renewed; a new session
 writes them again", pixi missing (launch.sh's `find_pixi` places and Claude
 Code's PATH: https://pixi.sh), else still setting up (no build started yet);
-the failed and pixi-missing sentences are launch.sh's `not_ready_text` ones
+the failed, pixi-too-old and pixi-missing sentences are launch.sh's `not_ready_text` ones
 (test_managed compares them). The approval hook has judged the command already, and the stand-ins
 in `$DATA/bin` (written by launch.sh's cold path) still say "still setting
 up" for configured targets. A script with a tool script's shape that
@@ -313,7 +316,10 @@ when an install dropped its executable bit. `conf` is written last and
 never dated before gateway.toml.
 
 Who writes them: SessionStart (`envfile.sync`), `launch.sh ensure-env` right
-after a build and before the env's warm-up, FileChanged on gateway.toml,
+after a build and before the env's warm-up (`run.py managed-sync --setup`,
+which first writes a missing gateway.toml as SessionStart would:
+`hooks_session._missing_form`, so a new install's starter form is there when
+setup says ready, not only from the next session on), FileChanged on gateway.toml,
 `consent.approve("settings")`, gate-sh's renewal (`run.py managed-sync`), and
 the first command after a vault unlock (gated's broker touches
 `<run>/gated-unlocked`; approved imports are inside the vault, so a session
@@ -368,11 +374,21 @@ every mode.
 
 **Found but not imported** (GW-UX-2b, `managed.found_not_imported`): the
 same reading (the login PATH folders, then the toolchain folders) gives the
-folders that hold programs and that the managed PATH lacks (not the system
-folders, `/System/`, `/Library/Apple/`, `/usr/libexec/`, what is imported or
-the gateway's own; at most 8, plain characters only). While the form has no
-`[shell] import_path` key at all (an explicit `import_path = []` says no) and
-the mode isn't "off", Claude's session context names them and says to
+folders that hold programs and that the managed PATH lacks, at most 8, plain
+characters only. Left out: the system folders, `/System/`,
+`/Library/Apple/`, `/usr/libexec/`, what is imported, the gateway's own, and
+every folder on the PATH the process inherited (`inherited_path_dirs`).
+That PATH is Claude Code's own for the hooks, the mod's setup and gate-sh's
+renewal (which runs the sync with it), and the managed PATH itself for `gate
+status` in Claude's shell. The snapshot's PATH starts from Claude Code's, so
+those folders are on the managed PATH already. A folder only the snapshot
+adds may still be listed by the hooks and `/gate-doctor`, since Python can't
+see the session's snapshot: the desktop app gives hooks a minimal PATH, so
+there `/opt/homebrew/bin`, which only the login shell adds, is listed.
+
+While the form has no `[shell] import_path` key at all (an explicit
+`import_path = []` says no) and the mode isn't "off", Claude's session
+context names them and says to
 propose importing them (`hooks_session.IMPORT_OFFER`: one form edit, then
 `gate check settings` and the consent dialog; only when it fits the
 context's 2500 characters, after the hosts and accounts); `state.json` carries them as

@@ -150,6 +150,7 @@ The files in the working tree and how many mutations each holds:
 | `mutations_posture.py` | 79 |
 | `mutations_relock.py` | 41 |
 | `mutations_remote.py` | 63 |
+| `mutations_setup.py` (0.11.1, the install-from-GitHub test's findings: the first setup's gateway.toml, pixi too old in gate-sh's notice and Claude's context, the tool folders already on the managed PATH) | 6 |
 | `mutations_ssh.py` | 97 |
 | `mutations_sso.py` | 67 |
 | `mutations_sudo.py` | 196 |
@@ -312,6 +313,17 @@ pixi 0.81.0 / 0.82.0; scratch configs and the fake model API throughout).
   from an installed 0.9.1 in a live session (unit-tested), an
   install from GitHub of the released version.
 
+## 0.11.1 verification
+
+Run on 2026-10-26 (Claude Code 2.1.310 and pixi 0.83.0 on macOS arm64;
+scratch configs and the fake model API): the whole suite, 1695 passed;
+the mutation files the patch touched, `mutations_setup.py` 6,
+`mutations_relock.py` 41 and `mutations_managed.py` 106, all killed with
+no errors; the TUI acceptances `acceptance_install` (non-VM parts) 63 of
+63 and `acceptance_managed` 51 of 51, and checkpoint's
+`acceptance_independence` 96 of 96. Not rerun for the patch: Linux,
+Rosetta and the other mutation files (0.11.0's runs below).
+
 ## 0.11.0 verification
 
 Run on 2026-10-24 and 25 (Claude Code 2.1.310, the newest then, on macOS and
@@ -356,7 +368,19 @@ the counts below are the last round's unless a line says otherwise.
   gets Claude Code's prompt, and declining runs nothing; in dontAsk a bare
   `true` gets no gateway decision and Claude Code refuses it, an explicit
   `dontAsk = "allow"` is approved, and "ask" prompts and runs after Yes.
+- Installed from GitHub after the release (Claude Code 2.1.310, pixi 0.83).
+  macOS: the untagged and the tag-pinned marketplace installs at the release
+  commits and a plain and a `--keep-data` uninstall (all passed), and a live
+  session with all three plugins, 27 of 27 (setup ready, checkpoint
+  recording, pixi-guard refusing `python3`, curl asked about, the user's own
+  ssh untouched, both doctors naming the versions); and a session with pixi
+  0.81 saying pixi is too old. Also on macOS: updating gateway 0.10.0,
+  checkpoint 0.8.0 and pixi-guard 0.3.0 to these releases. The Debian VM, 31
+  of 31: the same live checks, and uninstalling the gateway, with what stays.
+  Not covered: the gateway running checkpoint's jobs in a plain install (the
+  harness can't point checkpoint at a plain gateway), the drain during an
+  uninstall, Claude Code's ssh clone probe.
 - Not run: the headless e2e suite (it needs the real model API), the desktop
   app (by hand), a browser sign-in against the real Entra and ML catalog app
   registrations, real GitHub, Hugging Face and Azure accounts, x86-64
-  hardware, an install from GitHub of the released version.
+  hardware.

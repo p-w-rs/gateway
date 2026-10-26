@@ -1539,8 +1539,8 @@ cargo build of the newest pijul release, pre-releases included, into
 `$DATA/pijul`, against the env's own libraries only). Platforms:
 osx-arm64, osx-64, linux-64, linux-aarch64 (no win-64). `requires-pixi` is
 the pixi that made the lock, with no upper bound; an older pixi refuses the
-manifest, which launch.sh reports as pixi too old (`pixi self-update`).
-An older env is used only on the lock's Python minor. Tasks: `test`, `mutations` (every mutation file
+manifest, which launch.sh reports as pixi too old (`pixi self-update`, or
+the package manager for a Homebrew or MacPorts pixi). An older env is used only on the lock's Python minor. Tasks: `test`, `mutations` (every mutation file
 on scratch copies), `e2e`, `release-check`.
 
 ## 19. Files removed
